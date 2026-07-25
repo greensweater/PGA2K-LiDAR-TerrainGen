@@ -1,8 +1,9 @@
 """
 terrain/terrain_model.py
 
-TerrainModel: predicts terrain height at any (x, z) by summing the
-overlapping contributions of every nearby Stamp.
+TerrainModel: predicts terrain height at any (x, z) by replaying every
+affecting Stamp's "flatten" pull, in placement order, starting from a
+flat 0 height grid.
 
 This is the core function everything else depends on -- the optimizer,
 adaptive refinement, and the writer all read predicted height through
@@ -25,8 +26,23 @@ from terrain.terrain_kernel import TerrainKernel
 
 class TerrainModel:
     """
-    Evaluates predicted terrain height as the sum of every Stamp's
-    contribution at a point.
+    Evaluates predicted terrain height by folding every affecting
+    Stamp's pull over a starting height of 0.
+
+    Under PGA's flatten tool, a stamp doesn't add to the terrain -- it
+    pulls nearby height toward stamp.value, weighted by the brush's
+    falloff:
+
+        new_height = old_height + (stamp.value - old_height) * kernel.sample(r)
+
+    This is a lerp toward stamp.value, not a sum, so a single stamp can
+    never push terrain past its own value. It also means the result
+    depends on the order stamps are applied in -- two stamps overlapping
+    at different values give a different blended result depending on
+    which one is folded in last. That's fine as long as this model
+    replays stamps in the same order the in-game renderer will (list
+    order, i.e. placement/generation order); the order itself doesn't
+    need to be canonical, just consistent between the two.
 
     Terrain noise (terrainNoise.json) is a separate, always-on in-game
     layer per the architecture doc's "Terrain Noise" section and is
@@ -56,19 +72,26 @@ class TerrainModel:
                     )
                 self._kernels[stamp.brush] = TerrainKernel(BRUSH_PROFILES[stamp.brush])
 
-    def _nearby_stamp_indices(self, x: float, z: float) -> np.ndarray:
-        """Indices of stamps whose radius could possibly reach (x, z)."""
+    def _affecting_stamp_indices(self, x: float, z: float) -> np.ndarray:
+        """
+        Indices of stamps whose radius reaches (x, z), sorted ascending.
+
+        Ascending index order recovers original list order (the
+        placement/application order), which matters here since pulls
+        must be replayed in that order, not summed unordered.
+        """
         if self._tree is None:
             return np.empty(0, dtype=np.int64)
-        return np.asarray(
-            self._tree.query_ball_point([x, z], self._max_radius),
-            dtype=np.int64,
+        idx = np.asarray(
+            self._tree.query_ball_point([x, z], self._max_radius), dtype=np.int64
         )
+        idx.sort()
+        return idx
 
     def evaluate(self, x: float, z: float) -> float:
         """Predicted terrain height at a single (x, z), in meters."""
         height = 0.0
-        for i in self._nearby_stamp_indices(x, z):
+        for i in self._affecting_stamp_indices(x, z):
             stamp = self.stamps[i]
             dx = x - stamp.x
             dz = z - stamp.z
@@ -76,7 +99,8 @@ class TerrainModel:
             if dist > stamp.radius:
                 continue
             r = dist / stamp.radius
-            height += stamp.amplitude * self._kernels[stamp.brush].sample(r)
+            weight = self._kernels[stamp.brush].sample(r)
+            height += (stamp.value - height) * weight
         return height
 
     def evaluate_many(self, points: np.ndarray) -> np.ndarray:
@@ -86,12 +110,11 @@ class TerrainModel:
         points: shape (N, 2), columns (x, z).
         Returns: shape (N,) heights, in meters.
 
-        NOTE: this loops per-point today for correctness/simplicity.
-        If it becomes a bottleneck (e.g. inside the optimizer's residual
-        computation), it can be vectorized with a single batched
-        tree.query_ball_point(points, ...) call and grouped kernel
-        sampling -- worth revisiting once there's a real profile to
-        optimize against, rather than guessing now.
+        NOTE: this loops per-point today for correctness/simplicity. If
+        it becomes a bottleneck, it's worth profiling before optimizing
+        rather than guessing -- and any vectorization has to preserve
+        per-point stamp ordering, which a naive batched approach won't
+        do for free.
         """
         points = np.asarray(points, dtype=np.float64)
         heights = np.empty(points.shape[0], dtype=np.float64)
