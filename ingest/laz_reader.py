@@ -362,3 +362,38 @@ def select_crop(
         min_z, max_z = bounds.max_z - size_m, bounds.max_z
 
     return BoundingBox(min_x=min_x, min_z=min_z, max_x=max_x, max_z=max_z)
+
+
+def recentered_crop(
+    cloud: PointCloud,
+    size_m: float,
+    center_x: Optional[float] = None,
+    center_z: Optional[float] = None,
+) -> PointCloud:
+    """
+    Crop `cloud` to a size_m x size_m window (see select_crop) and shift
+    the result so its local (0, 0) sits at the crop's lower-left corner.
+
+    This is what makes a loaded LAZ point cloud directly usable with
+    TerrainModel / hexgrid.generate_hex_grid: both already work in a
+    local [0, size_m] x [0, size_m] frame (playable terrain is always
+    2000 x 2000 m; see constants.COURSE_SIZE_M), so after this call,
+    stamp coordinates and point cloud coordinates line up with no
+    further translation needed anywhere else in the pipeline.
+
+    origin_x / origin_y absorb the crop shift, so they keep being the
+    single source of truth for converting local (0, 0) back to real
+    projected-CRS coordinates -- needed later to align OSM features,
+    which are pulled in real-world coordinates, not local ones.
+    """
+    crop_bounds = select_crop(cloud.bounds, size_m, center_x=center_x, center_z=center_z)
+    cropped = cloud.cropped(crop_bounds)
+    return PointCloud(
+        x=cropped.x - crop_bounds.min_x,
+        z=cropped.z - crop_bounds.min_z,
+        elevation=cropped.elevation,
+        classification=cropped.classification,
+        crs=cropped.crs,
+        origin_x=cropped.origin_x + crop_bounds.min_x,
+        origin_y=cropped.origin_y + crop_bounds.min_z,
+    )
