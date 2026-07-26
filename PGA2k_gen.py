@@ -5,6 +5,8 @@ PGA2k_gen.py
 CLI orchestrator for the terrain compiler. Operates on a working
 directory, running one pipeline step at a time:
 
+    PGA2k_gen.py <working_dir>                       (same as --step init)
+    PGA2k_gen.py <working_dir> --step init
     PGA2k_gen.py <working_dir> --step ingest-laz --projection <EPSG>
     PGA2k_gen.py <working_dir> --step ingest-osm
     PGA2k_gen.py <working_dir> --step generate-terrain
@@ -97,6 +99,30 @@ def load_stamps(path: Path) -> list[Stamp]:
 # ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
+
+def step_init(working_dir: Path) -> None:
+    """
+    Scaffold a fresh working directory: create it (and laz/) if they
+    don't exist yet. Safe to run multiple times -- never touches
+    anything that's already there, including an existing project.json
+    from a prior ingest-laz run.
+    """
+    working_dir.mkdir(parents=True, exist_ok=True)
+    laz_dir = working_dir / "laz"
+    laz_dir.mkdir(exist_ok=True)
+
+    print(f"Working directory ready: {working_dir}")
+    if any(laz_dir.iterdir()):
+        print(f"  {laz_dir} already has files in it.")
+    else:
+        print(f"  Put your LAZ/LAS tiles in {laz_dir}")
+
+    if (working_dir / PROJECT_FILE).exists():
+        print(f"  {PROJECT_FILE} already exists -- this working directory has been used before.")
+    else:
+        print("  Next: PGA2k_gen.py "
+              f"{working_dir} --step ingest-laz --projection <EPSG code>")
+
 
 def step_ingest_laz(working_dir: Path, projection: int) -> None:
     laz_dir = working_dir / "laz"
@@ -239,6 +265,7 @@ def step_output_terrain(working_dir: Path, course_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 STEPS = {
+    "init": step_init,
     "ingest-laz": step_ingest_laz,
     "ingest-osm": step_ingest_osm,
     "generate-terrain": step_generate_terrain,
@@ -249,15 +276,21 @@ STEPS = {
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PGA2K terrain compiler CLI")
     parser.add_argument("working_dir", type=Path, help="Project working directory")
-    parser.add_argument("--step", required=True, choices=sorted(STEPS.keys()))
+    parser.add_argument("--step", default="init", choices=sorted(STEPS.keys()),
+                         help="Pipeline step to run (default: init)")
     parser.add_argument("--projection", type=int, help="EPSG code (required for ingest-laz)")
     parser.add_argument("--course-dir", type=Path, default=None,
                          help="Extracted blank .course folder (default: <working_dir>/course)")
     args = parser.parse_args(argv)
 
     working_dir: Path = args.working_dir
+
+    if args.step == "init":
+        step_init(working_dir)
+        return 0
+
     if not working_dir.is_dir():
-        print(f"error: {working_dir} is not a directory", file=sys.stderr)
+        print(f"error: {working_dir} is not a directory -- run --step init first", file=sys.stderr)
         return 1
 
     try:
