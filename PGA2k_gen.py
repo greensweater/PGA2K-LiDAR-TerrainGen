@@ -45,11 +45,17 @@ from pathlib import Path
 
 import pyproj
 
-from constants import COURSE_SIZE_M, POINTCLOUD_FILE, PROJECT_FILE
+from constants import (
+    COURSE_SIZE_M, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
+    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_STAMPS,
+    POINTCLOUD_FILE, PROJECT_FILE,
+)
+import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
 from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
 from terrain.stamp import Stamp
+from terrain.terrain_model import TerrainModel
 from writer import normalize_stamp_heights, write_user_layers
 
 INITIAL_STAMPS_FILE = "initial_stamps.json"
@@ -122,6 +128,55 @@ def step_init(working_dir: Path) -> None:
     else:
         print("  Next: PGA2k_gen.py "
               f"{working_dir} --step ingest-laz --projection <EPSG code>")
+
+
+def step_visualize(working_dir: Path) -> None:
+    """
+    Generate every diagnostic preview PNG this pipeline can currently
+    produce, against whatever artifacts already exist in working_dir.
+    Never a prerequisite for other steps -- purely for inspection (see
+    "never behave as a black box").
+    """
+    from terrain.bounding_box import BoundingBox
+
+    pointcloud_path = working_dir / POINTCLOUD_FILE
+    if not pointcloud_path.exists():
+        raise StepError(
+            f"No {POINTCLOUD_FILE} found under {working_dir}. Run --step ingest-laz first."
+        )
+
+    full_cloud = PointCloud.load(pointcloud_path)
+    print(f"Loaded {pointcloud_path} ({full_cloud.count:,} points)")
+
+    print(f"Writing {PREVIEW_LIDAR} and {PREVIEW_LIDAR_HEIGHTMAP} "
+          "(full merged point cloud, not just the course crop)...")
+    viz.render_lidar_preview(full_cloud, working_dir / PREVIEW_LIDAR)
+    viz.render_lidar_heightmap(full_cloud, full_cloud.bounds, working_dir / PREVIEW_LIDAR_HEIGHTMAP)
+
+    stamps_path = working_dir / OPTIMIZED_STAMPS_FILE
+    if not stamps_path.exists():
+        stamps_path = working_dir / INITIAL_STAMPS_FILE
+    if not stamps_path.exists():
+        print(f"No {INITIAL_STAMPS_FILE} yet -- run --step generate-terrain for the "
+              "hex/stamps/height/error previews. Stopping after the LIDAR previews.")
+        return
+
+    stamps = load_stamps(stamps_path)
+    bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+    model = TerrainModel(stamps)
+
+    print(f"Writing {PREVIEW_HEX}...")
+    viz.render_hex_preview(stamps, bounds, working_dir / PREVIEW_HEX)
+    print(f"Writing {PREVIEW_STAMPS}...")
+    viz.render_stamps_preview(stamps, bounds, working_dir / PREVIEW_STAMPS)
+    print(f"Writing {PREVIEW_HEIGHT}...")
+    viz.render_height_preview(model, bounds, working_dir / PREVIEW_HEIGHT)
+
+    print(f"Writing {PREVIEW_ERROR} (course-cropped point cloud vs. TerrainModel)...")
+    course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
+    viz.render_error_preview(model, course_cloud, bounds, working_dir / PREVIEW_ERROR)
+
+    print(f"All previews written to {working_dir}")
 
 
 def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
@@ -290,6 +345,7 @@ STEPS = {
     "ingest-osm": step_ingest_osm,
     "generate-terrain": step_generate_terrain,
     "output-terrain": step_output_terrain,
+    "visualize": step_visualize,
 }
 
 
@@ -325,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "output-terrain":
             course_dir = args.course_dir or (working_dir / "course")
             step_output_terrain(working_dir, course_dir)
+        elif args.step == "visualize":
+            step_visualize(working_dir)
     except StepError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
