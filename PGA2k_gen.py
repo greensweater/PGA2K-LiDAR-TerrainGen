@@ -196,17 +196,30 @@ def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
 
     cloud = load_point_cloud(laz_dir, force_crs=force_crs)
     print(f"  detected CRS: {cloud.crs}")
-    print(f"  {cloud.count} points loaded, local bounds {cloud.bounds}")
+    if abs(cloud.horizontal_unit_factor - 1.0) > 1e-9:
+        print(f"  NOTE: this CRS's native unit is not meters -- detected horizontal "
+              f"conversion factor {cloud.horizontal_unit_factor:.6f} to meters, applied.")
+    if cloud.vertical_unit_source == "assumed-matches-horizontal" and abs(cloud.vertical_unit_factor - 1.0) > 1e-9:
+        print(f"  WARNING: elevation unit could not be read from the CRS directly "
+              f"(not a compound CRS) -- ASSUMED to match the horizontal factor "
+              f"({cloud.vertical_unit_factor:.6f}). Verify against a known site "
+              "elevation if that seems off.")
+    print(f"  {cloud.count} points loaded, local bounds {cloud.bounds} (meters)")
 
     cloud.save(working_dir / POINTCLOUD_FILE)
     print(f"  wrote {POINTCLOUD_FILE}")
 
     # Report the merged extent as a lat/lon bbox, since that's what's
     # needed to manually pull an OSM export before the next step.
-    proj_min_x = cloud.origin_x + cloud.bounds.min_x
-    proj_max_x = cloud.origin_x + cloud.bounds.max_x
-    proj_min_z = cloud.origin_y + cloud.bounds.min_z
-    proj_max_z = cloud.origin_y + cloud.bounds.max_z
+    # pyproj's Transformer expects coordinates in the CRS's own native
+    # unit, so convert our true-meters coordinates back before feeding
+    # them in -- NOT the same as cloud.origin_x/bounds directly, which
+    # are already in meters (see ingest.laz_reader module docstring).
+    h_factor = cloud.horizontal_unit_factor
+    proj_min_x = (cloud.origin_x + cloud.bounds.min_x) / h_factor
+    proj_max_x = (cloud.origin_x + cloud.bounds.max_x) / h_factor
+    proj_min_z = (cloud.origin_y + cloud.bounds.min_z) / h_factor
+    proj_max_z = (cloud.origin_y + cloud.bounds.max_z) / h_factor
     corners_proj = [
         (proj_min_x, proj_min_z), (proj_min_x, proj_max_z),
         (proj_max_x, proj_min_z), (proj_max_x, proj_max_z),
@@ -227,6 +240,9 @@ def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
     save_project(working_dir, {
         "projection_epsg": cloud.crs.to_epsg(),
         "projection_source": "forced" if force_crs is not None else "auto-detected",
+        "horizontal_unit_factor": cloud.horizontal_unit_factor,
+        "vertical_unit_factor": cloud.vertical_unit_factor,
+        "vertical_unit_source": cloud.vertical_unit_source,
         "crs_wkt": cloud.crs.to_wkt(),
         "point_count": cloud.count,
         "merged_bounds_local": dataclasses.asdict(cloud.bounds),

@@ -14,14 +14,35 @@ diagnostic artifact produced by visualize.py, never terrain data
 consumed by the optimizer.
 
 Coordinate convention, matching terrain.bounding_box and terrain.stamp:
-    x  -- horizontal ground-plane axis (meters, local/origin-aligned)
-    z  -- horizontal ground-plane axis (meters, local/origin-aligned),
+    x  -- horizontal ground-plane axis (true meters, local/origin-aligned)
+    z  -- horizontal ground-plane axis (true meters, local/origin-aligned),
           mapped from the LAZ file's projected northing ("y")
-    elevation -- raw LIDAR height (meters), untouched vertical datum
+    elevation -- LIDAR height, converted to true meters (see below)
 
 Projected-CRS coordinates are only ever used internally, to compute the
 merged extent and the local origin. Everything past load_point_cloud()
-works in local x/z.
+works in local x/z, in true meters.
+
+Unit handling: many US state-plane CRSs (this pipeline's target data)
+are natively defined in US survey feet, not meters -- e.g. EPSG:6549 is
+Ohio North in US survey feet. Raw LAZ coordinate values are in whatever
+unit the CRS declares, so they're converted to true meters immediately
+on read using that CRS's own declared unit_conversion_factor -- never
+assumed to already be meters. The horizontal conversion is read
+directly from the CRS. The vertical (elevation) conversion can only be
+read directly from a compound CRS (horizontal + vertical sub-CRS); for
+a plain 2D CRS (the common case), it's ASSUMED to match the horizontal
+factor -- the standard convention for US survey data, but not
+independently verified -- and PointCloud.vertical_unit_source records
+which case applied so callers can warn appropriately.
+
+origin_x / origin_y are stored in true meters too (in a "metric
+version" of the same projected grid, not the CRS's native unit) --
+PointCloud.horizontal_unit_factor is kept around specifically so any
+later reprojection (e.g. OSM alignment, or another lat/lon lookup)
+can convert back to the CRS's native unit before handing coordinates
+to a pyproj Transformer, which expects values in the CRS's own
+declared unit, not ours.
 """
 
 from __future__ import annotations
@@ -54,6 +75,31 @@ class LazReadError(RuntimeError):
     """Raised when LAZ tiles can't be read, trusted, or merged safely."""
 
 
+def linear_unit_factors(crs: pyproj.CRS) -> tuple[float, float, str]:
+    """
+    Determine (horizontal_factor, vertical_factor, vertical_source) to
+    convert `crs`'s native linear unit to true meters.
+
+    horizontal_factor comes directly from the CRS's own horizontal axis
+    info (e.g. ~0.3048 for a US survey foot state-plane zone).
+    vertical_factor is read from a compound CRS's vertical sub-CRS if
+    present ("compound-crs"); otherwise it's assumed equal to
+    horizontal_factor ("assumed-matches-horizontal") -- the common
+    convention for US survey data delivered in feet, but not
+    independently verified from the CRS alone.
+    """
+    horizontal_factor = crs.axis_info[0].unit_conversion_factor
+
+    if crs.is_compound and len(crs.sub_crs_list) > 1:
+        vertical_factor = crs.sub_crs_list[-1].axis_info[0].unit_conversion_factor
+        vertical_source = "compound-crs"
+    else:
+        vertical_factor = horizontal_factor
+        vertical_source = "assumed-matches-horizontal"
+
+    return horizontal_factor, vertical_factor, vertical_source
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -74,12 +120,13 @@ class TileExtent:
 @dataclass(slots=True)
 class PointCloud:
     """
-    A merged LIDAR point cloud in local, origin-aligned coordinates.
+    A merged LIDAR point cloud in local, origin-aligned coordinates,
+    in true meters throughout (see module docstring on unit handling).
 
-    origin_x / origin_y are the projected-CRS coordinates that map to
-    local (0, 0). Keep these around: they're the only link back to the
-    source CRS, and OSM features must be reprojected through the same
-    origin/CRS before they'll line up with this terrain.
+    origin_x / origin_y are the true-meters equivalent of the
+    projected-CRS coordinates that map to local (0, 0). horizontal_unit_factor
+    is kept alongside them specifically so a later reprojection can
+    convert back to the CRS's native unit -- see module docstring.
     """
 
     x: np.ndarray
@@ -90,6 +137,10 @@ class PointCloud:
     crs: pyproj.CRS
     origin_x: float
     origin_y: float
+
+    horizontal_unit_factor: float = 1.0
+    vertical_unit_factor: float = 1.0
+    vertical_unit_source: str = "assumed-matches-horizontal"
 
     _tree: Optional[cKDTree] = field(default=None, repr=False, compare=False)
 
@@ -136,6 +187,9 @@ class PointCloud:
             crs=self.crs,
             origin_x=self.origin_x,
             origin_y=self.origin_y,
+            horizontal_unit_factor=self.horizontal_unit_factor,
+            vertical_unit_factor=self.vertical_unit_factor,
+            vertical_unit_source=self.vertical_unit_source,
         )
 
     def cropped(self, bounds: BoundingBox) -> "PointCloud":
@@ -157,6 +211,9 @@ class PointCloud:
             crs_wkt=self.crs.to_wkt(),
             origin_x=self.origin_x,
             origin_y=self.origin_y,
+            horizontal_unit_factor=self.horizontal_unit_factor,
+            vertical_unit_factor=self.vertical_unit_factor,
+            vertical_unit_source=self.vertical_unit_source,
         )
         logger.info("Wrote %d points to %s", self.count, path)
 
@@ -164,6 +221,11 @@ class PointCloud:
     def load(cls, path: Path) -> "PointCloud":
         """Read back a previously cached pointcloud.npz artifact."""
         with np.load(path, allow_pickle=False) as data:
+            # horizontal_unit_factor etc. are missing from files written
+            # before unit conversion existed -- default to 1.0/"unknown"
+            # rather than fail, since those files were saved when this
+            # bug meant native units were being treated as meters anyway.
+            keys = data.files
             return cls(
                 x=data["x"],
                 z=data["z"],
@@ -172,6 +234,9 @@ class PointCloud:
                 crs=pyproj.CRS.from_wkt(str(data["crs_wkt"])),
                 origin_x=float(data["origin_x"]),
                 origin_y=float(data["origin_y"]),
+                horizontal_unit_factor=float(data["horizontal_unit_factor"]) if "horizontal_unit_factor" in keys else 1.0,
+                vertical_unit_factor=float(data["vertical_unit_factor"]) if "vertical_unit_factor" in keys else 1.0,
+                vertical_unit_source=str(data["vertical_unit_source"]) if "vertical_unit_source" in keys else "unknown (pre-unit-fix cache)",
             )
 
 
@@ -268,11 +333,13 @@ def load_point_cloud(
     force_crs: Optional[pyproj.CRS] = None,
 ) -> PointCloud:
     """
-    Load every tile in `laz_dir` into one origin-aligned PointCloud.
+    Load every tile in `laz_dir` into one origin-aligned PointCloud, in
+    true meters (see module docstring on unit handling).
 
-    If origin_x / origin_y are not given, the lower-left corner of the
-    merged extent is used as local (0, 0) -- a zero-lower-left frame,
-    same convention Chad's tool used, so bearings stay comparable.
+    origin_x / origin_y, if given, are interpreted in the CRS's native
+    unit (matching what scan_merged_extent's bounds are in) -- same as
+    the default (the lower-left corner of the merged extent), a
+    zero-lower-left frame matching Chad's tool's convention.
     """
     extents, bounds, crs = scan_merged_extent(laz_dir, force_crs=force_crs)
 
@@ -280,6 +347,23 @@ def load_point_cloud(
         origin_x = bounds.min_x
     if origin_y is None:
         origin_y = bounds.min_z  # min_z holds the scanned min northing ("y")
+
+    h_factor, v_factor, v_source = linear_unit_factors(crs)
+    if abs(h_factor - 1.0) > 1e-9:
+        logger.warning(
+            "CRS %s's native horizontal unit is not meters (factor %.6f to meters) -- "
+            "converting on read.", crs, h_factor,
+        )
+    if v_source == "assumed-matches-horizontal" and abs(v_factor - 1.0) > 1e-9:
+        logger.warning(
+            "CRS %s has no vertical sub-CRS to read elevation units from; ASSUMING "
+            "elevation uses the same %.6f factor as horizontal (the common convention "
+            "for US survey data, but not independently verified). If elevations come "
+            "out wrong, this is the first thing to check.", crs, v_factor,
+        )
+
+    origin_x_m = origin_x * h_factor
+    origin_y_m = origin_y * h_factor
 
     xs: list[np.ndarray] = []
     zs: list[np.ndarray] = []
@@ -295,9 +379,9 @@ def load_point_cloud(
                 "header scan and the full read. Re-run scan_merged_extent."
             )
 
-        xs.append(np.asarray(las.x, dtype=np.float64) - origin_x)
-        zs.append(np.asarray(las.y, dtype=np.float64) - origin_y)
-        elevations.append(np.asarray(las.z, dtype=np.float64))
+        xs.append(np.asarray(las.x, dtype=np.float64) * h_factor - origin_x_m)
+        zs.append(np.asarray(las.y, dtype=np.float64) * h_factor - origin_y_m)
+        elevations.append(np.asarray(las.z, dtype=np.float64) * v_factor)
         classifications.append(np.asarray(las.classification, dtype=np.uint8))
 
     cloud = PointCloud(
@@ -306,11 +390,14 @@ def load_point_cloud(
         elevation=np.concatenate(elevations),
         classification=np.concatenate(classifications),
         crs=crs,
-        origin_x=origin_x,
-        origin_y=origin_y,
+        origin_x=origin_x_m,
+        origin_y=origin_y_m,
+        horizontal_unit_factor=h_factor,
+        vertical_unit_factor=v_factor,
+        vertical_unit_source=v_source,
     )
-    logger.info("Loaded %d points into local frame (origin %.1f, %.1f)",
-                cloud.count, origin_x, origin_y)
+    logger.info("Loaded %d points into local frame (origin %.1f, %.1f m)",
+                cloud.count, origin_x_m, origin_y_m)
     return cloud
 
 
@@ -396,4 +483,7 @@ def recentered_crop(
         crs=cropped.crs,
         origin_x=cropped.origin_x + crop_bounds.min_x,
         origin_y=cropped.origin_y + crop_bounds.min_z,
+        horizontal_unit_factor=cropped.horizontal_unit_factor,
+        vertical_unit_factor=cropped.vertical_unit_factor,
+        vertical_unit_source=cropped.vertical_unit_source,
     )
