@@ -50,7 +50,7 @@ from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recent
 from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
 from terrain.stamp import Stamp
-from writer import write_user_layers
+from writer import normalize_stamp_heights, write_user_layers
 
 INITIAL_STAMPS_FILE = "initial_stamps.json"
 OPTIMIZED_STAMPS_FILE = "optimized_stamps.json"  # not produced yet; see output-terrain
@@ -254,6 +254,15 @@ def step_output_terrain(working_dir: Path, course_dir: Path) -> None:
     stamps = load_stamps(stamps_path)
     print(f"  {len(stamps)} stamps")
 
+    min_value = min(s.value for s in stamps)
+    max_value = max(s.value for s in stamps)
+    print(f"Normalizing heights: raw range [{min_value:.3f}, {max_value:.3f}] m "
+          f"-> shifting by {-min_value:.3f} m so minimum lands at 0")
+    try:
+        stamps = normalize_stamp_heights(stamps)
+    except ValueError as e:
+        raise StepError(str(e)) from e
+
     nodes_dir = course_dir / "CourseDescription_nodes"
     if not nodes_dir.is_dir():
         raise StepError(
@@ -264,6 +273,11 @@ def step_output_terrain(working_dir: Path, course_dir: Path) -> None:
     out_path = nodes_dir / "userLayers.json"
     write_user_layers(stamps, out_path)
     print(f"Wrote {out_path}")
+
+    save_project(working_dir, {
+        "output_height_shift_m": -min_value,
+        "output_height_range_m": max_value - min_value,
+    })
 
 
 # ---------------------------------------------------------------------------
