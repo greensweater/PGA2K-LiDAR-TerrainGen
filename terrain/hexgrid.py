@@ -50,7 +50,7 @@ from scipy.spatial import cKDTree
 from terrain.bounding_box import BoundingBox
 from terrain.stamp import Stamp
 
-HEX_LATTICE_PITCH_M = 100.0            # derived from 2*pitch * 10 == course width
+HEX_LATTICE_PITCH_M = 50.0            # derived from 2*pitch * 10 == course width
 HEX_STAMP_RADIUS_M = 2.0 * HEX_LATTICE_PITCH_M  # reaches nearest-neighbor centers
 DEFAULT_BRUSH = 9
 PLACEHOLDER_VALUE = 0.0                # overwritten by height fitting

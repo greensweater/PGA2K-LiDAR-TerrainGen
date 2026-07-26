@@ -50,7 +50,7 @@ from constants import (
     PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_STAMPS,
     POINTCLOUD_FILE, PROJECT_FILE,
 )
-from util.visualize import visualize as viz
+import util.visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
 from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
