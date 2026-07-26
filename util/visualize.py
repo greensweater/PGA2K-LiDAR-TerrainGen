@@ -30,7 +30,7 @@ import numpy as np
 from matplotlib.patches import Circle
 from matplotlib.collections import PatchCollection
 
-from constants import DEBUG_IMAGE_SIZE
+from constants import DEBUG_IMAGE_SIZE, PREVIEW_LIDAR_HEIGHTMAP
 from ingest.laz_reader import PointCloud
 from terrain.bounding_box import BoundingBox
 from terrain.stamp import Stamp
@@ -83,6 +83,61 @@ def render_lidar_preview(cloud: PointCloud, path: Path, max_points: int = 200_00
     )
     fig.colorbar(sc, ax=ax, label="elevation (m)", fraction=0.046, pad=0.04)
     ax.set_title(f"LIDAR point cloud ({n:,} points)")
+    _save(fig, path)
+
+
+def _add_compass_labels(ax, bounds: BoundingBox) -> None:
+    """
+    Burn N/S/E/W labels onto the plot edges, per this pipeline's
+    coordinate convention: +z = north, +x = east (inherited directly
+    from the source LAZ's projected northing/easting, never flipped in
+    ingest.laz_reader or terrain_model.py). This lets a rendered image
+    be checked against known site geography to confirm whether PGA's
+    own grid actually matches this convention once exported (see
+    writer.py's NOTE on sign convention) -- if compass directions don't
+    match reality in-game, the mismatch is in the game's own grid
+    mapping or the writer's position transform, not in this image.
+    """
+    cx = (bounds.min_x + bounds.max_x) / 2.0
+    cz = (bounds.min_z + bounds.max_z) / 2.0
+    style = dict(color="red", fontsize=14, fontweight="bold")
+    ax.text(cx, bounds.max_z, "N", **style, ha="center", va="bottom")
+    ax.text(cx, bounds.min_z, "S", **style, ha="center", va="top")
+    ax.text(bounds.max_x, cz, "E", **style, ha="left", va="center")
+    ax.text(bounds.min_x, cz, "W", **style, ha="right", va="center")
+
+
+def render_lidar_heightmap(
+    cloud: PointCloud,
+    bounds: BoundingBox,
+    path: Path,
+    resolution: int = 800,
+) -> None:
+    """
+    Grayscale binned heightmap of the point cloud, with N/S/E/W labels
+    burned in (see _add_compass_labels), for checking against known
+    site geography whether PGA's in-game grid orientation actually
+    matches this pipeline's -z=south/+z=north/-x=west/+x=east
+    convention once exported and viewed in-editor.
+
+    Distinct from render_lidar_preview(): that's a scatter plot colored
+    by a perceptual colormap (good for spotting classification/coverage
+    issues); this is a proper binned grid in true grayscale, which
+    reads more like an actual heightmap/DEM and is easier to compare
+    shape-for-shape against an in-game view.
+    """
+    heights = _bin_point_cloud(cloud, bounds, resolution)
+
+    fig, ax = plt.subplots(figsize=_FIGSIZE, dpi=_DPI)
+    im = ax.imshow(
+        heights, origin="lower", cmap="gray",
+        extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
+    )
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("z (m)")
+    fig.colorbar(im, ax=ax, label="elevation (m)", fraction=0.046, pad=0.04)
+    _add_compass_labels(ax, bounds)
+    ax.set_title(f"LIDAR heightmap ({resolution}x{resolution})")
     _save(fig, path)
 
 
