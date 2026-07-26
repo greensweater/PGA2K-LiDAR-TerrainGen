@@ -1,9 +1,9 @@
 """
 terrain/hexgrid.py
 
-Generates the initial coarse stamp layout:
-  1. A flat-top hexagonal (triangular) lattice of overlapping stamps.
-  2. Small filler stamps at the lattice's leftover triangular gaps.
+Generates the initial coarse stamp layout: a flat-top hexagonal
+(triangular) lattice of overlapping stamp positions covering the
+playable course.
 
 Lattice geometry (hex circle-packing spacing):
     col_spacing (width)  = 2 * pitch   -- same-row neighbor spacing
@@ -19,75 +19,43 @@ makes both spacings hit exact corners simultaneously (that requires
 sqrt(3) to be rational) -- so rows are centered vertically instead,
 leaving an equal margin above and below.
 
-The lattice pitch and the actual Stamp radius are deliberately separate
-numbers. With col_spacing = 2 * pitch, same-row neighbors at
-radius = pitch are exactly tangent, never overlapping -- that's
-structural, not something pitch can fix. Since we're packing circles
-(not hexagons), and the circles are meant to overlap, HEX_STAMP_RADIUS_M
-is solved for instead of just reusing the pitch: it's the radius at
-which two overlapping Type 9 falloffs (the flattest of the four
-profiles) sum back up to exactly the flat plateau height at their
-shared midpoint -- the "ridge limit". Any larger and the seam becomes
-a visible ridge above the surrounding plateau; any smaller and it's a
-valley below it.
+Stamp radius, under pull-toward-value semantics (see terrain_model.py):
+there's no additive-overshoot concern here -- a lerp can never push
+terrain past a stamp's own value, so unlike an additive model, more
+overlap is basically free (it just means smoother blending between
+neighboring targets, not risk of a ridge). What actually matters is
+coverage: a point untouched by any stamp just stays at 0, unmoved --
+a real, literal hole, not a shape-blending nuance. The worst-covered
+point in the lattice is the "deep hole" at the center of each
+triangular gap between three mutual nearest-neighbor stamps, at
+distance 2*pitch/sqrt(3) from each. Setting stamp radius = 2 * pitch
+(each stamp reaches exactly to its nearest neighbors' centers) gets
+that point pulled by all three overlapping stamps to ~97.6% combined
+weight (1 - (1-w)^3, compounding each stamp's sequential pull) --
+solid coverage without needing extra filler stamps.
 
-Even at the ridge-limit radius, the lattice's deep holes -- the points
-equidistant from three mutual nearest-neighbor stamps, at distance
-2*pitch/sqrt(3) from each -- are still under-covered (three overlapping
-falloffs there sum to ~75% of plateau, not 100%). generate_hole_fillers()
-adds one small Type 10 (or 54) stamp per hole, sized from the model's
-own predicted deficit at that point, since those brushes' cosine-like
-falloff (no flat plateau) suits patching a localized dip better than
-Type 8/9's plateau shape would.
+Stamps here carry a placeholder value=0.0 -- this module only decides
+*where* stamps go and how big they are, never what height they pull
+toward. That's terrain height-fitting's job, against real LIDAR data,
+and it has to run before these stamps mean anything.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import numpy as np
-from scipy.optimize import brentq
 from scipy.spatial import cKDTree
 
 from terrain.bounding_box import BoundingBox
-from terrain.brush_profiles import BRUSH_PROFILES, REFERENCE_AMPLITUDE_M
 from terrain.stamp import Stamp
-from terrain.terrain_kernel import TerrainKernel
-from terrain.terrain_model import TerrainModel
 
-HEX_LATTICE_PITCH_M = 100.0    # r: derived from 2r * 10 == course width
+HEX_LATTICE_PITCH_M = 100.0            # derived from 2*pitch * 10 == course width
+HEX_STAMP_RADIUS_M = 2.0 * HEX_LATTICE_PITCH_M  # reaches nearest-neighbor centers
 DEFAULT_BRUSH = 9
-DEFAULT_FILLER_BRUSH = 10
-DEFAULT_AMPLITUDE = REFERENCE_AMPLITUDE_M
+PLACEHOLDER_VALUE = 0.0                # overwritten by height fitting
 
 _EPS = 1e-6
-
-
-def solve_ridge_radius(
-    pitch: float = HEX_LATTICE_PITCH_M,
-    brush: int = DEFAULT_BRUSH,
-) -> float:
-    """
-    Solve for the stamp radius at which two nearest-neighbor stamps'
-    falloffs sum to exactly the flat plateau height at their shared
-    midpoint (distance = pitch from each center, since neighbor spacing
-    is 2 * pitch).
-    """
-    profile = BRUSH_PROFILES[brush]
-    kernel = TerrainKernel(profile)
-    plateau = profile.samples[0, 1]  # normalized center height
-
-    def ridge_gap(radius: float) -> float:
-        return 2.0 * kernel.sample(pitch / radius) - plateau
-
-    # Just above `pitch` the midpoint sits right at the stamp edge (r->1,
-    # height->0); a few pitches out it's deep in the flat plateau on both
-    # sides (well above the ridge limit) -- root lies in between.
-    return brentq(ridge_gap, pitch + 1e-6, pitch * 10.0)
-
-
-HEX_STAMP_RADIUS_M = solve_ridge_radius()
 
 
 def generate_hex_grid(
@@ -95,11 +63,10 @@ def generate_hex_grid(
     pitch: float = HEX_LATTICE_PITCH_M,
     stamp_radius: float = HEX_STAMP_RADIUS_M,
     brush: int = DEFAULT_BRUSH,
-    amplitude: float = DEFAULT_AMPLITUDE,
 ) -> list[Stamp]:
     """
     Generate a flat-top hexagonal (triangular) lattice of Stamps covering
-    `bounds`.
+    `bounds`, with placeholder value=0.0 (see module docstring).
 
     Columns are anchored to bounds.min_x so a pitch that evenly divides
     the width lands exactly on both left and right corners. Rows are
@@ -128,7 +95,7 @@ def generate_hex_grid(
         x = bounds.min_x + x_offset
         while x <= bounds.max_x + _EPS:
             stamps.append(
-                Stamp(x=x, z=z, radius=stamp_radius, amplitude=amplitude, brush=brush)
+                Stamp(x=x, z=z, radius=stamp_radius, value=PLACEHOLDER_VALUE, brush=brush)
             )
             x += col_spacing
 
@@ -143,9 +110,11 @@ def find_deep_holes(
     """
     Find the lattice's deep-hole points: centroids of every equilateral
     triangle formed by three mutual nearest-neighbor stamp centers
-    (neighbor spacing = 2 * pitch). Each is the point farthest from any
-    stamp center within its triangle -- the worst-covered spot in the
-    coarse layout.
+    (neighbor spacing = 2 * pitch). Each is the worst-covered point in
+    the coarse layout -- useful as a diagnostic (e.g. flagging where
+    adaptive refinement should look first), not needed to place fillers
+    now that stamp radius alone gets these points solid coverage (see
+    module docstring).
     """
     positions = np.array([[s.x, s.z] for s in stamps])
     tree = cKDTree(positions)
@@ -168,41 +137,3 @@ def find_deep_holes(
                     holes.add((round(float(centroid[0]), 3), round(float(centroid[1]), 3)))
 
     return sorted(holes)
-
-
-def generate_hole_fillers(
-    stamps: list[Stamp],
-    pitch: float = HEX_LATTICE_PITCH_M,
-    filler_brush: int = DEFAULT_FILLER_BRUSH,
-    filler_radius: Optional[float] = None,
-    target_height: Optional[float] = None,
-) -> list[Stamp]:
-    """
-    Add one small filler stamp at each deep-hole gap, sized so its own
-    center contribution closes the model's predicted deficit there.
-
-    filler_radius defaults to the hole-to-neighbor distance
-    (2 * pitch / sqrt(3)), reaching roughly to the three surrounding
-    stamp centers without extending much further. target_height
-    defaults to the Type 9 plateau (the reference "fully covered"
-    height the rest of the layout is tuned to).
-    """
-    if filler_radius is None:
-        filler_radius = 2.0 * pitch / math.sqrt(3.0)
-
-    if target_height is None:
-        target_height = BRUSH_PROFILES[DEFAULT_BRUSH].samples[0, 1] * REFERENCE_AMPLITUDE_M
-
-    filler_center_normalized = BRUSH_PROFILES[filler_brush].samples[0, 1]
-    model = TerrainModel(stamps)
-
-    fillers: list[Stamp] = []
-    for hx, hz in find_deep_holes(stamps, pitch):
-        deficit = target_height - model.evaluate(hx, hz)
-        if deficit <= 0.0:
-            continue  # already at or above the target; nothing to add
-        amplitude = deficit / filler_center_normalized
-        fillers.append(
-            Stamp(x=hx, z=hz, radius=filler_radius, amplitude=amplitude, brush=filler_brush)
-        )
-    return fillers
