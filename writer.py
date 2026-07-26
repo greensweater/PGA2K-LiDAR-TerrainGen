@@ -27,11 +27,19 @@ Field mapping from Stamp -> userLayers.json entry:
                 landscape terrain stamps; real sizing is via `scale`.
 
 All numeric output is rounded to 3 decimal places.
+
+Height normalization (shifting the minimum value to 0, required by
+PGA's height field convention) is NOT automatic here -- see
+normalize_stamp_heights() below. write_user_layers() writes exactly
+the values it's given; callers must normalize first if needed, so the
+shift amount stays visible rather than happening silently inside a
+"just write the file" call.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -42,11 +50,46 @@ HOLE_ID_NONE = -1
 UNUSED_RADIUS_FIELD = 0.0  # see module docstring: sizing is via `scale`
 POSITION_Y = "-Infinity"
 
+# Observed in-game ceiling for terrain height. PGA's height field is
+# 0-based -- negative or excessively large values aren't representable,
+# so every stamp's value must be shifted so the minimum lands at exactly
+# 0 before writing, and the resulting span must fit under this ceiling.
+MAX_INGAME_HEIGHT_M = 275.0
+
 _DECIMALS = 3
 
 
 def _round(value: float) -> float:
     return round(float(value), _DECIMALS)
+
+
+def normalize_stamp_heights(stamps: Sequence[Stamp]) -> list[Stamp]:
+    """
+    Shift every stamp's value so the minimum becomes exactly 0, matching
+    PGA's 0-based height field convention.
+
+    Only `value` is touched -- positions, radii, and brush types are
+    untouched. Raises rather than silently clipping if the resulting
+    span would exceed MAX_INGAME_HEIGHT_M, since clipping would corrupt
+    real terrain shape rather than just failing loudly.
+    """
+    if not stamps:
+        return list(stamps)
+
+    min_value = min(s.value for s in stamps)
+    max_value = max(s.value for s in stamps)
+    span = max_value - min_value
+
+    if span > MAX_INGAME_HEIGHT_M:
+        raise ValueError(
+            f"Terrain relief ({span:.1f} m, from {min_value:.1f} to {max_value:.1f} m) "
+            f"exceeds the known in-game height ceiling of {MAX_INGAME_HEIGHT_M} m even "
+            "after shifting the minimum to 0. Writing this would require clipping real "
+            "terrain shape -- consider a smaller/different crop rather than exporting "
+            "as-is."
+        )
+
+    return [replace(s, value=s.value - min_value) for s in stamps]
 
 
 def stamp_to_entry(stamp: Stamp) -> dict:
