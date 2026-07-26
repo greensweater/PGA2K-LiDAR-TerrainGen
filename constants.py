@@ -56,6 +56,7 @@ PROJECT_FILE = "project.json"
 POINTCLOUD_FILE = "pointcloud.npz"
 
 PREVIEW_LIDAR = "preview_lidar.png"
+PREVIEW_LIDAR_HEIGHTMAP = "preview_lidar_heightmap.png"
 PREVIEW_HEX = "preview_hex.png"
 PREVIEW_HEIGHT = "preview_height.png"
 PREVIEW_ERROR = "preview_error.png"
