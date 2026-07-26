@@ -7,7 +7,7 @@ directory, running one pipeline step at a time:
 
     PGA2k_gen.py <working_dir>                       (same as --step init)
     PGA2k_gen.py <working_dir> --step init
-    PGA2k_gen.py <working_dir> --step ingest-laz --projection <EPSG>
+    PGA2k_gen.py <working_dir> --step ingest-laz [--projection <EPSG>]
     PGA2k_gen.py <working_dir> --step ingest-osm
     PGA2k_gen.py <working_dir> --step generate-terrain
     PGA2k_gen.py <working_dir> --step output-terrain [--course-dir DIR]
@@ -124,18 +124,23 @@ def step_init(working_dir: Path) -> None:
               f"{working_dir} --step ingest-laz --projection <EPSG code>")
 
 
-def step_ingest_laz(working_dir: Path, projection: int) -> None:
+def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
     laz_dir = working_dir / "laz"
     if not laz_dir.is_dir():
         raise StepError(f"No laz/ folder found under {working_dir} -- expected {laz_dir}")
 
-    try:
-        force_crs = pyproj.CRS.from_epsg(projection)
-    except pyproj.exceptions.CRSError as e:
-        raise StepError(f"--projection {projection} is not a valid EPSG code: {e}") from e
+    force_crs = None
+    if projection is not None:
+        try:
+            force_crs = pyproj.CRS.from_epsg(projection)
+        except pyproj.exceptions.CRSError as e:
+            raise StepError(f"--projection {projection} is not a valid EPSG code: {e}") from e
+        print(f"Reading LAZ tiles from {laz_dir} (forcing CRS EPSG:{projection})...")
+    else:
+        print(f"Reading LAZ tiles from {laz_dir} (auto-detecting CRS from LAZ headers)...")
 
-    print(f"Reading LAZ tiles from {laz_dir} (forcing CRS EPSG:{projection})...")
     cloud = load_point_cloud(laz_dir, force_crs=force_crs)
+    print(f"  detected CRS: {cloud.crs}")
     print(f"  {cloud.count} points loaded, local bounds {cloud.bounds}")
 
     cloud.save(working_dir / POINTCLOUD_FILE)
@@ -165,7 +170,8 @@ def step_ingest_laz(working_dir: Path, projection: int) -> None:
           f"{working_dir / 'map.osm'}, then run --step ingest-osm.")
 
     save_project(working_dir, {
-        "projection_epsg": projection,
+        "projection_epsg": cloud.crs.to_epsg(),
+        "projection_source": "forced" if force_crs is not None else "auto-detected",
         "crs_wkt": cloud.crs.to_wkt(),
         "point_count": cloud.count,
         "merged_bounds_local": dataclasses.asdict(cloud.bounds),
@@ -278,7 +284,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("working_dir", type=Path, help="Project working directory")
     parser.add_argument("--step", default="init", choices=sorted(STEPS.keys()),
                          help="Pipeline step to run (default: init)")
-    parser.add_argument("--projection", type=int, help="EPSG code (required for ingest-laz)")
+    parser.add_argument("--projection", type=int, default=None,
+                         help="EPSG code to force for ingest-laz (optional -- "
+                              "auto-detected from LAZ headers if omitted)")
     parser.add_argument("--course-dir", type=Path, default=None,
                          help="Extracted blank .course folder (default: <working_dir>/course)")
     args = parser.parse_args(argv)
@@ -295,9 +303,6 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.step == "ingest-laz":
-            if args.projection is None:
-                print("error: --step ingest-laz requires --projection <EPSG code>", file=sys.stderr)
-                return 1
             step_ingest_laz(working_dir, args.projection)
         elif args.step == "ingest-osm":
             step_ingest_osm(working_dir)
