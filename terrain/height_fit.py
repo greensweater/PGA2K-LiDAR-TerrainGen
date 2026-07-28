@@ -54,24 +54,31 @@ def fit_stamp_heights(
     cloud: PointCloud,
     bare_earth_only: bool = True,
     min_points: int = 3,
+    existing_stamps: Sequence[Stamp] = (),
 ) -> list[Stamp]:
     """
-    Return a new list of Stamps with value replaced by a per-stamp
-    best-fit height, estimated from nearby LIDAR points.
+    Return a new list of Stamps (same order, same length as `stamps`)
+    with value replaced by a per-stamp best-fit height, estimated from
+    nearby LIDAR points.
 
-    Stamps are processed in list order, and each one's fit accounts for
-    whatever height stamps earlier in the list already left at its
-    position -- see module docstring. Processing order should match
-    whatever order the stamps will ultimately be applied in (placement
-    order), same as terrain_model.py's evaluate().
+    `stamps` are processed in list order, and each one's fit accounts
+    for whatever height stamps earlier in the list -- or in
+    `existing_stamps`, which is seeded in first but not re-fit or
+    included in the return value -- already left at its position. This
+    is what makes it correct to fit new adaptive-refinement detail
+    stamps against an already-fitted coarse terrain: pass the coarse
+    stamps as `existing_stamps` so new stamps' fits account for the
+    baseline that's already there, instead of fitting against a false
+    zero baseline.
 
     Stamps with fewer than `min_points` nearby points are left
     unchanged (their placeholder value untouched) rather than guessing
     from sparse or absent data -- left for a later pass (denser
-    sampling, interpolation, or adaptive refinement) to handle.
+    sampling, interpolation, or further refinement) to handle.
     """
     kernels: dict[int, TerrainKernel] = {}
-    fitted: list[Stamp] = []
+    fitted: list[Stamp] = list(existing_stamps)
+    n_seed = len(fitted)
 
     for stamp in stamps:
         if stamp.brush not in kernels:
@@ -101,4 +108,4 @@ def fit_stamp_heights(
         value = current + (target - current) / weight_at_center
         fitted.append(replace(stamp, value=value))
 
-    return fitted
+    return fitted[n_seed:]
