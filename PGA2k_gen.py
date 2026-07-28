@@ -9,9 +9,11 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step init
     PGA2k_gen.py <working_dir> --step ingest-laz [--projection <EPSG>]
     PGA2k_gen.py <working_dir> --step ingest-osm
+    PGA2k_gen.py <working_dir> --step ingest-course --course-file <path>
     PGA2k_gen.py <working_dir> --step generate-terrain
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--subdivision-factor F]
-    PGA2k_gen.py <working_dir> --step output-terrain [--course-dir DIR]
+    PGA2k_gen.py <working_dir> --step output-terrain
+    PGA2k_gen.py <working_dir> --step repack --repack-filename <name>
 
 Each step reads/writes plain-file artifacts in <working_dir> instead of
 holding state in memory across invocations -- this is a CLI today, a
@@ -23,13 +25,12 @@ independently resumable and inspectable, never a black box.
     map.osm                 input OSM export (user-downloaded, using
                              the lat/lon bbox ingest-laz prints)
     project.json             small state manifest (projection, merged
-                             bounds, course origin) carried between
-                             steps so they don't need re-specifying
+                             bounds, course origin, course_name) carried
+                             between steps so they don't need re-specifying
     pointcloud.npz            ingest-laz output (ingest.laz_reader.PointCloud)
     initial_stamps.json      generate-terrain output (Stamp list)
-    course/                  extracted blank .course to write into
-                             (see output-terrain); override with
-                             --course-dir
+    course/                  extracted blank .course, always at this
+                             fixed path (see ingest-course / output-terrain)
 
 Step ordering is enforced with clear errors (e.g. generate-terrain
 without a pointcloud.npz on disk yet) rather than letting a later step
@@ -41,10 +42,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import subprocess
 import sys
 from pathlib import Path
 
 import pyproj
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 from constants import (
     COURSE_SIZE_M, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
@@ -380,7 +384,9 @@ def step_refine_terrain(
     })
 
 
-def step_output_terrain(working_dir: Path, course_dir: Path) -> None:
+def step_output_terrain(working_dir: Path) -> None:
+    course_dir = working_dir / "course"
+
     stamps_path = working_dir / OPTIMIZED_STAMPS_FILE
     if not stamps_path.exists():
         stamps_path = working_dir / INITIAL_STAMPS_FILE
@@ -406,18 +412,107 @@ def step_output_terrain(working_dir: Path, course_dir: Path) -> None:
     nodes_dir = course_dir / "CourseDescription_nodes"
     if not nodes_dir.is_dir():
         raise StepError(
-            f"{nodes_dir} doesn't exist. Extract the blank starting .course into "
-            f"{course_dir} first (see course_extract.py), or pass --course-dir."
+            f"{nodes_dir} doesn't exist. Run --step ingest-course to extract a blank "
+            f"starting .course into {course_dir} first."
         )
 
     out_path = nodes_dir / "userLayers.json"
     write_user_layers(stamps, out_path)
     print(f"Wrote {out_path}")
 
+    # If a course name has been set (see the GUI's "Course name" field / project.json),
+    # write it into CourseDescription.json's root-level "name" key, preserving every
+    # other key already there -- same preserve-everything-else pattern as
+    # write_user_layers uses for userLayers.json's sibling keys.
+    project = load_project(working_dir)
+    course_name = project.get("course_name")
+    course_desc_path = course_dir / "CourseDescription.json"
+    if course_name:
+        if course_desc_path.exists():
+            with course_desc_path.open(encoding="utf-8") as f:
+                desc = json.load(f)
+            desc["name"] = course_name
+            with course_desc_path.open("w", encoding="utf-8") as f:
+                json.dump(desc, f, indent=2)
+            print(f"Set course name to '{course_name}' in {course_desc_path}")
+        else:
+            print(f"NOTE: course_name is set ('{course_name}') but {course_desc_path} "
+                  "doesn't exist yet -- run --step ingest-course first if you want the "
+                  "name applied.")
+
     save_project(working_dir, {
         "output_height_shift_m": -min_value,
         "output_height_range_m": max_value - min_value,
     })
+
+
+def step_ingest_course(working_dir: Path, course_file: Path) -> None:
+    """
+    Extract a .course file into working_dir/course via util/course_extract.py,
+    invoked as a subprocess -- same "one place behavior lives" reasoning as
+    the GUI's own subprocess-per-step design (see PGA2k_gen_gui.py).
+    """
+    if not course_file.exists():
+        raise StepError(f"Course file not found: {course_file}")
+
+    script = SCRIPT_DIR / "util" / "course_extract.py"
+    if not script.exists():
+        raise StepError(f"course_extract.py not found at {script}")
+
+    course_dir = working_dir / "course"
+    course_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Extracting {course_file} -> {course_dir} ...")
+    result = subprocess.run(
+        [sys.executable, str(script), str(course_file), str(course_dir)],
+        capture_output=True, text=True,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        raise StepError(f"course_extract.py failed (exit {result.returncode})")
+
+    print(f"Extracted to {course_dir}")
+    save_project(working_dir, {"source_course_file": str(course_file)})
+
+
+def step_repack(working_dir: Path, filename: str) -> None:
+    """
+    Repack working_dir/course into a .course file via util/course_repack.py,
+    invoked as a subprocess (see step_ingest_course).
+    """
+    course_dir = working_dir / "course"
+    if not course_dir.is_dir():
+        raise StepError(f"No course/ folder under {working_dir}. Run --step ingest-course first.")
+
+    script = SCRIPT_DIR / "util" / "course_repack.py"
+    if not script.exists():
+        raise StepError(f"course_repack.py not found at {script}")
+
+    filename = filename.strip()
+    if not filename:
+        raise StepError("Repack filename can't be empty.")
+    if filename.lower().endswith(".course"):
+        filename = filename[: -len(".course")]
+
+    out_path = working_dir / f"{filename}.course"
+
+    print(f"Repacking {course_dir} -> {out_path} ...")
+    result = subprocess.run(
+        [sys.executable, str(script), str(course_dir), str(out_path)],
+        capture_output=True, text=True,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        raise StepError(f"course_repack.py failed (exit {result.returncode})")
+
+    print(f"Wrote {out_path}")
+    save_project(working_dir, {"repack_filename": filename})
 
 
 # ---------------------------------------------------------------------------
@@ -428,9 +523,11 @@ STEPS = {
     "init": step_init,
     "ingest-laz": step_ingest_laz,
     "ingest-osm": step_ingest_osm,
+    "ingest-course": step_ingest_course,
     "generate-terrain": step_generate_terrain,
     "refine-terrain": step_refine_terrain,
     "output-terrain": step_output_terrain,
+    "repack": step_repack,
     "visualize": step_visualize,
 }
 
@@ -443,8 +540,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--projection", type=int, default=None,
                          help="EPSG code to force for ingest-laz (optional -- "
                               "auto-detected from LAZ headers if omitted)")
-    parser.add_argument("--course-dir", type=Path, default=None,
-                         help="Extracted blank .course folder (default: <working_dir>/course)")
     parser.add_argument("--error-tolerance", type=float, default=2.0,
                          help="refine-terrain: RMS error (m) above which a stamp gets "
                               "subdivided (default: 2.0)")
@@ -453,6 +548,10 @@ def main(argv: list[str] | None = None) -> int:
                               f"(default: {DEFAULT_SUBDIVISION_FACTOR})")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
+    parser.add_argument("--course-file", type=Path, default=None,
+                         help="ingest-course: path to the .course file to extract")
+    parser.add_argument("--repack-filename", type=str, default=None,
+                         help="repack: output filename (without .course extension)")
     args = parser.parse_args(argv)
 
     working_dir: Path = args.working_dir
@@ -470,14 +569,23 @@ def main(argv: list[str] | None = None) -> int:
             step_ingest_laz(working_dir, args.projection)
         elif args.step == "ingest-osm":
             step_ingest_osm(working_dir)
+        elif args.step == "ingest-course":
+            if args.course_file is None:
+                print("error: --step ingest-course requires --course-file <path>", file=sys.stderr)
+                return 1
+            step_ingest_course(working_dir, args.course_file)
         elif args.step == "generate-terrain":
             step_generate_terrain(working_dir)
         elif args.step == "refine-terrain":
             step_refine_terrain(working_dir, args.error_tolerance, args.subdivision_factor,
                                  args.max_new_stamps)
         elif args.step == "output-terrain":
-            course_dir = args.course_dir or (working_dir / "course")
-            step_output_terrain(working_dir, course_dir)
+            step_output_terrain(working_dir)
+        elif args.step == "repack":
+            if not args.repack_filename:
+                print("error: --step repack requires --repack-filename <name>", file=sys.stderr)
+                return 1
+            step_repack(working_dir, args.repack_filename)
         elif args.step == "visualize":
             step_visualize(working_dir)
     except StepError as e:
