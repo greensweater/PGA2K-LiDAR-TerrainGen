@@ -10,6 +10,7 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step ingest-laz [--projection <EPSG>]
     PGA2k_gen.py <working_dir> --step ingest-osm
     PGA2k_gen.py <working_dir> --step generate-terrain
+    PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--subdivision-factor F]
     PGA2k_gen.py <working_dir> --step output-terrain [--course-dir DIR]
 
 Each step reads/writes plain-file artifacts in <working_dir> instead of
@@ -50,8 +51,9 @@ from constants import (
     PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_STAMPS,
     POINTCLOUD_FILE, PROJECT_FILE,
 )
-import util.visualize as viz
+import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
+from terrain.adaptive_refine import DEFAULT_SUBDIVISION_FACTOR, refine_stamps
 from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
 from terrain.stamp import Stamp
@@ -311,6 +313,73 @@ def step_generate_terrain(working_dir: Path) -> None:
     })
 
 
+def step_refine_terrain(
+    working_dir: Path,
+    tolerance: float,
+    subdivision_factor: float,
+    max_new_stamps: int | None,
+) -> None:
+    """
+    One adaptive refinement pass (see terrain/adaptive_refine.py):
+    flag stamps whose local fit is worst against real LIDAR, add
+    smaller detail stamps there, write the result back to
+    optimized_stamps.json.
+
+    Safe to run repeatedly -- each call reads its own prior output if
+    present (falling back to initial_stamps.json on the first call),
+    so "run this a few times, watch the flagged count drop" is the
+    expected way to iterate (see module docstring's "largest error ->
+    split -> repeat").
+    """
+    pointcloud_path = working_dir / POINTCLOUD_FILE
+    if not pointcloud_path.exists():
+        raise StepError(
+            f"No {POINTCLOUD_FILE} found under {working_dir}. Run --step ingest-laz first."
+        )
+
+    stamps_path = working_dir / OPTIMIZED_STAMPS_FILE
+    if not stamps_path.exists():
+        stamps_path = working_dir / INITIAL_STAMPS_FILE
+    if not stamps_path.exists():
+        raise StepError(
+            f"Neither {OPTIMIZED_STAMPS_FILE} nor {INITIAL_STAMPS_FILE} found under "
+            f"{working_dir}. Run --step generate-terrain first."
+        )
+
+    print(f"Loading stamps from {stamps_path}...")
+    stamps = load_stamps(stamps_path)
+    print(f"  {len(stamps)} stamps")
+
+    full_cloud = PointCloud.load(pointcloud_path)
+    course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
+
+    print(f"Scoring stamps against LIDAR (tolerance={tolerance} m)...")
+    refined, flagged = refine_stamps(
+        stamps, course_cloud, tolerance=tolerance,
+        subdivision_factor=subdivision_factor, max_new_stamps=max_new_stamps,
+    )
+
+    n_added = len(refined) - len(stamps)
+    if flagged:
+        worst = flagged[0]
+        print(f"  {len(flagged)} stamps over tolerance (worst: {worst.rms_error:.3f} m "
+              f"at ({worst.stamp.x:.1f}, {worst.stamp.z:.1f}))")
+    else:
+        print("  0 stamps over tolerance -- nothing to refine, terrain already meets it")
+    print(f"  added {n_added} detail stamps ({len(stamps)} -> {len(refined)} total)")
+
+    out_path = working_dir / OPTIMIZED_STAMPS_FILE
+    save_stamps(refined, out_path)
+    print(f"  wrote {out_path}")
+
+    save_project(working_dir, {
+        "last_refine_tolerance_m": tolerance,
+        "last_refine_flagged_count": len(flagged),
+        "last_refine_added_count": n_added,
+        "total_stamp_count": len(refined),
+    })
+
+
 def step_output_terrain(working_dir: Path, course_dir: Path) -> None:
     stamps_path = working_dir / OPTIMIZED_STAMPS_FILE
     if not stamps_path.exists():
@@ -360,6 +429,7 @@ STEPS = {
     "ingest-laz": step_ingest_laz,
     "ingest-osm": step_ingest_osm,
     "generate-terrain": step_generate_terrain,
+    "refine-terrain": step_refine_terrain,
     "output-terrain": step_output_terrain,
     "visualize": step_visualize,
 }
@@ -375,6 +445,14 @@ def main(argv: list[str] | None = None) -> int:
                               "auto-detected from LAZ headers if omitted)")
     parser.add_argument("--course-dir", type=Path, default=None,
                          help="Extracted blank .course folder (default: <working_dir>/course)")
+    parser.add_argument("--error-tolerance", type=float, default=2.0,
+                         help="refine-terrain: RMS error (m) above which a stamp gets "
+                              "subdivided (default: 2.0)")
+    parser.add_argument("--subdivision-factor", type=float, default=DEFAULT_SUBDIVISION_FACTOR,
+                         help=f"refine-terrain: detail stamp radius = parent radius / this "
+                              f"(default: {DEFAULT_SUBDIVISION_FACTOR})")
+    parser.add_argument("--max-new-stamps", type=int, default=None,
+                         help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     args = parser.parse_args(argv)
 
     working_dir: Path = args.working_dir
@@ -394,6 +472,9 @@ def main(argv: list[str] | None = None) -> int:
             step_ingest_osm(working_dir)
         elif args.step == "generate-terrain":
             step_generate_terrain(working_dir)
+        elif args.step == "refine-terrain":
+            step_refine_terrain(working_dir, args.error_tolerance, args.subdivision_factor,
+                                 args.max_new_stamps)
         elif args.step == "output-terrain":
             course_dir = args.course_dir or (working_dir / "course")
             step_output_terrain(working_dir, course_dir)
