@@ -23,16 +23,18 @@ more tightly-packed stamps later, where a stamp's own center *can* already
 be partway pulled by an earlier, larger stamp. fit_stamp_heights()
 handles that case correctly too: it reads whatever height prior stamps
 in the list already produced at each stamp's position (current), and
-solves the value that pulls the remaining distance to the target,
-given that brush's own center weight:
+solves the value that reaches the target, given that brush's own
+center weight and the stamp's own tool (see terrain/stamp.py):
 
-    target = current + (value - current) * weight_at_center
-    value  = current + (target - current) / weight_at_center
+    flatten (tool=0): target = current + (value - current) * weight_at_center
+                       value  = current + (target - current) / weight_at_center
+    raise   (tool=1): target = current + value * weight_at_center
+                       value  = (target - current) / weight_at_center
 
-which reduces to value = target exactly whenever current = 0 and
-weight_at_center = 1 -- true for every stamp in the initial hex grid,
-so this general form costs nothing there and is correct everywhere
-else too.
+Flatten's form reduces to value = target exactly whenever current = 0
+and weight_at_center = 1 -- true for every stamp in the initial hex
+grid, so this general form costs nothing there and is correct
+everywhere else too.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ import numpy as np
 
 from ingest.laz_reader import PointCloud
 from terrain.brush_profiles import BRUSH_PROFILES
-from terrain.stamp import Stamp
+from terrain.stamp import TOOL_RAISE, Stamp
 from terrain.terrain_kernel import TerrainKernel
 from terrain.terrain_model import TerrainModel
 
@@ -58,8 +60,9 @@ def fit_stamp_heights(
 ) -> list[Stamp]:
     """
     Return a new list of Stamps (same order, same length as `stamps`)
-    with value replaced by a per-stamp best-fit height, estimated from
-    nearby LIDAR points.
+    with value replaced by a per-stamp best-fit height (flatten) or
+    delta (raise), estimated from nearby LIDAR points -- see module
+    docstring for the two formulas.
 
     `stamps` are processed in list order, and each one's fit accounts
     for whatever height stamps earlier in the list -- or in
@@ -105,7 +108,10 @@ def fit_stamp_heights(
             continue
 
         current = TerrainModel(fitted).evaluate(stamp.x, stamp.z)
-        value = current + (target - current) / weight_at_center
+        if stamp.tool == TOOL_RAISE:
+            value = (target - current) / weight_at_center
+        else:
+            value = current + (target - current) / weight_at_center
         fitted.append(replace(stamp, value=value))
 
     return fitted[n_seed:]
