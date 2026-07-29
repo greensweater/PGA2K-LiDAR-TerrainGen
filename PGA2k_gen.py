@@ -62,7 +62,7 @@ from constants import (
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
-from osm import parse_osm_features, save_features
+from ingest.osm import parse_osm_features, save_features
 from terrain.adaptive_refine import DEFAULT_MIN_HOTSPOT_RADIUS_CELLS, DEFAULT_RESOLUTION, refine_stamps
 from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
