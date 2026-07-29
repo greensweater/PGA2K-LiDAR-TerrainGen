@@ -54,9 +54,37 @@ def _new_figure(bounds: BoundingBox):
     return fig, ax
 
 
+def _archive_existing(path: Path, max_history: int = 10) -> None:
+    """
+    If `path` already exists, shift it into a numbered history rather
+    than overwrite it silently: path -> path_1, an existing path_1 ->
+    path_2, and so on, so the previous run's preview stays around for
+    comparison. Anything beyond max_history is dropped rather than
+    kept forever.
+    """
+    if not path.exists():
+        return
+
+    stem, suffix, parent = path.stem, path.suffix, path.parent
+
+    existing_n = 0
+    while (parent / f"{stem}_{existing_n + 1}{suffix}").exists():
+        existing_n += 1
+
+    for n in range(existing_n, 0, -1):
+        src = parent / f"{stem}_{n}{suffix}"
+        if n + 1 > max_history:
+            src.unlink()
+        else:
+            src.rename(parent / f"{stem}_{n + 1}{suffix}")
+
+    path.rename(parent / f"{stem}_1{suffix}")
+
+
 def _save(fig, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _archive_existing(path)
     fig.savefig(path, facecolor="white", bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
 
@@ -207,16 +235,31 @@ def render_height_preview(
     _save(fig, path)
 
 
-def _bin_point_cloud(cloud: PointCloud, bounds: BoundingBox, resolution: int) -> np.ndarray:
+def _bin_point_cloud(
+    cloud: PointCloud, bounds: BoundingBox, resolution: int, bare_earth_only: bool = False,
+) -> np.ndarray:
     """
     Bin cloud.elevation into a resolution x resolution grid over bounds
     (mean elevation per cell, NaN where a cell has no points).
+
+    bare_earth_only defaults to False here since render_lidar_heightmap
+    (the general orientation/inspection view) benefits from showing
+    buildings and vegetation, not hiding them. render_error_preview
+    passes True explicitly -- comparing predicted terrain against
+    building-roof or treetop elevation isn't a meaningful error signal
+    (see terrain/adaptive_refine.py, which had this exact bug).
     """
+    if bare_earth_only:
+        mask = cloud.bare_earth_mask()
+        x, z, elevation = cloud.x[mask], cloud.z[mask], cloud.elevation[mask]
+    else:
+        x, z, elevation = cloud.x, cloud.z, cloud.elevation
+
     x_edges = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
     z_edges = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
 
-    sums, _, _ = np.histogram2d(cloud.z, cloud.x, bins=[z_edges, x_edges], weights=cloud.elevation)
-    counts, _, _ = np.histogram2d(cloud.z, cloud.x, bins=[z_edges, x_edges])
+    sums, _, _ = np.histogram2d(z, x, bins=[z_edges, x_edges], weights=elevation)
+    counts, _, _ = np.histogram2d(z, x, bins=[z_edges, x_edges])
 
     with np.errstate(invalid="ignore", divide="ignore"):
         means = sums / counts
@@ -236,7 +279,7 @@ def render_error_preview(
     Cells with no LIDAR points are left blank (NaN), not zero -- a
     missing measurement isn't the same as a confirmed-zero error.
     """
-    actual = _bin_point_cloud(cloud, bounds, resolution)
+    actual = _bin_point_cloud(cloud, bounds, resolution, bare_earth_only=True)
     predicted = model.render(resolution=resolution, bounds=bounds)
     error = predicted - actual
 
