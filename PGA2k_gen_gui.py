@@ -145,12 +145,15 @@ class PGAGenGUI:
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.tolerance_var = tk.StringVar(value="2.0")
-        self.subdivision_var = tk.StringVar(value="2.0")
+        self.resolution_var = tk.StringVar(value="200")
+        self.min_region_cells_var = tk.StringVar(value="2")
         self.max_new_var = tk.StringVar()
         ttk.Label(parent, text="Error tolerance (m):").pack(anchor="w")
         ttk.Entry(parent, textvariable=self.tolerance_var, width=14).pack(anchor="w")
-        ttk.Label(parent, text="Subdivision factor:").pack(anchor="w")
-        ttk.Entry(parent, textvariable=self.subdivision_var, width=14).pack(anchor="w")
+        ttk.Label(parent, text="Error grid resolution:").pack(anchor="w")
+        ttk.Entry(parent, textvariable=self.resolution_var, width=14).pack(anchor="w")
+        ttk.Label(parent, text="Min region cells:").pack(anchor="w")
+        ttk.Entry(parent, textvariable=self.min_region_cells_var, width=14).pack(anchor="w")
         ttk.Label(parent, text="Max new stamps (optional):").pack(anchor="w")
         ttk.Entry(parent, textvariable=self.max_new_var, width=14).pack(anchor="w")
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
@@ -315,9 +318,12 @@ class PGAGenGUI:
         tol = self.tolerance_var.get().strip()
         if tol:
             args += ["--error-tolerance", tol]
-        sub = self.subdivision_var.get().strip()
-        if sub:
-            args += ["--subdivision-factor", sub]
+        res = self.resolution_var.get().strip()
+        if res:
+            args += ["--resolution", res]
+        min_cells = self.min_region_cells_var.get().strip()
+        if min_cells:
+            args += ["--min-region-cells", min_cells]
         max_new = self.max_new_var.get().strip()
         if max_new:
             args += ["--max-new-stamps", max_new]
