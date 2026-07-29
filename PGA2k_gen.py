@@ -29,6 +29,9 @@ independently resumable and inspectable, never a black box.
                              between steps so they don't need re-specifying
     pointcloud.npz            ingest-laz output (ingest.laz_reader.PointCloud)
     initial_stamps.json      generate-terrain output (Stamp list)
+    refine_stamps_N.json      refine-terrain output: only the stamps
+                             pass N added (not a cumulative snapshot);
+                             deleting the highest N undoes that pass
     course/                  extracted blank .course, always at this
                              fixed path (see ingest-course / output-terrain)
 
@@ -66,7 +69,40 @@ from terrain.terrain_model import TerrainModel
 from writer import normalize_stamp_heights, write_user_layers
 
 INITIAL_STAMPS_FILE = "initial_stamps.json"
-OPTIMIZED_STAMPS_FILE = "optimized_stamps.json"  # not produced yet; see output-terrain
+REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
+
+
+def _refine_stamps_files(working_dir: Path) -> list[Path]:
+    """Every refine_stamps_N.json present, in order (N=1, 2, 3, ...)."""
+    files = []
+    n = 1
+    while (working_dir / REFINE_STAMPS_PATTERN.format(n=n)).exists():
+        files.append(working_dir / REFINE_STAMPS_PATTERN.format(n=n))
+        n += 1
+    return files
+
+
+def load_all_stamps(working_dir: Path) -> list[Stamp]:
+    """
+    Reconstruct the full, current stamp list: initial_stamps.json plus
+    every refine_stamps_N.json in order.
+
+    Each refine-terrain pass writes only the stamps *it* added, not a
+    cumulative snapshot -- so deleting the highest-numbered
+    refine_stamps_N.json is a natural undo of just the most recent
+    pass, and every earlier pass's file stays exactly as it was
+    (nothing gets rewritten/renumbered by later passes).
+    """
+    initial_path = working_dir / INITIAL_STAMPS_FILE
+    if not initial_path.exists():
+        raise StepError(
+            f"No {INITIAL_STAMPS_FILE} found under {working_dir}. Run --step generate-terrain first."
+        )
+
+    stamps = load_stamps(initial_path)
+    for path in _refine_stamps_files(working_dir):
+        stamps.extend(load_stamps(path))
+    return stamps
 
 
 class StepError(RuntimeError):
@@ -159,15 +195,12 @@ def step_visualize(working_dir: Path) -> None:
     viz.render_lidar_preview(full_cloud, working_dir / PREVIEW_LIDAR)
     viz.render_lidar_heightmap(full_cloud, full_cloud.bounds, working_dir / PREVIEW_LIDAR_HEIGHTMAP)
 
-    stamps_path = working_dir / OPTIMIZED_STAMPS_FILE
-    if not stamps_path.exists():
-        stamps_path = working_dir / INITIAL_STAMPS_FILE
-    if not stamps_path.exists():
+    if not (working_dir / INITIAL_STAMPS_FILE).exists():
         print(f"No {INITIAL_STAMPS_FILE} yet -- run --step generate-terrain for the "
               "hex/stamps/height/error previews. Stopping after the LIDAR previews.")
         return
 
-    stamps = load_stamps(stamps_path)
+    stamps = load_all_stamps(working_dir)
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
     model = TerrainModel(stamps)
 
@@ -327,14 +360,16 @@ def step_refine_terrain(
     One adaptive refinement pass (see terrain/adaptive_refine.py): find
     contiguous regions of the binned error grid exceeding `tolerance`
     (same grid preview_error.png visualizes), add one stamp per region
-    centered and sized on it, write the result back to
-    optimized_stamps.json.
+    centered and sized on it, write the newly-added stamps (only --
+    not the whole cumulative list) to the next refine_stamps_N.json.
 
-    Safe to run repeatedly -- each call reads its own prior output if
-    present (falling back to initial_stamps.json on the first call),
-    so "run this a few times, watch the hotspot count drop" is the
-    expected way to iterate (see module docstring's "largest error ->
-    split -> repeat").
+    Safe to run repeatedly -- each call reconstructs the full current
+    terrain via load_all_stamps() (initial_stamps.json plus every
+    prior refine_stamps_N.json) and scores against that, so "run this
+    a few times, watch the hotspot count drop" is the expected way to
+    iterate (see module docstring's "largest error -> split -> repeat").
+    Deleting the highest-numbered refine_stamps_N.json undoes just
+    that pass.
     """
     pointcloud_path = working_dir / POINTCLOUD_FILE
     if not pointcloud_path.exists():
@@ -342,18 +377,9 @@ def step_refine_terrain(
             f"No {POINTCLOUD_FILE} found under {working_dir}. Run --step ingest-laz first."
         )
 
-    stamps_path = working_dir / OPTIMIZED_STAMPS_FILE
-    if not stamps_path.exists():
-        stamps_path = working_dir / INITIAL_STAMPS_FILE
-    if not stamps_path.exists():
-        raise StepError(
-            f"Neither {OPTIMIZED_STAMPS_FILE} nor {INITIAL_STAMPS_FILE} found under "
-            f"{working_dir}. Run --step generate-terrain first."
-        )
-
-    print(f"Loading stamps from {stamps_path}...")
-    stamps = load_stamps(stamps_path)
-    print(f"  {len(stamps)} stamps")
+    stamps = load_all_stamps(working_dir)
+    print(f"  {len(stamps)} stamps (cumulative: initial + {len(_refine_stamps_files(working_dir))} "
+          "prior refine pass(es))")
 
     full_cloud = PointCloud.load(pointcloud_path)
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
@@ -366,23 +392,27 @@ def step_refine_terrain(
         max_new_stamps=max_new_stamps,
     )
 
-    n_added = len(refined) - len(stamps)
+    new_stamps = refined[len(stamps):]
     if hotspots:
         worst = hotspots[0]
         print(f"  {len(hotspots)} hotspots over tolerance (worst: {worst.peak_error:.3f} m "
               f"at ({worst.x:.1f}, {worst.z:.1f}), {worst.n_cells} cells)")
     else:
         print("  0 hotspots over tolerance -- nothing to refine, terrain already meets it")
-    print(f"  added {n_added} detail stamps ({len(stamps)} -> {len(refined)} total)")
 
-    out_path = working_dir / OPTIMIZED_STAMPS_FILE
-    save_stamps(refined, out_path)
-    print(f"  wrote {out_path}")
+    if new_stamps:
+        next_n = len(_refine_stamps_files(working_dir)) + 1
+        out_path = working_dir / REFINE_STAMPS_PATTERN.format(n=next_n)
+        save_stamps(new_stamps, out_path)
+        print(f"  wrote {out_path} ({len(new_stamps)} new stamps; "
+              f"{len(stamps)} -> {len(refined)} total)")
+    else:
+        print(f"  nothing written ({len(stamps)} total, unchanged)")
 
     save_project(working_dir, {
         "last_refine_tolerance_m": tolerance,
         "last_refine_hotspot_count": len(hotspots),
-        "last_refine_added_count": n_added,
+        "last_refine_added_count": len(new_stamps),
         "total_stamp_count": len(refined),
     })
 
@@ -390,17 +420,8 @@ def step_refine_terrain(
 def step_output_terrain(working_dir: Path) -> None:
     course_dir = working_dir / "course"
 
-    stamps_path = working_dir / OPTIMIZED_STAMPS_FILE
-    if not stamps_path.exists():
-        stamps_path = working_dir / INITIAL_STAMPS_FILE
-    if not stamps_path.exists():
-        raise StepError(
-            f"Neither {OPTIMIZED_STAMPS_FILE} nor {INITIAL_STAMPS_FILE} found under "
-            f"{working_dir}. Run --step generate-terrain first."
-        )
-
-    print(f"Loading stamps from {stamps_path}...")
-    stamps = load_stamps(stamps_path)
+    print(f"Loading stamps from {working_dir} (initial + all refine passes)...")
+    stamps = load_all_stamps(working_dir)
     print(f"  {len(stamps)} stamps")
 
     min_value = min(s.value for s in stamps)
