@@ -8,18 +8,43 @@ architecture doc's "Adaptive Refinement": "Only subdivide stamps whose
 local error exceeds tolerance").
 
 Targeting works directly off the same binned error grid preview_error.png
-already visualizes -- not per-stamp averages. An earlier version scored
-each existing stamp's own full-radius disk as one RMS number, but that
-dilutes a sharp localized error against everything else already fitted
-well within the same disk: a stamp's 100 m-radius neighborhood can
-easily average out to "fine" even with a severe, narrow miss somewhere
-inside it, so a real course found "0 stamps over tolerance" against a
-tolerance well below what the error heatmap visibly showed. Scoring a
-fine grid directly (find_error_hotspots) and centering new stamps on
-the actual flagged cells (not on whichever pre-existing lattice point
-happened to contain them) fixes both the accuracy problem and, as a
-side effect, is far faster: no more per-stamp query-and-evaluate loop
-over every point in every stamp's disk.
+already visualizes, using peak-seeking region growth rather than naive
+thresholding:
+
+  1. Find the single worst-error unclaimed cell (the peak).
+  2. Flood-fill outward to same-signed, unclaimed neighbors, stopping
+     once error drops below a fraction of the peak's own magnitude
+     (zero_crossing_fraction) rather than at some fraction of
+     tolerance -- sized relative to the peak, not an absolute floor,
+     so a broad low-level same-signed background can't get swept in
+     (see _grow_region). Requiring same sign is what makes this a real
+     boundary rather than an arbitrary cutoff: a region can't straddle
+     both an overshoot and an undershoot, since by definition error
+     changes sign somewhere between them.
+  3. Fit the region: try all four brushes x both tools (flatten pulls
+     toward an absolute value, discarding whatever relief the coarse
+     fit already got right; raise adds a delta on top of it, correcting
+     a uniform bias while preserving existing shape -- see
+     terrain/stamp.py) and keep whichever combination gives the lowest
+     RMS over the region's actual LIDAR points.
+  4. Claim the region's cells (excluded from future peaks in this
+     pass) and repeat from the next-worst unclaimed peak.
+
+An earlier version thresholded the whole grid at once and took each
+resulting connected component as one hotspot, whatever its size --
+with tolerance below the ambient curvature-driven error floor (see
+below), a single contiguous blob could span a huge fraction of the
+course, producing a stamp whose LIDAR-averaged target was a poor fit
+almost everywhere within it, actively making things worse where it got
+applied (order-dependent pull semantics mean the last-applied stamp at
+a point dominates). Peak-seeking with a same-signed, zero-crossing
+boundary bounds region size at the source rather than clamping after
+the fact -- though min_radius/max_radius clamps (tied to the coarse
+hex lattice's own scale) still apply as a second line of defense, plus
+a proximity cap against other hotspots found in the same pass (the
+min-radius clamp alone could otherwise push two nearby small regions'
+stamps into physical overlap even though their error cells never
+touched).
 
 No masks exist yet (Milestone 5), so this uses a single global error
 tolerance rather than the mask-driven per-region tolerances the doc
@@ -29,7 +54,12 @@ same spirit as height_fit.py's naive averaging.
 Designed to run repeatedly: each call re-scores the *current* terrain
 (coarse stamps plus any previously-added detail stamps) against the
 same grid, so "largest error -> split -> repeat" falls out of just
-calling refine_stamps() again on its own prior output.
+calling refine_stamps() again on its own prior output. Tightening
+tolerance between passes should be done carefully (check
+preview_error.png between passes) -- refining below the ambient
+curvature-driven error floor floods the grid with hotspots that are
+mostly noise, not real features, and can rescore/overwrite points that
+were already correctly fit by an earlier, more targeted pass.
 """
 
 from __future__ import annotations
@@ -42,33 +72,29 @@ from scipy import ndimage
 
 from ingest.laz_reader import PointCloud
 from terrain.bounding_box import BoundingBox
-from terrain.height_fit import fit_stamp_heights
-from terrain.hexgrid import HEX_STAMP_RADIUS_M, PLACEHOLDER_VALUE
-from terrain.stamp import Stamp
+from terrain.brush_profiles import BRUSH_PROFILES
+from terrain.hexgrid import HEX_STAMP_RADIUS_M
+from terrain.stamp import TOOL_FLATTEN, TOOL_RAISE, Stamp
+from terrain.terrain_kernel import TerrainKernel
 from terrain.terrain_model import TerrainModel
 
 DEFAULT_RESOLUTION = 200
 DEFAULT_MIN_POINTS = 3
 DEFAULT_MIN_REGION_CELLS = 2
+DEFAULT_ZERO_CROSSING_FRACTION = 0.2  # stop growing once error drops below this fraction of the peak
 
-# Hotspot patch brush is deliberately independent from hexgrid.DEFAULT_BRUSH
-# (the main coarse lattice's brush) -- they can have different needs. Type
-# 9 has a genuine flat plateau (unlike type 10's cosine falloff, which
-# starts weakening immediately from center), so an isolated patch stamp
-# gets uniform correction across a real area instead of a sharp point-fix
-# surrounded by a barely-touched halo ("punching holes").
-DEFAULT_HOTSPOT_BRUSH = 9
+# Candidate brushes/tools tried per hotspot; whichever combination
+# gives the lowest RMS over the region's actual LIDAR points wins.
+CANDIDATE_BRUSHES = (8, 9, 10, 54)
+CANDIDATE_TOOLS = (TOOL_FLATTEN, TOOL_RAISE)
 
 # Safety-net clamps on hotspot stamp radius, tied to the main lattice's
 # own scale rather than an arbitrary number -- max is half the coarse
-# stamp radius, min is half of that. Without a max clamp, a large
-# contiguous over-threshold region (e.g. tolerance set below the ambient
-# curvature-driven error floor) can otherwise produce a stamp sized to
-# the whole blob -- hundreds of meters, averaging LIDAR across a huge,
-# varied area into one poor-fit value that makes things worse where it
-# gets applied (see module docstring).
+# stamp radius, min is half of that.
 DEFAULT_MAX_HOTSPOT_RADIUS_M = HEX_STAMP_RADIUS_M / 2.0
 DEFAULT_MIN_HOTSPOT_RADIUS_M = DEFAULT_MAX_HOTSPOT_RADIUS_M / 2.0
+
+_NEIGHBOR_OFFSETS = ((-1, 0), (1, 0), (0, -1), (0, 1))  # 4-connectivity
 
 
 @dataclass(slots=True)
@@ -78,6 +104,14 @@ class ErrorHotspot:
     radius: float
     peak_error: float
     n_cells: int
+    brush: int
+    tool: int
+    value: float
+    fit_rms: float
+
+    def to_stamp(self) -> Stamp:
+        return Stamp(x=self.x, z=self.z, radius=self.radius, value=self.value,
+                     brush=self.brush, tool=self.tool)
 
 
 def _bin_actual_elevation(
@@ -92,8 +126,7 @@ def _bin_actual_elevation(
     bare_earth_only matters a lot here: without it, building roofs and
     vegetation returns get compared directly against predicted ground
     height and show up as "error" the refinement pass then tries to
-    correct -- fit_stamp_heights already filters to bare-earth for
-    exactly this reason; this needs to match it.
+    correct.
     """
     if bare_earth_only:
         mask = cloud.bare_earth_mask()
@@ -112,6 +145,94 @@ def _bin_actual_elevation(
     return means
 
 
+def _grow_region(
+    error: np.ndarray,
+    claimed: np.ndarray,
+    peak: tuple[int, int],
+    fraction: float,
+) -> list[tuple[int, int]]:
+    """
+    Flood-fill from `peak` to same-signed, unclaimed neighbors whose
+    |error| is still at least `fraction` of the peak's own |error|,
+    4-connected.
+
+    The threshold is relative to the peak, not an absolute floor --
+    using a fixed absolute cutoff (e.g. "keep growing until |error|
+    drops below 0.1 m") doesn't actually bound growth to the local
+    feature if the surrounding *background* error also happens to
+    share the peak's sign over a wide area (a broad, low-level
+    curvature-smoothing bias easily does this): growth would keep
+    picking up same-signed background cells indefinitely, producing a
+    region spanning most of the grid instead of just the anomaly. Sizing
+    the cutoff to the peak's own magnitude means a genuine sharp local
+    feature (which decays substantially away from its own peak) still
+    gets isolated correctly, while a flat, low-magnitude background
+    fails the relative test almost immediately.
+    """
+    peak_error = error[peak]
+    peak_sign = np.sign(peak_error)
+    threshold = fraction * abs(peak_error)
+    rows, cols = error.shape
+
+    region = [peak]
+    visited = {peak}
+    stack = [peak]
+
+    while stack:
+        r, c = stack.pop()
+        for dr, dc in _NEIGHBOR_OFFSETS:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < rows and 0 <= nc < cols):
+                continue
+            if (nr, nc) in visited or claimed[nr, nc]:
+                continue
+            e = error[nr, nc]
+            if not np.isfinite(e) or np.sign(e) != peak_sign or abs(e) < threshold:
+                continue
+            visited.add((nr, nc))
+            region.append((nr, nc))
+            stack.append((nr, nc))
+
+    return region
+
+
+def _score_candidate(
+    hx: float, hz: float, radius: float, brush: int, tool: int,
+    px: np.ndarray, pz: np.ndarray, actual: np.ndarray,
+    current_at_points: np.ndarray, current_at_center: float, target_mean: float,
+) -> Optional[tuple[float, float]]:
+    """
+    Analytically fit `value` for one (brush, tool) candidate and score
+    it against the region's actual LIDAR points, without rebuilding a
+    TerrainModel (and its KD-tree) per candidate -- current_at_points /
+    current_at_center are the *existing* terrain's prediction (computed
+    once per hotspot, reused across all 8 candidates), so overlaying
+    one new stamp's effect is just the flatten/raise formula applied
+    directly (see terrain/terrain_model.py).
+
+    Returns (value, rms), or None if this brush's center weight is
+    degenerate (shouldn't happen for any registered profile, but
+    guarded rather than dividing by zero).
+    """
+    kernel = TerrainKernel(BRUSH_PROFILES[brush])
+    dist = np.sqrt((px - hx) ** 2 + (pz - hz) ** 2)
+    r_norm = np.clip(dist / radius, 0.0, 1.0)
+    weight = kernel.sample_many(r_norm)
+    weight_center = kernel.sample(0.0)
+    if weight_center <= 0.0:
+        return None
+
+    if tool == TOOL_RAISE:
+        value = (target_mean - current_at_center) / weight_center
+        predicted = current_at_points + value * weight
+    else:
+        value = current_at_center + (target_mean - current_at_center) / weight_center
+        predicted = current_at_points + (value - current_at_points) * weight
+
+    rms = float(np.sqrt(np.mean((predicted - actual) ** 2)))
+    return value, rms
+
+
 def find_error_hotspots(
     stamps: Sequence[Stamp],
     cloud: PointCloud,
@@ -119,95 +240,120 @@ def find_error_hotspots(
     tolerance: float,
     resolution: int = DEFAULT_RESOLUTION,
     min_region_cells: int = DEFAULT_MIN_REGION_CELLS,
-    min_radius: Optional[float] = DEFAULT_MIN_HOTSPOT_RADIUS_M,
-    max_radius: Optional[float] = DEFAULT_MAX_HOTSPOT_RADIUS_M,
+    min_radius: float = DEFAULT_MIN_HOTSPOT_RADIUS_M,
+    max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
+    zero_crossing_fraction: float = DEFAULT_ZERO_CROSSING_FRACTION,
     bare_earth_only: bool = True,
+    min_points: int = DEFAULT_MIN_POINTS,
+    max_new_stamps: Optional[int] = None,
 ) -> list[ErrorHotspot]:
     """
-    Find contiguous regions of the error grid (predicted - actual)
-    where |error| > tolerance, exactly like preview_error.png's
-    heatmap. Each connected region becomes one hotspot: centered on
-    the region's centroid, sized to its own extent (max distance from
-    centroid to any flagged cell in it) -- "fit a circle to the area
-    bounded by low error", since connected-component labeling only
-    groups cells that exceed tolerance, so a region's boundary is
-    exactly where the surrounding cells drop back under it.
+    Find and fit error hotspots via peak-seeking region growth (see
+    module docstring). Each returned ErrorHotspot already carries its
+    best-fit brush/tool/value -- no separate fit_stamp_heights() call
+    needed afterward, since scoring candidates requires the region's
+    actual LIDAR points anyway and that's already done here.
 
-    Regions smaller than `min_region_cells` are dropped -- a single
-    flagged cell is as likely to be point-level noise as a real
-    feature. min_radius/max_radius clamp the resulting stamp size
-    (default: half the coarse hex radius for max, half of that for
-    min -- see DEFAULT_MAX_HOTSPOT_RADIUS_M/DEFAULT_MIN_HOTSPOT_RADIUS_M),
-    so a one-cell region doesn't produce an absurdly tiny stamp, and
-    -- more importantly -- a large contiguous blob (e.g. tolerance set
-    below the ambient curvature-driven error floor, see module
-    docstring) doesn't produce an absurdly *large* one. This clamp is
-    a safety net, not a full fix: it caps the damage a bad region can
-    do, but doesn't stop unrelated distant cells from merging into one
-    misshapen blob in the first place. Properly bounding region growth
-    at the source -- e.g. flood-filling out from each error peak only
-    while error stays meaningfully non-zero, rather than thresholding
-    the whole grid and connected-component labeling everything at
-    once -- is the real fix and hasn't been built yet.
-
-    Returns hotspots sorted by peak |error|, worst first.
+    Returns hotspots sorted by peak |error|, worst first (which is
+    also the order they were found in, since each pass claims the
+    current worst peak before moving to the next).
     """
-    cell_size_x = (bounds.max_x - bounds.min_x) / resolution
-    cell_size_z = (bounds.max_z - bounds.min_z) / resolution
-    if min_radius is None:
-        min_radius = 1.5 * max(cell_size_x, cell_size_z)
-
     actual = _bin_actual_elevation(cloud, bounds, resolution, bare_earth_only=bare_earth_only)
     model = TerrainModel(stamps)
     predicted = model.render(resolution=resolution, bounds=bounds)
-    error = predicted - actual  # NaN where actual has no data -- never flagged
+    error = predicted - actual  # NaN where actual has no data
 
-    mask = np.abs(error) > tolerance
-    labels, n_labels = ndimage.label(mask)
-    if n_labels == 0:
-        return []
+    claimed = ~np.isfinite(error)
 
-    x_centers = (np.linspace(bounds.min_x, bounds.max_x, resolution + 1)[:-1]
-                 + np.linspace(bounds.min_x, bounds.max_x, resolution + 1)[1:]) / 2.0
-    z_centers = (np.linspace(bounds.min_z, bounds.max_z, resolution + 1)[:-1]
-                 + np.linspace(bounds.min_z, bounds.max_z, resolution + 1)[1:]) / 2.0
+    edges_x = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
+    edges_z = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
+    x_centers = (edges_x[:-1] + edges_x[1:]) / 2.0
+    z_centers = (edges_z[:-1] + edges_z[1:]) / 2.0
+    cell_size_x = (bounds.max_x - bounds.min_x) / resolution
+    cell_size_z = (bounds.max_z - bounds.min_z) / resolution
 
     hotspots: list[ErrorHotspot] = []
-    for label_id in range(1, n_labels + 1):
-        rows, cols = np.nonzero(labels == label_id)
-        if rows.size < min_region_cells:
+    placed_centroids: list[tuple[float, float]] = []
+
+    # Bounded iteration count as a hard safety valve -- each loop either
+    # produces a hotspot or claims at least the peak cell, so this can't
+    # spin forever, but an explicit cap is cheap insurance.
+    for _ in range(resolution * resolution):
+        if max_new_stamps is not None and len(hotspots) >= max_new_stamps:
+            break
+
+        masked = np.where(claimed, -np.inf, np.abs(error))
+        peak = np.unravel_index(np.argmax(masked), masked.shape)
+        peak_val = masked[peak]
+        if not np.isfinite(peak_val) or peak_val <= tolerance:
+            break
+
+        region = _grow_region(error, claimed, peak, zero_crossing_fraction)
+        for cell in region:
+            claimed[cell] = True
+
+        if len(region) < min_region_cells:
             continue
 
+        rows = np.array([c[0] for c in region])
+        cols = np.array([c[1] for c in region])
         cell_x = x_centers[cols]
         cell_z = z_centers[rows]
         centroid_x = float(np.mean(cell_x))
         centroid_z = float(np.mean(cell_z))
 
-        dist = np.sqrt((cell_x - centroid_x) ** 2 + (cell_z - centroid_z) ** 2)
-        radius = float(np.max(dist)) + 0.5 * max(cell_size_x, cell_size_z)
+        dist_to_centroid = np.sqrt((cell_x - centroid_x) ** 2 + (cell_z - centroid_z) ** 2)
+        radius = float(np.max(dist_to_centroid)) + 0.5 * max(cell_size_x, cell_size_z)
         radius = max(radius, min_radius)
-        if max_radius is not None:
-            radius = min(radius, max_radius)
+        radius = min(radius, max_radius)
+
+        # Proximity cap: the min-radius clamp above could otherwise push
+        # this stamp into physical overlap with an already-placed one
+        # from this same pass, even though their error regions never
+        # touched. Half the distance to the nearest prior centroid keeps
+        # them from overlapping regardless of what the clamp did.
+        for px_c, pz_c in placed_centroids:
+            d = np.hypot(centroid_x - px_c, centroid_z - pz_c)
+            radius = min(radius, 0.5 * d)
 
         peak_error = float(np.max(np.abs(error[rows, cols])))
+
+        idx = cloud.query_radius(centroid_x, centroid_z, radius)
+        if bare_earth_only and idx.size > 0:
+            idx = idx[cloud.bare_earth_mask()[idx]]
+        if idx.size < min_points:
+            continue
+
+        px, pz = cloud.x[idx], cloud.z[idx]
+        actual_pts = cloud.elevation[idx]
+        current_at_points = model.evaluate_many(np.column_stack((px, pz)))
+        current_at_center = model.evaluate(centroid_x, centroid_z)
+        target_mean = float(np.mean(actual_pts))
+
+        best: Optional[tuple[int, int, float, float]] = None
+        for brush in CANDIDATE_BRUSHES:
+            for tool in CANDIDATE_TOOLS:
+                result = _score_candidate(
+                    centroid_x, centroid_z, radius, brush, tool,
+                    px, pz, actual_pts, current_at_points, current_at_center, target_mean,
+                )
+                if result is None:
+                    continue
+                value, rms = result
+                if best is None or rms < best[3]:
+                    best = (brush, tool, value, rms)
+
+        if best is None:
+            continue
+
+        brush, tool, value, rms = best
         hotspots.append(ErrorHotspot(
-            x=centroid_x, z=centroid_z, radius=radius,
-            peak_error=peak_error, n_cells=int(rows.size),
+            x=centroid_x, z=centroid_z, radius=radius, peak_error=peak_error,
+            n_cells=len(region), brush=brush, tool=tool, value=value, fit_rms=rms,
         ))
+        placed_centroids.append((centroid_x, centroid_z))
 
-    hotspots.sort(key=lambda h: h.peak_error, reverse=True)
     return hotspots
-
-
-def generate_hotspot_stamps(
-    hotspots: Sequence[ErrorHotspot],
-    brush: int = DEFAULT_HOTSPOT_BRUSH,
-) -> list[Stamp]:
-    """One placeholder-value Stamp per hotspot, centered and sized on it."""
-    return [
-        Stamp(x=h.x, z=h.z, radius=h.radius, value=PLACEHOLDER_VALUE, brush=brush)
-        for h in hotspots
-    ]
 
 
 def refine_stamps(
@@ -217,45 +363,31 @@ def refine_stamps(
     tolerance: float,
     resolution: int = DEFAULT_RESOLUTION,
     min_region_cells: int = DEFAULT_MIN_REGION_CELLS,
-    min_radius: Optional[float] = DEFAULT_MIN_HOTSPOT_RADIUS_M,
-    max_radius: Optional[float] = DEFAULT_MAX_HOTSPOT_RADIUS_M,
-    brush: int = DEFAULT_HOTSPOT_BRUSH,
+    min_radius: float = DEFAULT_MIN_HOTSPOT_RADIUS_M,
+    max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
+    zero_crossing_fraction: float = DEFAULT_ZERO_CROSSING_FRACTION,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
 ) -> tuple[list[Stamp], list[ErrorHotspot]]:
     """
-    One adaptive refinement pass: find error hotspots directly from the
-    binned error grid, add one stamp per hotspot (centered and sized on
-    it, not on any pre-existing lattice cell), fit their heights against
-    the existing (unchanged) coarse baseline, and return the combined
-    stamp list.
+    One adaptive refinement pass: find and fit error hotspots (see
+    find_error_hotspots), append their stamps to the existing
+    (unchanged) list, and return the combined result.
 
-    Existing stamps are never removed -- new stamps are appended after
-    them, so under pull-toward-value semantics they refine on top of
-    the existing baseline rather than replacing it (see
+    Existing stamps are never removed or re-fit -- new stamps are
+    appended after them, so under pull-toward-value/raise semantics
+    they refine on top of the existing baseline (see
     terrain_model.py). Safe to call repeatedly on its own output.
-
-    Returns (new_stamp_list, hotspots) -- hotspots is useful for
-    reporting/diagnostics even though the stamps themselves are already
-    folded into the returned list.
     """
     hotspots = find_error_hotspots(
-        stamps, cloud, bounds, tolerance, resolution=resolution,
-        min_region_cells=min_region_cells, min_radius=min_radius, max_radius=max_radius,
-        bare_earth_only=bare_earth_only,
-    )
-    if max_new_stamps is not None:
-        hotspots = hotspots[:max_new_stamps]
-
-    if not hotspots:
-        return list(stamps), hotspots
-
-    new_positions = generate_hotspot_stamps(hotspots, brush=brush)
-    fitted = fit_stamp_heights(
-        new_positions, cloud,
+        stamps, cloud, bounds, tolerance,
+        resolution=resolution, min_region_cells=min_region_cells,
+        min_radius=min_radius, max_radius=max_radius,
+        zero_crossing_fraction=zero_crossing_fraction,
         bare_earth_only=bare_earth_only, min_points=min_points,
-        existing_stamps=stamps,
+        max_new_stamps=max_new_stamps,
     )
 
-    return list(stamps) + fitted, hotspots
+    new_stamps = [h.to_stamp() for h in hotspots]
+    return list(stamps) + new_stamps, hotspots
