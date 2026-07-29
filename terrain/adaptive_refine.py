@@ -1,152 +1,217 @@
 """
 terrain/adaptive_refine.py
 
-Milestone 4's initial adaptive refinement pass: find stamps whose
-local fit is worst against real LIDAR, and add smaller detail stamps
-there -- rather than uniformly subdividing everywhere (see the
+Milestone 4's adaptive refinement pass: find where the terrain's
+prediction is worst against real LIDAR, and add small detail stamps
+exactly there -- rather than uniformly subdividing everywhere (see the
 architecture doc's "Adaptive Refinement": "Only subdivide stamps whose
 local error exceeds tolerance").
+
+Targeting works directly off the same binned error grid preview_error.png
+already visualizes -- not per-stamp averages. An earlier version scored
+each existing stamp's own full-radius disk as one RMS number, but that
+dilutes a sharp localized error against everything else already fitted
+well within the same disk: a stamp's 100 m-radius neighborhood can
+easily average out to "fine" even with a severe, narrow miss somewhere
+inside it, so a real course found "0 stamps over tolerance" against a
+tolerance well below what the error heatmap visibly showed. Scoring a
+fine grid directly (find_error_hotspots) and centering new stamps on
+the actual flagged cells (not on whichever pre-existing lattice point
+happened to contain them) fixes both the accuracy problem and, as a
+side effect, is far faster: no more per-stamp query-and-evaluate loop
+over every point in every stamp's disk.
 
 No masks exist yet (Milestone 5), so this uses a single global error
 tolerance rather than the mask-driven per-region tolerances the doc
 describes as the eventual design -- this is the "for now" version,
 same spirit as height_fit.py's naive averaging.
 
-Designed to run repeatedly: each call only touches stamps still over
-tolerance, including previously-added detail stamps from an earlier
-call that still aren't fine enough -- "largest error -> split ->
-repeat" naturally falls out of just re-running refine_stamps() against
-its own prior output.
+Designed to run repeatedly: each call re-scores the *current* terrain
+(coarse stamps plus any previously-added detail stamps) against the
+same grid, so "largest error -> split -> repeat" falls out of just
+calling refine_stamps() again on its own prior output.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import numpy as np
+from scipy import ndimage
 
 from ingest.laz_reader import PointCloud
 from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
-from terrain.hexgrid import DEFAULT_BRUSH, generate_hex_grid
+from terrain.hexgrid import DEFAULT_BRUSH, PLACEHOLDER_VALUE
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
 
-DEFAULT_SUBDIVISION_FACTOR = 2.0
+DEFAULT_RESOLUTION = 200
 DEFAULT_MIN_POINTS = 3
+DEFAULT_MIN_REGION_CELLS = 2
 
 
 @dataclass(slots=True)
-class StampError:
-    stamp: Stamp
-    rms_error: float
-    n_points: int
+class ErrorHotspot:
+    x: float
+    z: float
+    radius: float
+    peak_error: float
+    n_cells: int
 
 
-def compute_stamp_errors(
+def _bin_actual_elevation(
+    cloud: PointCloud, bounds: BoundingBox, resolution: int,
+) -> np.ndarray:
+    """
+    Mean LIDAR elevation per grid cell over `bounds`, resolution x
+    resolution, NaN where a cell has no points. Same binning convention
+    as visualize.py's _bin_point_cloud (rows = z, columns = x) so this
+    lines up cell-for-cell with TerrainModel.render()'s own grid.
+    """
+    x_edges = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
+    z_edges = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
+
+    sums, _, _ = np.histogram2d(cloud.z, cloud.x, bins=[z_edges, x_edges], weights=cloud.elevation)
+    counts, _, _ = np.histogram2d(cloud.z, cloud.x, bins=[z_edges, x_edges])
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        means = sums / counts
+    return means
+
+
+def find_error_hotspots(
     stamps: Sequence[Stamp],
     cloud: PointCloud,
-    bare_earth_only: bool = True,
-    min_points: int = DEFAULT_MIN_POINTS,
-) -> list[StampError]:
+    bounds: BoundingBox,
+    tolerance: float,
+    resolution: int = DEFAULT_RESOLUTION,
+    min_region_cells: int = DEFAULT_MIN_REGION_CELLS,
+    min_radius: Optional[float] = None,
+    max_radius: Optional[float] = None,
+) -> list[ErrorHotspot]:
     """
-    Local RMS error per stamp: predicted TerrainModel height (from the
-    *full* current stamp list, so every stamp's neighbors' contributions
-    are accounted for) vs. actual LIDAR elevation, at that stamp's own
-    nearby bare-earth points.
+    Find contiguous regions of the error grid (predicted - actual)
+    where |error| > tolerance, exactly like preview_error.png's
+    heatmap. Each connected region becomes one hotspot: centered on
+    the region's centroid, sized to its own extent (max distance from
+    centroid to any flagged cell in it) -- "fit a circle to the area
+    bounded by low error", since connected-component labeling only
+    groups cells that exceed tolerance, so a region's boundary is
+    exactly where the surrounding cells drop back under it.
 
-    Stamps with fewer than `min_points` nearby points are skipped
-    (excluded from the result, not scored as zero-error) -- there's
-    no data to judge them by, so they shouldn't look artificially fine.
+    Regions smaller than `min_region_cells` are dropped -- a single
+    flagged cell is as likely to be point-level noise as a real
+    feature. min_radius/max_radius clamp the resulting stamp size
+    (default: min = 1.5 grid cells, max = unclamped) so a one-cell
+    region doesn't produce an absurdly tiny stamp.
+
+    Returns hotspots sorted by peak |error|, worst first.
     """
+    cell_size_x = (bounds.max_x - bounds.min_x) / resolution
+    cell_size_z = (bounds.max_z - bounds.min_z) / resolution
+    if min_radius is None:
+        min_radius = 1.5 * max(cell_size_x, cell_size_z)
+
+    actual = _bin_actual_elevation(cloud, bounds, resolution)
     model = TerrainModel(stamps)
-    results: list[StampError] = []
+    predicted = model.render(resolution=resolution, bounds=bounds)
+    error = predicted - actual  # NaN where actual has no data -- never flagged
 
-    for stamp in stamps:
-        idx = cloud.query_radius(stamp.x, stamp.z, stamp.radius)
-        if bare_earth_only and idx.size > 0:
-            idx = idx[cloud.bare_earth_mask()[idx]]
+    mask = np.abs(error) > tolerance
+    labels, n_labels = ndimage.label(mask)
+    if n_labels == 0:
+        return []
 
-        if idx.size < min_points:
+    x_centers = (np.linspace(bounds.min_x, bounds.max_x, resolution + 1)[:-1]
+                 + np.linspace(bounds.min_x, bounds.max_x, resolution + 1)[1:]) / 2.0
+    z_centers = (np.linspace(bounds.min_z, bounds.max_z, resolution + 1)[:-1]
+                 + np.linspace(bounds.min_z, bounds.max_z, resolution + 1)[1:]) / 2.0
+
+    hotspots: list[ErrorHotspot] = []
+    for label_id in range(1, n_labels + 1):
+        rows, cols = np.nonzero(labels == label_id)
+        if rows.size < min_region_cells:
             continue
 
-        points = np.column_stack((cloud.x[idx], cloud.z[idx]))
-        predicted = model.evaluate_many(points)
-        actual = cloud.elevation[idx]
-        rms = float(np.sqrt(np.mean(np.square(predicted - actual))))
-        results.append(StampError(stamp=stamp, rms_error=rms, n_points=int(idx.size)))
+        cell_x = x_centers[cols]
+        cell_z = z_centers[rows]
+        centroid_x = float(np.mean(cell_x))
+        centroid_z = float(np.mean(cell_z))
 
-    return results
+        dist = np.sqrt((cell_x - centroid_x) ** 2 + (cell_z - centroid_z) ** 2)
+        radius = float(np.max(dist)) + 0.5 * max(cell_size_x, cell_size_z)
+        radius = max(radius, min_radius)
+        if max_radius is not None:
+            radius = min(radius, max_radius)
+
+        peak_error = float(np.max(np.abs(error[rows, cols])))
+        hotspots.append(ErrorHotspot(
+            x=centroid_x, z=centroid_z, radius=radius,
+            peak_error=peak_error, n_cells=int(rows.size),
+        ))
+
+    hotspots.sort(key=lambda h: h.peak_error, reverse=True)
+    return hotspots
 
 
-def generate_detail_stamps(
-    parent: Stamp,
-    subdivision_factor: float = DEFAULT_SUBDIVISION_FACTOR,
+def generate_hotspot_stamps(
+    hotspots: Sequence[ErrorHotspot],
     brush: int = DEFAULT_BRUSH,
 ) -> list[Stamp]:
-    """
-    A small local hex lattice covering `parent`'s footprint, at
-    parent.radius / subdivision_factor -- same 2:1 radius:pitch ratio
-    used for the whole-course grid (see hexgrid.py), just applied
-    locally at a finer scale. No bleed: this is a local patch, not a
-    course-edge concern.
-    """
-    child_radius = parent.radius / subdivision_factor
-    child_pitch = child_radius / 2.0
-    local_bounds = BoundingBox(
-        min_x=parent.x - parent.radius, max_x=parent.x + parent.radius,
-        min_z=parent.z - parent.radius, max_z=parent.z + parent.radius,
-    )
-    return generate_hex_grid(local_bounds, pitch=child_pitch, stamp_radius=child_radius,
-                              brush=brush, bleed=0.0)
+    """One placeholder-value Stamp per hotspot, centered and sized on it."""
+    return [
+        Stamp(x=h.x, z=h.z, radius=h.radius, value=PLACEHOLDER_VALUE, brush=brush)
+        for h in hotspots
+    ]
 
 
 def refine_stamps(
     stamps: Sequence[Stamp],
     cloud: PointCloud,
+    bounds: BoundingBox,
     tolerance: float,
-    subdivision_factor: float = DEFAULT_SUBDIVISION_FACTOR,
+    resolution: int = DEFAULT_RESOLUTION,
+    min_region_cells: int = DEFAULT_MIN_REGION_CELLS,
+    min_radius: Optional[float] = None,
+    max_radius: Optional[float] = None,
+    brush: int = DEFAULT_BRUSH,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
-    max_new_stamps: int | None = None,
-) -> tuple[list[Stamp], list[StampError]]:
+    max_new_stamps: Optional[int] = None,
+) -> tuple[list[Stamp], list[ErrorHotspot]]:
     """
-    One adaptive refinement pass: flag every stamp whose local RMS
-    error exceeds `tolerance`, generate detail stamps for each, fit
-    their heights against the existing (unchanged) coarse baseline,
-    and return the combined stamp list.
+    One adaptive refinement pass: find error hotspots directly from the
+    binned error grid, add one stamp per hotspot (centered and sized on
+    it, not on any pre-existing lattice cell), fit their heights against
+    the existing (unchanged) coarse baseline, and return the combined
+    stamp list.
 
-    Flagged (unchanged) stamps are NOT removed -- their detail stamps
-    are appended after them, so under pull-toward-value semantics the
-    detail stamps refine on top of the existing baseline rather than
-    replacing it outright (see terrain_model.py). This also means
-    re-running refine_stamps() on its own output is safe and does the
-    right thing: previously-added detail stamps get scored again, and
-    only the ones still over tolerance get subdivided further.
+    Existing stamps are never removed -- new stamps are appended after
+    them, so under pull-toward-value semantics they refine on top of
+    the existing baseline rather than replacing it (see
+    terrain_model.py). Safe to call repeatedly on its own output.
 
-    Returns (new_stamp_list, flagged_errors) -- flagged_errors is
-    useful for reporting/diagnostics even though the stamps themselves
-    are already folded into the returned list.
+    Returns (new_stamp_list, hotspots) -- hotspots is useful for
+    reporting/diagnostics even though the stamps themselves are already
+    folded into the returned list.
     """
-    errors = compute_stamp_errors(stamps, cloud, bare_earth_only=bare_earth_only, min_points=min_points)
-    flagged = sorted((e for e in errors if e.rms_error > tolerance),
-                      key=lambda e: e.rms_error, reverse=True)
+    hotspots = find_error_hotspots(
+        stamps, cloud, bounds, tolerance, resolution=resolution,
+        min_region_cells=min_region_cells, min_radius=min_radius, max_radius=max_radius,
+    )
+    if max_new_stamps is not None:
+        hotspots = hotspots[:max_new_stamps]
 
-    detail_positions: list[Stamp] = []
-    for stamp_error in flagged:
-        detail_positions.extend(generate_detail_stamps(stamp_error.stamp, subdivision_factor))
-        if max_new_stamps is not None and len(detail_positions) >= max_new_stamps:
-            detail_positions = detail_positions[:max_new_stamps]
-            break
+    if not hotspots:
+        return list(stamps), hotspots
 
-    if not detail_positions:
-        return list(stamps), flagged
-
-    fitted_details = fit_stamp_heights(
-        detail_positions, cloud,
+    new_positions = generate_hotspot_stamps(hotspots, brush=brush)
+    fitted = fit_stamp_heights(
+        new_positions, cloud,
         bare_earth_only=bare_earth_only, min_points=min_points,
         existing_stamps=stamps,
     )
 
-    return list(stamps) + fitted_details, flagged
+    return list(stamps) + fitted, hotspots
