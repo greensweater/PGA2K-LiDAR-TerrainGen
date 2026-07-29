@@ -212,11 +212,34 @@ class PGAGenGUI:
             state="readonly", width=30,
         )
         dropdown.pack(side="left", padx=4)
-        dropdown.bind("<<ComboboxSelected>>", lambda e: self._show_preview())
-        ttk.Button(header, text="Refresh", command=self._show_preview).pack(side="left")
+        dropdown.bind("<<ComboboxSelected>>", lambda e: self._on_preview_choice_changed())
+        ttk.Button(header, text="Refresh", command=self._refresh_preview_and_slider).pack(side="left")
+
+        version_row = ttk.Frame(frame)
+        version_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(version_row, text="Version:").pack(side="left")
+        self.preview_version = tk.IntVar(value=0)
+        self.preview_version_scale = ttk.Scale(
+            version_row, from_=0, to=0, orient="horizontal",
+            variable=self.preview_version, command=self._on_preview_version_changed,
+        )
+        self.preview_version_scale.pack(side="left", fill="x", expand=True, padx=4)
+        self.preview_version_label = ttk.Label(version_row, text="current", width=10)
+        self.preview_version_label.pack(side="left")
+
+        # Scroll wheel over either the slider or the image itself steps
+        # through versions -- Windows/Mac send <MouseWheel> with event.delta;
+        # Linux sends <Button-4>/<Button-5> instead.
+        for widget in (self.preview_version_scale,):
+            widget.bind("<MouseWheel>", self._on_preview_scroll)
+            widget.bind("<Button-4>", self._on_preview_scroll)
+            widget.bind("<Button-5>", self._on_preview_scroll)
 
         self.preview_label = ttk.Label(frame, text="(no preview loaded)", anchor="center")
         self.preview_label.pack(fill="both", expand=True)
+        self.preview_label.bind("<MouseWheel>", self._on_preview_scroll)
+        self.preview_label.bind("<Button-4>", self._on_preview_scroll)
+        self.preview_label.bind("<Button-5>", self._on_preview_scroll)
 
     def _add_step_button(self, parent: ttk.Frame, label: str, command) -> ttk.Button:
         btn = ttk.Button(parent, text=label, command=command, width=22)
@@ -237,7 +260,7 @@ class PGAGenGUI:
             self.course_name.set(project.get("course_name", ""))
         finally:
             self._suppress_course_name_save = False
-        self._show_preview()
+        self._refresh_preview_and_slider()
 
     def _on_course_name_changed(self) -> None:
         if self._suppress_course_name_save:
@@ -441,8 +464,7 @@ class PGAGenGUI:
                         self.status_label.config(text="Done", foreground="green")
                     else:
                         self.status_label.config(text=f"Failed (exit {payload})", foreground="red")
-                    self._show_preview()
-                elif kind == "error":
+                    self._refresh_preview_and_slider()
                     self.running = False
                     self.status_label.config(text="Error", foreground="red")
                     self._append_log(f"\n[GUI error] {payload}\n")
@@ -465,6 +487,75 @@ class PGAGenGUI:
     # Preview panel
     # ------------------------------------------------------------------
 
+    def _versioned_preview_path(self, working_dir: Path, version: int) -> Path:
+        """
+        version=0 is the current (unsuffixed) file; version=1,2,...
+        are the archived previous runs (see visualize.py's
+        _archive_existing: preview_error.png, preview_error_1.png, ...).
+        """
+        name = self.preview_choice.get()
+        if version == 0:
+            return working_dir / name
+        stem, suffix = Path(name).stem, Path(name).suffix
+        return working_dir / f"{stem}_{version}{suffix}"
+
+    def _max_preview_version(self, working_dir: Path) -> int:
+        """Highest archived version present for the currently chosen preview."""
+        n = 0
+        while self._versioned_preview_path(working_dir, n + 1).exists():
+            n += 1
+        return n
+
+    def _refresh_preview_and_slider(self) -> None:
+        """
+        Recompute how many archived versions exist for the current
+        preview choice, update the slider's range accordingly, and jump
+        to version 0 (current) -- called whenever the working directory
+        changes, the preview type changes, or a step just finished (so
+        the newest result is what's shown by default; older versions
+        are still one scroll away).
+        """
+        wd = self.working_dir.get().strip()
+        max_version = self._max_preview_version(Path(wd)) if wd and Path(wd).is_dir() else 0
+        self.preview_version_scale.configure(to=max_version)
+        self.preview_version.set(0)
+        self._update_version_label()
+        self._show_preview()
+
+    def _on_preview_choice_changed(self) -> None:
+        self._refresh_preview_and_slider()
+
+    def _on_preview_version_changed(self, _value: str) -> None:
+        self._update_version_label()
+        self._show_preview()
+
+    def _update_version_label(self) -> None:
+        v = int(round(self.preview_version.get()))
+        self.preview_version_label.config(text="current" if v == 0 else f"-{v}")
+
+    def _on_preview_scroll(self, event) -> None:
+        """
+        Cross-platform scroll handling: Windows/Mac send <MouseWheel>
+        with event.delta (positive = scroll up, magnitude varies by
+        platform); Linux sends <Button-4> (up) / <Button-5> (down)
+        instead, with no delta. Scrolling up moves toward current
+        (version 0); scrolling down moves back through history.
+        """
+        if event.num == 4:
+            step = -1
+        elif event.num == 5:
+            step = 1
+        else:
+            step = -1 if event.delta > 0 else 1
+
+        current = int(round(self.preview_version.get()))
+        max_version = int(round(float(self.preview_version_scale.cget("to"))))
+        new_version = max(0, min(max_version, current + step))
+        if new_version != current:
+            self.preview_version.set(new_version)
+            self._update_version_label()
+            self._show_preview()
+
     def _show_preview(self) -> None:
         wd = self.working_dir.get().strip()
         if not wd:
@@ -475,7 +566,8 @@ class PGAGenGUI:
             )
             return
 
-        path = Path(wd) / self.preview_choice.get()
+        version = int(round(self.preview_version.get()))
+        path = self._versioned_preview_path(Path(wd), version)
         if not path.exists():
             self.preview_label.config(text=f"(no {path.name} yet)", image="")
             self._preview_imgtk = None
