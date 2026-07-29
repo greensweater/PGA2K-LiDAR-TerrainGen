@@ -11,7 +11,7 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step ingest-osm
     PGA2k_gen.py <working_dir> --step ingest-course --course-file <path>
     PGA2k_gen.py <working_dir> --step generate-terrain
-    PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--subdivision-factor F]
+    PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
     PGA2k_gen.py <working_dir> --step output-terrain
     PGA2k_gen.py <working_dir> --step repack --repack-filename <name>
 
@@ -57,7 +57,8 @@ from constants import (
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
-from terrain.adaptive_refine import DEFAULT_SUBDIVISION_FACTOR, refine_stamps
+from terrain.adaptive_refine import DEFAULT_MIN_REGION_CELLS, DEFAULT_RESOLUTION, refine_stamps
+from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
 from terrain.stamp import Stamp
@@ -143,7 +144,6 @@ def step_visualize(working_dir: Path) -> None:
     Never a prerequisite for other steps -- purely for inspection (see
     "never behave as a black box").
     """
-    from terrain.bounding_box import BoundingBox
 
     pointcloud_path = working_dir / POINTCLOUD_FILE
     if not pointcloud_path.exists():
@@ -292,7 +292,6 @@ def step_generate_terrain(working_dir: Path) -> None:
     except LazReadError as e:
         raise StepError(f"Couldn't crop to a {COURSE_SIZE_M:.0f} m course: {e}") from e
 
-    from terrain.bounding_box import BoundingBox
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
 
     print("Generating hex grid...")
@@ -320,18 +319,20 @@ def step_generate_terrain(working_dir: Path) -> None:
 def step_refine_terrain(
     working_dir: Path,
     tolerance: float,
-    subdivision_factor: float,
+    resolution: int,
+    min_region_cells: int,
     max_new_stamps: int | None,
 ) -> None:
     """
-    One adaptive refinement pass (see terrain/adaptive_refine.py):
-    flag stamps whose local fit is worst against real LIDAR, add
-    smaller detail stamps there, write the result back to
+    One adaptive refinement pass (see terrain/adaptive_refine.py): find
+    contiguous regions of the binned error grid exceeding `tolerance`
+    (same grid preview_error.png visualizes), add one stamp per region
+    centered and sized on it, write the result back to
     optimized_stamps.json.
 
     Safe to run repeatedly -- each call reads its own prior output if
     present (falling back to initial_stamps.json on the first call),
-    so "run this a few times, watch the flagged count drop" is the
+    so "run this a few times, watch the hotspot count drop" is the
     expected way to iterate (see module docstring's "largest error ->
     split -> repeat").
     """
@@ -356,20 +357,22 @@ def step_refine_terrain(
 
     full_cloud = PointCloud.load(pointcloud_path)
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
+    bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
 
-    print(f"Scoring stamps against LIDAR (tolerance={tolerance} m)...")
-    refined, flagged = refine_stamps(
-        stamps, course_cloud, tolerance=tolerance,
-        subdivision_factor=subdivision_factor, max_new_stamps=max_new_stamps,
+    print(f"Scanning the error grid ({resolution}x{resolution}, tolerance={tolerance} m)...")
+    refined, hotspots = refine_stamps(
+        stamps, course_cloud, bounds, tolerance=tolerance,
+        resolution=resolution, min_region_cells=min_region_cells,
+        max_new_stamps=max_new_stamps,
     )
 
     n_added = len(refined) - len(stamps)
-    if flagged:
-        worst = flagged[0]
-        print(f"  {len(flagged)} stamps over tolerance (worst: {worst.rms_error:.3f} m "
-              f"at ({worst.stamp.x:.1f}, {worst.stamp.z:.1f}))")
+    if hotspots:
+        worst = hotspots[0]
+        print(f"  {len(hotspots)} hotspots over tolerance (worst: {worst.peak_error:.3f} m "
+              f"at ({worst.x:.1f}, {worst.z:.1f}), {worst.n_cells} cells)")
     else:
-        print("  0 stamps over tolerance -- nothing to refine, terrain already meets it")
+        print("  0 hotspots over tolerance -- nothing to refine, terrain already meets it")
     print(f"  added {n_added} detail stamps ({len(stamps)} -> {len(refined)} total)")
 
     out_path = working_dir / OPTIMIZED_STAMPS_FILE
@@ -378,7 +381,7 @@ def step_refine_terrain(
 
     save_project(working_dir, {
         "last_refine_tolerance_m": tolerance,
-        "last_refine_flagged_count": len(flagged),
+        "last_refine_hotspot_count": len(hotspots),
         "last_refine_added_count": n_added,
         "total_stamp_count": len(refined),
     })
@@ -541,11 +544,14 @@ def main(argv: list[str] | None = None) -> int:
                          help="EPSG code to force for ingest-laz (optional -- "
                               "auto-detected from LAZ headers if omitted)")
     parser.add_argument("--error-tolerance", type=float, default=2.0,
-                         help="refine-terrain: RMS error (m) above which a stamp gets "
-                              "subdivided (default: 2.0)")
-    parser.add_argument("--subdivision-factor", type=float, default=DEFAULT_SUBDIVISION_FACTOR,
-                         help=f"refine-terrain: detail stamp radius = parent radius / this "
-                              f"(default: {DEFAULT_SUBDIVISION_FACTOR})")
+                         help="refine-terrain: |predicted - actual| (m) above which a grid "
+                              "cell counts as a hotspot (default: 2.0)")
+    parser.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION,
+                         help=f"refine-terrain: error grid resolution, same grid "
+                              f"preview_error.png uses (default: {DEFAULT_RESOLUTION})")
+    parser.add_argument("--min-region-cells", type=int, default=DEFAULT_MIN_REGION_CELLS,
+                         help=f"refine-terrain: drop hotspot regions smaller than this many "
+                              f"cells, likely point-level noise (default: {DEFAULT_MIN_REGION_CELLS})")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
@@ -577,8 +583,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "generate-terrain":
             step_generate_terrain(working_dir)
         elif args.step == "refine-terrain":
-            step_refine_terrain(working_dir, args.error_tolerance, args.subdivision_factor,
-                                 args.max_new_stamps)
+            step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
+                                 args.min_region_cells, args.max_new_stamps)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
         elif args.step == "repack":
