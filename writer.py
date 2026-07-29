@@ -21,8 +21,10 @@ schema if no file exists there yet. As more of the pipeline gets built
 here instead of just passed through.
 
 Field mapping from Stamp -> one entry in the "height" array:
-    tool     -- fixed at 0 (flatten). This compiler only targets
-                flatten, not raise (tool 1) -- see terrain_model.py.
+    tool     -- stamp.tool (0=flatten, 1=raise). Both live in the same
+                "height" (Landscape mode) array -- tool is a per-stamp
+                property, not a different output destination; see
+                terrain/stamp.py and terrain_model.py.
     position -- {x, y: "-Infinity", z}. y is always the literal string
                 "-Infinity" for landscape-mode stamps -- height comes
                 from `value`, not position.y. x/z are shifted by
@@ -73,7 +75,6 @@ from typing import Sequence
 
 from terrain.stamp import Stamp
 
-TOOL_FLATTEN = 0
 HOLE_ID_NONE = -1
 UNUSED_RADIUS_FIELD = 0.0  # see module docstring: sizing is via `scale`
 POSITION_Y = "-Infinity"
@@ -152,7 +153,7 @@ def stamp_to_entry(stamp: Stamp) -> dict:
     orientation = _round(stamp.rotation)
     radius = _round(stamp.radius)
     return {
-        "tool": TOOL_FLATTEN,
+        "tool": stamp.tool,
         "position": {
             "x": _round(stamp.x - GRID_ORIGIN_OFFSET),
             "y": POSITION_Y,
