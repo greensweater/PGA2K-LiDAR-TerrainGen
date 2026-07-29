@@ -190,10 +190,20 @@ def step_visualize(working_dir: Path) -> None:
     full_cloud = PointCloud.load(pointcloud_path)
     print(f"Loaded {pointcloud_path} ({full_cloud.count:,} points)")
 
-    print(f"Writing {PREVIEW_LIDAR} and {PREVIEW_LIDAR_HEIGHTMAP} "
-          "(full merged point cloud, not just the course crop)...")
-    viz.render_lidar_preview(full_cloud, working_dir / PREVIEW_LIDAR)
-    viz.render_lidar_heightmap(full_cloud, full_cloud.bounds, working_dir / PREVIEW_LIDAR_HEIGHTMAP)
+    lidar_preview_paths = [working_dir / PREVIEW_LIDAR, working_dir / PREVIEW_LIDAR_HEIGHTMAP]
+    pointcloud_mtime = pointcloud_path.stat().st_mtime
+    lidar_previews_stale = any(
+        not p.exists() or p.stat().st_mtime < pointcloud_mtime for p in lidar_preview_paths
+    )
+
+    if lidar_previews_stale:
+        print(f"Writing {PREVIEW_LIDAR} and {PREVIEW_LIDAR_HEIGHTMAP} "
+              "(full merged point cloud, not just the course crop)...")
+        viz.render_lidar_preview(full_cloud, working_dir / PREVIEW_LIDAR)
+        viz.render_lidar_heightmap(full_cloud, full_cloud.bounds, working_dir / PREVIEW_LIDAR_HEIGHTMAP)
+    else:
+        print(f"{PREVIEW_LIDAR} / {PREVIEW_LIDAR_HEIGHTMAP} already up to date with "
+              f"{POINTCLOUD_FILE} -- skipping (re-run --step ingest-laz to force a refresh)")
 
     if not (working_dir / INITIAL_STAMPS_FILE).exists():
         print(f"No {INITIAL_STAMPS_FILE} yet -- run --step generate-terrain for the "
