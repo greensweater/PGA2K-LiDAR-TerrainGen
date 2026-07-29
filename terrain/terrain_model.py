@@ -20,29 +20,33 @@ from scipy.spatial import cKDTree
 
 from terrain.bounding_box import BoundingBox
 from terrain.brush_profiles import BRUSH_PROFILES
-from terrain.stamp import Stamp
+from terrain.stamp import TOOL_RAISE, Stamp
 from terrain.terrain_kernel import TerrainKernel
 
 
 class TerrainModel:
     """
     Evaluates predicted terrain height by folding every affecting
-    Stamp's pull over a starting height of 0.
+    Stamp's update over a starting height of 0. Each stamp's own
+    `tool` selects which update rule applies (see terrain/stamp.py):
 
-    Under PGA's flatten tool, a stamp doesn't add to the terrain -- it
-    pulls nearby height toward stamp.value, weighted by the brush's
-    falloff:
+        flatten (tool=0): new_height = old_height + (stamp.value - old_height) * weight
+        raise   (tool=1): new_height = old_height + stamp.value * weight
 
-        new_height = old_height + (stamp.value - old_height) * kernel.sample(r)
+    Flatten is a lerp toward stamp.value (an absolute height), so a
+    single stamp can never push terrain past its own value. Raise adds
+    a delta scaled by the brush weight, preserving whatever relief
+    already exists rather than overriding it with one flat target --
+    better suited to correcting a uniform bias over an area that's
+    already roughly the right shape (see terrain/adaptive_refine.py).
 
-    This is a lerp toward stamp.value, not a sum, so a single stamp can
-    never push terrain past its own value. It also means the result
-    depends on the order stamps are applied in -- two stamps overlapping
-    at different values give a different blended result depending on
-    which one is folded in last. That's fine as long as this model
-    replays stamps in the same order the in-game renderer will (list
-    order, i.e. placement/generation order); the order itself doesn't
-    need to be canonical, just consistent between the two.
+    Either way the result depends on the order stamps are applied in
+    -- two stamps overlapping at different values give a different
+    blended result depending on which one is folded in last. That's
+    fine as long as this model replays stamps in the same order the
+    in-game renderer will (list order, i.e. placement/generation
+    order); the order itself doesn't need to be canonical, just
+    consistent between the two.
 
     Terrain noise (terrainNoise.json) is a separate, always-on in-game
     layer per the architecture doc's "Terrain Noise" section and is
@@ -100,7 +104,10 @@ class TerrainModel:
                 continue
             r = dist / stamp.radius
             weight = self._kernels[stamp.brush].sample(r)
-            height += (stamp.value - height) * weight
+            if stamp.tool == TOOL_RAISE:
+                height += stamp.value * weight
+            else:
+                height += (stamp.value - height) * weight
         return height
 
     def evaluate_many(self, points: np.ndarray) -> np.ndarray:
