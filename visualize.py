@@ -57,7 +57,7 @@ def _new_figure(bounds: BoundingBox):
 def _save(fig, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, facecolor="white")
+    fig.savefig(path, facecolor="white", bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
 
 
