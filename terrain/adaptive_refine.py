@@ -8,42 +8,55 @@ architecture doc's "Adaptive Refinement": "Only subdivide stamps whose
 local error exceeds tolerance").
 
 Targeting works directly off the same binned error grid preview_error.png
-already visualizes, using peak-seeking region growth rather than naive
-thresholding:
+already visualizes, using a Euclidean distance transform to find the
+best-centered stamp for each unclaimed flagged region:
 
-  1. Find the single worst-error unclaimed cell (the peak).
-  2. Flood-fill outward to same-signed, unclaimed neighbors, stopping
-     once error drops below a fraction of the peak's own magnitude
-     (zero_crossing_fraction) rather than at some fraction of
-     tolerance -- sized relative to the peak, not an absolute floor,
-     so a broad low-level same-signed background can't get swept in
-     (see _grow_region). Requiring same sign is what makes this a real
-     boundary rather than an arbitrary cutoff: a region can't straddle
-     both an overshoot and an undershoot, since by definition error
-     changes sign somewhere between them.
+  1. Build two boolean masks over the (unclaimed) error grid: cells
+     overshooting (error > tolerance) and cells undershooting
+     (error < -tolerance). Kept separate so a single stamp can never
+     straddle both an overshoot and an undershoot region.
+  2. For each mask, compute a distance transform: every flagged cell's
+     value becomes its distance to the nearest *unflagged* cell (i.e.
+     the region's boundary). The cell with the largest such value is
+     the most-interior point of that region -- the center of the
+     largest circle that fits entirely inside it without crossing the
+     boundary -- and that distance *is* the natural radius for a stamp
+     placed there. Take whichever mask (over or under) currently has
+     the larger such value as this iteration's hotspot.
   3. Fit the region: try all four brushes x both tools (flatten pulls
      toward an absolute value, discarding whatever relief the coarse
      fit already got right; raise adds a delta on top of it, correcting
      a uniform bias while preserving existing shape -- see
      terrain/stamp.py) and keep whichever combination gives the lowest
      RMS over the region's actual LIDAR points.
-  4. Claim the region's cells (excluded from future peaks in this
-     pass) and repeat from the next-worst unclaimed peak.
+  4. Claim only the cells actually covered by the placed (possibly
+     radius-clamped) circle -- not the whole flagged region -- and
+     repeat from the next-largest remaining distance-transform value.
 
-An earlier version thresholded the whole grid at once and took each
-resulting connected component as one hotspot, whatever its size --
+Claiming only the placed circle, not the whole flagged region, matters
+a lot for elongated features (a long, narrow river-valley error band,
+for instance): the first iteration correctly centers a stamp on the
+valley's centerline (the distance transform is unaffected by the
+region's overall length, unlike a plain centroid-of-all-flagged-cells
+approach, which gets pulled toward whichever end of an elongated
+region happens to be flagged more thickly, effectively "targeting the
+edges rather than the centers"), and leaves the rest of the valley's
+length unclaimed for the next iteration to find -- producing a line of
+separately-centered stamps tracing the valley, rather than one
+mis-centered stamp (or, in an earlier version that thresholded and
+grew without claiming per-circle, one giant stamp swallowing the
+entire elongated region).
+
+An even earlier version thresholded the whole grid at once and took
+each resulting connected component as one hotspot, whatever its size --
 with tolerance below the ambient curvature-driven error floor (see
 below), a single contiguous blob could span a huge fraction of the
 course, producing a stamp whose LIDAR-averaged target was a poor fit
-almost everywhere within it, actively making things worse where it got
-applied (order-dependent pull semantics mean the last-applied stamp at
-a point dominates). Peak-seeking with a same-signed, zero-crossing
-boundary bounds region size at the source rather than clamping after
-the fact -- though min_radius/max_radius clamps (tied to the coarse
-hex lattice's own scale) still apply as a second line of defense, plus
-a proximity cap against other hotspots found in the same pass (the
+almost everywhere within it. min_radius/max_radius clamps (tied to the
+coarse hex lattice's own scale) still apply as a safety net, plus a
+proximity cap against other hotspots found in the same pass (the
 min-radius clamp alone could otherwise push two nearby small regions'
-stamps into physical overlap even though their error cells never
+stamps into physical overlap even though their flagged cells never
 touched).
 
 No masks exist yet (Milestone 5), so this uses a single global error
@@ -80,8 +93,7 @@ from terrain.terrain_model import TerrainModel
 
 DEFAULT_RESOLUTION = 200
 DEFAULT_MIN_POINTS = 3
-DEFAULT_MIN_REGION_CELLS = 2
-DEFAULT_ZERO_CROSSING_FRACTION = 0.2  # stop growing once error drops below this fraction of the peak
+DEFAULT_MIN_HOTSPOT_RADIUS_CELLS = 1.0  # below this (pre-clamp), treat as noise, not a feature
 
 # Candidate brushes/tools tried per hotspot; whichever combination
 # gives the lowest RMS over the region's actual LIDAR points wins.
@@ -93,8 +105,6 @@ CANDIDATE_TOOLS = (TOOL_FLATTEN, TOOL_RAISE)
 # stamp radius, min is half of that.
 DEFAULT_MAX_HOTSPOT_RADIUS_M = HEX_STAMP_RADIUS_M / 2.0
 DEFAULT_MIN_HOTSPOT_RADIUS_M = DEFAULT_MAX_HOTSPOT_RADIUS_M / 2.0
-
-_NEIGHBOR_OFFSETS = ((-1, 0), (1, 0), (0, -1), (0, 1))  # 4-connectivity
 
 
 @dataclass(slots=True)
@@ -145,57 +155,6 @@ def _bin_actual_elevation(
     return means
 
 
-def _grow_region(
-    error: np.ndarray,
-    claimed: np.ndarray,
-    peak: tuple[int, int],
-    fraction: float,
-) -> list[tuple[int, int]]:
-    """
-    Flood-fill from `peak` to same-signed, unclaimed neighbors whose
-    |error| is still at least `fraction` of the peak's own |error|,
-    4-connected.
-
-    The threshold is relative to the peak, not an absolute floor --
-    using a fixed absolute cutoff (e.g. "keep growing until |error|
-    drops below 0.1 m") doesn't actually bound growth to the local
-    feature if the surrounding *background* error also happens to
-    share the peak's sign over a wide area (a broad, low-level
-    curvature-smoothing bias easily does this): growth would keep
-    picking up same-signed background cells indefinitely, producing a
-    region spanning most of the grid instead of just the anomaly. Sizing
-    the cutoff to the peak's own magnitude means a genuine sharp local
-    feature (which decays substantially away from its own peak) still
-    gets isolated correctly, while a flat, low-magnitude background
-    fails the relative test almost immediately.
-    """
-    peak_error = error[peak]
-    peak_sign = np.sign(peak_error)
-    threshold = fraction * abs(peak_error)
-    rows, cols = error.shape
-
-    region = [peak]
-    visited = {peak}
-    stack = [peak]
-
-    while stack:
-        r, c = stack.pop()
-        for dr, dc in _NEIGHBOR_OFFSETS:
-            nr, nc = r + dr, c + dc
-            if not (0 <= nr < rows and 0 <= nc < cols):
-                continue
-            if (nr, nc) in visited or claimed[nr, nc]:
-                continue
-            e = error[nr, nc]
-            if not np.isfinite(e) or np.sign(e) != peak_sign or abs(e) < threshold:
-                continue
-            visited.add((nr, nc))
-            region.append((nr, nc))
-            stack.append((nr, nc))
-
-    return region
-
-
 def _score_candidate(
     hx: float, hz: float, radius: float, brush: int, tool: int,
     px: np.ndarray, pz: np.ndarray, actual: np.ndarray,
@@ -239,31 +198,30 @@ def find_error_hotspots(
     bounds: BoundingBox,
     tolerance: float,
     resolution: int = DEFAULT_RESOLUTION,
-    min_region_cells: int = DEFAULT_MIN_REGION_CELLS,
+    min_hotspot_radius_cells: float = DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
     min_radius: float = DEFAULT_MIN_HOTSPOT_RADIUS_M,
     max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
-    zero_crossing_fraction: float = DEFAULT_ZERO_CROSSING_FRACTION,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
 ) -> list[ErrorHotspot]:
     """
-    Find and fit error hotspots via peak-seeking region growth (see
-    module docstring). Each returned ErrorHotspot already carries its
-    best-fit brush/tool/value -- no separate fit_stamp_heights() call
-    needed afterward, since scoring candidates requires the region's
-    actual LIDAR points anyway and that's already done here.
+    Find and fit error hotspots via distance-transform region centering
+    (see module docstring). Each returned ErrorHotspot already carries
+    its best-fit brush/tool/value -- no separate fit_stamp_heights()
+    call needed afterward, since scoring candidates requires the
+    region's actual LIDAR points anyway and that's already done here.
 
-    Returns hotspots sorted by peak |error|, worst first (which is
-    also the order they were found in, since each pass claims the
-    current worst peak before moving to the next).
+    Returns hotspots in the order found (largest inscribed radius
+    first, which tracks -- but isn't identical to -- worst peak error).
     """
     actual = _bin_actual_elevation(cloud, bounds, resolution, bare_earth_only=bare_earth_only)
     model = TerrainModel(stamps)
     predicted = model.render(resolution=resolution, bounds=bounds)
     error = predicted - actual  # NaN where actual has no data
 
-    claimed = ~np.isfinite(error)
+    valid = np.isfinite(error)
+    claimed = ~valid
 
     edges_x = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
     edges_z = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
@@ -271,52 +229,68 @@ def find_error_hotspots(
     z_centers = (edges_z[:-1] + edges_z[1:]) / 2.0
     cell_size_x = (bounds.max_x - bounds.min_x) / resolution
     cell_size_z = (bounds.max_z - bounds.min_z) / resolution
+    sampling = (cell_size_z, cell_size_x)  # (row, col) spacing for distance_transform_edt
 
     hotspots: list[ErrorHotspot] = []
     placed_centroids: list[tuple[float, float]] = []
 
-    # Bounded iteration count as a hard safety valve -- each loop either
-    # produces a hotspot or claims at least the peak cell, so this can't
-    # spin forever, but an explicit cap is cheap insurance.
     for _ in range(resolution * resolution):
         if max_new_stamps is not None and len(hotspots) >= max_new_stamps:
             break
 
-        masked = np.where(claimed, -np.inf, np.abs(error))
-        peak = np.unravel_index(np.argmax(masked), masked.shape)
-        peak_val = masked[peak]
-        if not np.isfinite(peak_val) or peak_val <= tolerance:
-            break
+        over_mask = (error > tolerance) & ~claimed
+        under_mask = (error < -tolerance) & ~claimed
 
-        region = _grow_region(error, claimed, peak, zero_crossing_fraction)
-        for cell in region:
-            claimed[cell] = True
+        dist_over = ndimage.distance_transform_edt(over_mask, sampling=sampling)
+        dist_under = ndimage.distance_transform_edt(under_mask, sampling=sampling)
 
-        if len(region) < min_region_cells:
+        if dist_over.max(initial=0.0) >= dist_under.max(initial=0.0):
+            dist_map, sign_mask = dist_over, over_mask
+        else:
+            dist_map, sign_mask = dist_under, under_mask
+
+        peak_dist = dist_map.max(initial=0.0)
+        if peak_dist <= 0.0:
+            break  # nothing left flagged in either direction
+
+        peak_row, peak_col = np.unravel_index(np.argmax(dist_map), dist_map.shape)
+
+        min_dist_needed = min_hotspot_radius_cells * min(cell_size_x, cell_size_z)
+        if peak_dist < min_dist_needed:
+            # Too small to be a real feature rather than noise -- claim
+            # just this one cell so it can't be picked again, but don't
+            # place a stamp for it.
+            claimed[peak_row, peak_col] = True
             continue
 
-        rows = np.array([c[0] for c in region])
-        cols = np.array([c[1] for c in region])
-        cell_x = x_centers[cols]
-        cell_z = z_centers[rows]
-        centroid_x = float(np.mean(cell_x))
-        centroid_z = float(np.mean(cell_z))
-
-        dist_to_centroid = np.sqrt((cell_x - centroid_x) ** 2 + (cell_z - centroid_z) ** 2)
-        radius = float(np.max(dist_to_centroid)) + 0.5 * max(cell_size_x, cell_size_z)
-        radius = max(radius, min_radius)
+        centroid_x = float(x_centers[peak_col])
+        centroid_z = float(z_centers[peak_row])
+        radius = max(peak_dist, min_radius)
         radius = min(radius, max_radius)
 
         # Proximity cap: the min-radius clamp above could otherwise push
         # this stamp into physical overlap with an already-placed one
-        # from this same pass, even though their error regions never
+        # from this same pass, even though their flagged cells never
         # touched. Half the distance to the nearest prior centroid keeps
         # them from overlapping regardless of what the clamp did.
         for px_c, pz_c in placed_centroids:
             d = np.hypot(centroid_x - px_c, centroid_z - pz_c)
             radius = min(radius, 0.5 * d)
 
-        peak_error = float(np.max(np.abs(error[rows, cols])))
+        peak_error = float(abs(error[peak_row, peak_col]))
+
+        # Claim every originally-valid cell within the placed (possibly
+        # clamped) radius -- not the whole flagged region -- so an
+        # elongated feature longer than this stamp's reach leaves the
+        # rest of itself available for the next iteration to find (see
+        # module docstring's river-valley example).
+        rows_idx, cols_idx = np.nonzero(valid & ~claimed)
+        if rows_idx.size:
+            cell_dist = np.hypot(
+                (z_centers[rows_idx] - centroid_z), (x_centers[cols_idx] - centroid_x)
+            )
+            claimed[rows_idx[cell_dist <= radius], cols_idx[cell_dist <= radius]] = True
+        claimed[peak_row, peak_col] = True  # guaranteed claimed even if radius rounds to ~0
 
         idx = cloud.query_radius(centroid_x, centroid_z, radius)
         if bare_earth_only and idx.size > 0:
@@ -347,9 +321,12 @@ def find_error_hotspots(
             continue
 
         brush, tool, value, rms = best
+        n_cells = int(np.sum((valid) & (np.hypot(
+            (z_centers[:, None] - centroid_z), (x_centers[None, :] - centroid_x)
+        ) <= radius)))
         hotspots.append(ErrorHotspot(
             x=centroid_x, z=centroid_z, radius=radius, peak_error=peak_error,
-            n_cells=len(region), brush=brush, tool=tool, value=value, fit_rms=rms,
+            n_cells=n_cells, brush=brush, tool=tool, value=value, fit_rms=rms,
         ))
         placed_centroids.append((centroid_x, centroid_z))
 
@@ -362,10 +339,9 @@ def refine_stamps(
     bounds: BoundingBox,
     tolerance: float,
     resolution: int = DEFAULT_RESOLUTION,
-    min_region_cells: int = DEFAULT_MIN_REGION_CELLS,
+    min_hotspot_radius_cells: float = DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
     min_radius: float = DEFAULT_MIN_HOTSPOT_RADIUS_M,
     max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
-    zero_crossing_fraction: float = DEFAULT_ZERO_CROSSING_FRACTION,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
@@ -382,9 +358,8 @@ def refine_stamps(
     """
     hotspots = find_error_hotspots(
         stamps, cloud, bounds, tolerance,
-        resolution=resolution, min_region_cells=min_region_cells,
+        resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
         min_radius=min_radius, max_radius=max_radius,
-        zero_crossing_fraction=zero_crossing_fraction,
         bare_earth_only=bare_earth_only, min_points=min_points,
         max_new_stamps=max_new_stamps,
     )
