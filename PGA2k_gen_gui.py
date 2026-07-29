@@ -215,16 +215,16 @@ class PGAGenGUI:
         dropdown.bind("<<ComboboxSelected>>", lambda e: self._on_preview_choice_changed())
         ttk.Button(header, text="Refresh", command=self._refresh_preview_and_slider).pack(side="left")
 
-        version_row = ttk.Frame(frame)
-        version_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(version_row, text="Version:").pack(side="left")
+        ttk.Label(header, text="Version:").pack(side="left", padx=(8, 0))
         self.preview_version = tk.IntVar(value=0)
         self.preview_version_scale = ttk.Scale(
-            version_row, from_=0, to=0, orient="horizontal",
+            header, from_=0, to=0, orient="horizontal",
             variable=self.preview_version, command=self._on_preview_version_changed,
         )
+        # This is the widget that should take up whatever space is left
+        # in the row, unlike the fixed-size dropdown/button/label beside it.
         self.preview_version_scale.pack(side="left", fill="x", expand=True, padx=4)
-        self.preview_version_label = ttk.Label(version_row, text="current", width=10)
+        self.preview_version_label = ttk.Label(header, text="current", width=10)
         self.preview_version_label.pack(side="left")
 
         # Scroll wheel over either the slider or the image itself steps
