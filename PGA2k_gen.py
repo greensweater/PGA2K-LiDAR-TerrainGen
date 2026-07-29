@@ -24,6 +24,8 @@ independently resumable and inspectable, never a black box.
     laz/                    input LAZ/LAS tiles
     map.osm                 input OSM export (user-downloaded, using
                              the lat/lon bbox ingest-laz prints)
+    features.geojson         ingest-osm output (see osm.py): classified
+                             vector Features in the course's local frame
     project.json             small state manifest (projection, merged
                              bounds, course origin, course_name) carried
                              between steps so they don't need re-specifying
@@ -60,7 +62,8 @@ from constants import (
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
-from terrain.adaptive_refine import DEFAULT_MIN_REGION_CELLS, DEFAULT_RESOLUTION, refine_stamps
+from osm import parse_osm_features, save_features
+from terrain.adaptive_refine import DEFAULT_MIN_HOTSPOT_RADIUS_CELLS, DEFAULT_RESOLUTION, refine_stamps
 from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
@@ -69,6 +72,7 @@ from terrain.terrain_model import TerrainModel
 from writer import normalize_stamp_heights, write_user_layers
 
 INITIAL_STAMPS_FILE = "initial_stamps.json"
+FEATURES_FILE = "features.geojson"
 REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
 
 
@@ -312,11 +316,38 @@ def step_ingest_osm(working_dir: Path) -> None:
             "the lat/lon bbox, download an OSM export covering it, and save it there."
         )
 
-    print(f"Found {osm_path} ({osm_path.stat().st_size:,} bytes).")
-    print("OSM parsing is not implemented yet (osm.py TBD per the architecture doc's "
-          "Milestone 5) -- this step currently just confirms the file is in place.")
+    pointcloud_path = working_dir / POINTCLOUD_FILE
+    if not pointcloud_path.exists():
+        raise StepError(
+            f"No {POINTCLOUD_FILE} found under {working_dir}. Run --step ingest-laz first."
+        )
 
-    save_project(working_dir, {"osm_file_present": True})
+    print(f"Found {osm_path} ({osm_path.stat().st_size:,} bytes).")
+
+    # OSM features need to land in the *course-cropped* local frame
+    # (the same one stamps/terrain use, established by recentered_crop),
+    # not the full merged LAZ extent's frame.
+    full_cloud = PointCloud.load(pointcloud_path)
+    course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
+    bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+
+    print("Parsing OSM features into the course's local frame...")
+    features = parse_osm_features(
+        osm_path, course_cloud.crs, course_cloud.origin_x, course_cloud.origin_y,
+        course_cloud.horizontal_unit_factor, bounds=bounds,
+    )
+
+    counts: dict[str, int] = {}
+    for f in features:
+        counts[f.kind] = counts.get(f.kind, 0) + 1
+    for kind, n in sorted(counts.items()):
+        print(f"  {kind}: {n}")
+
+    out_path = working_dir / FEATURES_FILE
+    save_features(features, out_path)
+    print(f"  wrote {out_path}")
+
+    save_project(working_dir, {"osm_feature_count": len(features), "osm_feature_kinds": counts})
 
 
 def step_generate_terrain(working_dir: Path) -> None:
@@ -363,7 +394,7 @@ def step_refine_terrain(
     working_dir: Path,
     tolerance: float,
     resolution: int,
-    min_region_cells: int,
+    min_hotspot_radius_cells: float,
     max_new_stamps: int | None,
 ) -> None:
     """
@@ -398,7 +429,7 @@ def step_refine_terrain(
     print(f"Scanning the error grid ({resolution}x{resolution}, tolerance={tolerance} m)...")
     refined, hotspots = refine_stamps(
         stamps, course_cloud, bounds, tolerance=tolerance,
-        resolution=resolution, min_region_cells=min_region_cells,
+        resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
         max_new_stamps=max_new_stamps,
     )
 
@@ -580,9 +611,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION,
                          help=f"refine-terrain: error grid resolution, same grid "
                               f"preview_error.png uses (default: {DEFAULT_RESOLUTION})")
-    parser.add_argument("--min-region-cells", type=int, default=DEFAULT_MIN_REGION_CELLS,
+    parser.add_argument("--min-hotspot-radius-cells", type=float, default=DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
                          help=f"refine-terrain: drop hotspot regions smaller than this many "
-                              f"cells, likely point-level noise (default: {DEFAULT_MIN_REGION_CELLS})")
+                              f"cells (pre-clamp), likely noise not a feature (default: {DEFAULT_MIN_HOTSPOT_RADIUS_CELLS})")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
@@ -615,7 +646,7 @@ def main(argv: list[str] | None = None) -> int:
             step_generate_terrain(working_dir)
         elif args.step == "refine-terrain":
             step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
-                                 args.min_region_cells, args.max_new_stamps)
+                                 args.min_hotspot_radius_cells, args.max_new_stamps)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
         elif args.step == "repack":
