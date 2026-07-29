@@ -43,13 +43,32 @@ from scipy import ndimage
 from ingest.laz_reader import PointCloud
 from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
-from terrain.hexgrid import DEFAULT_BRUSH, PLACEHOLDER_VALUE
+from terrain.hexgrid import HEX_STAMP_RADIUS_M, PLACEHOLDER_VALUE
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
 
 DEFAULT_RESOLUTION = 200
 DEFAULT_MIN_POINTS = 3
 DEFAULT_MIN_REGION_CELLS = 2
+
+# Hotspot patch brush is deliberately independent from hexgrid.DEFAULT_BRUSH
+# (the main coarse lattice's brush) -- they can have different needs. Type
+# 9 has a genuine flat plateau (unlike type 10's cosine falloff, which
+# starts weakening immediately from center), so an isolated patch stamp
+# gets uniform correction across a real area instead of a sharp point-fix
+# surrounded by a barely-touched halo ("punching holes").
+DEFAULT_HOTSPOT_BRUSH = 9
+
+# Safety-net clamps on hotspot stamp radius, tied to the main lattice's
+# own scale rather than an arbitrary number -- max is half the coarse
+# stamp radius, min is half of that. Without a max clamp, a large
+# contiguous over-threshold region (e.g. tolerance set below the ambient
+# curvature-driven error floor) can otherwise produce a stamp sized to
+# the whole blob -- hundreds of meters, averaging LIDAR across a huge,
+# varied area into one poor-fit value that makes things worse where it
+# gets applied (see module docstring).
+DEFAULT_MAX_HOTSPOT_RADIUS_M = HEX_STAMP_RADIUS_M / 2.0
+DEFAULT_MIN_HOTSPOT_RADIUS_M = DEFAULT_MAX_HOTSPOT_RADIUS_M / 2.0
 
 
 @dataclass(slots=True)
@@ -62,19 +81,31 @@ class ErrorHotspot:
 
 
 def _bin_actual_elevation(
-    cloud: PointCloud, bounds: BoundingBox, resolution: int,
+    cloud: PointCloud, bounds: BoundingBox, resolution: int, bare_earth_only: bool = True,
 ) -> np.ndarray:
     """
     Mean LIDAR elevation per grid cell over `bounds`, resolution x
     resolution, NaN where a cell has no points. Same binning convention
     as visualize.py's _bin_point_cloud (rows = z, columns = x) so this
     lines up cell-for-cell with TerrainModel.render()'s own grid.
+
+    bare_earth_only matters a lot here: without it, building roofs and
+    vegetation returns get compared directly against predicted ground
+    height and show up as "error" the refinement pass then tries to
+    correct -- fit_stamp_heights already filters to bare-earth for
+    exactly this reason; this needs to match it.
     """
+    if bare_earth_only:
+        mask = cloud.bare_earth_mask()
+        x, z, elevation = cloud.x[mask], cloud.z[mask], cloud.elevation[mask]
+    else:
+        x, z, elevation = cloud.x, cloud.z, cloud.elevation
+
     x_edges = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
     z_edges = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
 
-    sums, _, _ = np.histogram2d(cloud.z, cloud.x, bins=[z_edges, x_edges], weights=cloud.elevation)
-    counts, _, _ = np.histogram2d(cloud.z, cloud.x, bins=[z_edges, x_edges])
+    sums, _, _ = np.histogram2d(z, x, bins=[z_edges, x_edges], weights=elevation)
+    counts, _, _ = np.histogram2d(z, x, bins=[z_edges, x_edges])
 
     with np.errstate(invalid="ignore", divide="ignore"):
         means = sums / counts
@@ -88,8 +119,9 @@ def find_error_hotspots(
     tolerance: float,
     resolution: int = DEFAULT_RESOLUTION,
     min_region_cells: int = DEFAULT_MIN_REGION_CELLS,
-    min_radius: Optional[float] = None,
-    max_radius: Optional[float] = None,
+    min_radius: Optional[float] = DEFAULT_MIN_HOTSPOT_RADIUS_M,
+    max_radius: Optional[float] = DEFAULT_MAX_HOTSPOT_RADIUS_M,
+    bare_earth_only: bool = True,
 ) -> list[ErrorHotspot]:
     """
     Find contiguous regions of the error grid (predicted - actual)
@@ -104,8 +136,19 @@ def find_error_hotspots(
     Regions smaller than `min_region_cells` are dropped -- a single
     flagged cell is as likely to be point-level noise as a real
     feature. min_radius/max_radius clamp the resulting stamp size
-    (default: min = 1.5 grid cells, max = unclamped) so a one-cell
-    region doesn't produce an absurdly tiny stamp.
+    (default: half the coarse hex radius for max, half of that for
+    min -- see DEFAULT_MAX_HOTSPOT_RADIUS_M/DEFAULT_MIN_HOTSPOT_RADIUS_M),
+    so a one-cell region doesn't produce an absurdly tiny stamp, and
+    -- more importantly -- a large contiguous blob (e.g. tolerance set
+    below the ambient curvature-driven error floor, see module
+    docstring) doesn't produce an absurdly *large* one. This clamp is
+    a safety net, not a full fix: it caps the damage a bad region can
+    do, but doesn't stop unrelated distant cells from merging into one
+    misshapen blob in the first place. Properly bounding region growth
+    at the source -- e.g. flood-filling out from each error peak only
+    while error stays meaningfully non-zero, rather than thresholding
+    the whole grid and connected-component labeling everything at
+    once -- is the real fix and hasn't been built yet.
 
     Returns hotspots sorted by peak |error|, worst first.
     """
@@ -114,7 +157,7 @@ def find_error_hotspots(
     if min_radius is None:
         min_radius = 1.5 * max(cell_size_x, cell_size_z)
 
-    actual = _bin_actual_elevation(cloud, bounds, resolution)
+    actual = _bin_actual_elevation(cloud, bounds, resolution, bare_earth_only=bare_earth_only)
     model = TerrainModel(stamps)
     predicted = model.render(resolution=resolution, bounds=bounds)
     error = predicted - actual  # NaN where actual has no data -- never flagged
@@ -158,7 +201,7 @@ def find_error_hotspots(
 
 def generate_hotspot_stamps(
     hotspots: Sequence[ErrorHotspot],
-    brush: int = DEFAULT_BRUSH,
+    brush: int = DEFAULT_HOTSPOT_BRUSH,
 ) -> list[Stamp]:
     """One placeholder-value Stamp per hotspot, centered and sized on it."""
     return [
@@ -174,9 +217,9 @@ def refine_stamps(
     tolerance: float,
     resolution: int = DEFAULT_RESOLUTION,
     min_region_cells: int = DEFAULT_MIN_REGION_CELLS,
-    min_radius: Optional[float] = None,
-    max_radius: Optional[float] = None,
-    brush: int = DEFAULT_BRUSH,
+    min_radius: Optional[float] = DEFAULT_MIN_HOTSPOT_RADIUS_M,
+    max_radius: Optional[float] = DEFAULT_MAX_HOTSPOT_RADIUS_M,
+    brush: int = DEFAULT_HOTSPOT_BRUSH,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
@@ -200,6 +243,7 @@ def refine_stamps(
     hotspots = find_error_hotspots(
         stamps, cloud, bounds, tolerance, resolution=resolution,
         min_region_cells=min_region_cells, min_radius=min_radius, max_radius=max_radius,
+        bare_earth_only=bare_earth_only,
     )
     if max_new_stamps is not None:
         hotspots = hotspots[:max_new_stamps]
