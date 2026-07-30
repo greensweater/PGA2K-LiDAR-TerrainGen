@@ -51,13 +51,46 @@ An even earlier version thresholded the whole grid at once and took
 each resulting connected component as one hotspot, whatever its size --
 with tolerance below the ambient curvature-driven error floor (see
 below), a single contiguous blob could span a huge fraction of the
-course, producing a stamp whose LIDAR-averaged target was a poor fit
-almost everywhere within it. min_radius/max_radius clamps (tied to the
-coarse hex lattice's own scale) still apply as a safety net, plus a
-proximity cap against other hotspots found in the same pass (the
-min-radius clamp alone could otherwise push two nearby small regions'
-stamps into physical overlap even though their flagged cells never
-touched).
+course. min_radius/max_radius clamps (tied to the coarse hex lattice's
+own scale) still apply as a safety net.
+
+Claiming the *entire* placement radius, though, means neighboring
+stamps can touch at best, never overlap -- which produces a visibly
+"cratered" look in practice (corrected divots surrounded by untouched
+original terrain, since each stamp's influence tapers to ~0 at its own
+edge and nothing beyond it gets pulled at all). claim_radius_fraction
+(feature-flagged, see below) claims only an inner fraction of the
+placed radius, leaving an outer band unclaimed so the next iteration's
+stamp naturally lands closer and its influence overlaps this one's.
+
+A prior version also capped radius by proximity to already-placed
+hotspots in the same pass, specifically to *prevent* that overlap --
+which is now the opposite of the goal, and turned out to have a real
+bug besides: it could force radius down to half the distance between
+two nearby centroids with no floor re-applied, producing degenerate
+near-zero-radius stamps (confirmed: min_radius clamped to 25 m, but
+stamps with radius 1 m or less were observed in practice whenever two
+centroids landed close together). Removed outright rather than patched,
+since deliberate overlap is now the point.
+
+enable_brush_radius_scaling (feature-flagged) addresses a separate,
+subtler issue: scoring all four brushes at the *same* radius
+structurally favors whichever brush's falloff shape happens to match
+that size, since RMS is measured over that one region only, blind to
+how the edge blends into whatever's outside it. Type 8 (wide flat
+plateau, sharp drop) tends to win this way even where a gentler brush
+would blend better -- in practice, one real course's refinement runs
+came out ~98% type 8. BRUSH_RADIUS_SCALE is derived from the measured
+profiles themselves (each brush's radius, scaled so its 50%-of-center
+weight falls at the same absolute distance as type 8's), not eyeballed
+-- see _compute_brush_radius_scale.
+
+Both new knobs default to their old (pre-existing) behavior when
+disabled: claim_radius_fraction=1.0 claims the whole placement radius
+exactly as before, enable_brush_radius_scaling=False scores every
+brush at the same radius exactly as before. PGA2k_gen.py persists
+whichever settings were used to project.json, so they carry forward
+between refine-terrain runs without needing to be retyped each time.
 
 No masks exist yet (Milestone 5), so this uses a single global error
 tolerance rather than the mask-driven per-region tolerances the doc
@@ -94,6 +127,8 @@ from terrain.terrain_model import TerrainModel
 DEFAULT_RESOLUTION = 200
 DEFAULT_MIN_POINTS = 3
 DEFAULT_MIN_HOTSPOT_RADIUS_CELLS = 1.0  # below this (pre-clamp), treat as noise, not a feature
+DEFAULT_CLAIM_RADIUS_FRACTION = 1.0  # 1.0 = claim the whole radius (old behavior, no overlap)
+DEFAULT_ENABLE_BRUSH_RADIUS_SCALING = False
 
 # Candidate brushes/tools tried per hotspot; whichever combination
 # gives the lowest RMS over the region's actual LIDAR points wins.
@@ -105,6 +140,32 @@ CANDIDATE_TOOLS = (TOOL_FLATTEN, TOOL_RAISE)
 # stamp radius, min is half of that.
 DEFAULT_MAX_HOTSPOT_RADIUS_M = HEX_STAMP_RADIUS_M / 2.0
 DEFAULT_MIN_HOTSPOT_RADIUS_M = DEFAULT_MAX_HOTSPOT_RADIUS_M / 2.0
+
+
+def _compute_brush_radius_scale() -> dict[int, float]:
+    """
+    For each candidate brush, find the normalized radius at which its
+    weight first drops to half its own center value, then scale
+    relative to type 8 (the reference) so every brush's radius, once
+    multiplied by its entry here, reaches that same *absolute*
+    half-weight distance as type 8 would at radius 1.0 -- see module
+    docstring on why this is derived from the profiles rather than
+    guessed.
+    """
+    def half_weight_r(brush: int) -> float:
+        kernel = TerrainKernel(BRUSH_PROFILES[brush])
+        target = 0.5 * kernel.sample(0.0)
+        rs = np.linspace(0.0, 1.0, 2001)
+        weights = kernel.sample_many(rs)
+        idx = np.argmax(weights <= target)
+        return float(rs[idx])
+
+    radii = {b: half_weight_r(b) for b in CANDIDATE_BRUSHES}
+    reference = radii[8]
+    return {b: reference / r for b, r in radii.items()}
+
+
+BRUSH_RADIUS_SCALE = _compute_brush_radius_scale()
 
 
 @dataclass(slots=True)
@@ -201,6 +262,8 @@ def find_error_hotspots(
     min_hotspot_radius_cells: float = DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
     min_radius: float = DEFAULT_MIN_HOTSPOT_RADIUS_M,
     max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
+    claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
+    enable_brush_radius_scaling: bool = DEFAULT_ENABLE_BRUSH_RADIUS_SCALING,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
@@ -231,8 +294,9 @@ def find_error_hotspots(
     cell_size_z = (bounds.max_z - bounds.min_z) / resolution
     sampling = (cell_size_z, cell_size_x)  # (row, col) spacing for distance_transform_edt
 
+    max_brush_scale = max(BRUSH_RADIUS_SCALE.values()) if enable_brush_radius_scaling else 1.0
+
     hotspots: list[ErrorHotspot] = []
-    placed_centroids: list[tuple[float, float]] = []
 
     for _ in range(resolution * resolution):
         if max_new_stamps is not None and len(hotspots) >= max_new_stamps:
@@ -245,9 +309,9 @@ def find_error_hotspots(
         dist_under = ndimage.distance_transform_edt(under_mask, sampling=sampling)
 
         if dist_over.max(initial=0.0) >= dist_under.max(initial=0.0):
-            dist_map, sign_mask = dist_over, over_mask
+            dist_map = dist_over
         else:
-            dist_map, sign_mask = dist_under, under_mask
+            dist_map = dist_under
 
         peak_dist = dist_map.max(initial=0.0)
         if peak_dist <= 0.0:
@@ -265,37 +329,23 @@ def find_error_hotspots(
 
         centroid_x = float(x_centers[peak_col])
         centroid_z = float(z_centers[peak_row])
-        radius = max(peak_dist, min_radius)
-        radius = min(radius, max_radius)
-
-        # Proximity cap: the min-radius clamp above could otherwise push
-        # this stamp into physical overlap with an already-placed one
-        # from this same pass, even though their flagged cells never
-        # touched. Half the distance to the nearest prior centroid keeps
-        # them from overlapping regardless of what the clamp did.
-        for px_c, pz_c in placed_centroids:
-            d = np.hypot(centroid_x - px_c, centroid_z - pz_c)
-            radius = min(radius, 0.5 * d)
+        base_radius = max(peak_dist, min_radius)
+        base_radius = min(base_radius, max_radius)
 
         peak_error = float(abs(error[peak_row, peak_col]))
 
-        # Claim every originally-valid cell within the placed (possibly
-        # clamped) radius -- not the whole flagged region -- so an
-        # elongated feature longer than this stamp's reach leaves the
-        # rest of itself available for the next iteration to find (see
-        # module docstring's river-valley example).
-        rows_idx, cols_idx = np.nonzero(valid & ~claimed)
-        if rows_idx.size:
-            cell_dist = np.hypot(
-                (z_centers[rows_idx] - centroid_z), (x_centers[cols_idx] - centroid_x)
-            )
-            claimed[rows_idx[cell_dist <= radius], cols_idx[cell_dist <= radius]] = True
-        claimed[peak_row, peak_col] = True  # guaranteed claimed even if radius rounds to ~0
-
-        idx = cloud.query_radius(centroid_x, centroid_z, radius)
+        # Query at the largest radius any candidate could use (base
+        # radius scaled up for the most-generous brush, if brush radius
+        # scaling is on) so every candidate scores against its own
+        # correct point set with a single query -- points beyond a
+        # given candidate's own radius simply get r_norm=1 (weight 0)
+        # for that candidate, which is already correct/harmless.
+        query_radius = min(max_radius, base_radius * max_brush_scale)
+        idx = cloud.query_radius(centroid_x, centroid_z, query_radius)
         if bare_earth_only and idx.size > 0:
             idx = idx[cloud.bare_earth_mask()[idx]]
         if idx.size < min_points:
+            claimed[peak_row, peak_col] = True
             continue
 
         px, pz = cloud.x[idx], cloud.z[idx]
@@ -304,31 +354,51 @@ def find_error_hotspots(
         current_at_center = model.evaluate(centroid_x, centroid_z)
         target_mean = float(np.mean(actual_pts))
 
-        best: Optional[tuple[int, int, float, float]] = None
+        best: Optional[tuple[int, int, float, float, float]] = None  # + candidate_radius
         for brush in CANDIDATE_BRUSHES:
+            if enable_brush_radius_scaling:
+                candidate_radius = base_radius * BRUSH_RADIUS_SCALE[brush]
+                candidate_radius = max(min_radius, min(candidate_radius, max_radius))
+            else:
+                candidate_radius = base_radius
+
             for tool in CANDIDATE_TOOLS:
                 result = _score_candidate(
-                    centroid_x, centroid_z, radius, brush, tool,
+                    centroid_x, centroid_z, candidate_radius, brush, tool,
                     px, pz, actual_pts, current_at_points, current_at_center, target_mean,
                 )
                 if result is None:
                     continue
                 value, rms = result
                 if best is None or rms < best[3]:
-                    best = (brush, tool, value, rms)
+                    best = (brush, tool, value, rms, candidate_radius)
 
         if best is None:
+            claimed[peak_row, peak_col] = True
             continue
 
-        brush, tool, value, rms = best
-        n_cells = int(np.sum((valid) & (np.hypot(
+        brush, tool, value, rms, final_radius = best
+
+        # Claim only an inner fraction of the placed radius (see module
+        # docstring): leaves an outer band unclaimed so the next
+        # iteration's stamp can land closer and actually overlap this
+        # one, rather than merely touching it at best.
+        claim_radius = final_radius * claim_radius_fraction
+        rows_idx, cols_idx = np.nonzero(valid & ~claimed)
+        if rows_idx.size:
+            cell_dist = np.hypot(
+                (z_centers[rows_idx] - centroid_z), (x_centers[cols_idx] - centroid_x)
+            )
+            claimed[rows_idx[cell_dist <= claim_radius], cols_idx[cell_dist <= claim_radius]] = True
+        claimed[peak_row, peak_col] = True  # guaranteed claimed even if claim_radius rounds to ~0
+
+        n_cells = int(np.sum(valid & (np.hypot(
             (z_centers[:, None] - centroid_z), (x_centers[None, :] - centroid_x)
-        ) <= radius)))
+        ) <= final_radius)))
         hotspots.append(ErrorHotspot(
-            x=centroid_x, z=centroid_z, radius=radius, peak_error=peak_error,
+            x=centroid_x, z=centroid_z, radius=final_radius, peak_error=peak_error,
             n_cells=n_cells, brush=brush, tool=tool, value=value, fit_rms=rms,
         ))
-        placed_centroids.append((centroid_x, centroid_z))
 
     return hotspots
 
@@ -342,6 +412,8 @@ def refine_stamps(
     min_hotspot_radius_cells: float = DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
     min_radius: float = DEFAULT_MIN_HOTSPOT_RADIUS_M,
     max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
+    claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
+    enable_brush_radius_scaling: bool = DEFAULT_ENABLE_BRUSH_RADIUS_SCALING,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
@@ -360,6 +432,8 @@ def refine_stamps(
         stamps, cloud, bounds, tolerance,
         resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
         min_radius=min_radius, max_radius=max_radius,
+        claim_radius_fraction=claim_radius_fraction,
+        enable_brush_radius_scaling=enable_brush_radius_scaling,
         bare_earth_only=bare_earth_only, min_points=min_points,
         max_new_stamps=max_new_stamps,
     )
