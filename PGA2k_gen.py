@@ -465,12 +465,13 @@ def step_output_terrain(working_dir: Path) -> None:
     stamps = load_all_stamps(working_dir)
     print(f"  {len(stamps)} stamps")
 
-    min_value = min(s.value for s in stamps)
-    max_value = max(s.value for s in stamps)
-    print(f"Normalizing heights: raw range [{min_value:.3f}, {max_value:.3f}] m "
-          f"-> shifting by {-min_value:.3f} m so minimum lands at 0")
+    bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+    heights = TerrainModel(stamps).render(resolution=200, bounds=bounds)
+    true_min, true_max = float(heights.min()), float(heights.max())
+    print(f"Normalizing heights: actual resolved range [{true_min:.3f}, {true_max:.3f}] m "
+          f"-> shifting by {-true_min:.3f} m so minimum lands at 0")
     try:
-        stamps = normalize_stamp_heights(stamps)
+        stamps = normalize_stamp_heights(stamps, bounds)
     except ValueError as e:
         raise StepError(str(e)) from e
 
@@ -506,8 +507,8 @@ def step_output_terrain(working_dir: Path) -> None:
                   "name applied.")
 
     save_project(working_dir, {
-        "output_height_shift_m": -min_value,
-        "output_height_range_m": max_value - min_value,
+        "output_height_shift_m": -true_min,
+        "output_height_range_m": true_max - true_min,
     })
 
 
