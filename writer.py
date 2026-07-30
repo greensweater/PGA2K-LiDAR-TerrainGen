@@ -73,7 +73,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
-from terrain.stamp import Stamp
+import numpy as np
+
+from terrain.bounding_box import BoundingBox
+from terrain.stamp import TOOL_RAISE, Stamp
+from terrain.terrain_model import TerrainModel
 
 HOLE_ID_NONE = -1
 UNUSED_RADIUS_FIELD = 0.0  # see module docstring: sizing is via `scale`
@@ -119,33 +123,75 @@ def _round(value: float) -> float:
     return round(float(value), _DECIMALS)
 
 
-def normalize_stamp_heights(stamps: Sequence[Stamp]) -> list[Stamp]:
+def normalize_stamp_heights(
+    stamps: Sequence[Stamp],
+    bounds: BoundingBox,
+    resolution: int = 200,
+) -> list[Stamp]:
     """
-    Shift every stamp's value so the minimum becomes exactly 0, matching
+    Shift the terrain so its minimum height is exactly 0, matching
     PGA's 0-based height field convention.
 
-    Only `value` is touched -- positions, radii, and brush types are
-    untouched. Raises rather than silently clipping if the resulting
-    span would exceed MAX_INGAME_HEIGHT_M, since clipping would corrupt
-    real terrain shape rather than just failing loudly.
+    This evaluates the actual resolved terrain (TerrainModel.render()
+    over `bounds`) to find the true min/max, rather than scanning raw
+    stamp.value fields directly -- naive min/max over .value is wrong
+    once raise-tool stamps exist: a raise stamp's value is a relative
+    delta (e.g. -15 to nudge an area down a little), not an absolute
+    height, so mixing deltas with flatten's absolute values produces a
+    meaningless range (a real course hit exactly this: reported span
+    408 m from a delta of -15.7 and an absolute value of 392.3, when
+    the actual resolved terrain only spanned about 120 m).
+
+    The shift is applied as one additional raise-tool stamp, appended
+    after every existing stamp, with a radius many times the course
+    size -- large enough that its weight is (exactly, for every brush
+    profile's flat plateau) 1.0 across the whole course. Because it's
+    applied last, "old_height + shift * 1.0" shifts whatever the
+    already-fully-resolved height is at every point by exactly `shift`,
+    regardless of the mix of flatten/raise stamps and partial blend
+    weights that produced that height -- directly rescaling individual
+    stamps' own values can't be done reliably once raise stamps and
+    partial (non-1.0) weights are involved (a uniform shift to every
+    flatten target does *not* generally produce a uniformly shifted
+    result wherever a point isn't fully committed to some stamp's
+    center), so this appended-stamp approach sidesteps that entirely.
+
+    Raises rather than silently clipping if the resulting span would
+    exceed MAX_INGAME_HEIGHT_M, since clipping would corrupt real
+    terrain shape rather than just failing loudly.
     """
     if not stamps:
         return list(stamps)
 
-    min_value = min(s.value for s in stamps)
-    max_value = max(s.value for s in stamps)
-    span = max_value - min_value
+    model = TerrainModel(stamps)
+    heights = model.render(resolution=resolution, bounds=bounds)
+    true_min = float(np.min(heights))
+    true_max = float(np.max(heights))
+    span = true_max - true_min
 
     if span > MAX_INGAME_HEIGHT_M:
         raise ValueError(
-            f"Terrain relief ({span:.1f} m, from {min_value:.1f} to {max_value:.1f} m) "
+            f"Terrain relief ({span:.1f} m, from {true_min:.1f} to {true_max:.1f} m) "
             f"exceeds the known in-game height ceiling of {MAX_INGAME_HEIGHT_M} m even "
             "after shifting the minimum to 0. Writing this would require clipping real "
             "terrain shape -- consider a smaller/different crop rather than exporting "
             "as-is."
         )
 
-    return [replace(s, value=s.value - min_value) for s in stamps]
+    shift = -true_min
+    if abs(shift) < 1e-9:
+        return list(stamps)
+
+    course_size = max(bounds.max_x - bounds.min_x, bounds.max_z - bounds.min_z)
+    shim = Stamp(
+        x=(bounds.min_x + bounds.max_x) / 2.0,
+        z=(bounds.min_z + bounds.max_z) / 2.0,
+        radius=50.0 * course_size,
+        value=shift,
+        brush=9,
+        tool=TOOL_RAISE,
+    )
+    return list(stamps) + [shim]
 
 
 def stamp_to_entry(stamp: Stamp) -> dict:
