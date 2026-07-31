@@ -44,14 +44,45 @@ _BRUSH_COLORS = {8: "#4C72B0", 9: "#55A868", 10: "#C44E52", 54: "#8172B2"}
 _DEFAULT_BRUSH_COLOR = "#888888"
 
 
+# Fixed plot-area and colorbar positions, in figure-fraction coordinates
+# -- every preview uses the exact same rectangle for its main plot and
+# the exact same rectangle for its colorbar (real or dummy), so no
+# preview's pixel dimensions or internal layout depend on its own data
+# (e.g. a wider "-10.0" tick label vs "1.0" on a different preview).
+# This is what actually fixes switching-between-previews reflow in the
+# GUI, which bbox_inches="tight" (removed from _save below) could not:
+# tight-bbox crops to the rendered content's own bounding box, which
+# shifts with tick label width -- exactly the thing being fixed here.
+_PLOT_RECT = (0.10, 0.08, 0.72, 0.86)     # left, bottom, width, height
+_COLORBAR_RECT = (0.85, 0.08, 0.03, 0.86)
+
+
 def _new_figure(bounds: BoundingBox):
-    fig, ax = plt.subplots(figsize=_FIGSIZE, dpi=_DPI)
+    fig = plt.figure(figsize=_FIGSIZE, dpi=_DPI)
+    ax = fig.add_axes(_PLOT_RECT)
     ax.set_xlim(bounds.min_x, bounds.max_x)
     ax.set_ylim(bounds.min_z, bounds.max_z)
     ax.set_aspect("equal")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("z (m)")
     return fig, ax
+
+
+def _add_colorbar(fig, mappable, label: str) -> None:
+    cax = fig.add_axes(_COLORBAR_RECT)
+    fig.colorbar(mappable, cax=cax, label=label)
+
+
+def _add_dummy_scale(fig) -> None:
+    """
+    Blank placeholder occupying the same rectangle _add_colorbar would
+    -- so preview_hex.png (brush-type legend, not a continuous
+    colorbar) still reserves identical space, and its plot area ends
+    up pixel-identical in size/position to every colorbar-having
+    preview.
+    """
+    cax = fig.add_axes(_COLORBAR_RECT)
+    cax.axis("off")
 
 
 def _archive_existing(path: Path, max_history: int = 10) -> None:
@@ -85,7 +116,12 @@ def _save(fig, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _archive_existing(path)
-    fig.savefig(path, facecolor="white", bbox_inches="tight", pad_inches=0.1)
+    # No bbox_inches="tight": that crops to the rendered content's own
+    # bounding box, which shifts with tick-label width -- exactly what
+    # causes different previews to come out at different pixel sizes.
+    # _PLOT_RECT/_COLORBAR_RECT (see _new_figure) already give a fixed,
+    # tight-looking layout without being content-dependent.
+    fig.savefig(path, facecolor="white")
     plt.close(fig)
 
 
@@ -109,7 +145,7 @@ def render_lidar_preview(cloud: PointCloud, path: Path, max_points: int = 200_00
         cloud.x[idx], cloud.z[idx], c=cloud.elevation[idx],
         s=1, cmap="terrain", linewidths=0,
     )
-    fig.colorbar(sc, ax=ax, label="elevation (m)", fraction=0.046, pad=0.04)
+    _add_colorbar(fig, sc, "elevation (m)")
     ax.set_title(f"LIDAR point cloud ({n:,} points)")
     _save(fig, path)
 
@@ -156,14 +192,12 @@ def render_lidar_heightmap(
     """
     heights = _bin_point_cloud(cloud, bounds, resolution)
 
-    fig, ax = plt.subplots(figsize=_FIGSIZE, dpi=_DPI)
+    fig, ax = _new_figure(bounds)
     im = ax.imshow(
         heights, origin="lower", cmap="gray",
         extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
     )
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("z (m)")
-    fig.colorbar(im, ax=ax, label="elevation (m)", fraction=0.046, pad=0.04)
+    _add_colorbar(fig, im, "elevation (m)")
     _add_compass_labels(ax, bounds)
     ax.set_title(f"LIDAR heightmap ({resolution}x{resolution})")
     _save(fig, path)
@@ -190,6 +224,7 @@ def render_hex_preview(stamps: Sequence[Stamp], bounds: BoundingBox, path: Path)
     ]
     ax.legend(handles=handles, loc="upper right", fontsize=6)
     ax.set_title(f"Stamp layout ({len(stamps)} stamps)")
+    _add_dummy_scale(fig)
     _save(fig, path)
 
 
@@ -209,7 +244,7 @@ def render_stamps_preview(stamps: Sequence[Stamp], bounds: BoundingBox, path: Pa
     ax.add_collection(coll)
     ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=2, zorder=3)
 
-    fig.colorbar(coll, ax=ax, label="fitted value (m)", fraction=0.046, pad=0.04)
+    _add_colorbar(fig, coll, "fitted value (m)")
     ax.set_title(f"Stamp values ({len(stamps)} stamps)")
     _save(fig, path)
 
@@ -223,14 +258,12 @@ def render_height_preview(
     """TerrainModel's predicted height field over `bounds`."""
     grid = model.render(resolution=resolution, bounds=bounds)
 
-    fig, ax = plt.subplots(figsize=_FIGSIZE, dpi=_DPI)
+    fig, ax = _new_figure(bounds)
     im = ax.imshow(
         grid, origin="lower", cmap="terrain",
         extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
     )
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("z (m)")
-    fig.colorbar(im, ax=ax, label="predicted height (m)", fraction=0.046, pad=0.04)
+    _add_colorbar(fig, im, "predicted height (m)")
     ax.set_title(f"Predicted terrain height ({resolution}x{resolution})")
     _save(fig, path)
 
@@ -288,14 +321,12 @@ def render_error_preview(
         raise ValueError("No overlapping LIDAR coverage in bounds -- can't compute error preview.")
     vmax = np.percentile(np.abs(finite), 98)  # robust to a few outlier cells
 
-    fig, ax = plt.subplots(figsize=_FIGSIZE, dpi=_DPI)
+    fig, ax = _new_figure(bounds)
     im = ax.imshow(
         error, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax,
         extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
     )
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("z (m)")
-    fig.colorbar(im, ax=ax, label="predicted - actual (m)", fraction=0.046, pad=0.04)
+    _add_colorbar(fig, im, "predicted - actual (m)")
 
     rms = float(np.sqrt(np.mean(np.square(finite))))
     ax.set_title(f"Height error, RMS={rms:.2f} m ({resolution}x{resolution})")
