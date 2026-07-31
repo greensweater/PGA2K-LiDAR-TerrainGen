@@ -73,24 +73,45 @@ stamps with radius 1 m or less were observed in practice whenever two
 centroids landed close together). Removed outright rather than patched,
 since deliberate overlap is now the point.
 
-enable_brush_radius_scaling (feature-flagged) addresses a separate,
+brush_radius_spread_ratio (feature-flagged) addresses a separate,
 subtler issue: scoring all four brushes at the *same* radius
 structurally favors whichever brush's falloff shape happens to match
 that size, since RMS is measured over that one region only, blind to
 how the edge blends into whatever's outside it. Type 8 (wide flat
 plateau, sharp drop) tends to win this way even where a gentler brush
 would blend better -- in practice, one real course's refinement runs
-came out ~98% type 8. BRUSH_RADIUS_SCALE is derived from the measured
-profiles themselves (each brush's radius, scaled so its 50%-of-center
-weight falls at the same absolute distance as type 8's), not eyeballed
--- see _compute_brush_radius_scale.
+came out ~98% type 8. brush_radius_spread_ratio scales each brush's
+candidate radius by spread_ratio ** BRUSH_RANK[brush] before scoring
+(rank 0..3 for types 8/9/10/54, so spread_ratio=1 is a no-op and larger
+values progressively favor giving smoother brushes more reach). This
+was originally derived from the measured profiles (each brush's radius
+scaled to reach the same half-weight distance as type 8's), but
+checking Chad's TGC-Designer-Tools source directly showed that isn't
+actually how his tool achieves smooth results -- he uses exactly one
+brush type (10) everywhere, with a single fixed rule (stamp radius =
+2x its placement grid spacing), not a per-brush-type multiplier table.
+So rather than chase a "correct" derived table, this is exposed as a
+plain tunable ratio instead: 1.0 disables it, 2.0 matches doubling per
+rank step, whatever value works for real data is the real answer here,
+not a formula.
+
+Claiming uses the *pre-scaling* base radius, not whatever a winning
+brush's scaled candidate_radius came out to -- otherwise
+brush_radius_spread_ratio would also inflate how much area gets marked
+done purely because a larger-radius brush happened to win a given
+hotspot, making stamp density (and therefore overlap) depend on which
+brush was picked rather than being controlled by claim_radius_fraction
+alone. Keeping these independent means each knob controls exactly one
+thing: claim_radius_fraction controls overlap/density, spread_ratio
+controls which brush gets a fair comparison at a larger size, and
+changing one doesn't secretly change the other's effect too.
 
 Both new knobs default to their old (pre-existing) behavior when
 disabled: claim_radius_fraction=1.0 claims the whole placement radius
-exactly as before, enable_brush_radius_scaling=False scores every
-brush at the same radius exactly as before. PGA2k_gen.py persists
-whichever settings were used to project.json, so they carry forward
-between refine-terrain runs without needing to be retyped each time.
+exactly as before, brush_radius_spread_ratio=1.0 scores every brush at
+the same radius exactly as before. PGA2k_gen.py persists whichever
+settings were used to project.json, so they carry forward between
+refine-terrain runs without needing to be retyped each time.
 
 No masks exist yet (Milestone 5), so this uses a single global error
 tolerance rather than the mask-driven per-region tolerances the doc
@@ -128,12 +149,25 @@ DEFAULT_RESOLUTION = 200
 DEFAULT_MIN_POINTS = 3
 DEFAULT_MIN_HOTSPOT_RADIUS_CELLS = 1.0  # below this (pre-clamp), treat as noise, not a feature
 DEFAULT_CLAIM_RADIUS_FRACTION = 1.0  # 1.0 = claim the whole radius (old behavior, no overlap)
-DEFAULT_ENABLE_BRUSH_RADIUS_SCALING = False
+DEFAULT_BRUSH_RADIUS_SPREAD_RATIO = 1.0  # 1.0 = every brush scored at the same radius (old behavior)
 
 # Candidate brushes/tools tried per hotspot; whichever combination
 # gives the lowest RMS over the region's actual LIDAR points wins.
+# BRUSH_RANK orders them for brush_radius_spread_ratio (see
+# _brush_radius_multiplier): candidate_radius = base_radius *
+# spread_ratio ** BRUSH_RANK[brush], so spread_ratio=1 means every
+# brush gets the same radius (multiplier 1 regardless of rank) and
+# larger values progressively favor giving smoother-falloff brushes
+# (higher rank) more reach. This is a deliberately simple, tunable
+# parameterization rather than a fixed per-brush table -- see module
+# docstring for why: it turned out not to match how Chad's tool
+# actually achieves smooth results (a single always-radius-2x-spacing
+# rule with one brush type, not a per-brush-type multiplier table), so
+# a fixed "correct" table isn't something to chase -- better to expose
+# the ratio directly and let it be tuned against real results.
 CANDIDATE_BRUSHES = (8, 9, 10, 54)
 CANDIDATE_TOOLS = (TOOL_FLATTEN, TOOL_RAISE)
+BRUSH_RANK = {8: 0, 9: 1, 10: 2, 54: 3}
 
 # Safety-net clamps on hotspot stamp radius, tied to the main lattice's
 # own scale rather than an arbitrary number -- max is half the coarse
@@ -142,30 +176,8 @@ DEFAULT_MAX_HOTSPOT_RADIUS_M = HEX_STAMP_RADIUS_M / 2.0
 DEFAULT_MIN_HOTSPOT_RADIUS_M = DEFAULT_MAX_HOTSPOT_RADIUS_M / 2.0
 
 
-def _compute_brush_radius_scale() -> dict[int, float]:
-    """
-    For each candidate brush, find the normalized radius at which its
-    weight first drops to half its own center value, then scale
-    relative to type 8 (the reference) so every brush's radius, once
-    multiplied by its entry here, reaches that same *absolute*
-    half-weight distance as type 8 would at radius 1.0 -- see module
-    docstring on why this is derived from the profiles rather than
-    guessed.
-    """
-    def half_weight_r(brush: int) -> float:
-        kernel = TerrainKernel(BRUSH_PROFILES[brush])
-        target = 0.5 * kernel.sample(0.0)
-        rs = np.linspace(0.0, 1.0, 2001)
-        weights = kernel.sample_many(rs)
-        idx = np.argmax(weights <= target)
-        return float(rs[idx])
-
-    radii = {b: half_weight_r(b) for b in CANDIDATE_BRUSHES}
-    reference = radii[8]
-    return {b: reference / r for b, r in radii.items()}
-
-
-BRUSH_RADIUS_SCALE = _compute_brush_radius_scale()
+def _brush_radius_multiplier(brush: int, spread_ratio: float) -> float:
+    return spread_ratio ** BRUSH_RANK[brush]
 
 
 @dataclass(slots=True)
@@ -263,7 +275,7 @@ def find_error_hotspots(
     min_radius: float = DEFAULT_MIN_HOTSPOT_RADIUS_M,
     max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
     claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
-    enable_brush_radius_scaling: bool = DEFAULT_ENABLE_BRUSH_RADIUS_SCALING,
+    brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
@@ -294,7 +306,9 @@ def find_error_hotspots(
     cell_size_z = (bounds.max_z - bounds.min_z) / resolution
     sampling = (cell_size_z, cell_size_x)  # (row, col) spacing for distance_transform_edt
 
-    max_brush_scale = max(BRUSH_RADIUS_SCALE.values()) if enable_brush_radius_scaling else 1.0
+    max_brush_scale = max(
+        _brush_radius_multiplier(b, brush_radius_spread_ratio) for b in CANDIDATE_BRUSHES
+    )
 
     hotspots: list[ErrorHotspot] = []
 
@@ -356,11 +370,8 @@ def find_error_hotspots(
 
         best: Optional[tuple[int, int, float, float, float]] = None  # + candidate_radius
         for brush in CANDIDATE_BRUSHES:
-            if enable_brush_radius_scaling:
-                candidate_radius = base_radius * BRUSH_RADIUS_SCALE[brush]
-                candidate_radius = max(min_radius, min(candidate_radius, max_radius))
-            else:
-                candidate_radius = base_radius
+            candidate_radius = base_radius * _brush_radius_multiplier(brush, brush_radius_spread_ratio)
+            candidate_radius = max(min_radius, min(candidate_radius, max_radius))
 
             for tool in CANDIDATE_TOOLS:
                 result = _score_candidate(
@@ -379,11 +390,13 @@ def find_error_hotspots(
 
         brush, tool, value, rms, final_radius = best
 
-        # Claim only an inner fraction of the placed radius (see module
-        # docstring): leaves an outer band unclaimed so the next
-        # iteration's stamp can land closer and actually overlap this
-        # one, rather than merely touching it at best.
-        claim_radius = final_radius * claim_radius_fraction
+        # Claim only an inner fraction of the *base* (pre-brush-scaling)
+        # radius -- not final_radius, which may be inflated by
+        # brush_radius_spread_ratio. Using final_radius here would let
+        # spread_ratio also control claimed area/density purely as a
+        # side effect of which brush happened to win, entangling two
+        # knobs that should stay independent (see module docstring).
+        claim_radius = base_radius * claim_radius_fraction
         rows_idx, cols_idx = np.nonzero(valid & ~claimed)
         if rows_idx.size:
             cell_dist = np.hypot(
@@ -413,7 +426,7 @@ def refine_stamps(
     min_radius: float = DEFAULT_MIN_HOTSPOT_RADIUS_M,
     max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
     claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
-    enable_brush_radius_scaling: bool = DEFAULT_ENABLE_BRUSH_RADIUS_SCALING,
+    brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
@@ -433,7 +446,7 @@ def refine_stamps(
         resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
         min_radius=min_radius, max_radius=max_radius,
         claim_radius_fraction=claim_radius_fraction,
-        enable_brush_radius_scaling=enable_brush_radius_scaling,
+        brush_radius_spread_ratio=brush_radius_spread_ratio,
         bare_earth_only=bare_earth_only, min_points=min_points,
         max_new_stamps=max_new_stamps,
     )
