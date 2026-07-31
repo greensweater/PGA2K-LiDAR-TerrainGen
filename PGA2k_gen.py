@@ -489,6 +489,27 @@ def step_refine_terrain(
     })
 
 
+def _set_course_name_in_file(path: Path, course_name: str, key: str) -> None:
+    """
+    Set `key` to `course_name` in the JSON object at `path`, preserving
+    every other key already there (same preserve-everything-else
+    pattern write_user_layers.py uses for userLayers.json's sibling
+    keys). No-ops with a note if `path` doesn't exist yet, rather than
+    creating a file whose overall structure we don't actually know.
+    """
+    if not path.exists():
+        print(f"NOTE: course_name is set ('{course_name}') but {path} doesn't exist yet "
+              "-- run --step ingest-course first if you want the name applied there.")
+        return
+
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    data[key] = course_name
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"Set course name to '{course_name}' in {path}")
+
+
 def step_output_terrain(working_dir: Path) -> None:
     course_dir = working_dir / "course"
 
@@ -517,25 +538,21 @@ def step_output_terrain(working_dir: Path) -> None:
     write_user_layers(stamps, out_path)
     print(f"Wrote {out_path}")
 
-    # If a course name has been set (see the GUI's "Course name" field / project.json),
-    # write it into CourseDescription.json's root-level "name" key, preserving every
-    # other key already there -- same preserve-everything-else pattern as
-    # write_user_layers uses for userLayers.json's sibling keys.
+    # If a course name has been set (see the GUI's "Course name" field /
+    # project.json), write it into both CourseDescription.json and
+    # CourseMetadata.json -- which one the game actually reads from
+    # depends on version: confirmed CourseMetadata.json for 2019, with
+    # CourseDescription.json believed to be what later versions (2K21+)
+    # use instead. Writing both covers either case rather than guessing
+    # which version a given course targets.
     project = load_project(working_dir)
     course_name = project.get("course_name")
-    course_desc_path = course_dir / "CourseDescription.json"
     if course_name:
-        if course_desc_path.exists():
-            with course_desc_path.open(encoding="utf-8") as f:
-                desc = json.load(f)
-            desc["name"] = course_name
-            with course_desc_path.open("w", encoding="utf-8") as f:
-                json.dump(desc, f, indent=2)
-            print(f"Set course name to '{course_name}' in {course_desc_path}")
-        else:
-            print(f"NOTE: course_name is set ('{course_name}') but {course_desc_path} "
-                  "doesn't exist yet -- run --step ingest-course first if you want the "
-                  "name applied.")
+        _set_course_name_in_file(course_dir / "CourseDescription.json", course_name, "name")
+        # ASSUMPTION: using the same "name" key here as CourseDescription.json --
+        # unconfirmed for CourseMetadata.json specifically. If the game doesn't
+        # pick up the name after this, that key name is the first thing to check.
+        _set_course_name_in_file(course_dir / "CourseMetadata.json", course_name, "name")
 
     save_project(working_dir, {
         "output_height_shift_m": -true_min,
