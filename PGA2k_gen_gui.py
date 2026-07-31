@@ -62,6 +62,36 @@ GAME_VERSIONS = {
 }
 
 
+class _Tooltip:
+    """Minimal hover tooltip: shows `text` near the widget on mouse-enter."""
+
+    def __init__(self, widget: tk.Widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.tipwindow: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _event=None) -> None:
+        if self.tipwindow or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tw, text=self.text, justify="left", background="#ffffe0",
+            relief="solid", borderwidth=1, font=("TkDefaultFont", 8), wraplength=240,
+        )
+        label.pack(ipadx=4, ipady=2)
+
+    def _hide(self, _event=None) -> None:
+        if self.tipwindow:
+            self.tipwindow.destroy()
+            self.tipwindow = None
+
+
 class PGAGenGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -144,18 +174,46 @@ class PGAGenGUI:
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self.tolerance_var = tk.StringVar(value="2.0")
+        self.tolerance_var = tk.StringVar(value="2")
         self.resolution_var = tk.StringVar(value="200")
         self.min_hotspot_radius_cells_var = tk.StringVar(value="1.0")
         self.max_new_var = tk.StringVar()
-        ttk.Label(parent, text="Error tolerance (m):").pack(anchor="w")
-        ttk.Entry(parent, textvariable=self.tolerance_var, width=14).pack(anchor="w")
-        ttk.Label(parent, text="Error grid resolution:").pack(anchor="w")
-        ttk.Entry(parent, textvariable=self.resolution_var, width=14).pack(anchor="w")
-        ttk.Label(parent, text="Min hotspot radius (cells):").pack(anchor="w")
-        ttk.Entry(parent, textvariable=self.min_hotspot_radius_cells_var, width=14).pack(anchor="w")
-        ttk.Label(parent, text="Max new stamps (optional):").pack(anchor="w")
-        ttk.Entry(parent, textvariable=self.max_new_var, width=14).pack(anchor="w")
+        self.spread_ratio_var = tk.StringVar(value="1")
+        self.claim_fraction_var = tk.StringVar(value="1")
+        self.refine_labels: dict[str, ttk.Label] = {}
+
+        grid_frame = ttk.Frame(parent)
+        grid_frame.pack(anchor="w", fill="x")
+
+        def add_field(row, col, key, abbrev, tooltip, variable, required):
+            cell = ttk.Frame(grid_frame)
+            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+            label = ttk.Label(cell, text=abbrev)
+            label.pack(anchor="w")
+            entry = ttk.Entry(cell, textvariable=variable, width=8)
+            entry.pack(anchor="w")
+            full_tooltip = tooltip + ("" if required else " (optional)")
+            _Tooltip(label, full_tooltip)
+            _Tooltip(entry, full_tooltip)
+            if required:
+                self.refine_labels[key] = label
+
+        add_field(0, 0, "tolerance", "TOL m", "Error tolerance (m): |predicted - actual| above this "
+                  "counts as a hotspot.", self.tolerance_var, required=True)
+        add_field(0, 1, "resolution", "RES px", "Error grid resolution (cells per side) -- same grid "
+                  "preview_error.png uses.", self.resolution_var, required=True)
+        add_field(1, 0, "min_hotspot", "HOT m", "Min hotspot radius in cells (pre-clamp). Smaller "
+                  "regions are treated as noise, not a real feature.", self.min_hotspot_radius_cells_var,
+                  required=True)
+        add_field(1, 1, "max_new", "MAX n", "Cap on new stamps this pass. Leave blank for no cap.",
+                  self.max_new_var, required=False)
+        add_field(2, 0, "spread_ratio", "SPR %", "Brush radius spread ratio: each brush's candidate "
+                  "radius is scaled by spread_ratio ** rank (ranks 0..3 for types 8/9/10/54). "
+                  "1 disables it.", self.spread_ratio_var, required=True)
+        add_field(2, 1, "claim_fraction", "EAT %", "Claimed radius fraction: how much of the placed "
+                  "radius gets marked done. Below 1 lets neighboring stamps overlap. 1 disables it "
+                  "(old behavior).", self.claim_fraction_var, required=True)
+
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -182,6 +240,8 @@ class PGAGenGUI:
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=10)
         self.status_label = ttk.Label(parent, text="Idle", foreground="gray")
         self.status_label.pack(anchor="w")
+        self.play_sound_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(parent, text="\U0001F514 Sound when done", variable=self.play_sound_var).pack(anchor="w")
 
     def _build_log_panel(self, paned: ttk.PanedWindow) -> None:
         frame = ttk.Frame(paned)
@@ -333,20 +393,43 @@ class PGAGenGUI:
         if wd:
             self._run_step(["--step", "generate-terrain"], wd)
 
+    def _validate_refine_fields(self) -> bool:
+        """Highlight (in red) any required Refine Terrain field left empty; returns True if all are filled."""
+        field_vars = {
+            "tolerance": self.tolerance_var,
+            "resolution": self.resolution_var,
+            "min_hotspot": self.min_hotspot_radius_cells_var,
+            "spread_ratio": self.spread_ratio_var,
+            "claim_fraction": self.claim_fraction_var,
+        }
+        all_valid = True
+        for key, label in self.refine_labels.items():
+            if field_vars[key].get().strip():
+                label.configure(foreground="black")
+            else:
+                label.configure(foreground="red")
+                all_valid = False
+        return all_valid
+
     def _run_refine_terrain(self) -> None:
         wd = self._require_working_dir()
         if not wd:
             return
-        args = ["--step", "refine-terrain"]
-        tol = self.tolerance_var.get().strip()
-        if tol:
-            args += ["--error-tolerance", tol]
-        res = self.resolution_var.get().strip()
-        if res:
-            args += ["--resolution", res]
-        min_cells = self.min_hotspot_radius_cells_var.get().strip()
-        if min_cells:
-            args += ["--min-hotspot-radius-cells", min_cells]
+        if not self._validate_refine_fields():
+            messagebox.showwarning(
+                "Missing required fields",
+                "Fill in all required Refine Terrain fields (shown in red) before running.",
+            )
+            return
+
+        args = [
+            "--step", "refine-terrain",
+            "--error-tolerance", self.tolerance_var.get().strip(),
+            "--resolution", self.resolution_var.get().strip(),
+            "--min-hotspot-radius-cells", self.min_hotspot_radius_cells_var.get().strip(),
+            "--brush-radius-spread-ratio", self.spread_ratio_var.get().strip(),
+            "--claim-radius-fraction", self.claim_fraction_var.get().strip(),
+        ]
         max_new = self.max_new_var.get().strip()
         if max_new:
             args += ["--max-new-stamps", max_new]
@@ -465,13 +548,19 @@ class PGAGenGUI:
                     else:
                         self.status_label.config(text=f"Failed (exit {payload})", foreground="red")
                     self._refresh_preview_and_slider()
+                    self._ring_bell()
                 elif kind == "error":
                     self.running = False
                     self.status_label.config(text="Error", foreground="red")
                     self._append_log(f"\n[GUI error] {payload}\n")
+                    self._ring_bell()
         except queue.Empty:
             pass
         self.root.after(100, self._poll_log_queue)
+
+    def _ring_bell(self) -> None:
+        if self.play_sound_var.get():
+            self.root.bell()
 
     def _append_log(self, text: str) -> None:
         self.log_text.config(state="normal")
