@@ -65,7 +65,7 @@ from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recent
 from ingest.osm import parse_osm_features, save_features
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
-    DEFAULT_ENABLE_BRUSH_RADIUS_SCALING,
+    DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
     DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
     DEFAULT_RESOLUTION,
     refine_stamps,
@@ -403,7 +403,7 @@ def step_refine_terrain(
     min_hotspot_radius_cells: float,
     max_new_stamps: int | None,
     claim_radius_fraction: float | None,
-    enable_brush_radius_scaling: bool | None,
+    brush_radius_spread_ratio: float | None,
 ) -> None:
     """
     One adaptive refinement pass (see terrain/adaptive_refine.py): find
@@ -420,7 +420,7 @@ def step_refine_terrain(
     Deleting the highest-numbered refine_stamps_N.json undoes just
     that pass.
 
-    claim_radius_fraction / enable_brush_radius_scaling are
+    claim_radius_fraction / brush_radius_spread_ratio are
     feature-flagged via project.json rather than always needing a CLI
     value: pass None here to use whatever was last saved (defaulting
     to the old/off behavior -- 1.0 and False -- if never set), or an
@@ -438,16 +438,16 @@ def step_refine_terrain(
         claim_radius_fraction = project.get(
             "refine_claim_radius_fraction", DEFAULT_CLAIM_RADIUS_FRACTION
         )
-    if enable_brush_radius_scaling is None:
-        enable_brush_radius_scaling = project.get(
-            "refine_enable_brush_radius_scaling", DEFAULT_ENABLE_BRUSH_RADIUS_SCALING
+    if brush_radius_spread_ratio is None:
+        brush_radius_spread_ratio = project.get(
+            "refine_brush_radius_spread_ratio", DEFAULT_BRUSH_RADIUS_SPREAD_RATIO
         )
 
     stamps = load_all_stamps(working_dir)
     print(f"  {len(stamps)} stamps (cumulative: initial + {len(_refine_stamps_files(working_dir))} "
           "prior refine pass(es))")
     print(f"  claim_radius_fraction={claim_radius_fraction}  "
-          f"enable_brush_radius_scaling={enable_brush_radius_scaling}")
+          f"brush_radius_spread_ratio={brush_radius_spread_ratio}")
 
     full_cloud = PointCloud.load(pointcloud_path)
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
@@ -458,7 +458,7 @@ def step_refine_terrain(
         stamps, course_cloud, bounds, tolerance=tolerance,
         resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
         claim_radius_fraction=claim_radius_fraction,
-        enable_brush_radius_scaling=enable_brush_radius_scaling,
+        brush_radius_spread_ratio=brush_radius_spread_ratio,
         max_new_stamps=max_new_stamps,
     )
 
@@ -485,7 +485,7 @@ def step_refine_terrain(
         "last_refine_added_count": len(new_stamps),
         "total_stamp_count": len(refined),
         "refine_claim_radius_fraction": claim_radius_fraction,
-        "refine_enable_brush_radius_scaling": enable_brush_radius_scaling,
+        "refine_brush_radius_spread_ratio": brush_radius_spread_ratio,
     })
 
 
@@ -650,11 +650,11 @@ def main(argv: list[str] | None = None) -> int:
                          help="refine-terrain: fraction of placement radius to mark claimed "
                               f"(< 1.0 lets neighboring stamps overlap; default: use whatever's "
                               f"saved in project.json, or {DEFAULT_CLAIM_RADIUS_FRACTION} if never set)")
-    parser.add_argument("--enable-brush-radius-scaling", action=argparse.BooleanOptionalAction, default=None,
-                         help="refine-terrain: scale each candidate brush's radius from the "
-                              "measured profiles before scoring, instead of comparing all four "
-                              "at the same radius (default: use whatever's saved in project.json, "
-                              f"or {DEFAULT_ENABLE_BRUSH_RADIUS_SCALING} if never set)")
+    parser.add_argument("--brush-radius-spread-ratio", type=float, default=None,
+                         help="refine-terrain: radius multiplier per brush rank "
+                              "(spread_ratio ** rank, ranks 0..3 for types 8/9/10/54); "
+                              "1.0 disables it (default: use whatever's saved in project.json, "
+                              f"or {DEFAULT_BRUSH_RADIUS_SPREAD_RATIO} if never set)")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
@@ -688,7 +688,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "refine-terrain":
             step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
                                  args.min_hotspot_radius_cells, args.max_new_stamps,
-                                 args.claim_radius_fraction, args.enable_brush_radius_scaling)
+                                 args.claim_radius_fraction, args.brush_radius_spread_ratio)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
         elif args.step == "repack":
