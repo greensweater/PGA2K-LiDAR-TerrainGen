@@ -58,7 +58,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 from constants import (
     COURSE_SIZE_M, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
-    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL, PREVIEW_STAMPS,
+    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_MASK, PREVIEW_OSM, PREVIEW_OSM_FULL, PREVIEW_STAMPS,
     POINTCLOUD_FILE, PREVIEW_DIR, PROJECT_FILE, STAMPS_DIR,
 )
 import visualize as viz
@@ -251,10 +251,12 @@ def step_visualize(working_dir: Path) -> None:
     full_cloud = PointCloud.load(pointcloud_path)
     print(f"Loaded {pointcloud_path} ({full_cloud.count:,} points)")
 
-    lidar_preview_paths = [preview_dir / PREVIEW_LIDAR, preview_dir / PREVIEW_LIDAR_HEIGHTMAP]
     pointcloud_mtime = pointcloud_path.stat().st_mtime
-    lidar_previews_stale = any(
-        not p.exists() or p.stat().st_mtime < pointcloud_mtime for p in lidar_preview_paths
+    latest_lidar = viz.find_latest_preview(preview_dir, PREVIEW_LIDAR)
+    latest_lidar_heightmap = viz.find_latest_preview(preview_dir, PREVIEW_LIDAR_HEIGHTMAP)
+    lidar_previews_stale = (
+        latest_lidar is None or latest_lidar.stat().st_mtime < pointcloud_mtime
+        or latest_lidar_heightmap is None or latest_lidar_heightmap.stat().st_mtime < pointcloud_mtime
     )
 
     if lidar_previews_stale:
@@ -446,6 +448,11 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
               "--use-height-mask on refine-terrain would restrict everything)")
     else:
         print(f"  wrote {mask_path} (fairway + green, buffered {height_mask_buffer_px} m/px)")
+
+    mask_preview_path = working_dir / PREVIEW_DIR / PREVIEW_MASK
+    viz.render_mask_preview(mask_geometry, bounds, mask_preview_path)
+    print(f"  wrote {mask_preview_path} (black/white -- multiply-blend over another "
+          "course-cropped preview in the GUI's 'Show mask' toggle)")
 
     save_project(working_dir, {
         "osm_feature_count": len(features), "osm_feature_kinds": counts,
