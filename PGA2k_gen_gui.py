@@ -44,7 +44,7 @@ CLI_SCRIPT = SCRIPT_DIR / "PGA2k_gen.py"
 # Reused directly rather than duplicated -- these are plain, side-effect-free
 # JSON helpers already tested as part of the CLI (see PGA2k_gen.py).
 sys.path.insert(0, str(SCRIPT_DIR))
-from constants import PREVIEW_DIR  # noqa: E402
+from constants import PREVIEW_DIR, PREVIEW_OSM  # noqa: E402
 from PGA2k_gen import load_project, save_project  # noqa: E402
 
 PREVIEW_FILES = [
@@ -322,6 +322,20 @@ class PGAGenGUI:
         self.preview_label.bind("<Shift-MouseWheel>", self._on_preview_type_scroll)
         self.preview_label.bind("<Shift-Button-4>", self._on_preview_type_scroll)
         self.preview_label.bind("<Shift-Button-5>", self._on_preview_type_scroll)
+
+        overlay_row = ttk.Frame(frame)
+        overlay_row.pack(fill="x", pady=(4, 0))
+        self.overlay_osm_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            overlay_row, text="Overlay OSM", variable=self.overlay_osm_var,
+            command=self._show_preview,
+        ).pack(side="left")
+        ttk.Label(overlay_row, text="Opacity:").pack(side="left", padx=(8, 0))
+        self.overlay_opacity_var = tk.DoubleVar(value=0.6)
+        ttk.Scale(
+            overlay_row, from_=0.0, to=1.0, orient="horizontal",
+            variable=self.overlay_opacity_var, command=lambda _v: self._show_preview(),
+        ).pack(side="left", fill="x", expand=True, padx=4)
 
     def _add_step_button(self, parent: ttk.Frame, label: str, command) -> ttk.Button:
         btn = ttk.Button(parent, text=label, command=command, width=22)
@@ -772,7 +786,24 @@ class PGAGenGUI:
             return
 
         try:
-            img = Image.open(path)
+            img = Image.open(path).convert("RGBA")
+
+            # Composite the OSM overlay at full resolution before
+            # thumbnailing (both are the same native size, since every
+            # preview shares the same fixed plot-area dimensions) --
+            # skip it when the base preview *is* the overlay itself, or
+            # when it hasn't been generated yet (no OSM ingested).
+            if self.overlay_osm_var.get() and path.name != PREVIEW_OSM:
+                overlay_path = Path(wd) / PREVIEW_DIR / PREVIEW_OSM
+                if overlay_path.exists():
+                    overlay = Image.open(overlay_path).convert("RGBA")
+                    if overlay.size == img.size:
+                        opacity = self.overlay_opacity_var.get()
+                        r, g, b, a = overlay.split()
+                        a = a.point(lambda v: int(v * opacity))
+                        overlay = Image.merge("RGBA", (r, g, b, a))
+                        img = Image.alpha_composite(img, overlay)
+
             img.thumbnail((900, 900), Image.LANCZOS)
             self._preview_imgtk = ImageTk.PhotoImage(img)
             self.preview_label.config(image=self._preview_imgtk, text="")
