@@ -45,9 +45,12 @@ CLI_SCRIPT = SCRIPT_DIR / "PGA2k_gen.py"
 # JSON helpers already tested as part of the CLI (see PGA2k_gen.py).
 sys.path.insert(0, str(SCRIPT_DIR))
 from constants import (  # noqa: E402
-    PREVIEW_DIR, PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+    COURSE_SIZE_M, PREVIEW_DIR, PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
 )
-from PGA2k_gen import load_project, save_project  # noqa: E402
+from PGA2k_gen import FEATURES_FILE, load_project, save_project  # noqa: E402
+from ingest.osm import merge_height_mask_features, load_features, rasterize_mask_rgba  # noqa: E402
+from terrain.bounding_box import BoundingBox  # noqa: E402
+import visualize as viz  # noqa: E402
 
 PREVIEW_FILES = [
     "preview_lidar_heightmap.png",
@@ -109,6 +112,10 @@ class PGAGenGUI:
         self.running = False
         self._step_start_time = 0.0
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
+        self._cached_mask_merged_geom = None  # see _get_cached_mask_merged_geometry
+        self._cached_mask_geom_working_dir = None
+        self._cached_base_thumb = None  # see _show_preview's static-part cache
+        self._cached_base_thumb_key = None
         self._suppress_course_name_save = False
 
         self._build_layout()
@@ -351,6 +358,27 @@ class PGAGenGUI:
             variable=self.overlay_opacity_var, command=lambda _v: self._show_preview(),
         ).pack(side="left", fill="x", expand=True, padx=4)
 
+        # Separate, independent overlay from the static OSM one above:
+        # a live-redrawn highlight of the fairway/green mask buffer, so
+        # dragging the slider shows exactly how far the buffer currently
+        # reaches without needing to re-run ingest-osm each time (see
+        # _get_cached_mask_merged_geometry / ingest.osm.rasterize_mask_rgba).
+        mask_row = ttk.Frame(frame)
+        mask_row.pack(fill="x", pady=(4, 0))
+        self.show_mask_buffer_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            mask_row, text="Mask buffer preview", variable=self.show_mask_buffer_var,
+            command=self._show_preview,
+        ).pack(side="left")
+        ttk.Label(mask_row, text="Buffer (px):").pack(side="left", padx=(8, 0))
+        self.mask_buffer_preview_var = tk.DoubleVar(value=50.0)
+        ttk.Scale(
+            mask_row, from_=0.0, to=200.0, orient="horizontal",
+            variable=self.mask_buffer_preview_var, command=lambda _v: self._show_preview(),
+        ).pack(side="left", fill="x", expand=True, padx=4)
+        self.mask_buffer_preview_label = ttk.Label(mask_row, text="50", width=4)
+        self.mask_buffer_preview_label.pack(side="left")
+
     def _add_step_button(self, parent: ttk.Frame, label: str, command) -> ttk.Button:
         btn = ttk.Button(parent, text=label, command=command, width=22)
         btn.pack(anchor="w", pady=2)
@@ -364,6 +392,8 @@ class PGAGenGUI:
         wd = self.working_dir.get().strip()
         if not wd or not Path(wd).is_dir():
             return
+        self._cached_mask_merged_geom = None
+        self._cached_mask_geom_working_dir = None
         project = load_project(Path(wd))
         self._suppress_course_name_save = True
         try:
@@ -787,6 +817,32 @@ class PGAGenGUI:
             self.preview_choice.set(PREVIEW_FILES[new_idx])
             self._on_preview_choice_changed()
 
+    def _get_cached_mask_merged_geometry(self, working_dir: Path):
+        """
+        Lazily load features.geojson and cache the merged (pre-buffer)
+        fairway/green geometry -- the relatively expensive part
+        (parsing + shapely unary_union) -- so the buffer slider can
+        redraw on every tick by just re-buffering this cached shape
+        (cheap) and rasterizing it (also cheap, see
+        ingest.osm.rasterize_mask_rgba), not re-parsing/re-unioning
+        from scratch each time.
+
+        Returns None if there's no features.geojson yet, or it has no
+        fairway/green features to mask.
+        """
+        if self._cached_mask_geom_working_dir == working_dir:
+            return self._cached_mask_merged_geom
+
+        features_path = working_dir / FEATURES_FILE
+        merged = None
+        if features_path.exists():
+            features = load_features(features_path)
+            merged = merge_height_mask_features(features)
+
+        self._cached_mask_merged_geom = merged
+        self._cached_mask_geom_working_dir = working_dir
+        return merged
+
     def _show_preview(self) -> None:
         wd = self.working_dir.get().strip()
         if not wd:
@@ -805,33 +861,73 @@ class PGAGenGUI:
             return
 
         try:
-            img = Image.open(path).convert("RGBA")
+            # Cache the "static" part -- base image + OSM overlay,
+            # already thumbnailed to display size -- keyed on everything
+            # that would change it. A mask-buffer slider drag changes
+            # none of these, so re-deriving this every tick (disk I/O +
+            # full-resolution compositing + LANCZOS thumbnail, all
+            # measured at hundreds of ms combined) was the actual
+            # bottleneck, not the mask rasterization itself (~5 ms).
+            overlay_on = self.overlay_osm_var.get()
+            cache_key = (
+                str(path), path.stat().st_mtime, overlay_on,
+                self.overlay_opacity_var.get() if overlay_on else None,
+            )
+            if getattr(self, "_cached_base_thumb_key", None) == cache_key:
+                base_thumb = self._cached_base_thumb
+            else:
+                img = Image.open(path).convert("RGBA")
 
-            # Composite the OSM overlay at full resolution before
-            # thumbnailing (both are the same native size, since every
-            # preview shares the same fixed plot-area dimensions).
-            # The LIDAR previews render the *full* merged point cloud in
-            # its own local frame, not the course crop's [0, COURSE_SIZE_M]
-            # frame every other preview uses -- they need the separately
-            # shifted overlay (preview_osm_full.png), not the course-crop
-            # one, or features land in the wrong relative position (see
-            # ingest/osm.py's shift_features / step_ingest_osm).
-            if self.overlay_osm_var.get() and path.name not in (PREVIEW_OSM, PREVIEW_OSM_FULL):
-                overlay_name = (
-                    PREVIEW_OSM_FULL if path.name in (PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP)
-                    else PREVIEW_OSM
-                )
-                overlay_path = Path(wd) / PREVIEW_DIR / overlay_name
-                if overlay_path.exists():
-                    overlay = Image.open(overlay_path).convert("RGBA")
-                    if overlay.size == img.size:
-                        opacity = self.overlay_opacity_var.get()
-                        r, g, b, a = overlay.split()
-                        a = a.point(lambda v: int(v * opacity))
-                        overlay = Image.merge("RGBA", (r, g, b, a))
-                        img = Image.alpha_composite(img, overlay)
+                # The LIDAR previews render the *full* merged point cloud
+                # in its own local frame, not the course crop's
+                # [0, COURSE_SIZE_M] frame every other preview uses --
+                # they need the separately shifted overlay
+                # (preview_osm_full.png), not the course-crop one, or
+                # features land in the wrong relative position (see
+                # ingest/osm.py's shift_features / step_ingest_osm).
+                if overlay_on and path.name not in (PREVIEW_OSM, PREVIEW_OSM_FULL):
+                    overlay_name = (
+                        PREVIEW_OSM_FULL if path.name in (PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP)
+                        else PREVIEW_OSM
+                    )
+                    overlay_path = Path(wd) / PREVIEW_DIR / overlay_name
+                    if overlay_path.exists():
+                        overlay = Image.open(overlay_path).convert("RGBA")
+                        if overlay.size == img.size:
+                            opacity = self.overlay_opacity_var.get()
+                            r, g, b, a = overlay.split()
+                            a = a.point(lambda v: int(v * opacity))
+                            overlay = Image.merge("RGBA", (r, g, b, a))
+                            img = Image.alpha_composite(img, overlay)
 
-            img.thumbnail((900, 900), Image.LANCZOS)
+                img.thumbnail((900, 900), Image.LANCZOS)
+                base_thumb = img
+                self._cached_base_thumb = img
+                self._cached_base_thumb_key = cache_key
+
+            img = base_thumb
+
+            # Live mask-buffer highlight -- separate/independent from the
+            # static OSM overlay above. Only meaningful for the
+            # course-cropped previews: the mask is defined in that
+            # frame, and (unlike the static OSM overlay) there's no
+            # shifted "_full" variant for the LIDAR previews here.
+            if self.show_mask_buffer_var.get() and path.name not in (
+                PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+            ):
+                buffer_px = self.mask_buffer_preview_var.get()
+                self.mask_buffer_preview_label.config(text=f"{buffer_px:.0f}")
+                merged_geom = self._get_cached_mask_merged_geometry(Path(wd))
+                if merged_geom is not None:
+                    buffered = merged_geom.buffer(buffer_px)
+                    course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+                    # Rasterize directly at the (already small) thumbnail
+                    # size -- no separate full-res-then-downscale step
+                    # needed, since this is the final display size anyway.
+                    mask_rgba = rasterize_mask_rgba(buffered, course_bounds, img.width, img.height)
+                    mask_img = Image.fromarray(mask_rgba, mode="RGBA")
+                    img = Image.alpha_composite(img, mask_img)
+
             self._preview_imgtk = ImageTk.PhotoImage(img)
             self.preview_label.config(image=self._preview_imgtk, text="")
         except Exception as e:
