@@ -56,10 +56,15 @@ FEET_TO_METERS = 0.3048
 REFERENCE_AMPLITUDE_M = 200.0
 
 
+SHAPE_CIRCLE = "circle"
+SHAPE_SQUARE = "square"
+
+
 @dataclass(frozen=True, slots=True)
 class BrushProfile:
     brush_id: int
     samples: np.ndarray  # shape (N, 2): columns are (r, normalized_weight)
+    shape: str = SHAPE_CIRCLE  # SHAPE_CIRCLE (Euclidean r) or SHAPE_SQUARE (Chebyshev r)
 
     def sorted_samples(self) -> np.ndarray:
         """Samples sorted by r, for safe use with np.interp."""
@@ -129,6 +134,25 @@ TYPE_9_CORRECTION = 1.0 - _raw_center(_TYPE_9_DELTAS_FT)
 SHARED_CORRECTION = (TYPE_8_CORRECTION + TYPE_9_CORRECTION) / 2.0  # applied to 10 & 54
 
 
+def _hard_edge_profile(brush_id: int, shape: str, bevel: float = 0.03) -> BrushProfile:
+    """
+    A "hard" stamp: full weight (1.0) everywhere except a thin bevel
+    right at the edge, where it drops linearly to 0. This is an
+    ESTIMATE, not measured data like types 8/9/10/54 -- no stake
+    measurements exist yet for types 72/73 (a hard square and hard
+    circle, per real-world observation: vertical walls in-game with a
+    tiny beveled edge). bevel=0.03 is a guess at "tiny"; replace with
+    real ring measurements the same way the other four profiles were
+    built (see module docstring) if/when they're available.
+    """
+    samples = np.array([
+        [0.0, 1.0],
+        [1.0 - bevel, 1.0],
+        [1.0, 0.0],
+    ])
+    return BrushProfile(brush_id=brush_id, samples=samples, shape=shape)
+
+
 # ---------------------------------------------------------------------------
 # Build the lookup table
 # ---------------------------------------------------------------------------
@@ -140,4 +164,6 @@ BRUSH_PROFILES: dict[int, BrushProfile] = {
     54: _profile_from_ring_deltas(
         54, _TYPE_54_DELTAS_FT + [_TYPE_54_R90_DELTA_FT], SHARED_CORRECTION
     ),
+    72: _hard_edge_profile(72, SHAPE_SQUARE),  # hard square -- ESTIMATED, see _hard_edge_profile
+    73: _hard_edge_profile(73, SHAPE_CIRCLE),  # hard circle -- ESTIMATED, see _hard_edge_profile
 }
