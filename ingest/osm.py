@@ -47,6 +47,7 @@ import numpy as np
 from shapely.geometry import LineString, Polygon, box, mapping, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
+from shapely.affinity import translate
 import shapely.vectorized
 
 from terrain.bounding_box import BoundingBox
@@ -230,6 +231,20 @@ def save_features(features: list[Feature], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         json.dump(collection, fh)
+
+
+def shift_features(features: list[Feature], dx: float, dz: float) -> list[Feature]:
+    """
+    Translate every feature's geometry by (dx, dz) -- a pure coordinate
+    shift, not a reprojection. Used to move Features from the
+    course-crop-relative frame they're parsed in (see parse_osm_features)
+    into a different local frame that shares the same real-world origin
+    but a different (0, 0), e.g. the full merged point cloud's own frame
+    used by the LIDAR previews (see PGA2k_gen.py's step_ingest_osm for
+    how that shift is derived from the two clouds' own origin_x/origin_y).
+    """
+    return [Feature(geometry=translate(f.geometry, xoff=dx, yoff=dz), kind=f.kind, tags=f.tags)
+            for f in features]
 
 
 def load_features(path: Path) -> list[Feature]:
