@@ -13,13 +13,14 @@ evaluate() / evaluate_many(), never by inspecting stamps directly (see
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Sequence
 
 import numpy as np
 from scipy.spatial import cKDTree
 
 from terrain.bounding_box import BoundingBox
-from terrain.brush_profiles import BRUSH_PROFILES
+from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE
 from terrain.stamp import TOOL_RAISE, Stamp
 from terrain.terrain_kernel import TerrainKernel
 
@@ -60,7 +61,14 @@ class TerrainModel:
         if self.stamps:
             centers = np.array([[s.x, s.z] for s in self.stamps])
             self._tree: Optional[cKDTree] = cKDTree(centers)
-            self._max_radius = max(s.radius for s in self.stamps)
+            # A square stamp's corners sit radius*sqrt(2) away in
+            # Euclidean terms, even though its own (Chebyshev) radius
+            # is just `radius` -- the KD-tree query below is always
+            # Euclidean (that's what cKDTree does), so it needs a
+            # pruning radius generous enough to still catch a point
+            # near a square stamp's corner, or that stamp would never
+            # even be considered as a candidate for such a point.
+            self._max_radius = max(self._euclidean_reach(s) for s in self.stamps)
         else:
             self._tree = None
             self._max_radius = 0.0
@@ -75,6 +83,14 @@ class TerrainModel:
                         f"No BrushProfile registered for brush type {stamp.brush}"
                     )
                 self._kernels[stamp.brush] = TerrainKernel(BRUSH_PROFILES[stamp.brush])
+
+    @staticmethod
+    def _euclidean_reach(stamp: Stamp) -> float:
+        """Furthest Euclidean distance from center this stamp can affect -- radius for circular, radius*sqrt(2) for square (its corners)."""
+        profile = BRUSH_PROFILES.get(stamp.brush)
+        if profile is not None and profile.shape == SHAPE_SQUARE:
+            return stamp.radius * math.sqrt(2.0)
+        return stamp.radius
 
     def _affecting_stamp_indices(self, x: float, z: float) -> np.ndarray:
         """
@@ -99,7 +115,16 @@ class TerrainModel:
             stamp = self.stamps[i]
             dx = x - stamp.x
             dz = z - stamp.z
-            dist = (dx * dx + dz * dz) ** 0.5
+            profile = BRUSH_PROFILES.get(stamp.brush)
+            if profile is not None and profile.shape == SHAPE_SQUARE:
+                # Square footprint, axis-aligned (rotation=0 only --
+                # see terrain/stamp.py): Chebyshev/L-infinity distance,
+                # not Euclidean. A rotated square would need dx/dz
+                # rotated into the stamp's local frame first; not
+                # supported yet since nothing uses rotation != 0.
+                dist = max(abs(dx), abs(dz))
+            else:
+                dist = (dx * dx + dz * dz) ** 0.5
             if dist > stamp.radius:
                 continue
             r = dist / stamp.radius
