@@ -256,6 +256,25 @@ def load_features(path: Path) -> list[Feature]:
     ]
 
 
+def merge_height_mask_features(
+    features: list[Feature],
+    kinds: tuple[str, ...] = DEFAULT_HEIGHT_MASK_KINDS,
+) -> Optional[BaseGeometry]:
+    """
+    Merge every Feature of the given kinds (default: fairway + green)
+    into one shape (the unary_union), *before* any buffering. Split out
+    from build_height_mask so this (parsing + union, the relatively
+    expensive part) can be done once and cached, then buffered
+    repeatedly at different distances cheaply -- e.g. for a live GUI
+    slider, where re-parsing features.geojson and re-unioning on every
+    tick would be wasted, unnecessary work.
+    """
+    relevant = [f.geometry for f in features if f.kind in kinds]
+    if not relevant:
+        return None
+    return unary_union(relevant)
+
+
 def build_height_mask(
     features: list[Feature],
     buffer_px: float = DEFAULT_HEIGHT_MASK_BUFFER_PX,
@@ -277,10 +296,9 @@ def build_height_mask(
 
     Returns None if no matching features exist (nothing to mask).
     """
-    relevant = [f.geometry for f in features if f.kind in kinds]
-    if not relevant:
+    merged = merge_height_mask_features(features, kinds)
+    if merged is None:
         return None
-    merged = unary_union(relevant)
     return merged.buffer(buffer_px)
 
 
@@ -320,3 +338,52 @@ def rasterize_mask(geometry: Optional[BaseGeometry], bounds: BoundingBox, resolu
     xx, zz = np.meshgrid(x_centers, z_centers)  # shape (resolution, resolution), rows=z cols=x
 
     return shapely.vectorized.contains(geometry, xx, zz)
+
+
+def rasterize_mask_rgba(
+    geometry: Optional[BaseGeometry],
+    bounds: BoundingBox,
+    width_px: int,
+    height_px: int,
+    color: tuple[int, int, int] = (255, 255, 0),
+    opacity: float = 0.3,
+    invert: bool = True,
+) -> np.ndarray:
+    """
+    Fast (no matplotlib) RGBA raster of `geometry`, colored `color` at
+    `opacity`, for interactive preview use -- a GUI slider redrawing on
+    every tick needs something much cheaper than matplotlib's full
+    figure/savefig/reload pipeline. Returns a (height_px, width_px, 4)
+    uint8 array with row 0 = top (max z), matching normal top-down image
+    convention directly -- unlike rasterize_mask's row-0-is-min-z grid,
+    which is fine for algorithm-internal use but wouldn't line up with
+    a screen image without flipping.
+
+    invert follows the same "rasterize, then invert, then use as alpha"
+    recipe as a Photoshop selection-to-mask conversion: with
+    invert=True (the default here), the cells *outside* `geometry` end
+    up colored/opaque and the inside stays fully transparent; pass
+    invert=False to highlight the inside instead.
+
+    geometry=None renders fully transparent (nothing to highlight).
+    """
+    if geometry is None:
+        return np.zeros((height_px, width_px, 4), dtype=np.uint8)
+
+    edges_x = np.linspace(bounds.min_x, bounds.max_x, width_px + 1)
+    edges_z = np.linspace(bounds.max_z, bounds.min_z, height_px + 1)  # descending: row 0 = max z (top)
+    x_centers = (edges_x[:-1] + edges_x[1:]) / 2.0
+    z_centers = (edges_z[:-1] + edges_z[1:]) / 2.0
+    xx, zz = np.meshgrid(x_centers, z_centers)
+
+    inside = shapely.vectorized.contains(geometry, xx, zz)
+    gray = np.where(inside, 255, 0).astype(np.uint8)
+    if invert:
+        gray = 255 - gray
+
+    rgba = np.zeros((height_px, width_px, 4), dtype=np.uint8)
+    rgba[..., 0] = color[0]
+    rgba[..., 1] = color[1]
+    rgba[..., 2] = color[2]
+    rgba[..., 3] = (gray.astype(np.float64) * opacity).astype(np.uint8)
+    return rgba
