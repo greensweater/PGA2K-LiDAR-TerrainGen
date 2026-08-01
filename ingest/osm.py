@@ -345,7 +345,7 @@ def rasterize_mask_rgba(
     bounds: BoundingBox,
     width_px: int,
     height_px: int,
-    color: tuple[int, int, int] = (255, 255, 0),
+    color: tuple[int, int, int] = (255, 0, 255),
     opacity: float = 0.3,
     invert: bool = True,
 ) -> np.ndarray:
