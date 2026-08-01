@@ -20,6 +20,7 @@ Five previews, one per stage:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -33,6 +34,7 @@ from matplotlib.collections import PatchCollection
 from constants import DEBUG_IMAGE_SIZE, PREVIEW_LIDAR_HEIGHTMAP
 from ingest.laz_reader import PointCloud
 from ingest.osm import Feature
+from shapely.geometry.base import BaseGeometry
 from terrain.bounding_box import BoundingBox
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
@@ -116,37 +118,76 @@ def _add_dummy_scale(fig) -> None:
     cax.axis("off")
 
 
-def _archive_existing(path: Path, max_history: int = 10) -> None:
-    """
-    If `path` already exists, shift it into a numbered history rather
-    than overwrite it silently: path -> path_1, an existing path_1 ->
-    path_2, and so on, so the previous run's preview stays around for
-    comparison. Anything beyond max_history is dropped rather than
-    kept forever.
-    """
-    if not path.exists():
-        return
+_VERSION_SUFFIX_RE = re.compile(r"^(.*)_(\d+)(\.[^.]+)$")
 
+
+def strip_preview_version(filename: str) -> str:
+    """
+    'preview_lidar_5.png' -> 'preview_lidar.png' -- recovers the
+    logical preview "kind" from a versioned filename, for callers that
+    need to know which series a file belongs to (e.g. picking the
+    right OSM overlay variant) without caring which version it is.
+    """
+    m = _VERSION_SUFFIX_RE.match(filename)
+    if not m:
+        return filename
+    stem, _n, suffix = m.groups()
+    return f"{stem}{suffix}"
+
+
+def find_all_preview_versions(directory: Path, base_name: str) -> list:
+    """
+    Every existing version of `base_name`'s series (e.g.
+    "preview_lidar.png" finds preview_lidar_0.png, _1.png, ...) in
+    `directory`, sorted by version number descending -- index 0 is
+    always the latest.
+    """
+    stem, suffix = Path(base_name).stem, Path(base_name).suffix
+    if not directory.is_dir():
+        return []
+    pattern = re.compile(rf"^{re.escape(stem)}_(\d+){re.escape(suffix)}$")
+    found = []
+    for f in directory.iterdir():
+        m = pattern.match(f.name)
+        if m:
+            found.append((int(m.group(1)), f))
+    found.sort(key=lambda t: t[0], reverse=True)
+    return [f for _n, f in found]
+
+
+def find_latest_preview(directory: Path, base_name: str):
+    """The highest-numbered existing version of `base_name`'s series, or None if none exists yet."""
+    versions = find_all_preview_versions(directory, base_name)
+    return versions[0] if versions else None
+
+
+def _next_version_path(path: Path) -> Path:
+    """
+    Every preview is written as {stem}_{N}{suffix} (N starting at 0),
+    never as a bare unsuffixed name -- "latest" is simply whichever N
+    is highest on disk. This replaces an earlier scheme that kept the
+    current file unsuffixed and shifted every archived version up by
+    one on each write (path -> path_1, existing path_1 -> path_2, and
+    so on): that cascaded through the *entire* history on every single
+    write, and made "undo" a two-step delete-then-rename dance instead
+    of just deleting the newest file. Append-only means there is
+    nothing to rename, ever, in either direction -- writing a new
+    version never touches an existing file, and undoing the latest
+    version is exactly one delete, nothing else.
+    """
     stem, suffix, parent = path.stem, path.suffix, path.parent
-
-    existing_n = 0
-    while (parent / f"{stem}_{existing_n + 1}{suffix}").exists():
-        existing_n += 1
-
-    for n in range(existing_n, 0, -1):
-        src = parent / f"{stem}_{n}{suffix}"
-        if n + 1 > max_history:
-            src.unlink()
-        else:
-            src.rename(parent / f"{stem}_{n + 1}{suffix}")
-
-    path.rename(parent / f"{stem}_1{suffix}")
+    existing = find_all_preview_versions(parent, path.name)
+    next_n = 0
+    if existing:
+        m = _VERSION_SUFFIX_RE.match(existing[0].name)
+        next_n = int(m.group(2)) + 1
+    return parent / f"{stem}_{next_n}{suffix}"
 
 
 def _save(fig, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    _archive_existing(path)
+    path = _next_version_path(path)
     # No bbox_inches="tight": that crops to the rendered content's own
     # bounding box, which shifts with tick-label width -- exactly what
     # causes different previews to come out at different pixel sizes.
@@ -160,7 +201,7 @@ def _save_transparent(fig, path: Path) -> None:
     """Like _save, but with a transparent background -- for the OSM overlay, meant to be composited over another preview, not viewed alone."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    _archive_existing(path)
+    path = _next_version_path(path)
     fig.savefig(path, transparent=True)
     plt.close(fig)
 
@@ -168,10 +209,18 @@ def _save_transparent(fig, path: Path) -> None:
 def _new_overlay_figure(bounds: BoundingBox):
     """
     Same _PLOT_RECT position/size as _new_figure (so content lines up
-    pixel-for-pixel with every other preview when composited), but with
-    a transparent background and no axis chrome (ticks/labels/spines) --
+    pixel-for-pixel with every other preview when composited), with a
+    transparent background and no axis chrome (ticks/labels/spines) --
     those would double up visually on top of whatever base preview this
     gets composited over, which already has its own.
+
+    Callers that need an opaque (not transparent) background -- e.g.
+    render_mask_preview -- can override fig.patch/ax.patch after
+    getting these back; NOT via ax.axis("off"), which also calls
+    set_frame_on(False) and hides the axes' own background patch
+    entirely (confirmed directly: ax.set_facecolor(...) has no visible
+    effect at all with axis("off") on). Hiding just the ticks/spines
+    keeps the patch intact either way, transparent or not.
     """
     fig = plt.figure(figsize=_FIGSIZE, dpi=_DPI)
     fig.patch.set_alpha(0.0)
@@ -180,7 +229,10 @@ def _new_overlay_figure(bounds: BoundingBox):
     ax.set_xlim(bounds.min_x, bounds.max_x)
     ax.set_ylim(bounds.min_z, bounds.max_z)
     ax.set_aspect("equal")
-    ax.axis("off")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     return fig, ax
 
 
@@ -243,6 +295,52 @@ def render_osm_features(features: Sequence[Feature], bounds: BoundingBox, path: 
         ax.legend(handles=handles, loc="upper right", fontsize=6, framealpha=0.7)
 
     _save_transparent(fig, path)
+
+
+def render_mask_preview(mask_geometry: Optional[BaseGeometry], bounds: BoundingBox, path: Path) -> None:
+    """
+    Plain black/white PNG for use as a PIL ImageChops.multiply mask --
+    same "black conceals, white reveals" convention as a Photoshop layer
+    mask: white wherever the buffered fairway/green outline (see
+    ingest/osm.py's build_height_mask) covers, black everywhere else.
+    Multiplying another image by this one crushes everything outside
+    the mask to black while leaving everything inside it unchanged
+    (white * x = x; black * x = 0).
+
+    Rendered directly from the vector geometry, not the lower-resolution
+    boolean grid find_error_hotspots actually rasterizes internally --
+    the boundary stays crisp/exact here rather than blocky, since this
+    is for looking at, not for the algorithm to consume.
+
+    mask_geometry=None (no fairway/green features found) renders solid
+    white -- "no mask" means "don't restrict/darken anything", matching
+    ingest/osm.py's rasterize_mask same-situation convention.
+    """
+    fig, ax = _new_overlay_figure(bounds)
+    # _new_overlay_figure defaults to transparent -- override to opaque
+    # here: white margin (pass-through, so multiplying this against a
+    # base image doesn't blacken its labels/border area), black data
+    # area by default (masked-out), with the mask polygon(s) filled
+    # white (masked-in) on top.
+    fig.patch.set_alpha(1.0)
+    fig.patch.set_facecolor("white")
+    ax.patch.set_alpha(1.0)
+    ax.set_facecolor("black")
+
+    if mask_geometry is None:
+        ax.axhspan(bounds.min_z, bounds.max_z, facecolor="white")
+    else:
+        parts = mask_geometry.geoms if hasattr(mask_geometry, "geoms") else [mask_geometry]
+        for part in parts:
+            if part.geom_type != "Polygon":
+                continue
+            xs, zs = part.exterior.xy
+            ax.fill(xs, zs, facecolor="white", edgecolor="none")
+            for interior in part.interiors:
+                ixs, izs = interior.xy
+                ax.fill(ixs, izs, facecolor="black", edgecolor="none")
+
+    _save(fig, path)
 
 
 def render_lidar_preview(cloud: PointCloud, path: Path, max_points: int = 200_000) -> None:
