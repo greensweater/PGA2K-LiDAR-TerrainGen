@@ -134,21 +134,27 @@ TYPE_9_CORRECTION = 1.0 - _raw_center(_TYPE_9_DELTAS_FT)
 SHARED_CORRECTION = (TYPE_8_CORRECTION + TYPE_9_CORRECTION) / 2.0  # applied to 10 & 54
 
 
-def _hard_edge_profile(brush_id: int, shape: str, bevel: float = 0.03) -> BrushProfile:
+def _hard_edge_profile(brush_id: int, shape: str) -> BrushProfile:
     """
-    A "hard" stamp: full weight (1.0) everywhere except a thin bevel
-    right at the edge, where it drops linearly to 0. This is an
-    ESTIMATE, not measured data like types 8/9/10/54 -- no stake
-    measurements exist yet for types 72/73 (a hard square and hard
-    circle, per real-world observation: vertical walls in-game with a
-    tiny beveled edge). bevel=0.03 is a guess at "tiny"; replace with
-    real ring measurements the same way the other four profiles were
-    built (see module docstring) if/when they're available.
+    A "hard" stamp: full weight (1.0) everywhere within the stamp,
+    with no falloff ramp at all -- not even a thin one. An earlier
+    version of this modeled a small bevel near the edge, on the
+    (reasonable-sounding) assumption that "vertical walls with a tiny
+    beveled edge" meant the brush's own alpha mask had a soft edge.
+    Direct evidence points the other way: the apparent softness is
+    much more likely an artifact of the game's own sub-1m terrain
+    surface smoothing, not the stamp itself -- confirmed by directly
+    counting individual pixels on a hard-edged circle stamp scaled to
+    R=100m (128x128px), which wouldn't be possible to do cleanly if
+    the mask itself were blurred at the edge. TerrainModel.evaluate()
+    already treats anything beyond the stamp's radius as unaffected
+    (dist > stamp.radius skips it entirely), so this only ever gets
+    sampled for r in [0, 1] -- a flat 1.0 across that whole range is
+    the correct hard-edge shape, not an approximation of one.
     """
     samples = np.array([
         [0.0, 1.0],
-        [1.0 - bevel, 1.0],
-        [1.0, 0.0],
+        [1.0, 1.0],
     ])
     return BrushProfile(brush_id=brush_id, samples=samples, shape=shape)
 
