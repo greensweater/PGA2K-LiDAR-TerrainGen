@@ -58,14 +58,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 from constants import (
     COURSE_SIZE_M, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
-    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_STAMPS,
+    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL, PREVIEW_STAMPS,
     POINTCLOUD_FILE, PREVIEW_DIR, PROJECT_FILE, STAMPS_DIR,
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
 from ingest.osm import (
     DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_height_mask,
-    parse_osm_features, rasterize_mask, save_features, save_height_mask,
+    parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
 )
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -419,8 +419,24 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
 
     preview_path = working_dir / PREVIEW_DIR / PREVIEW_OSM
     viz.render_osm_features(features, bounds, preview_path)
-    print(f"  wrote {preview_path} (transparent overlay -- composite over another "
-          "preview in the GUI, doesn't stand alone)")
+    print(f"  wrote {preview_path} (transparent overlay -- composite over the course-cropped "
+          "previews [hex/stamps/height/error] in the GUI, doesn't stand alone)")
+
+    # The LIDAR previews (preview_lidar.png / preview_lidar_heightmap.png)
+    # render the *full* merged point cloud, in its own local frame --
+    # not the course crop's [0, COURSE_SIZE_M] frame the overlay above
+    # was built in. Both frames share the same real-world origin, just
+    # offset from each other by however far the course crop sits inside
+    # the larger merged extent, so a plain coordinate shift (not a
+    # reprojection) is enough to correctly place the same features
+    # against the full cloud's own bounds.
+    full_shift_x = course_cloud.origin_x - full_cloud.origin_x
+    full_shift_z = course_cloud.origin_y - full_cloud.origin_y
+    full_features = shift_features(features, dx=full_shift_x, dz=full_shift_z)
+    full_preview_path = working_dir / PREVIEW_DIR / PREVIEW_OSM_FULL
+    viz.render_osm_features(full_features, full_cloud.bounds, full_preview_path)
+    print(f"  wrote {full_preview_path} (same overlay, shifted to align with the "
+          "LIDAR previews' full-point-cloud frame instead)")
 
     mask_geometry = build_height_mask(features, buffer_px=height_mask_buffer_px)
     mask_path = working_dir / HEIGHT_MASK_FILE
