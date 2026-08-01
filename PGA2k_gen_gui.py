@@ -21,11 +21,13 @@ still works without Pillow, previews just won't render).
 
 from __future__ import annotations
 
+import platform
 import queue
 import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -102,6 +104,7 @@ class PGAGenGUI:
         self.course_name = tk.StringVar()
         self.log_queue: queue.Queue = queue.Queue()
         self.running = False
+        self._step_start_time = 0.0
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
         self._suppress_course_name_save = False
 
@@ -246,7 +249,10 @@ class PGAGenGUI:
     def _build_log_panel(self, paned: ttk.PanedWindow) -> None:
         frame = ttk.Frame(paned)
         paned.add(frame, weight=1)
-        ttk.Label(frame, text="Output log").pack(anchor="w")
+        header = ttk.Frame(frame)
+        header.pack(fill="x")
+        ttk.Label(header, text="Output log").pack(side="left")
+        ttk.Button(header, text="Clear", command=self._clear_log).pack(side="right")
 
         text_row = ttk.Frame(frame)
         text_row.pack(fill="both", expand=True)
@@ -289,17 +295,24 @@ class PGAGenGUI:
 
         # Scroll wheel over either the slider or the image itself steps
         # through versions -- Windows/Mac send <MouseWheel> with event.delta;
-        # Linux sends <Button-4>/<Button-5> instead.
+        # Linux sends <Button-4>/<Button-5> instead. Shift+scroll instead
+        # cycles the preview *type* dropdown (same cross-platform split).
         for widget in (self.preview_version_scale,):
             widget.bind("<MouseWheel>", self._on_preview_scroll)
             widget.bind("<Button-4>", self._on_preview_scroll)
             widget.bind("<Button-5>", self._on_preview_scroll)
+            widget.bind("<Shift-MouseWheel>", self._on_preview_type_scroll)
+            widget.bind("<Shift-Button-4>", self._on_preview_type_scroll)
+            widget.bind("<Shift-Button-5>", self._on_preview_type_scroll)
 
         self.preview_label = ttk.Label(frame, text="(no preview loaded)", anchor="center")
         self.preview_label.pack(fill="both", expand=True)
         self.preview_label.bind("<MouseWheel>", self._on_preview_scroll)
         self.preview_label.bind("<Button-4>", self._on_preview_scroll)
         self.preview_label.bind("<Button-5>", self._on_preview_scroll)
+        self.preview_label.bind("<Shift-MouseWheel>", self._on_preview_type_scroll)
+        self.preview_label.bind("<Shift-Button-4>", self._on_preview_type_scroll)
+        self.preview_label.bind("<Shift-Button-5>", self._on_preview_type_scroll)
 
     def _add_step_button(self, parent: ttk.Frame, label: str, command) -> ttk.Button:
         btn = ttk.Button(parent, text=label, command=command, width=22)
@@ -514,10 +527,14 @@ class PGAGenGUI:
         self.running = True
         step_name = extra_args[1]
         self.status_label.config(text=f"Running {step_name}...", foreground="orange")
-        self._clear_log()
+        self._step_start_time = time.time()
 
         cmd = [sys.executable, str(CLI_SCRIPT), str(working_dir)] + extra_args
-        self._append_log(f"$ {' '.join(cmd)}\n\n")
+        started_at = time.strftime("%H:%M:%S")
+        # Log output accumulates across steps (not cleared each run) so
+        # earlier results -- stamp counts, hotspot counts, etc. -- stay
+        # visible/scrollable; use the Clear button for a fresh view.
+        self._append_log(f"\n{'-' * 70}\n[{started_at}] $ {' '.join(cmd)}\n\n")
 
         thread = threading.Thread(target=self._run_subprocess, args=(cmd,), daemon=True)
         thread.start()
@@ -543,24 +560,54 @@ class PGAGenGUI:
                     self._append_log(payload)
                 elif kind == "done":
                     self.running = False
+                    elapsed = time.time() - self._step_start_time
                     if payload == 0:
-                        self.status_label.config(text="Done", foreground="green")
+                        self.status_label.config(text=f"Done ({elapsed:.1f}s)", foreground="green")
                     else:
-                        self.status_label.config(text=f"Failed (exit {payload})", foreground="red")
+                        self.status_label.config(
+                            text=f"Failed (exit {payload}, {elapsed:.1f}s)", foreground="red"
+                        )
+                    self._append_log(f"\n[finished in {elapsed:.1f}s]\n")
                     self._refresh_preview_and_slider()
                     self._ring_bell()
                 elif kind == "error":
                     self.running = False
-                    self.status_label.config(text="Error", foreground="red")
-                    self._append_log(f"\n[GUI error] {payload}\n")
+                    elapsed = time.time() - self._step_start_time
+                    self.status_label.config(text=f"Error ({elapsed:.1f}s)", foreground="red")
+                    self._append_log(f"\n[GUI error] {payload}\n[finished in {elapsed:.1f}s]\n")
                     self._ring_bell()
         except queue.Empty:
             pass
         self.root.after(100, self._poll_log_queue)
 
     def _ring_bell(self) -> None:
-        if self.play_sound_var.get():
-            self.root.bell()
+        """
+        root.bell() alone is unreliable: on Windows it depends on the
+        "Default Beep" system sound not being set to None, and on
+        macOS it can silently just flash the screen instead of making
+        noise depending on Accessibility settings -- neither is
+        something code can force. Try a platform-specific, actually-
+        audible method first, falling back to root.bell() only if that
+        isn't available or fails.
+        """
+        if not self.play_sound_var.get():
+            return
+
+        system = platform.system()
+        try:
+            if system == "Windows":
+                import winsound
+                winsound.MessageBeep()
+                return
+            elif system == "Darwin":
+                subprocess.run(
+                    ["afplay", "/System/Library/Sounds/Glass.aiff"],
+                    timeout=2, check=False,
+                )
+                return
+        except Exception:
+            pass
+        self.root.bell()
 
     def _append_log(self, text: str) -> None:
         self.log_text.config(state="normal")
@@ -645,6 +692,22 @@ class PGAGenGUI:
             self.preview_version.set(new_version)
             self._update_version_label()
             self._show_preview()
+
+    def _on_preview_type_scroll(self, event) -> None:
+        """Shift+scroll cycles the preview *type* dropdown (see _on_preview_scroll for the plain-scroll version control)."""
+        if event.num == 4:
+            step = -1
+        elif event.num == 5:
+            step = 1
+        else:
+            step = -1 if event.delta > 0 else 1
+
+        current = self.preview_choice.get()
+        idx = PREVIEW_FILES.index(current) if current in PREVIEW_FILES else 0
+        new_idx = max(0, min(len(PREVIEW_FILES) - 1, idx + step))
+        if new_idx != idx:
+            self.preview_choice.set(PREVIEW_FILES[new_idx])
+            self._on_preview_choice_changed()
 
     def _show_preview(self) -> None:
         wd = self.working_dir.get().strip()
