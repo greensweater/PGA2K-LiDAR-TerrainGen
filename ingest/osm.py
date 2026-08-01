@@ -43,10 +43,16 @@ from typing import Optional
 
 import overpy
 import pyproj
+import numpy as np
 from shapely.geometry import LineString, Polygon, box, mapping, shape
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
+import shapely.vectorized
 
 from terrain.bounding_box import BoundingBox
+
+DEFAULT_HEIGHT_MASK_KINDS = ("fairway", "green")
+DEFAULT_HEIGHT_MASK_BUFFER_PX = 50.0  # see build_height_mask's docstring for what "pixel" means here
 
 
 @dataclass(slots=True)
@@ -233,3 +239,69 @@ def load_features(path: Path) -> list[Feature]:
         Feature(geometry=shape(f["geometry"]), kind=f["properties"]["kind"], tags=f["properties"]["tags"])
         for f in collection["features"]
     ]
+
+
+def build_height_mask(
+    features: list[Feature],
+    buffer_px: float = DEFAULT_HEIGHT_MASK_BUFFER_PX,
+    kinds: tuple[str, ...] = DEFAULT_HEIGHT_MASK_KINDS,
+) -> Optional[BaseGeometry]:
+    """
+    Merge every Feature of the given kinds (default: fairway + green --
+    the areas adaptive refinement should actually spend effort on) into
+    one shape, then buffer it outward -- the "merge filled splines, then
+    buffer to create a simple outline" approach.
+
+    buffer_px follows the same 1-pixel-per-meter convention the earlier
+    generate_height_mask_v3.py script used for its CANVAS_SIZE=2000
+    raster over a 2000-unit map -- our course is likewise exactly
+    2000x2000 m, so a pixel and a meter are the same number here, and
+    buffer_px is used directly as meters. If a genuinely different
+    raster resolution is ever introduced elsewhere, this would need
+    converting explicitly rather than assumed equivalent.
+
+    Returns None if no matching features exist (nothing to mask).
+    """
+    relevant = [f.geometry for f in features if f.kind in kinds]
+    if not relevant:
+        return None
+    merged = unary_union(relevant)
+    return merged.buffer(buffer_px)
+
+
+def save_height_mask(geometry: Optional[BaseGeometry], path: Path) -> None:
+    """Write the height mask as a single-geometry GeoJSON file, or an explicit null if there's nothing to mask."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(mapping(geometry) if geometry is not None else None, fh)
+
+
+def load_height_mask(path: Path) -> Optional[BaseGeometry]:
+    with Path(path).open(encoding="utf-8") as fh:
+        data = json.load(fh)
+    return shape(data) if data is not None else None
+
+
+def rasterize_mask(geometry: Optional[BaseGeometry], bounds: BoundingBox, resolution: int) -> np.ndarray:
+    """
+    Boolean grid (resolution x resolution, rows=z cols=x -- same
+    convention as adaptive_refine.py's error grid) that's True wherever
+    a cell's center falls inside `geometry`, False everywhere else.
+    Rasterized fresh at whatever resolution/bounds are asked for, since
+    the mask is stored as a vector geometry, not tied to one fixed grid.
+
+    If geometry is None (no fairway/green features found), returns an
+    all-True grid -- "no mask" means "don't restrict anything", not
+    "restrict everything".
+    """
+    if geometry is None:
+        return np.ones((resolution, resolution), dtype=bool)
+
+    edges_x = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
+    edges_z = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
+    x_centers = (edges_x[:-1] + edges_x[1:]) / 2.0
+    z_centers = (edges_z[:-1] + edges_z[1:]) / 2.0
+    xx, zz = np.meshgrid(x_centers, z_centers)  # shape (resolution, resolution), rows=z cols=x
+
+    return shapely.vectorized.contains(geometry, xx, zz)
