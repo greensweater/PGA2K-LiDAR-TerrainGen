@@ -47,8 +47,10 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from constants import (  # noqa: E402
     COURSE_SIZE_M, PREVIEW_DIR, PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
 )
-from PGA2k_gen import FEATURES_FILE, load_project, save_project  # noqa: E402
-from ingest.osm import merge_height_mask_features, load_features, rasterize_mask_rgba  # noqa: E402
+from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, load_project, save_project  # noqa: E402
+from ingest.osm import (  # noqa: E402
+    merge_height_mask_features, load_features, rasterize_mask_rgba, save_height_mask,
+)
 from terrain.bounding_box import BoundingBox  # noqa: E402
 import visualize as viz  # noqa: E402
 
@@ -507,6 +509,22 @@ class PGAGenGUI:
                 "Fill in all required Refine Terrain fields (shown in red) before running.",
             )
             return
+
+        # If the mask buffer preview has been used, snapshot its current
+        # value into height_mask.geojson before running -- otherwise
+        # --use-height-mask would silently use whatever buffer was set
+        # the last time Ingest OSM ran (likely stale/different from
+        # whatever was just previewed), not what's actually on screen.
+        if self.use_height_mask_var.get():
+            merged_geom = self._get_cached_mask_merged_geometry(Path(wd))
+            if merged_geom is not None:
+                buffer_px = self.mask_buffer_preview_var.get()
+                buffered = merged_geom.buffer(buffer_px)
+                save_height_mask(buffered, Path(wd) / HEIGHT_MASK_FILE)
+                self._append_log(
+                    f"\n[snapshotting height_mask.geojson at buffer={buffer_px:.0f} px "
+                    "before refine-terrain]\n"
+                )
 
         args = [
             "--step", "refine-terrain",
