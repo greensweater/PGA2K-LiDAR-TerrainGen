@@ -174,9 +174,6 @@ class PGAGenGUI:
         self._add_step_button(parent, "Ingest LAZ", self._run_ingest_laz)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self.height_mask_buffer_var = tk.StringVar(value="50")
-        ttk.Label(parent, text="Mask buffer (px = m):").pack(anchor="w")
-        ttk.Entry(parent, textvariable=self.height_mask_buffer_var, width=14).pack(anchor="w")
         self._add_step_button(parent, "Ingest OSM", self._run_ingest_osm)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -369,7 +366,7 @@ class PGAGenGUI:
         mask_row.pack(fill="x", pady=(4, 0))
         self.show_mask_buffer_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            mask_row, text="Mask buffer preview", variable=self.show_mask_buffer_var,
+            mask_row, text="Mask buffer", variable=self.show_mask_buffer_var,
             command=self._show_preview,
         ).pack(side="left")
         ttk.Label(mask_row, text="Buffer (px):").pack(side="left", padx=(8, 0))
@@ -459,10 +456,10 @@ class PGAGenGUI:
     def _run_ingest_osm(self) -> None:
         wd = self._require_working_dir()
         if wd:
-            args = ["--step", "ingest-osm"]
-            buffer_px = self.height_mask_buffer_var.get().strip()
-            if buffer_px:
-                args += ["--height-mask-buffer-px", buffer_px]
+            args = [
+                "--step", "ingest-osm",
+                "--height-mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}",
+            ]
             self._run_step(args, wd)
 
     def _run_ingest_course(self) -> None:
