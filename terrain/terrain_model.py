@@ -142,16 +142,72 @@ class TerrainModel:
         points: shape (N, 2), columns (x, z).
         Returns: shape (N,) heights, in meters.
 
-        NOTE: this loops per-point today for correctness/simplicity. If
-        it becomes a bottleneck, it's worth profiling before optimizing
-        rather than guessing -- and any vectorization has to preserve
-        per-point stamp ordering, which a naive batched approach won't
-        do for free.
+        Different points are independent of each other (a stamp's
+        effect on one point doesn't depend on its effect on another),
+        so this loops over *stamps*, not points -- for each stamp,
+        finding and updating every point it affects in one vectorized
+        numpy operation, rather than calling evaluate() (which itself
+        loops over stamps) once per point. Only the fold *within* one
+        point's own affecting stamps needs to preserve order, which
+        this does, since stamps are still visited in original list
+        order -- just with the per-stamp update applied to every
+        affected point at once instead of one point at a time.
+
+        Stamps are pre-filtered to only those whose reach could
+        possibly overlap this batch of points at all (via the same
+        KD-tree built in __init__, queried once against the batch's
+        bounding-box center) -- without that, a cumulative stamp list
+        that's grown into the thousands over many refinement passes
+        would mean scanning every stamp for every batch, even when a
+        given batch (e.g. a few hundred LIDAR points within one
+        hotspot's small radius) is nowhere near most of them.
         """
         points = np.asarray(points, dtype=np.float64)
-        heights = np.empty(points.shape[0], dtype=np.float64)
-        for i in range(points.shape[0]):
-            heights[i] = self.evaluate(points[i, 0], points[i, 1])
+        n = points.shape[0]
+        heights = np.zeros(n, dtype=np.float64)
+        if not self.stamps or n == 0 or self._tree is None:
+            return heights
+
+        min_x, max_x = points[:, 0].min(), points[:, 0].max()
+        min_z, max_z = points[:, 1].min(), points[:, 1].max()
+        center = [(min_x + max_x) / 2.0, (min_z + max_z) / 2.0]
+        half_diag = math.hypot(max_x - min_x, max_z - min_z) / 2.0
+
+        # Safe (if slightly loose) superset: any stamp actually
+        # affecting any point in this batch must have its center
+        # within half_diag + that stamp's own Euclidean reach of the
+        # batch's bounding-box center (triangle inequality) -- and
+        # self._max_radius already accounts for square stamps' corners
+        # reaching further than their radius (see _euclidean_reach),
+        # so using it here is the same safety margin _affecting_stamp_indices
+        # relies on for the single-point case.
+        candidate_idx = np.asarray(
+            self._tree.query_ball_point(center, half_diag + self._max_radius), dtype=np.int64
+        )
+        candidate_idx.sort()  # preserve original placement/application order
+
+        px, pz = points[:, 0], points[:, 1]
+        for i in candidate_idx:
+            stamp = self.stamps[i]
+            dx = px - stamp.x
+            dz = pz - stamp.z
+            profile = BRUSH_PROFILES.get(stamp.brush)
+            if profile is not None and profile.shape == SHAPE_SQUARE:
+                dist = np.maximum(np.abs(dx), np.abs(dz))
+            else:
+                dist = np.hypot(dx, dz)
+
+            mask = dist <= stamp.radius
+            if not np.any(mask):
+                continue
+
+            r = dist[mask] / stamp.radius
+            weight = self._kernels[stamp.brush].sample_many(r)
+            if stamp.tool == TOOL_RAISE:
+                heights[mask] += stamp.value * weight
+            else:
+                heights[mask] += (stamp.value - heights[mask]) * weight
+
         return heights
 
     def render(self, resolution: int, bounds: Optional[BoundingBox] = None) -> np.ndarray:
