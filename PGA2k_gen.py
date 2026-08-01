@@ -67,7 +67,10 @@ from ingest.osm import parse_osm_features, save_features
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
     DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
+    DEFAULT_MAX_HOTSPOT_RADIUS_M,
     DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
+    DEFAULT_MIN_HOTSPOT_RADIUS_M,
+    DEFAULT_RADIUS_DECAY_PER_PASS,
     DEFAULT_RESOLUTION,
     refine_stamps,
 )
@@ -467,6 +470,7 @@ def step_refine_terrain(
     max_new_stamps: int | None,
     claim_radius_fraction: float | None,
     brush_radius_spread_ratio: float | None,
+    radius_decay_per_pass: float | None,
 ) -> None:
     """
     One adaptive refinement pass (see terrain/adaptive_refine.py): find
@@ -483,12 +487,27 @@ def step_refine_terrain(
     Deleting the highest-numbered refine_stamps_N.json undoes just
     that pass.
 
-    claim_radius_fraction / brush_radius_spread_ratio are
-    feature-flagged via project.json rather than always needing a CLI
-    value: pass None here to use whatever was last saved (defaulting
-    to the old/off behavior -- 1.0 and False -- if never set), or an
-    explicit value to override for this run and persist it as the new
-    default for next time.
+    Without radius_decay_per_pass, every pass uses the exact same
+    min/max hotspot radius clamps (see adaptive_refine.py's
+    DEFAULT_MIN/MAX_HOTSPOT_RADIUS_M) regardless of how many prior
+    passes have already run -- confirmed in practice to cause a real
+    problem: a second pass over the same course reproduced hotspots at
+    nearly the same shape/radius as the first, just at lower error,
+    because min_radius=12.5 still floors every stamp up to at least
+    that size even where the residual error region is now much smaller
+    than that. radius_decay_per_pass > 1.0 shrinks both clamps by
+    decay**(pass_number - 1) each successive pass (pass 1 unchanged,
+    pass 2 divided by decay, pass 3 by decay^2, ...), so later passes
+    are only allowed to add progressively finer detail rather than
+    re-covering the same ground at a smaller value. 1.0 disables this
+    (every pass uses the same clamps -- the old default behavior).
+
+    claim_radius_fraction / brush_radius_spread_ratio / radius_decay_per_pass
+    are feature-flagged via project.json rather than always needing a
+    CLI value: pass None here to use whatever was last saved
+    (defaulting to the old/off behavior if never set), or an explicit
+    value to override for this run and persist it as the new default
+    for next time.
     """
     pointcloud_path = working_dir / POINTCLOUD_FILE
     if not pointcloud_path.exists():
@@ -505,12 +524,24 @@ def step_refine_terrain(
         brush_radius_spread_ratio = project.get(
             "refine_brush_radius_spread_ratio", DEFAULT_BRUSH_RADIUS_SPREAD_RATIO
         )
+    if radius_decay_per_pass is None:
+        radius_decay_per_pass = project.get(
+            "refine_radius_decay_per_pass", DEFAULT_RADIUS_DECAY_PER_PASS
+        )
 
     stamps = load_all_stamps(working_dir)
-    print(f"  {len(stamps)} stamps (cumulative: initial + {len(_refine_stamps_files(working_dir))} "
-          "prior refine pass(es))")
+    pass_number = len(_refine_stamps_files(working_dir)) + 1
+    print(f"  {len(stamps)} stamps (cumulative: initial + {pass_number - 1} prior refine pass(es))")
     print(f"  claim_radius_fraction={claim_radius_fraction}  "
-          f"brush_radius_spread_ratio={brush_radius_spread_ratio}")
+          f"brush_radius_spread_ratio={brush_radius_spread_ratio}  "
+          f"radius_decay_per_pass={radius_decay_per_pass} (this is pass {pass_number})")
+
+    decay = radius_decay_per_pass ** (pass_number - 1)
+    min_radius = DEFAULT_MIN_HOTSPOT_RADIUS_M / decay
+    max_radius = DEFAULT_MAX_HOTSPOT_RADIUS_M / decay
+    if decay != 1.0:
+        print(f"  min/max hotspot radius this pass: {min_radius:.2f} / {max_radius:.2f} m "
+              f"(decayed {decay:.2f}x from {DEFAULT_MIN_HOTSPOT_RADIUS_M}/{DEFAULT_MAX_HOTSPOT_RADIUS_M})")
 
     full_cloud = PointCloud.load(pointcloud_path)
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
@@ -520,6 +551,7 @@ def step_refine_terrain(
     refined, hotspots = refine_stamps(
         stamps, course_cloud, bounds, tolerance=tolerance,
         resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
+        min_radius=min_radius, max_radius=max_radius,
         claim_radius_fraction=claim_radius_fraction,
         brush_radius_spread_ratio=brush_radius_spread_ratio,
         max_new_stamps=max_new_stamps,
@@ -561,6 +593,7 @@ def step_refine_terrain(
         "total_stamp_count": len(refined),
         "refine_claim_radius_fraction": claim_radius_fraction,
         "refine_brush_radius_spread_ratio": brush_radius_spread_ratio,
+        "refine_radius_decay_per_pass": radius_decay_per_pass,
     })
 
     print("Refreshing previews (parameters used above are now the header on the terrain previews)...")
@@ -750,6 +783,13 @@ def main(argv: list[str] | None = None) -> int:
                               "(spread_ratio ** rank, ranks 0..3 for types 8/9/10/54); "
                               "1.0 disables it (default: use whatever's saved in project.json, "
                               f"or {DEFAULT_BRUSH_RADIUS_SPREAD_RATIO} if never set)")
+    parser.add_argument("--radius-decay-per-pass", type=float, default=None,
+                         help="refine-terrain: shrink min/max hotspot radius by this factor per "
+                              "prior refine pass already run (pass 2 divided by this once, pass 3 "
+                              "twice, ...), so later passes add progressively finer detail instead "
+                              "of re-covering the same ground at lower error; 1.0 disables it "
+                              "(default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RADIUS_DECAY_PER_PASS} if never set)")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
@@ -783,7 +823,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "refine-terrain":
             step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
                                  args.min_hotspot_radius_cells, args.max_new_stamps,
-                                 args.claim_radius_fraction, args.brush_radius_spread_ratio)
+                                 args.claim_radius_fraction, args.brush_radius_spread_ratio,
+                                 args.radius_decay_per_pass)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
         elif args.step == "repack":
