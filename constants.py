@@ -54,6 +54,8 @@ EPSILON = 1.0e-9
 
 PROJECT_FILE = "project.json"
 POINTCLOUD_FILE = "pointcloud.npz"
+STAMPS_DIR = "stamps"
+PREVIEW_DIR = "preview"
 
 PREVIEW_LIDAR = "preview_lidar.png"
 PREVIEW_LIDAR_HEIGHTMAP = "preview_lidar_heightmap.png"
