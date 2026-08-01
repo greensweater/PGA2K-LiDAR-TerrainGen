@@ -182,13 +182,27 @@ def normalize_stamp_heights(
     if abs(shift) < 1e-9:
         return list(stamps)
 
-    course_size = max(bounds.max_x - bounds.min_x, bounds.max_z - bounds.min_z)
+    # A hard square (type 72) is a better fit here than the previous
+    # huge-radius circular workaround: stamps are fundamentally square
+    # bitmaps (circular brushes are just a circle inscribed in that
+    # square), so a square stamp's scale is literally its half-width --
+    # scale = course half-width gives a stamp exactly as wide as the
+    # course. The margin beyond that half-width needs to clear this
+    # brush's bevel (see terrain/brush_profiles.py's _hard_edge_profile
+    # -- an ESTIMATE, no real measurements exist for this brush yet),
+    # not just be "a bit more than zero": at the estimated 3% bevel, a
+    # small ~20 m margin still leaves the course corners inside the
+    # bevel getting partial weight, not the full 1.0 the whole point of
+    # this stamp depends on. 100 m comfortably clears that estimate
+    # with room to spare in case the real bevel turns out wider.
+    half_width = max(bounds.max_x - bounds.min_x, bounds.max_z - bounds.min_z) / 2.0
+    shim_margin = 100.0
     shim = Stamp(
         x=(bounds.min_x + bounds.max_x) / 2.0,
         z=(bounds.min_z + bounds.max_z) / 2.0,
-        radius=50.0 * course_size,
+        radius=half_width + shim_margin,
         value=shift,
-        brush=9,
+        brush=72,
         tool=TOOL_RAISE,
     )
     return list(stamps) + [shim]
