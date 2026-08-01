@@ -750,24 +750,28 @@ class PGAGenGUI:
 
     def _versioned_preview_path(self, working_dir: Path, version: int) -> Path:
         """
-        version=0 is the current (unsuffixed) file; version=1,2,...
-        are the archived previous runs (see visualize.py's
-        _archive_existing: preview_error.png, preview_error_1.png, ...).
-        All previews live under <working_dir>/preview/.
+        ui_version=0 is the latest (highest-numbered) file on disk;
+        ui_version=1 is the next-highest, and so on -- see
+        visualize.py's find_all_preview_versions/_next_version_path:
+        every preview is written as preview_error_0.png,
+        preview_error_1.png, ... (never unsuffixed), so "latest" is
+        just whichever N is highest, with nothing to rename either way.
         """
         preview_dir = working_dir / PREVIEW_DIR
         name = self.preview_choice.get()
-        if version == 0:
-            return preview_dir / name
+        versions = viz.find_all_preview_versions(preview_dir, name)
+        if version < len(versions):
+            return versions[version]
+        # Nothing at this slot -- return a path that can't exist, so
+        # callers correctly show "no preview yet" rather than erroring.
         stem, suffix = Path(name).stem, Path(name).suffix
-        return preview_dir / f"{stem}_{version}{suffix}"
+        return preview_dir / f"{stem}_no_such_version{suffix}"
 
     def _max_preview_version(self, working_dir: Path) -> int:
-        """Highest archived version present for the currently chosen preview."""
-        n = 0
-        while self._versioned_preview_path(working_dir, n + 1).exists():
-            n += 1
-        return n
+        """Number of scrollable versions available for the currently chosen preview, 0 if only one (or none) exist."""
+        preview_dir = working_dir / PREVIEW_DIR
+        versions = viz.find_all_preview_versions(preview_dir, self.preview_choice.get())
+        return max(0, len(versions) - 1)
 
     def _refresh_preview_and_slider(self) -> None:
         """
@@ -896,6 +900,12 @@ class PGAGenGUI:
             else:
                 img = Image.open(path).convert("RGBA")
 
+                # path.name is always versioned now (e.g.
+                # "preview_hex_3.png", never bare "preview_hex.png"),
+                # so compare against the stripped kind, not the exact
+                # name -- see visualize.py's strip_preview_version.
+                base_kind = viz.strip_preview_version(path.name)
+
                 # The LIDAR previews render the *full* merged point cloud
                 # in its own local frame, not the course crop's
                 # [0, COURSE_SIZE_M] frame every other preview uses --
@@ -903,13 +913,13 @@ class PGAGenGUI:
                 # (preview_osm_full.png), not the course-crop one, or
                 # features land in the wrong relative position (see
                 # ingest/osm.py's shift_features / step_ingest_osm).
-                if overlay_on and path.name not in (PREVIEW_OSM, PREVIEW_OSM_FULL):
+                if overlay_on and base_kind not in (PREVIEW_OSM, PREVIEW_OSM_FULL):
                     overlay_name = (
-                        PREVIEW_OSM_FULL if path.name in (PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP)
+                        PREVIEW_OSM_FULL if base_kind in (PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP)
                         else PREVIEW_OSM
                     )
-                    overlay_path = Path(wd) / PREVIEW_DIR / overlay_name
-                    if overlay_path.exists():
+                    overlay_path = viz.find_latest_preview(Path(wd) / PREVIEW_DIR, overlay_name)
+                    if overlay_path is not None:
                         overlay = Image.open(overlay_path).convert("RGBA")
                         if overlay.size == img.size:
                             opacity = self.overlay_opacity_var.get()
@@ -930,7 +940,7 @@ class PGAGenGUI:
             # course-cropped previews: the mask is defined in that
             # frame, and (unlike the static OSM overlay) there's no
             # shifted "_full" variant for the LIDAR previews here.
-            if self.show_mask_buffer_var.get() and path.name not in (
+            if self.show_mask_buffer_var.get() and viz.strip_preview_version(path.name) not in (
                 PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
             ):
                 buffer_px = self.mask_buffer_preview_var.get()
@@ -939,12 +949,27 @@ class PGAGenGUI:
                 if merged_geom is not None:
                     buffered = merged_geom.buffer(buffer_px)
                     course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
-                    # Rasterize directly at the (already small) thumbnail
-                    # size -- no separate full-res-then-downscale step
-                    # needed, since this is the final display size anyway.
-                    mask_rgba = rasterize_mask_rgba(buffered, course_bounds, img.width, img.height)
-                    mask_img = Image.fromarray(mask_rgba, mode="RGBA")
-                    img = Image.alpha_composite(img, mask_img)
+                    # The course's 2000x2000 data only occupies the
+                    # _PLOT_RECT sub-region of the image (margins around
+                    # it hold axis labels/title/colorbar) -- rasterizing
+                    # at the full img.width/height, as done before,
+                    # stretched the mask across the *entire* image
+                    # instead of just that data area. Compute the same
+                    # sub-region in pixel terms (matplotlib's _PLOT_RECT
+                    # is figure-fraction, origin bottom-left; image
+                    # pixels are top-left) and rasterize/paste only
+                    # there, leaving the margin fully transparent.
+                    left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
+                    data_left = round(img.width * left_frac)
+                    data_top = round(img.height * (1 - bottom_frac - height_frac))
+                    data_width = max(1, round(img.width * width_frac))
+                    data_height = max(1, round(img.height * height_frac))
+
+                    mask_rgba = rasterize_mask_rgba(buffered, course_bounds, data_width, data_height)
+                    mask_data_img = Image.fromarray(mask_rgba, mode="RGBA")
+                    mask_full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
+                    mask_full.paste(mask_data_img, (data_left, data_top), mask_data_img)
+                    img = Image.alpha_composite(img, mask_full)
 
             self._preview_imgtk = ImageTk.PhotoImage(img)
             self.preview_label.config(image=self._preview_imgtk, text="")
