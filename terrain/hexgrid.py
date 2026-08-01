@@ -76,7 +76,7 @@ from terrain.stamp import Stamp
 HEX_LATTICE_PITCH_M = 50.0             # doubled resolution; derived from 2*pitch * 40 == course width
 HEX_STAMP_RADIUS_M = 2.0 * HEX_LATTICE_PITCH_M  # reaches nearest-neighbor centers
 HEX_BLEED_M = HEX_STAMP_RADIUS_M / 2.0  # = pitch; closes the offset-row edge gap, see module docstring
-DEFAULT_BRUSH = 8
+DEFAULT_BRUSH = 8  # type 8: widest flat plateau, sharpest edge -- empirically the best-performing default in practice
 PLACEHOLDER_VALUE = 0.0                # overwritten by height fitting
 
 _EPS = 1e-6
