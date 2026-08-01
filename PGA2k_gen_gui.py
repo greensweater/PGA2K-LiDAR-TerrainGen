@@ -163,6 +163,9 @@ class PGAGenGUI:
         self._add_step_button(parent, "Ingest LAZ", self._run_ingest_laz)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self.height_mask_buffer_var = tk.StringVar(value="50")
+        ttk.Label(parent, text="Mask buffer (px = m):").pack(anchor="w")
+        ttk.Entry(parent, textvariable=self.height_mask_buffer_var, width=14).pack(anchor="w")
         self._add_step_button(parent, "Ingest OSM", self._run_ingest_osm)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -222,6 +225,15 @@ class PGAGenGUI:
                   "radius by this factor for each prior refine pass already run, so later passes add "
                   "finer detail instead of re-covering the same ground at lower error. 1 disables it "
                   "(every pass uses the same clamps).", self.radius_decay_var, required=True)
+
+        self.use_height_mask_var = tk.BooleanVar(value=False)
+        mask_checkbox = ttk.Checkbutton(
+            grid_frame, text="Use heightmask", variable=self.use_height_mask_var,
+        )
+        mask_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=3, pady=(4, 0))
+        _Tooltip(mask_checkbox, "Restrict hotspot placement to inside height_mask.geojson "
+                 "(fairway/green, from Ingest OSM). Everything outside is treated like no-data -- "
+                 "never becomes a hotspot.")
 
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
@@ -413,7 +425,11 @@ class PGAGenGUI:
     def _run_ingest_osm(self) -> None:
         wd = self._require_working_dir()
         if wd:
-            self._run_step(["--step", "ingest-osm"], wd)
+            args = ["--step", "ingest-osm"]
+            buffer_px = self.height_mask_buffer_var.get().strip()
+            if buffer_px:
+                args += ["--height-mask-buffer-px", buffer_px]
+            self._run_step(args, wd)
 
     def _run_ingest_course(self) -> None:
         wd = self._require_working_dir()
@@ -468,6 +484,7 @@ class PGAGenGUI:
             "--brush-radius-spread-ratio", self.spread_ratio_var.get().strip(),
             "--claim-radius-fraction", self.claim_fraction_var.get().strip(),
             "--radius-decay-per-pass", self.radius_decay_var.get().strip(),
+            "--use-height-mask" if self.use_height_mask_var.get() else "--no-use-height-mask",
         ]
         max_new = self.max_new_var.get().strip()
         if max_new:
