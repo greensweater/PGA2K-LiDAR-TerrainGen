@@ -336,6 +336,7 @@ class PGAGenGUI:
             self.course_name.set(project.get("course_name", ""))
         finally:
             self._suppress_course_name_save = False
+        self.repack_filename_var.set(project.get("repack_filename", ""))
         self._refresh_preview_and_slider()
 
     def _on_course_name_changed(self) -> None:
