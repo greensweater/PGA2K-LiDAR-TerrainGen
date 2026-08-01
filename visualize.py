@@ -21,7 +21,7 @@ Five previews, one per stage:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 import matplotlib
 matplotlib.use("Agg")  # headless: never opens a window, just writes files
@@ -237,7 +237,20 @@ def _stamp_patches(stamps: Sequence[Stamp], colors: list[str]) -> PatchCollectio
     return PatchCollection(circles, facecolor=colors, edgecolor="black", linewidths=0.3, alpha=0.35)
 
 
-def render_hex_preview(stamps: Sequence[Stamp], bounds: BoundingBox, path: Path) -> None:
+def _set_title(ax, base_title: str, extra_label: Optional[str] = None) -> None:
+    """
+    Set the plot title, with an optional second line summarizing
+    whatever parameters actually produced this preview (e.g. the
+    refine-terrain settings used for the latest pass) -- so a preview
+    is self-documenting about what generated it without needing to
+    cross-reference a separate log.
+    """
+    ax.set_title(f"{base_title}\n{extra_label}" if extra_label else base_title, fontsize=10)
+
+
+def render_hex_preview(
+    stamps: Sequence[Stamp], bounds: BoundingBox, path: Path, extra_label: Optional[str] = None,
+) -> None:
     """Stamp layout: one circle per stamp (center + radius), colored by brush type."""
     fig, ax = _new_figure(bounds)
 
@@ -252,12 +265,14 @@ def render_hex_preview(stamps: Sequence[Stamp], bounds: BoundingBox, path: Path)
         for b in used_brushes
     ]
     ax.legend(handles=handles, loc="upper right", fontsize=6)
-    ax.set_title(f"Stamp layout ({len(stamps)} stamps)")
+    _set_title(ax, f"Stamp layout ({len(stamps)} stamps)", extra_label)
     _add_dummy_scale(fig)
     _save(fig, path)
 
 
-def render_stamps_preview(stamps: Sequence[Stamp], bounds: BoundingBox, path: Path) -> None:
+def render_stamps_preview(
+    stamps: Sequence[Stamp], bounds: BoundingBox, path: Path, extra_label: Optional[str] = None,
+) -> None:
     """
     Same layout as preview_hex.png, but colored by fitted value instead
     of brush type -- makes unfit stamps (still at their placeholder,
@@ -274,7 +289,7 @@ def render_stamps_preview(stamps: Sequence[Stamp], bounds: BoundingBox, path: Pa
     ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=2, zorder=3)
 
     _add_colorbar(fig, coll, "fitted value (m)")
-    ax.set_title(f"Stamp values ({len(stamps)} stamps)")
+    _set_title(ax, f"Stamp values ({len(stamps)} stamps)", extra_label)
     _save(fig, path)
 
 
@@ -283,6 +298,7 @@ def render_height_preview(
     bounds: BoundingBox,
     path: Path,
     resolution: int = 400,
+    extra_label: Optional[str] = None,
 ) -> None:
     """TerrainModel's predicted height field over `bounds`."""
     grid = model.render(resolution=resolution, bounds=bounds)
@@ -293,7 +309,7 @@ def render_height_preview(
         extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
     )
     _add_colorbar(fig, im, "predicted height (m)")
-    ax.set_title(f"Predicted terrain height ({resolution}x{resolution})")
+    _set_title(ax, f"Predicted terrain height ({resolution}x{resolution})", extra_label)
     _save(fig, path)
 
 
@@ -334,6 +350,7 @@ def render_error_preview(
     bounds: BoundingBox,
     path: Path,
     resolution: int = 200,
+    extra_label: Optional[str] = None,
 ) -> None:
     """
     Predicted height vs. binned LIDAR elevation, as signed error
@@ -358,5 +375,5 @@ def render_error_preview(
     _add_colorbar(fig, im, "predicted - actual (m)")
 
     rms = float(np.sqrt(np.mean(np.square(finite))))
-    ax.set_title(f"Height error, RMS={rms:.2f} m ({resolution}x{resolution})")
+    _set_title(ax, f"Height error, RMS={rms:.2f} m ({resolution}x{resolution})", extra_label)
     _save(fig, path)
