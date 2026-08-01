@@ -44,6 +44,7 @@ CLI_SCRIPT = SCRIPT_DIR / "PGA2k_gen.py"
 # Reused directly rather than duplicated -- these are plain, side-effect-free
 # JSON helpers already tested as part of the CLI (see PGA2k_gen.py).
 sys.path.insert(0, str(SCRIPT_DIR))
+from constants import PREVIEW_DIR  # noqa: E402
 from PGA2k_gen import load_project, save_project  # noqa: E402
 
 PREVIEW_FILES = [
@@ -664,12 +665,14 @@ class PGAGenGUI:
         version=0 is the current (unsuffixed) file; version=1,2,...
         are the archived previous runs (see visualize.py's
         _archive_existing: preview_error.png, preview_error_1.png, ...).
+        All previews live under <working_dir>/preview/.
         """
+        preview_dir = working_dir / PREVIEW_DIR
         name = self.preview_choice.get()
         if version == 0:
-            return working_dir / name
+            return preview_dir / name
         stem, suffix = Path(name).stem, Path(name).suffix
-        return working_dir / f"{stem}_{version}{suffix}"
+        return preview_dir / f"{stem}_{version}{suffix}"
 
     def _max_preview_version(self, working_dir: Path) -> int:
         """Highest archived version present for the currently chosen preview."""
