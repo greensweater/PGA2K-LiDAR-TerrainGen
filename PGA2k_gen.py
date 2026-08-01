@@ -455,6 +455,9 @@ def step_generate_terrain(working_dir: Path) -> None:
         "stamp_count": len(fitted),
     })
 
+    print("Refreshing previews...")
+    step_visualize(working_dir)
+
 
 def step_refine_terrain(
     working_dir: Path,
