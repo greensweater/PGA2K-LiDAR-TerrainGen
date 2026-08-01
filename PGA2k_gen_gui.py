@@ -244,7 +244,10 @@ class PGAGenGUI:
         self.status_label = ttk.Label(parent, text="Idle", foreground="gray")
         self.status_label.pack(anchor="w")
         self.play_sound_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(parent, text="\U0001F514 Sound when done", variable=self.play_sound_var).pack(anchor="w")
+        sound_row = ttk.Frame(parent)
+        sound_row.pack(anchor="w", fill="x")
+        ttk.Checkbutton(sound_row, text="\U0001F514 Sound when done", variable=self.play_sound_var).pack(side="left")
+        ttk.Button(sound_row, text="Test", width=5, command=self._test_sound).pack(side="left", padx=4)
 
     def _build_log_panel(self, paned: ttk.PanedWindow) -> None:
         frame = ttk.Frame(paned)
@@ -580,34 +583,65 @@ class PGAGenGUI:
             pass
         self.root.after(100, self._poll_log_queue)
 
-    def _ring_bell(self) -> None:
+    def _play_completion_sound(self) -> str:
         """
-        root.bell() alone is unreliable: on Windows it depends on the
-        "Default Beep" system sound not being set to None, and on
-        macOS it can silently just flash the screen instead of making
-        noise depending on Accessibility settings -- neither is
-        something code can force. Try a platform-specific, actually-
-        audible method first, falling back to root.bell() only if that
-        isn't available or fails.
+        Try platform-specific, actually-audible methods in order,
+        falling back to root.bell() only if none work. Returns a short
+        description of what was actually tried/used, for _test_sound's
+        diagnostic feedback -- since none of this can be verified from
+        here, only reported.
         """
-        if not self.play_sound_var.get():
-            return
-
         system = platform.system()
         try:
             if system == "Windows":
                 import winsound
                 winsound.MessageBeep()
-                return
+                return "winsound.MessageBeep() (Windows)"
             elif system == "Darwin":
-                subprocess.run(
-                    ["afplay", "/System/Library/Sounds/Glass.aiff"],
-                    timeout=2, check=False,
-                )
-                return
-        except Exception:
-            pass
+                path = "/System/Library/Sounds/Glass.aiff"
+                subprocess.run(["afplay", path], timeout=2, check=False)
+                return f"afplay {path} (macOS)"
+            elif system == "Linux":
+                # Common freedesktop sound-theme paths; paplay
+                # (PulseAudio/PipeWire) covers most modern desktops,
+                # aplay (plain ALSA) as a second try.
+                candidates = [
+                    ("paplay", "/usr/share/sounds/freedesktop/stereo/complete.oga"),
+                    ("paplay", "/usr/share/sounds/freedesktop/stereo/bell.oga"),
+                    ("aplay", "/usr/share/sounds/alsa/Front_Center.wav"),
+                ]
+                for player, sound_path in candidates:
+                    if shutil.which(player) and Path(sound_path).exists():
+                        subprocess.run([player, sound_path], timeout=2, check=False)
+                        return f"{player} {sound_path} (Linux)"
+        except Exception as e:
+            self.root.bell()
+            return f"root.bell() fallback (exception trying platform method: {e})"
+
         self.root.bell()
+        return "root.bell() fallback (no platform-specific method matched or found)"
+
+    def _ring_bell(self) -> None:
+        """
+        root.bell() alone is unreliable: on Windows it depends on the
+        "Default Beep" system sound not being set to None, on macOS it
+        can silently just flash the screen instead of making noise
+        depending on Accessibility settings, and on Linux it depends
+        on X11 bell / PC-speaker support that's disabled by default on
+        many modern distros -- none of that is something code can
+        force. See _play_completion_sound for the platform-specific
+        methods tried first.
+        """
+        if self.play_sound_var.get():
+            self._play_completion_sound()
+
+    def _test_sound(self) -> None:
+        """Always fires (ignores the checkbox) and reports what it tried, for diagnosing why the real thing isn't audible."""
+        used = self._play_completion_sound()
+        messagebox.showinfo("Sound test", f"Tried: {used}\n\nIf you didn't hear anything, this is "
+                             "very likely an OS-level sound setting (muted system sound, wrong output "
+                             "device, or the sound file above missing on your system) rather than "
+                             "something the code can fix.")
 
     def _append_log(self, text: str) -> None:
         self.log_text.config(state="normal")
