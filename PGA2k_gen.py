@@ -49,6 +49,7 @@ import dataclasses
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pyproj
@@ -58,7 +59,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 from constants import (
     COURSE_SIZE_M, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
     PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_STAMPS,
-    POINTCLOUD_FILE, PROJECT_FILE,
+    POINTCLOUD_FILE, PREVIEW_DIR, PROJECT_FILE, STAMPS_DIR,
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
@@ -82,12 +83,16 @@ FEATURES_FILE = "features.geojson"
 REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
 
 
+def _stamps_dir(working_dir: Path) -> Path:
+    return working_dir / STAMPS_DIR
+
+
 def _refine_stamps_files(working_dir: Path) -> list[Path]:
-    """Every refine_stamps_N.json present, in order (N=1, 2, 3, ...)."""
+    """Every refine_stamps_N.json present under stamps/, in order (N=1, 2, 3, ...)."""
     files = []
     n = 1
-    while (working_dir / REFINE_STAMPS_PATTERN.format(n=n)).exists():
-        files.append(working_dir / REFINE_STAMPS_PATTERN.format(n=n))
+    while (_stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=n)).exists():
+        files.append(_stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=n))
         n += 1
     return files
 
@@ -95,7 +100,7 @@ def _refine_stamps_files(working_dir: Path) -> list[Path]:
 def load_all_stamps(working_dir: Path) -> list[Stamp]:
     """
     Reconstruct the full, current stamp list: initial_stamps.json plus
-    every refine_stamps_N.json in order.
+    every refine_stamps_N.json in order, all under stamps/.
 
     Each refine-terrain pass writes only the stamps *it* added, not a
     cumulative snapshot -- so deleting the highest-numbered
@@ -103,16 +108,32 @@ def load_all_stamps(working_dir: Path) -> list[Stamp]:
     pass, and every earlier pass's file stays exactly as it was
     (nothing gets rewritten/renumbered by later passes).
     """
-    initial_path = working_dir / INITIAL_STAMPS_FILE
+    initial_path = _stamps_dir(working_dir) / INITIAL_STAMPS_FILE
     if not initial_path.exists():
         raise StepError(
-            f"No {INITIAL_STAMPS_FILE} found under {working_dir}. Run --step generate-terrain first."
+            f"No {INITIAL_STAMPS_FILE} found under {_stamps_dir(working_dir)}. "
+            "Run --step generate-terrain first."
         )
 
-    stamps = load_stamps(initial_path)
+    stamps, _ = load_stamp_file(initial_path)
     for path in _refine_stamps_files(working_dir):
-        stamps.extend(load_stamps(path))
+        more_stamps, _ = load_stamp_file(path)
+        stamps.extend(more_stamps)
     return stamps
+
+
+def load_latest_refine_metadata(working_dir: Path) -> dict | None:
+    """
+    Metadata (step/parameters/timestamp/hotspot_count -- see
+    save_stamp_file) from the most recent refine_stamps_N.json, or
+    None if no refine pass has run yet. Used to label previews with
+    whatever settings actually produced the terrain being looked at.
+    """
+    files = _refine_stamps_files(working_dir)
+    if not files:
+        return None
+    _, metadata = load_stamp_file(files[-1])
+    return metadata
 
 
 class StepError(RuntimeError):
@@ -141,18 +162,40 @@ def save_project(working_dir: Path, updates: dict) -> None:
 
 # ---------------------------------------------------------------------------
 # Stamp list <-> JSON (internal artifact format, distinct from writer.py's
-# userLayers.json -- this is our own working representation, not PGA's)
+# userLayers.json -- this is our own working representation, not PGA's).
+#
+# Each file is self-contained: whatever step/parameters produced these
+# stamps travels with them in the same file, rather than living in a
+# separate history in project.json. That matters specifically because
+# refine_stamps_N.json files can be deleted individually (undoing one
+# pass) -- a separate history would leave orphaned entries referencing
+# files that no longer exist, needing its own cleanup logic to stay in
+# sync. Keeping metadata and stamps in the same file means deleting the
+# file removes its metadata too, automatically, with nothing to orphan.
 # ---------------------------------------------------------------------------
 
-def save_stamps(stamps: list[Stamp], path: Path) -> None:
+def save_stamp_file(
+    stamps: list[Stamp], path: Path, step: str, parameters: dict, extra: dict | None = None,
+) -> None:
+    payload = {
+        "step": step,
+        "parameters": parameters,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        **(extra or {}),
+        "stamps": [dataclasses.asdict(s) for s in stamps],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
-        json.dump([dataclasses.asdict(s) for s in stamps], f, indent=2)
+        json.dump(payload, f, indent=2)
 
 
-def load_stamps(path: Path) -> list[Stamp]:
+def load_stamp_file(path: Path) -> tuple[list[Stamp], dict]:
+    """Returns (stamps, metadata) -- metadata is everything in the file except "stamps" itself."""
     with path.open() as f:
-        raw = json.load(f)
-    return [Stamp(**entry) for entry in raw]
+        payload = json.load(f)
+    stamps = [Stamp(**entry) for entry in payload["stamps"]]
+    metadata = {k: v for k, v in payload.items() if k != "stamps"}
+    return stamps, metadata
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +240,11 @@ def step_visualize(working_dir: Path) -> None:
             f"No {POINTCLOUD_FILE} found under {working_dir}. Run --step ingest-laz first."
         )
 
+    preview_dir = working_dir / PREVIEW_DIR
     full_cloud = PointCloud.load(pointcloud_path)
     print(f"Loaded {pointcloud_path} ({full_cloud.count:,} points)")
 
-    lidar_preview_paths = [working_dir / PREVIEW_LIDAR, working_dir / PREVIEW_LIDAR_HEIGHTMAP]
+    lidar_preview_paths = [preview_dir / PREVIEW_LIDAR, preview_dir / PREVIEW_LIDAR_HEIGHTMAP]
     pointcloud_mtime = pointcloud_path.stat().st_mtime
     lidar_previews_stale = any(
         not p.exists() or p.stat().st_mtime < pointcloud_mtime for p in lidar_preview_paths
@@ -209,13 +253,13 @@ def step_visualize(working_dir: Path) -> None:
     if lidar_previews_stale:
         print(f"Writing {PREVIEW_LIDAR} and {PREVIEW_LIDAR_HEIGHTMAP} "
               "(full merged point cloud, not just the course crop)...")
-        viz.render_lidar_preview(full_cloud, working_dir / PREVIEW_LIDAR)
-        viz.render_lidar_heightmap(full_cloud, full_cloud.bounds, working_dir / PREVIEW_LIDAR_HEIGHTMAP)
+        viz.render_lidar_preview(full_cloud, preview_dir / PREVIEW_LIDAR)
+        viz.render_lidar_heightmap(full_cloud, full_cloud.bounds, preview_dir / PREVIEW_LIDAR_HEIGHTMAP)
     else:
         print(f"{PREVIEW_LIDAR} / {PREVIEW_LIDAR_HEIGHTMAP} already up to date with "
               f"{POINTCLOUD_FILE} -- skipping (re-run --step ingest-laz to force a refresh)")
 
-    if not (working_dir / INITIAL_STAMPS_FILE).exists():
+    if not (_stamps_dir(working_dir) / INITIAL_STAMPS_FILE).exists():
         print(f"No {INITIAL_STAMPS_FILE} yet -- run --step generate-terrain for the "
               "hex/stamps/height/error previews. Stopping after the LIDAR previews.")
         return
@@ -224,18 +268,31 @@ def step_visualize(working_dir: Path) -> None:
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
     model = TerrainModel(stamps)
 
+    # Label the terrain-related previews with whatever refine-terrain
+    # parameters actually produced the latest stamps, if any pass has
+    # run -- self-documenting, without cross-referencing a separate
+    # log (see terrain/adaptive_refine.py's stamp-file metadata).
+    extra_label = None
+    latest_refine = load_latest_refine_metadata(working_dir)
+    if latest_refine is not None:
+        p = latest_refine["parameters"]
+        extra_label = (
+            f"tol={p['tolerance']} res={p['resolution']} hot={p['min_hotspot_radius_cells']} "
+            f"claim={p['claim_radius_fraction']} spread={p['brush_radius_spread_ratio']}"
+        )
+
     print(f"Writing {PREVIEW_HEX}...")
-    viz.render_hex_preview(stamps, bounds, working_dir / PREVIEW_HEX)
+    viz.render_hex_preview(stamps, bounds, preview_dir / PREVIEW_HEX, extra_label=extra_label)
     print(f"Writing {PREVIEW_STAMPS}...")
-    viz.render_stamps_preview(stamps, bounds, working_dir / PREVIEW_STAMPS)
+    viz.render_stamps_preview(stamps, bounds, preview_dir / PREVIEW_STAMPS, extra_label=extra_label)
     print(f"Writing {PREVIEW_HEIGHT}...")
-    viz.render_height_preview(model, bounds, working_dir / PREVIEW_HEIGHT)
+    viz.render_height_preview(model, bounds, preview_dir / PREVIEW_HEIGHT, extra_label=extra_label)
 
     print(f"Writing {PREVIEW_ERROR} (course-cropped point cloud vs. TerrainModel)...")
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
-    viz.render_error_preview(model, course_cloud, bounds, working_dir / PREVIEW_ERROR)
+    viz.render_error_preview(model, course_cloud, bounds, preview_dir / PREVIEW_ERROR, extra_label=extra_label)
 
-    print(f"All previews written to {working_dir}")
+    print(f"All previews written to {preview_dir}")
 
 
 def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
@@ -385,8 +442,11 @@ def step_generate_terrain(working_dir: Path) -> None:
         print(f"  WARNING: {n_unfitted} stamps had too few nearby points and kept "
               "their placeholder value=0.0")
 
-    out_path = working_dir / INITIAL_STAMPS_FILE
-    save_stamps(fitted, out_path)
+    out_path = _stamps_dir(working_dir) / INITIAL_STAMPS_FILE
+    save_stamp_file(
+        fitted, out_path, step="generate-terrain",
+        parameters={"course_size_m": COURSE_SIZE_M},
+    )
     print(f"  wrote {out_path}")
 
     save_project(working_dir, {
@@ -470,10 +530,22 @@ def step_refine_terrain(
     else:
         print("  0 hotspots over tolerance -- nothing to refine, terrain already meets it")
 
+    parameters = {
+        "tolerance": tolerance,
+        "resolution": resolution,
+        "min_hotspot_radius_cells": min_hotspot_radius_cells,
+        "max_new_stamps": max_new_stamps,
+        "claim_radius_fraction": claim_radius_fraction,
+        "brush_radius_spread_ratio": brush_radius_spread_ratio,
+    }
+
     if new_stamps:
         next_n = len(_refine_stamps_files(working_dir)) + 1
-        out_path = working_dir / REFINE_STAMPS_PATTERN.format(n=next_n)
-        save_stamps(new_stamps, out_path)
+        out_path = _stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=next_n)
+        save_stamp_file(
+            new_stamps, out_path, step="refine-terrain", parameters=parameters,
+            extra={"hotspot_count": len(hotspots)},
+        )
         print(f"  wrote {out_path} ({len(new_stamps)} new stamps; "
               f"{len(stamps)} -> {len(refined)} total)")
     else:
@@ -487,6 +559,9 @@ def step_refine_terrain(
         "refine_claim_radius_fraction": claim_radius_fraction,
         "refine_brush_radius_spread_ratio": brush_radius_spread_ratio,
     })
+
+    print("Refreshing previews (parameters used above are now the header on the terrain previews)...")
+    step_visualize(working_dir)
 
 
 def _set_course_name_in_file(path: Path, course_name: str, key: str) -> None:
