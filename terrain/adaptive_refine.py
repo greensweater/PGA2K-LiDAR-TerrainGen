@@ -150,6 +150,7 @@ DEFAULT_MIN_POINTS = 3
 DEFAULT_MIN_HOTSPOT_RADIUS_CELLS = 1.0  # below this (pre-clamp), treat as noise, not a feature
 DEFAULT_CLAIM_RADIUS_FRACTION = 1.0  # 1.0 = claim the whole radius (old behavior, no overlap)
 DEFAULT_BRUSH_RADIUS_SPREAD_RATIO = 1.0  # 1.0 = every brush scored at the same radius (old behavior)
+DEFAULT_RADIUS_DECAY_PER_PASS = 1.0  # 1.0 = every refine-terrain pass uses the same clamps (old behavior)
 
 # Candidate brushes/tools tried per hotspot; whichever combination
 # gives the lowest RMS over the region's actual LIDAR points wins.
