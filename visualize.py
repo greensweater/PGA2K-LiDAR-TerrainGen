@@ -32,9 +32,11 @@ from matplotlib.collections import PatchCollection
 
 from constants import DEBUG_IMAGE_SIZE, PREVIEW_LIDAR_HEIGHTMAP
 from ingest.laz_reader import PointCloud
+from ingest.osm import Feature
 from terrain.bounding_box import BoundingBox
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
+from matplotlib.lines import Line2D
 
 _DPI = 100
 
@@ -152,6 +154,95 @@ def _save(fig, path: Path) -> None:
     # tight-looking layout without being content-dependent.
     fig.savefig(path, facecolor="white")
     plt.close(fig)
+
+
+def _save_transparent(fig, path: Path) -> None:
+    """Like _save, but with a transparent background -- for the OSM overlay, meant to be composited over another preview, not viewed alone."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _archive_existing(path)
+    fig.savefig(path, transparent=True)
+    plt.close(fig)
+
+
+def _new_overlay_figure(bounds: BoundingBox):
+    """
+    Same _PLOT_RECT position/size as _new_figure (so content lines up
+    pixel-for-pixel with every other preview when composited), but with
+    a transparent background and no axis chrome (ticks/labels/spines) --
+    those would double up visually on top of whatever base preview this
+    gets composited over, which already has its own.
+    """
+    fig = plt.figure(figsize=_FIGSIZE, dpi=_DPI)
+    fig.patch.set_alpha(0.0)
+    ax = fig.add_axes(_PLOT_RECT)
+    ax.patch.set_alpha(0.0)
+    ax.set_xlim(bounds.min_x, bounds.max_x)
+    ax.set_ylim(bounds.min_z, bounds.max_z)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    return fig, ax
+
+
+# Distinct colors per OSM feature kind (see ingest/osm.py's classify_way).
+# Deliberately saturated/high-contrast, since this overlay is meant to
+# be composited at partial opacity over another preview -- muted colors
+# would wash out and become hard to distinguish once blended.
+_OSM_FEATURE_COLORS = {
+    "green": "#3CB371",
+    "tee": "#2E8B57",
+    "fairway": "#7CFC00",
+    "rough": "#556B2F",
+    "bunker": "#EDC9AF",
+    "water": "#4682B4",
+    "cartpath": "#8B7355",
+    "path": "#A9A9A9",
+    "building": "#B22222",
+    "wood": "#228B22",
+    "hole": "#FFD700",
+}
+_OSM_DEFAULT_COLOR = "#FF00FF"  # unclassified kind -- deliberately jarring so it's obvious
+
+
+def _draw_osm_feature(ax, feature: Feature) -> None:
+    color = _OSM_FEATURE_COLORS.get(feature.kind, _OSM_DEFAULT_COLOR)
+    geom = feature.geometry
+    parts = geom.geoms if hasattr(geom, "geoms") else [geom]
+    for part in parts:
+        if part.geom_type == "Polygon":
+            xs, zs = part.exterior.xy
+            ax.fill(xs, zs, facecolor=color, edgecolor=color, alpha=0.55, linewidth=1.2)
+        elif part.geom_type == "LineString":
+            xs, zs = part.xy
+            ax.plot(xs, zs, color=color, linewidth=2.0, alpha=0.85, solid_capstyle="round")
+
+
+def render_osm_features(features: Sequence[Feature], bounds: BoundingBox, path: Path) -> None:
+    """
+    Transparent PNG of every OSM Feature (see ingest/osm.py), colored by
+    kind, at the exact same plot-area position/size every other preview
+    uses -- meant to be alpha-composited over any of them (in the GUI,
+    not baked into a new file per base preview), not viewed standalone.
+    """
+    fig, ax = _new_overlay_figure(bounds)
+
+    kinds_present = set()
+    for feature in features:
+        _draw_osm_feature(ax, feature)
+        kinds_present.add(feature.kind)
+
+    if kinds_present:
+        handles = [
+            Line2D(
+                [0], [0], marker="s", linestyle="", markersize=8,
+                markerfacecolor=_OSM_FEATURE_COLORS.get(kind, _OSM_DEFAULT_COLOR),
+                markeredgecolor="black", label=kind,
+            )
+            for kind in sorted(kinds_present)
+        ]
+        ax.legend(handles=handles, loc="upper right", fontsize=6, framealpha=0.7)
+
+    _save_transparent(fig, path)
 
 
 def render_lidar_preview(cloud: PointCloud, path: Path, max_points: int = 200_000) -> None:
