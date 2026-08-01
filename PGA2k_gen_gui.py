@@ -184,6 +184,7 @@ class PGAGenGUI:
         self.max_new_var = tk.StringVar()
         self.spread_ratio_var = tk.StringVar(value="1")
         self.claim_fraction_var = tk.StringVar(value="1")
+        self.radius_decay_var = tk.StringVar(value="1")
         self.refine_labels: dict[str, ttk.Label] = {}
 
         grid_frame = ttk.Frame(parent)
@@ -217,6 +218,10 @@ class PGAGenGUI:
         add_field(2, 1, "claim_fraction", "EAT %", "Claimed radius fraction: how much of the placed "
                   "radius gets marked done. Below 1 lets neighboring stamps overlap. 1 disables it "
                   "(old behavior).", self.claim_fraction_var, required=True)
+        add_field(3, 0, "radius_decay", "DEC %", "Radius decay per pass: shrinks min/max hotspot "
+                  "radius by this factor for each prior refine pass already run, so later passes add "
+                  "finer detail instead of re-covering the same ground at lower error. 1 disables it "
+                  "(every pass uses the same clamps).", self.radius_decay_var, required=True)
 
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
@@ -419,6 +424,7 @@ class PGAGenGUI:
             "min_hotspot": self.min_hotspot_radius_cells_var,
             "spread_ratio": self.spread_ratio_var,
             "claim_fraction": self.claim_fraction_var,
+            "radius_decay": self.radius_decay_var,
         }
         all_valid = True
         for key, label in self.refine_labels.items():
@@ -447,6 +453,7 @@ class PGAGenGUI:
             "--min-hotspot-radius-cells", self.min_hotspot_radius_cells_var.get().strip(),
             "--brush-radius-spread-ratio", self.spread_ratio_var.get().strip(),
             "--claim-radius-fraction", self.claim_fraction_var.get().strip(),
+            "--radius-decay-per-pass", self.radius_decay_var.get().strip(),
         ]
         max_new = self.max_new_var.get().strip()
         if max_new:
