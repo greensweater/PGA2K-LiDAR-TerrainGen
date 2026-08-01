@@ -280,6 +280,7 @@ def find_error_hotspots(
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
+    mask: Optional[np.ndarray] = None,
 ) -> list[ErrorHotspot]:
     """
     Find and fit error hotspots via distance-transform region centering
@@ -287,6 +288,14 @@ def find_error_hotspots(
     its best-fit brush/tool/value -- no separate fit_stamp_heights()
     call needed afterward, since scoring candidates requires the
     region's actual LIDAR points anyway and that's already done here.
+
+    mask, if given, is a boolean grid the same (resolution, resolution)
+    shape as the error grid -- True where refinement is allowed to
+    place stamps, False where it isn't (e.g. outside fairway/green; see
+    ingest/osm.py's build_height_mask/rasterize_mask). Cells outside the
+    mask are treated exactly like invalid/no-data cells: excluded from
+    consideration entirely, never becoming a peak or getting claimed,
+    rather than being scored and then discarded.
 
     Returns hotspots in the order found (largest inscribed radius
     first, which tracks -- but isn't identical to -- worst peak error).
@@ -297,6 +306,8 @@ def find_error_hotspots(
     error = predicted - actual  # NaN where actual has no data
 
     valid = np.isfinite(error)
+    if mask is not None:
+        valid = valid & mask
     claimed = ~valid
 
     edges_x = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
@@ -473,6 +484,7 @@ def refine_stamps(
     bare_earth_only: bool = True,
     min_points: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
+    mask: Optional[np.ndarray] = None,
 ) -> tuple[list[Stamp], list[ErrorHotspot]]:
     """
     One adaptive refinement pass: find and fit error hotspots (see
@@ -490,6 +502,7 @@ def refine_stamps(
         min_radius=min_radius, max_radius=max_radius,
         claim_radius_fraction=claim_radius_fraction,
         brush_radius_spread_ratio=brush_radius_spread_ratio,
+        mask=mask,
         bare_earth_only=bare_earth_only, min_points=min_points,
         max_new_stamps=max_new_stamps,
     )
