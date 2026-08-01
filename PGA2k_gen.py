@@ -63,7 +63,10 @@ from constants import (
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
-from ingest.osm import parse_osm_features, save_features
+from ingest.osm import (
+    DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_height_mask,
+    parse_osm_features, rasterize_mask, save_features, save_height_mask,
+)
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
     DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
@@ -83,6 +86,7 @@ from writer import normalize_stamp_heights, write_user_layers
 
 INITIAL_STAMPS_FILE = "initial_stamps.json"
 FEATURES_FILE = "features.geojson"
+HEIGHT_MASK_FILE = "height_mask.geojson"
 REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
 
 
@@ -374,7 +378,7 @@ def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
     })
 
 
-def step_ingest_osm(working_dir: Path) -> None:
+def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
     osm_path = working_dir / "map.osm"
     if not osm_path.exists():
         raise StepError(
@@ -418,7 +422,19 @@ def step_ingest_osm(working_dir: Path) -> None:
     print(f"  wrote {preview_path} (transparent overlay -- composite over another "
           "preview in the GUI, doesn't stand alone)")
 
-    save_project(working_dir, {"osm_feature_count": len(features), "osm_feature_kinds": counts})
+    mask_geometry = build_height_mask(features, buffer_px=height_mask_buffer_px)
+    mask_path = working_dir / HEIGHT_MASK_FILE
+    save_height_mask(mask_geometry, mask_path)
+    if mask_geometry is None:
+        print(f"  wrote {mask_path} (no fairway/green features found -- mask is empty, "
+              "--use-height-mask on refine-terrain would restrict everything)")
+    else:
+        print(f"  wrote {mask_path} (fairway + green, buffered {height_mask_buffer_px} m/px)")
+
+    save_project(working_dir, {
+        "osm_feature_count": len(features), "osm_feature_kinds": counts,
+        "height_mask_buffer_px": height_mask_buffer_px,
+    })
 
 
 def step_generate_terrain(working_dir: Path) -> None:
@@ -476,6 +492,7 @@ def step_refine_terrain(
     claim_radius_fraction: float | None,
     brush_radius_spread_ratio: float | None,
     radius_decay_per_pass: float | None,
+    use_height_mask: bool | None,
 ) -> None:
     """
     One adaptive refinement pass (see terrain/adaptive_refine.py): find
@@ -533,13 +550,16 @@ def step_refine_terrain(
         radius_decay_per_pass = project.get(
             "refine_radius_decay_per_pass", DEFAULT_RADIUS_DECAY_PER_PASS
         )
+    if use_height_mask is None:
+        use_height_mask = project.get("refine_use_height_mask", False)
 
     stamps = load_all_stamps(working_dir)
     pass_number = len(_refine_stamps_files(working_dir)) + 1
     print(f"  {len(stamps)} stamps (cumulative: initial + {pass_number - 1} prior refine pass(es))")
     print(f"  claim_radius_fraction={claim_radius_fraction}  "
           f"brush_radius_spread_ratio={brush_radius_spread_ratio}  "
-          f"radius_decay_per_pass={radius_decay_per_pass} (this is pass {pass_number})")
+          f"radius_decay_per_pass={radius_decay_per_pass} (this is pass {pass_number})  "
+          f"use_height_mask={use_height_mask}")
 
     decay = radius_decay_per_pass ** (pass_number - 1)
     min_radius = DEFAULT_MIN_HOTSPOT_RADIUS_M / decay
@@ -552,6 +572,18 @@ def step_refine_terrain(
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
 
+    mask_grid = None
+    if use_height_mask:
+        mask_path = working_dir / HEIGHT_MASK_FILE
+        if not mask_path.exists():
+            raise StepError(
+                f"use_height_mask is on but no {HEIGHT_MASK_FILE} found under {working_dir}. "
+                "Run --step ingest-osm first."
+            )
+        mask_geometry = load_height_mask(mask_path)
+        mask_grid = rasterize_mask(mask_geometry, bounds, resolution)
+        print(f"  height mask covers {mask_grid.mean():.1%} of the course at this resolution")
+
     print(f"Scanning the error grid ({resolution}x{resolution}, tolerance={tolerance} m)...")
     refined, hotspots = refine_stamps(
         stamps, course_cloud, bounds, tolerance=tolerance,
@@ -560,6 +592,7 @@ def step_refine_terrain(
         claim_radius_fraction=claim_radius_fraction,
         brush_radius_spread_ratio=brush_radius_spread_ratio,
         max_new_stamps=max_new_stamps,
+        mask=mask_grid,
     )
 
     new_stamps = refined[len(stamps):]
@@ -599,6 +632,7 @@ def step_refine_terrain(
         "refine_claim_radius_fraction": claim_radius_fraction,
         "refine_brush_radius_spread_ratio": brush_radius_spread_ratio,
         "refine_radius_decay_per_pass": radius_decay_per_pass,
+        "refine_use_height_mask": use_height_mask,
     })
 
     print("Refreshing previews (parameters used above are now the header on the terrain previews)...")
@@ -795,6 +829,15 @@ def main(argv: list[str] | None = None) -> int:
                               "of re-covering the same ground at lower error; 1.0 disables it "
                               "(default: use whatever's saved in project.json, or "
                               f"{DEFAULT_RADIUS_DECAY_PER_PASS} if never set)")
+    parser.add_argument("--use-height-mask", action=argparse.BooleanOptionalAction, default=None,
+                         help="refine-terrain: restrict hotspot placement to inside height_mask.geojson "
+                              "(fairway/green, see ingest-osm) -- everything outside is treated like "
+                              "no-data, never becoming a hotspot (default: use whatever's saved in "
+                              "project.json, or off if never set)")
+    parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
+                         help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
+                              "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
+                              f"2000x2000 m (default: {DEFAULT_HEIGHT_MASK_BUFFER_PX})")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
@@ -817,7 +860,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.step == "ingest-laz":
             step_ingest_laz(working_dir, args.projection)
         elif args.step == "ingest-osm":
-            step_ingest_osm(working_dir)
+            step_ingest_osm(working_dir, args.height_mask_buffer_px)
         elif args.step == "ingest-course":
             if args.course_file is None:
                 print("error: --step ingest-course requires --course-file <path>", file=sys.stderr)
@@ -829,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
             step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
                                  args.min_hotspot_radius_cells, args.max_new_stamps,
                                  args.claim_radius_fraction, args.brush_radius_spread_ratio,
-                                 args.radius_decay_per_pass)
+                                 args.radius_decay_per_pass, args.use_height_mask)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
         elif args.step == "repack":
