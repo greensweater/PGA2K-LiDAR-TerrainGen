@@ -37,7 +37,29 @@ from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
 
 _DPI = 100
-_FIGSIZE = (DEBUG_IMAGE_SIZE / _DPI, DEBUG_IMAGE_SIZE / _DPI)
+
+# Margins defined in absolute inches, not figure fractions -- this is
+# what actually eliminates wasted padding, not just relocates it. Course
+# bounds are always square (2000x2000) and every plot uses
+# ax.set_aspect("equal"), so if the allocated axes rect isn't ALSO
+# square in absolute terms, matplotlib shrinks the plot to fit the
+# smaller dimension and centers it, leaving the mismatch as blank
+# padding inside the rect (measured directly: ~140px of exactly this,
+# landing almost entirely at the top, before this fix). Forcing a
+# square *figure* and picking fractions independently for width vs.
+# height (the previous approach) can't avoid this -- the fractions
+# have to correspond to equal absolute sizes, which means computing
+# them from a common plot size in inches, and letting the figure itself
+# be non-square rather than forcing it square and eating the mismatch.
+_PLOT_SIZE_IN = DEBUG_IMAGE_SIZE / _DPI * 0.8   # square plot area
+_LEFT_MARGIN_IN = 1.2     # y-axis label + tick labels
+_RIGHT_MARGIN_IN = 2.4    # colorbar (or dummy) + its label + tick labels
+_BOTTOM_MARGIN_IN = 1.0   # x-axis label + tick labels
+_TOP_MARGIN_IN = 0.8      # title
+
+_FIG_W_IN = _LEFT_MARGIN_IN + _PLOT_SIZE_IN + _RIGHT_MARGIN_IN
+_FIG_H_IN = _BOTTOM_MARGIN_IN + _PLOT_SIZE_IN + _TOP_MARGIN_IN
+_FIGSIZE = (_FIG_W_IN, _FIG_H_IN)
 
 # Distinct colors per brush type, for preview_hex.png
 _BRUSH_COLORS = {8: "#4C72B0", 9: "#55A868", 10: "#C44E52", 54: "#8172B2"}
@@ -45,16 +67,23 @@ _DEFAULT_BRUSH_COLOR = "#888888"
 
 
 # Fixed plot-area and colorbar positions, in figure-fraction coordinates
-# -- every preview uses the exact same rectangle for its main plot and
-# the exact same rectangle for its colorbar (real or dummy), so no
-# preview's pixel dimensions or internal layout depend on its own data
-# (e.g. a wider "-10.0" tick label vs "1.0" on a different preview).
-# This is what actually fixes switching-between-previews reflow in the
-# GUI, which bbox_inches="tight" (removed from _save below) could not:
-# tight-bbox crops to the rendered content's own bounding box, which
-# shifts with tick label width -- exactly the thing being fixed here.
-_PLOT_RECT = (0.10, 0.08, 0.72, 0.86)     # left, bottom, width, height
-_COLORBAR_RECT = (0.85, 0.08, 0.03, 0.86)
+# -- every preview uses the exact same rectangle (in absolute inches,
+# per _FIG_W_IN/_FIG_H_IN above) for its main plot and its colorbar
+# (real or dummy), so no preview's pixel dimensions or internal layout
+# depend on its own data (e.g. a wider "-10.0" tick label vs "1.0" on a
+# different preview). This is what actually fixes switching-between-
+# previews reflow in the GUI, which bbox_inches="tight" (removed from
+# _save below) could not: tight-bbox crops to the rendered content's
+# own bounding box, which shifts with tick label width -- exactly the
+# thing being fixed here.
+_PLOT_RECT = (
+    _LEFT_MARGIN_IN / _FIG_W_IN, _BOTTOM_MARGIN_IN / _FIG_H_IN,
+    _PLOT_SIZE_IN / _FIG_W_IN, _PLOT_SIZE_IN / _FIG_H_IN,
+)
+_COLORBAR_RECT = (
+    (_LEFT_MARGIN_IN + _PLOT_SIZE_IN + 0.3) / _FIG_W_IN, _BOTTOM_MARGIN_IN / _FIG_H_IN,
+    0.35 / _FIG_W_IN, _PLOT_SIZE_IN / _FIG_H_IN,
+)
 
 
 def _new_figure(bounds: BoundingBox):
