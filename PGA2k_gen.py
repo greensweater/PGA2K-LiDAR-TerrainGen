@@ -58,7 +58,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 from constants import (
     COURSE_SIZE_M, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
-    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_STAMPS,
+    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_STAMPS,
     POINTCLOUD_FILE, PREVIEW_DIR, PROJECT_FILE, STAMPS_DIR,
 )
 import visualize as viz
@@ -412,6 +412,11 @@ def step_ingest_osm(working_dir: Path) -> None:
     out_path = working_dir / FEATURES_FILE
     save_features(features, out_path)
     print(f"  wrote {out_path}")
+
+    preview_path = working_dir / PREVIEW_DIR / PREVIEW_OSM
+    viz.render_osm_features(features, bounds, preview_path)
+    print(f"  wrote {preview_path} (transparent overlay -- composite over another "
+          "preview in the GUI, doesn't stand alone)")
 
     save_project(working_dir, {"osm_feature_count": len(features), "osm_feature_kinds": counts})
 
