@@ -44,7 +44,9 @@ CLI_SCRIPT = SCRIPT_DIR / "PGA2k_gen.py"
 # Reused directly rather than duplicated -- these are plain, side-effect-free
 # JSON helpers already tested as part of the CLI (see PGA2k_gen.py).
 sys.path.insert(0, str(SCRIPT_DIR))
-from constants import PREVIEW_DIR, PREVIEW_OSM  # noqa: E402
+from constants import (  # noqa: E402
+    PREVIEW_DIR, PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+)
 from PGA2k_gen import load_project, save_project  # noqa: E402
 
 PREVIEW_FILES = [
@@ -807,11 +809,19 @@ class PGAGenGUI:
 
             # Composite the OSM overlay at full resolution before
             # thumbnailing (both are the same native size, since every
-            # preview shares the same fixed plot-area dimensions) --
-            # skip it when the base preview *is* the overlay itself, or
-            # when it hasn't been generated yet (no OSM ingested).
-            if self.overlay_osm_var.get() and path.name != PREVIEW_OSM:
-                overlay_path = Path(wd) / PREVIEW_DIR / PREVIEW_OSM
+            # preview shares the same fixed plot-area dimensions).
+            # The LIDAR previews render the *full* merged point cloud in
+            # its own local frame, not the course crop's [0, COURSE_SIZE_M]
+            # frame every other preview uses -- they need the separately
+            # shifted overlay (preview_osm_full.png), not the course-crop
+            # one, or features land in the wrong relative position (see
+            # ingest/osm.py's shift_features / step_ingest_osm).
+            if self.overlay_osm_var.get() and path.name not in (PREVIEW_OSM, PREVIEW_OSM_FULL):
+                overlay_name = (
+                    PREVIEW_OSM_FULL if path.name in (PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP)
+                    else PREVIEW_OSM
+                )
+                overlay_path = Path(wd) / PREVIEW_DIR / overlay_name
                 if overlay_path.exists():
                     overlay = Image.open(overlay_path).convert("RGBA")
                     if overlay.size == img.size:
