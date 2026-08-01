@@ -313,26 +313,42 @@ def find_error_hotspots(
 
     hotspots: list[ErrorHotspot] = []
 
+    # dist_over/dist_under are cached across iterations rather than
+    # recomputed from scratch every time: a claim only ever touches
+    # cells matching the peak's own sign (see the claim step below, and
+    # its comment on why that restriction matters for correctness too,
+    # not just this), so the *other* sign's mask is provably unchanged
+    # by that claim and its distance transform is still valid --
+    # recomputing it anyway was pure wasted work every single
+    # iteration. Each is recomputed only the first time, and again only
+    # after an iteration actually claims cells of its matching sign.
+    dist_over: Optional[np.ndarray] = None
+    dist_under: Optional[np.ndarray] = None
+
     for _ in range(resolution * resolution):
         if max_new_stamps is not None and len(hotspots) >= max_new_stamps:
             break
 
-        over_mask = (error > tolerance) & ~claimed
-        under_mask = (error < -tolerance) & ~claimed
-
-        dist_over = ndimage.distance_transform_edt(over_mask, sampling=sampling)
-        dist_under = ndimage.distance_transform_edt(under_mask, sampling=sampling)
+        if dist_over is None:
+            over_mask = (error > tolerance) & ~claimed
+            dist_over = ndimage.distance_transform_edt(over_mask, sampling=sampling)
+        if dist_under is None:
+            under_mask = (error < -tolerance) & ~claimed
+            dist_under = ndimage.distance_transform_edt(under_mask, sampling=sampling)
 
         if dist_over.max(initial=0.0) >= dist_under.max(initial=0.0):
             dist_map = dist_over
+            peak_is_over = True
         else:
             dist_map = dist_under
+            peak_is_over = False
 
         peak_dist = dist_map.max(initial=0.0)
         if peak_dist <= 0.0:
             break  # nothing left flagged in either direction
 
         peak_row, peak_col = np.unravel_index(np.argmax(dist_map), dist_map.shape)
+        peak_sign = 1.0 if peak_is_over else -1.0
 
         min_dist_needed = min_hotspot_radius_cells * min(cell_size_x, cell_size_z)
         if peak_dist < min_dist_needed:
@@ -340,6 +356,10 @@ def find_error_hotspots(
             # just this one cell so it can't be picked again, but don't
             # place a stamp for it.
             claimed[peak_row, peak_col] = True
+            if peak_is_over:
+                dist_over = None
+            else:
+                dist_under = None
             continue
 
         centroid_x = float(x_centers[peak_col])
@@ -361,6 +381,10 @@ def find_error_hotspots(
             idx = idx[cloud.bare_earth_mask()[idx]]
         if idx.size < min_points:
             claimed[peak_row, peak_col] = True
+            if peak_is_over:
+                dist_over = None
+            else:
+                dist_under = None
             continue
 
         px, pz = cloud.x[idx], cloud.z[idx]
@@ -387,6 +411,10 @@ def find_error_hotspots(
 
         if best is None:
             claimed[peak_row, peak_col] = True
+            if peak_is_over:
+                dist_over = None
+            else:
+                dist_under = None
             continue
 
         brush, tool, value, rms, final_radius = best
@@ -397,14 +425,28 @@ def find_error_hotspots(
         # spread_ratio also control claimed area/density purely as a
         # side effect of which brush happened to win, entangling two
         # knobs that should stay independent (see module docstring).
+        #
+        # Restricted to cells matching the peak's own sign: a stamp
+        # placed to correct an overshoot doesn't do anything to fix a
+        # nearby undershoot, so marking that undershoot "claimed" just
+        # because it happened to be geometrically close (which base_radius
+        # inflated up to min_radius can cause) would wrongly prevent a
+        # future pass from ever placing a stamp to correct it. This also
+        # what makes the distance-transform caching above valid: without
+        # it, a claim could silently modify the *other* sign's mask too.
         claim_radius = base_radius * claim_radius_fraction
-        rows_idx, cols_idx = np.nonzero(valid & ~claimed)
+        rows_idx, cols_idx = np.nonzero(valid & ~claimed & (np.sign(error) == peak_sign))
         if rows_idx.size:
             cell_dist = np.hypot(
                 (z_centers[rows_idx] - centroid_z), (x_centers[cols_idx] - centroid_x)
             )
             claimed[rows_idx[cell_dist <= claim_radius], cols_idx[cell_dist <= claim_radius]] = True
         claimed[peak_row, peak_col] = True  # guaranteed claimed even if claim_radius rounds to ~0
+
+        if peak_is_over:
+            dist_over = None
+        else:
+            dist_under = None
 
         n_cells = int(np.sum(valid & (np.hypot(
             (z_centers[:, None] - centroid_z), (x_centers[None, :] - centroid_x)
