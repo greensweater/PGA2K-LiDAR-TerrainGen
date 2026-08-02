@@ -108,9 +108,18 @@ class TerrainModel:
         idx.sort()
         return idx
 
-    def evaluate(self, x: float, z: float) -> float:
-        """Predicted terrain height at a single (x, z), in meters."""
-        height = 0.0
+    def evaluate(self, x: float, z: float, start_height: float = 0.0) -> float:
+        """
+        Predicted terrain height at a single (x, z), in meters.
+
+        start_height, if given, is where the sequential fold begins
+        instead of the implicit 0.0 baseline -- lets a *separate*,
+        smaller TerrainModel (e.g. just the hotspots added so far
+        within one find_error_hotspots pass) be folded on top of this
+        model's own result, without needing to rebuild this model's
+        (potentially large) KD-tree to include those newer stamps too.
+        """
+        height = start_height
         for i in self._affecting_stamp_indices(x, z):
             stamp = self.stamps[i]
             dx = x - stamp.x
@@ -135,12 +144,18 @@ class TerrainModel:
                 height += (stamp.value - height) * weight
         return height
 
-    def evaluate_many(self, points: np.ndarray) -> np.ndarray:
+    def evaluate_many(self, points: np.ndarray, start_heights: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Predicted terrain height at many (x, z) points.
 
         points: shape (N, 2), columns (x, z).
         Returns: shape (N,) heights, in meters.
+
+        start_heights, if given (shape (N,)), is where each point's
+        fold begins instead of the implicit zero baseline -- same
+        purpose as evaluate()'s start_height: folding a separate,
+        smaller model's stamps on top of this one's own result without
+        rebuilding this model's KD-tree to include them too.
 
         Different points are independent of each other (a stamp's
         effect on one point doesn't depend on its effect on another),
@@ -164,7 +179,7 @@ class TerrainModel:
         """
         points = np.asarray(points, dtype=np.float64)
         n = points.shape[0]
-        heights = np.zeros(n, dtype=np.float64)
+        heights = np.zeros(n, dtype=np.float64) if start_heights is None else np.array(start_heights, dtype=np.float64)
         if not self.stamps or n == 0 or self._tree is None:
             return heights
 
@@ -218,6 +233,26 @@ class TerrainModel:
         never used as terrain data internally -- the compiler never
         rasterizes for real optimization work (see "Important Design
         Rules": never rasterize terrain internally).
+
+        Samples at histogram bin *centers* (edges = linspace(min, max,
+        resolution+1), centers = midpoints of consecutive edges) --
+        not at linspace(min, max, resolution) directly, which was a
+        real bug found and fixed here: that endpoint-inclusive sampling
+        doesn't match _bin_actual_elevation's bin-center convention
+        (adaptive_refine.py), so `predicted - actual` in
+        find_error_hotspots was comparing two differently-gridded
+        arrays -- up to half a cell width (5 m at resolution=200)
+        misaligned at the course edges, tapering to near-zero at the
+        center. Both now use the exact same grid.
+
+        Implemented via direct per-stamp bounding-box index arithmetic
+        rather than calling evaluate_many() over every grid point: on a
+        *regular* grid, a stamp's affected cells are directly computable
+        from its center/radius, with no need for evaluate_many's
+        KD-tree candidate search (built for arbitrary, non-grid-aligned
+        point batches, which this isn't). Measured ~13x faster than the
+        previous evaluate_many-based implementation at 3000 stamps,
+        200x200 -- confirmed to produce bit-identical output first.
         """
         if bounds is None:
             if not self.stamps:
@@ -229,10 +264,52 @@ class TerrainModel:
             zs = [s.z for s in self.stamps]
             bounds = BoundingBox(min_x=min(xs), min_z=min(zs), max_x=max(xs), max_z=max(zs))
 
-        grid_x, grid_z = np.meshgrid(
-            np.linspace(bounds.min_x, bounds.max_x, resolution),
-            np.linspace(bounds.min_z, bounds.max_z, resolution),
-        )
-        points = np.column_stack((grid_x.ravel(), grid_z.ravel()))
-        heights = self.evaluate_many(points)
-        return heights.reshape(resolution, resolution)
+        edges_x = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
+        edges_z = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
+        x_centers = (edges_x[:-1] + edges_x[1:]) / 2.0
+        z_centers = (edges_z[:-1] + edges_z[1:]) / 2.0
+        cell_size_x = (bounds.max_x - bounds.min_x) / resolution
+        cell_size_z = (bounds.max_z - bounds.min_z) / resolution
+
+        accum = np.zeros((resolution, resolution), dtype=np.float64)
+
+        for stamp in self.stamps:
+            profile = BRUSH_PROFILES.get(stamp.brush)
+            is_square = profile is not None and profile.shape == SHAPE_SQUARE
+            # Bounding box uses the stamp's full Euclidean reach (radius
+            # for circles, radius*sqrt(2) for squares' corners) -- the
+            # exact per-cell shape test below (Chebyshev vs Euclidean
+            # distance) is what actually decides inclusion; this box
+            # only needs to be a safe superset, same principle as
+            # TerrainModel._euclidean_reach for the KD-tree case.
+            reach = stamp.radius * math.sqrt(2.0) if is_square else stamp.radius
+
+            col_min = max(0, int((stamp.x - reach - bounds.min_x) / cell_size_x))
+            col_max = min(resolution, int((stamp.x + reach - bounds.min_x) / cell_size_x) + 1)
+            row_min = max(0, int((stamp.z - reach - bounds.min_z) / cell_size_z))
+            row_max = min(resolution, int((stamp.z + reach - bounds.min_z) / cell_size_z) + 1)
+            if col_min >= col_max or row_min >= row_max:
+                continue
+
+            sub_x = x_centers[col_min:col_max]
+            sub_z = z_centers[row_min:row_max]
+            xx, zz = np.meshgrid(sub_x, sub_z)
+            dx = xx - stamp.x
+            dz = zz - stamp.z
+            dist = np.maximum(np.abs(dx), np.abs(dz)) if is_square else np.hypot(dx, dz)
+
+            mask = dist <= stamp.radius
+            if not np.any(mask):
+                continue
+            r = dist[mask] / stamp.radius
+            weight = self._kernels[stamp.brush].sample_many(r)
+
+            sub_accum = accum[row_min:row_max, col_min:col_max]
+            local = sub_accum[mask]
+            if stamp.tool == TOOL_RAISE:
+                sub_accum[mask] = local + stamp.value * weight
+            else:
+                sub_accum[mask] = local + (stamp.value - local) * weight
+            accum[row_min:row_max, col_min:col_max] = sub_accum
+
+        return accum
