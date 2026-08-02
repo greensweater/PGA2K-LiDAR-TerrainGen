@@ -66,7 +66,7 @@ import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
 from ingest.heightmap import DEFAULT_HEIGHTMAP_RESOLUTION, load_heightmap, rasterize_ground_heightmap, save_heightmap
 from ingest.osm import (
-    DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_features, load_height_mask,
+    DEFAULT_HEIGHT_MASK_BUFFER_PX, GOLF_OBJECT_KINDS, build_height_mask, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
 )
 from splines import build_surface_splines, feature_to_spline, save_surface_splines
@@ -485,10 +485,11 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
     mask_path = working_dir / HEIGHT_MASK_FILE
     save_height_mask(mask_geometry, mask_path)
     if mask_geometry is None:
-        print(f"  wrote {mask_path} (no fairway/green/tee/hole features found -- mask is empty, "
+        print(f"  wrote {mask_path} (no masked-in features found -- mask is empty, "
               "--use-height-mask on refine-terrain would restrict everything)")
     else:
-        print(f"  wrote {mask_path} (fairway + green + tee, plus buffered hole-path corridors, "
+        print(f"  wrote {mask_path} (every feature with mask=True -- defaults to fairway/green/tee/hole, "
+              f"individually overridable per-feature in the GUI's Splines tab -- "
               f"then buffered {height_mask_buffer_px} m/px)")
 
     mask_preview_path = working_dir / PREVIEW_DIR / PREVIEW_MASK
@@ -510,9 +511,10 @@ def step_write_splines(working_dir: Path) -> None:
     Scope: green/tee/fairway/rough/bunker/cartpath/path/building/wood.
     Water and hole are deliberately excluded (see splines.py's module
     docstring) -- neither is handled by this generic writer yet.
-    Features marked "ignored" (e.g. a duplicate hole bleeding in from a
-    neighboring course) are skipped, not just the ones with an
-    unsupported kind.
+    Golf-object features (fairway/green/tee/hole) with mask=False are
+    also skipped -- e.g. a duplicate hole's fairway/tee bleeding in
+    from a neighboring course (PGA can't import more than 18 holes).
+    Every other kind exports regardless of its own mask value.
 
     This overwrites surfaceSplines.json wholesale -- it's the primary
     generator for these surface types now, not a merge with whatever
@@ -526,14 +528,15 @@ def step_write_splines(working_dir: Path) -> None:
     features = load_features(features_path)
     splines = build_surface_splines(features)
 
-    ignored_count = sum(1 for f in features if f.ignored)
+    excluded_count = sum(1 for f in features if f.kind in GOLF_OBJECT_KINDS and not f.mask)
     unsupported: dict[str, int] = {}
     for f in features:
-        if not f.ignored and feature_to_spline(f) is None:
+        excluded = f.kind in GOLF_OBJECT_KINDS and not f.mask
+        if not excluded and feature_to_spline(f) is None:
             unsupported[f.kind] = unsupported.get(f.kind, 0) + 1
 
     print(f"Generated {len(splines)} splines from {len(features)} features "
-          f"({ignored_count} ignored, {sum(unsupported.values())} unsupported kind: {unsupported})")
+          f"({excluded_count} excluded via mask, {sum(unsupported.values())} unsupported kind: {unsupported})")
 
     nodes_dir = working_dir / "course" / "CourseDescription_nodes"
     if not nodes_dir.is_dir():
