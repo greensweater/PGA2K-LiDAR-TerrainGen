@@ -613,6 +613,7 @@ def step_refine_terrain(
     use_height_mask: bool | None,
     mask_buffer_px: float | None = None,
     model_rebuild_interval: int | None = None,
+    candidate_brushes: tuple[int, ...] | None = None,
 ) -> None:
     """
     One adaptive refinement pass (see terrain/adaptive_refine.py): find
@@ -676,6 +677,9 @@ def step_refine_terrain(
         model_rebuild_interval = project.get(
             "refine_model_rebuild_interval", DEFAULT_MODEL_REBUILD_INTERVAL
         )
+    if candidate_brushes is None:
+        saved_brushes = project.get("refine_candidate_brushes")
+        candidate_brushes = tuple(saved_brushes) if saved_brushes is not None else None
 
     stamps = load_all_stamps(working_dir)
     pass_number = len(_refine_stamps_files(working_dir)) + 1
@@ -724,6 +728,7 @@ def step_refine_terrain(
         max_new_stamps=max_new_stamps,
         mask=mask_grid,
         model_rebuild_interval=model_rebuild_interval,
+        candidate_brushes=candidate_brushes,
     )
 
     new_stamps = refined[len(stamps):]
@@ -744,6 +749,7 @@ def step_refine_terrain(
         "use_height_mask": use_height_mask,
         "mask_buffer_px": mask_buffer_px,
         "model_rebuild_interval": model_rebuild_interval,
+        "candidate_brushes": list(candidate_brushes) if candidate_brushes is not None else None,
     }
 
     if new_stamps:
@@ -768,6 +774,7 @@ def step_refine_terrain(
         "refine_radius_decay_per_pass": radius_decay_per_pass,
         "refine_use_height_mask": use_height_mask,
         "refine_model_rebuild_interval": model_rebuild_interval,
+        "refine_candidate_brushes": list(candidate_brushes) if candidate_brushes is not None else None,
     })
 
     print("Refreshing previews (parameters used above are now the header on the terrain previews)...")
@@ -985,6 +992,14 @@ def main(argv: list[str] | None = None) -> int:
                               "= more accurate but slower (rebuilds the whole error grid each time); "
                               f"default: use whatever's saved in project.json, or {DEFAULT_MODEL_REBUILD_INTERVAL} "
                               "if never set.")
+    parser.add_argument("--candidate-brushes", type=str, default=None,
+                         help="refine-terrain: comma-separated brush types to consider per hotspot, "
+                              "e.g. '10,54' to restrict to only the two brushes with no flat plateau "
+                              "(smooth, cosine-like falloff the whole way from center to edge) -- "
+                              "excluding 8/9 avoids the flat-topped 'crater' look densely-packed small "
+                              "8/9 stamps can produce, at some cost to how precisely a wide flat area "
+                              "can hit an exact target height. Default: use whatever's saved in "
+                              "project.json, or all four (8,9,10,54) if never set.")
     parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
@@ -1020,11 +1035,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "generate-terrain":
             step_generate_terrain(working_dir)
         elif args.step == "refine-terrain":
+            parsed_candidate_brushes = (
+                tuple(int(b.strip()) for b in args.candidate_brushes.split(","))
+                if args.candidate_brushes else None
+            )
             step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
                                  args.min_hotspot_radius_cells, args.max_new_stamps,
                                  args.claim_radius_fraction, args.brush_radius_spread_ratio,
                                  args.radius_decay_per_pass, args.use_height_mask, args.mask_buffer_px,
-                                 args.model_rebuild_interval)
+                                 args.model_rebuild_interval, parsed_candidate_brushes)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
         elif args.step == "write-splines":
