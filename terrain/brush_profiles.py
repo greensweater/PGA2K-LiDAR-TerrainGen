@@ -33,17 +33,18 @@ shares that same shape. Only 9 of type 54's 10 rings were measured
 (r=0..0.8); its r=0.9 ring was back-solved so the reconstructed center
 matched its separately-measured 392 ft plateau.
 
-Terrain noise correction: the reconstructed centers for types 8 and 9
-come out just under 1.0 (raw ~0.986 / ~0.988) rather than exactly 1.0,
-which they should hit by definition (dead center under the cursor = the
-full requested value). That gap is attributed to the always-on ambient
-terrain noise layer (terrainNoise.json) biasing every stake reading,
-not per-brush error, so each brush is corrected by a constant offset
-across every ring (not just the center). Types 8 and 9 are corrected to
-their own exact values; type 10 and 54 -- whose reconstructed centers
-are built by summing many more independently-rounded ring
-measurements, so more prone to compounding error -- use the average of
-types 8 and 9's corrections rather than their own raw numbers.
+No terrain-noise correction is applied (an earlier version corrected
+for terrainNoise.json's always-on ambient bias, back-solved from these
+same stake measurements). That correction doesn't make sense once
+these measured-and-reconstructed profiles are replaced by the real
+brush alpha masks extracted directly from the game's own assets (see
+the "stamp and check" rework this module is slated for) -- those are
+the raw, noise-free brush data itself, not a reading taken through the
+in-game noise layer, so there's nothing left to correct for. In the
+meantime, the reconstructed centers for types 8 and 9 come out just
+under 1.0 (raw ~0.986 / ~0.988) rather than exactly 1.0, purely from
+compounding rounding error across many independently-measured ring
+deltas -- used as-is rather than force-normalized to exactly 1.0.
 """
 
 from __future__ import annotations
@@ -71,29 +72,20 @@ class BrushProfile:
         return self.samples[np.argsort(self.samples[:, 0])]
 
 
-def _raw_center(delta_ft: list[float]) -> float:
-    """Raw (uncorrected) normalized center weight from ring deltas."""
-    deltas_m = np.asarray(delta_ft, dtype=np.float64) * FEET_TO_METERS
-    heights_m = -np.cumsum(deltas_m[::-1])[::-1]
-    return float(heights_m[0] / REFERENCE_AMPLITUDE_M)
-
-
 def _profile_from_ring_deltas(
     brush_id: int,
     delta_ft: list[float],
-    noise_correction: float,
 ) -> BrushProfile:
     """
     Convert measured ring-to-ring feet deltas (r = 0, 10, 20, ... m, read
     outside-in) into a normalized (r, weight) sample table, anchored at
-    weight=0 at r=1.0 (the true edge) and corrected by `noise_correction`
-    at every other ring.
+    weight=0 at r=1.0 (the true edge).
     """
     deltas_m = np.asarray(delta_ft, dtype=np.float64) * FEET_TO_METERS
     heights_m = -np.cumsum(deltas_m[::-1])[::-1]
 
     radii = np.arange(len(delta_ft), dtype=np.float64) * 0.1
-    heights = heights_m / REFERENCE_AMPLITUDE_M + noise_correction
+    heights = heights_m / REFERENCE_AMPLITUDE_M
 
     # Append the r=1.0 anchor point itself -- unshifted, since it was
     # never a measurement (see module docstring).
@@ -123,15 +115,6 @@ _TYPE_10_DELTAS_FT = [-28.1, -66.5, -91.3, -102.8, -97.5, -79.7, -63.2, -50.8, -
 _TYPE_54_DELTAS_FT = [-19.9, -48.5, -71.6, -63.9, -51.3, -33.4, -21.6, -7.5, -0.4]
 _TYPE_54_MEASURED_CENTER_FT = 392.0
 _TYPE_54_R90_DELTA_FT = -(_TYPE_54_MEASURED_CENTER_FT + sum(_TYPE_54_DELTAS_FT))
-
-
-# ---------------------------------------------------------------------------
-# Terrain noise correction (see module docstring)
-# ---------------------------------------------------------------------------
-
-TYPE_8_CORRECTION = 1.0 - _raw_center(_TYPE_8_DELTAS_FT)
-TYPE_9_CORRECTION = 1.0 - _raw_center(_TYPE_9_DELTAS_FT)
-SHARED_CORRECTION = (TYPE_8_CORRECTION + TYPE_9_CORRECTION) / 2.0  # applied to 10 & 54
 
 
 def _hard_edge_profile(brush_id: int, shape: str) -> BrushProfile:
@@ -164,12 +147,10 @@ def _hard_edge_profile(brush_id: int, shape: str) -> BrushProfile:
 # ---------------------------------------------------------------------------
 
 BRUSH_PROFILES: dict[int, BrushProfile] = {
-    8: _profile_from_ring_deltas(8, _TYPE_8_DELTAS_FT, TYPE_8_CORRECTION),
-    9: _profile_from_ring_deltas(9, _TYPE_9_DELTAS_FT, TYPE_9_CORRECTION),
-    10: _profile_from_ring_deltas(10, _TYPE_10_DELTAS_FT, SHARED_CORRECTION),
-    54: _profile_from_ring_deltas(
-        54, _TYPE_54_DELTAS_FT + [_TYPE_54_R90_DELTA_FT], SHARED_CORRECTION
-    ),
+    8: _profile_from_ring_deltas(8, _TYPE_8_DELTAS_FT),
+    9: _profile_from_ring_deltas(9, _TYPE_9_DELTAS_FT),
+    10: _profile_from_ring_deltas(10, _TYPE_10_DELTAS_FT),
+    54: _profile_from_ring_deltas(54, _TYPE_54_DELTAS_FT + [_TYPE_54_R90_DELTA_FT]),
     72: _hard_edge_profile(72, SHAPE_SQUARE),  # hard square -- ESTIMATED, see _hard_edge_profile
     73: _hard_edge_profile(73, SHAPE_CIRCLE),  # hard circle -- ESTIMATED, see _hard_edge_profile
 }
