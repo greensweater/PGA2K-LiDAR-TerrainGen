@@ -548,21 +548,22 @@ def step_generate_terrain(working_dir: Path) -> None:
 
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
 
-    print("Generating hex grid...")
-    stamps = generate_hex_grid(bounds)
-    print(f"  {len(stamps)} stamps placed")
-
-    print("Fitting stamp heights from nearby LIDAR points...")
-    fitted = fit_stamp_heights(stamps, course_cloud)
-    n_unfitted = sum(1 for s in fitted if s.value == 0.0)
-    if n_unfitted:
-        print(f"  WARNING: {n_unfitted} stamps had too few nearby points and kept "
-              "their placeholder value=0.0")
-
     heightmap_path = working_dir / HEIGHTMAP_FILE
     if not heightmap_path.exists():
         raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
     heightmap, _ = load_heightmap(heightmap_path)
+
+    print("Generating hex grid...")
+    stamps = generate_hex_grid(bounds)
+    print(f"  {len(stamps)} stamps placed")
+
+    print("Fitting stamp heights from the rasterized ground heightmap...")
+    fitted = fit_stamp_heights(stamps, heightmap, bounds)
+    n_unfitted = sum(1 for s in fitted if s.value == 0.0)
+    if n_unfitted:
+        print(f"  WARNING: {n_unfitted} stamps had too few nearby heightmap cells and kept "
+              "their placeholder value=0.0")
+
     mean_elevation = float(np.nanmean(heightmap))
     print(f"Prepending a course-wide baseline-flatten stamp at the mean ground "
           f"elevation ({mean_elevation:.2f} m)...")
