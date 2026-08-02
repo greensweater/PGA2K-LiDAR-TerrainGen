@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import platform
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -45,7 +46,9 @@ CLI_SCRIPT = SCRIPT_DIR / "PGA2k_gen.py"
 # JSON helpers already tested as part of the CLI (see PGA2k_gen.py).
 sys.path.insert(0, str(SCRIPT_DIR))
 from constants import (  # noqa: E402
-    COURSE_SIZE_M, PREVIEW_DIR, PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+    COURSE_SIZE_M, PREVIEW_DIR, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
+    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+    PREVIEW_STAMPS, STAMPS_DIR,
 )
 from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, load_project, save_project  # noqa: E402
 from ingest.osm import (  # noqa: E402
@@ -308,7 +311,10 @@ class PGAGenGUI:
         )
         dropdown.pack(side="left", padx=4)
         dropdown.bind("<<ComboboxSelected>>", lambda e: self._on_preview_choice_changed())
-        ttk.Button(header, text="Refresh", command=self._refresh_preview_and_slider).pack(side="left")
+        self.undo_button = ttk.Button(header, text="Undo", command=self._run_undo)
+        self.undo_button.pack(side="left")
+        self.redo_button = ttk.Button(header, text="Redo", command=self._run_redo)
+        self.redo_button.pack(side="left")
 
         ttk.Label(header, text="Version:").pack(side="left", padx=(8, 0))
         self.preview_version = tk.IntVar(value=0)
@@ -769,6 +775,97 @@ class PGAGenGUI:
         preview_dir = working_dir / PREVIEW_DIR
         versions = viz.find_all_preview_versions(preview_dir, self.preview_choice.get())
         return max(0, len(versions) - 1)
+
+    _UNDO_SUFFIX_RE = re.compile(r"^(.*)\.(\d{14})\.undo$")
+    _TERRAIN_PREVIEW_KINDS = (PREVIEW_HEX, PREVIEW_STAMPS, PREVIEW_HEIGHT, PREVIEW_ERROR)
+
+    def _find_latest_refine_stamps(self, working_dir: Path) -> Path | None:
+        stamps_dir = working_dir / STAMPS_DIR
+        n = 1
+        latest = None
+        while (stamps_dir / f"refine_stamps_{n}.json").exists():
+            latest = stamps_dir / f"refine_stamps_{n}.json"
+            n += 1
+        return latest
+
+    def _find_undo_group(self, working_dir: Path) -> list[Path]:
+        """
+        Files that make up "the last refine-terrain iteration": the
+        latest refine_stamps_N.json, plus the latest version of each
+        terrain-related preview (hex/stamps/height/error) -- the same
+        set refine-terrain's auto-visualize always regenerates together.
+        Deliberately doesn't touch initial_stamps.json or its own
+        previews -- there's nothing more fundamental to undo back to.
+        """
+        files = []
+        latest_stamps = self._find_latest_refine_stamps(working_dir)
+        if latest_stamps is not None:
+            files.append(latest_stamps)
+        preview_dir = working_dir / PREVIEW_DIR
+        for kind in self._TERRAIN_PREVIEW_KINDS:
+            latest_preview = viz.find_latest_preview(preview_dir, kind)
+            if latest_preview is not None:
+                files.append(latest_preview)
+        return files
+
+    def _find_redo_group(self, working_dir: Path) -> tuple[str | None, list[Path]]:
+        """Most recent group of .undo files (sharing the same undo timestamp), across stamps/ and preview/."""
+        candidates = []
+        for directory in (working_dir / STAMPS_DIR, working_dir / PREVIEW_DIR):
+            if not directory.is_dir():
+                continue
+            for f in directory.iterdir():
+                m = self._UNDO_SUFFIX_RE.match(f.name)
+                if m:
+                    candidates.append((m.group(2), f))
+        if not candidates:
+            return None, []
+        latest_ts = max(ts for ts, _ in candidates)
+        group = [f for ts, f in candidates if ts == latest_ts]
+        return latest_ts, group
+
+    def _run_undo(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        wd = Path(wd)
+        files = self._find_undo_group(wd)
+        if not files:
+            messagebox.showinfo("Nothing to undo", "No refine-terrain pass found to undo.")
+            return
+
+        timestamp = time.strftime("%Y%m%d%H%M%S")
+        for f in files:
+            f.rename(f.with_name(f.name + f".{timestamp}.undo"))
+        self._append_log(
+            f"\n[undo] moved {len(files)} file(s) aside with suffix .{timestamp}.undo "
+            f"(click Redo to bring them back)\n"
+        )
+        self._cached_base_thumb_key = None  # the on-disk "latest" just changed underneath it
+        self._refresh_preview_and_slider()
+
+    def _run_redo(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        wd = Path(wd)
+        timestamp, files = self._find_redo_group(wd)
+        if not files:
+            messagebox.showinfo("Nothing to redo", "No undone files found to restore.")
+            return
+
+        restored = 0
+        for f in files:
+            m = self._UNDO_SUFFIX_RE.match(f.name)
+            target = f.with_name(m.group(1))
+            if target.exists():
+                self._append_log(f"\n[redo] skipped {f.name}: {target.name} already exists\n")
+                continue
+            f.rename(target)
+            restored += 1
+        self._append_log(f"\n[redo] restored {restored} file(s) from {timestamp}\n")
+        self._cached_base_thumb_key = None
+        self._refresh_preview_and_slider()
 
     def _refresh_preview_and_slider(self) -> None:
         """
