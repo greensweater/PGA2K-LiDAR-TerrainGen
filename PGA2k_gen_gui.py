@@ -254,8 +254,8 @@ class PGAGenGUI:
         )
         mask_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=3, pady=(4, 0))
         _Tooltip(mask_checkbox, "Restrict hotspot placement to inside height_mask.geojson "
-                 "(fairway/green, from Ingest OSM). Everything outside is treated like no-data -- "
-                 "never becomes a hotspot.")
+                 "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM). Everything "
+                 "outside is treated like no-data -- never becomes a hotspot.")
 
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
@@ -642,6 +642,8 @@ class PGAGenGUI:
             "--radius-decay-per-pass", self.radius_decay_var.get().strip(),
             "--use-height-mask" if self.use_height_mask_var.get() else "--no-use-height-mask",
         ]
+        if self.use_height_mask_var.get():
+            args += ["--mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}"]
         max_new = self.max_new_var.get().strip()
         if max_new:
             args += ["--max-new-stamps", max_new]
