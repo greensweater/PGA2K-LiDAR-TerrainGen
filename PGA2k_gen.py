@@ -64,7 +64,7 @@ from constants import (
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
-from ingest.heightmap import DEFAULT_HEIGHTMAP_RESOLUTION, rasterize_ground_heightmap, save_heightmap
+from ingest.heightmap import DEFAULT_HEIGHTMAP_RESOLUTION, load_heightmap, rasterize_ground_heightmap, save_heightmap
 from ingest.osm import (
     DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
@@ -85,7 +85,7 @@ from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
-from writer import normalize_stamp_heights, write_user_layers
+from writer import build_baseline_flatten_stamp, normalize_stamp_heights, write_user_layers
 
 INITIAL_STAMPS_FILE = "initial_stamps.json"
 FEATURES_FILE = "features.geojson"
@@ -558,6 +558,16 @@ def step_generate_terrain(working_dir: Path) -> None:
     if n_unfitted:
         print(f"  WARNING: {n_unfitted} stamps had too few nearby points and kept "
               "their placeholder value=0.0")
+
+    heightmap_path = working_dir / HEIGHTMAP_FILE
+    if not heightmap_path.exists():
+        raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
+    heightmap, _ = load_heightmap(heightmap_path)
+    mean_elevation = float(np.nanmean(heightmap))
+    print(f"Prepending a course-wide baseline-flatten stamp at the mean ground "
+          f"elevation ({mean_elevation:.2f} m)...")
+    baseline_stamp = build_baseline_flatten_stamp(bounds, mean_elevation)
+    fitted = [baseline_stamp] + fitted
 
     out_path = _stamps_dir(working_dir) / INITIAL_STAMPS_FILE
     save_stamp_file(
