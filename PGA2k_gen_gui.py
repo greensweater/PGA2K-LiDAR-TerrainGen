@@ -52,7 +52,8 @@ from constants import (  # noqa: E402
 )
 from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, load_project, save_project  # noqa: E402
 from ingest.osm import (  # noqa: E402
-    merge_height_mask_features, load_features, rasterize_mask_rgba, save_features, save_height_mask,
+    GOLF_OBJECT_KINDS, build_height_mask, merge_height_mask_features, load_features,
+    rasterize_mask_rgba, save_features, save_height_mask,
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
 import visualize as viz  # noqa: E402
@@ -433,12 +434,12 @@ class PGAGenGUI:
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.splines_tree = ttk.Treeview(
-            tree_frame, columns=("kind", "ignored"), show="headings", height=18, selectmode="browse",
+            tree_frame, columns=("kind", "mask"), show="headings", height=18, selectmode="browse",
         )
         self.splines_tree.heading("kind", text="Kind")
-        self.splines_tree.heading("ignored", text="Ignored")
+        self.splines_tree.heading("mask", text="Mask")
         self.splines_tree.column("kind", width=90)
-        self.splines_tree.column("ignored", width=55, anchor="center")
+        self.splines_tree.column("mask", width=55, anchor="center")
         self.splines_tree.pack(side="left", fill="both", expand=True)
         tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.splines_tree.yview)
         tree_scroll.pack(side="left", fill="y")
@@ -447,10 +448,18 @@ class PGAGenGUI:
 
         button_row = ttk.Frame(parent)
         button_row.pack(fill="x", pady=(6, 0))
-        ttk.Button(button_row, text="Toggle Ignored", command=self._toggle_selected_ignored).pack(side="left")
+        ttk.Button(button_row, text="Toggle Mask", command=self._toggle_selected_mask).pack(side="left")
+        toggle_all_btn = ttk.Button(button_row, text="Toggle All", command=self._toggle_all_mask)
+        toggle_all_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(toggle_all_btn, "Toggle mask for every currently-visible golf object (fairway/green/"
+                 "tee/hole only -- bunker/water/cartpath/etc. are never affected, regardless of the "
+                 "filter). If any are currently unmasked, masks all of them in; otherwise masks all "
+                 "of them out.")
 
         ttk.Label(
-            parent, text="Select a spline to highlight it on the preview (course-cropped previews only).",
+            parent, text="Select a spline to highlight it on the preview (course-cropped previews only). "
+            "Mask determines both height_mask.geojson membership and (for fairway/green/tee/hole) "
+            "whether the feature exports at all -- redefined immediately whenever it changes.",
             wraplength=220, foreground="gray",
         ).pack(anchor="w", pady=(6, 0))
 
@@ -480,7 +489,7 @@ class PGAGenGUI:
             if f.osm_id is None:
                 continue  # nothing stable to select/highlight/toggle by
             self.splines_tree.insert(
-                "", "end", iid=str(f.osm_id), values=(f.kind, "yes" if f.ignored else ""),
+                "", "end", iid=str(f.osm_id), values=(f.kind, "yes" if f.mask else ""),
             )
 
     def _on_spline_selected(self) -> None:
@@ -488,7 +497,24 @@ class PGAGenGUI:
         self._highlighted_feature_osm_id = int(selection[0]) if selection else None
         self._show_preview()
 
-    def _toggle_selected_ignored(self) -> None:
+    def _regenerate_height_mask(self, working_dir: Path) -> None:
+        """
+        Rebuild height_mask.geojson from the currently in-memory
+        feature list (self._splines_features) right away, rather than
+        waiting for the next Ingest OSM run -- so a mask toggle in the
+        Splines tab is reflected immediately, matching how the live
+        buffer-preview slider already behaves. Also invalidates the
+        slider's own cached merged geometry, since the mask membership
+        it was built from just changed.
+        """
+        mask_geometry = build_height_mask(
+            self._splines_features, buffer_px=self.mask_buffer_preview_var.get(),
+        )
+        save_height_mask(mask_geometry, working_dir / HEIGHT_MASK_FILE)
+        self._cached_mask_merged_geom = None
+        self._cached_mask_geom_working_dir = None
+
+    def _toggle_selected_mask(self) -> None:
         wd = self.working_dir.get().strip()
         selection = self.splines_tree.selection()
         if not wd or not selection:
@@ -497,11 +523,40 @@ class PGAGenGUI:
         feature = next((f for f in self._splines_features if f.osm_id == osm_id), None)
         if feature is None:
             return
-        feature.ignored = not feature.ignored
+        feature.mask = not feature.mask
         save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+        self._regenerate_height_mask(Path(wd))
         self._refresh_splines_list()
         if self.splines_tree.exists(str(osm_id)):
             self.splines_tree.selection_set(str(osm_id))
+        self._show_preview()
+
+    def _toggle_all_mask(self) -> None:
+        """
+        Toggle mask for every feature currently visible in the tree
+        (i.e. matching the active kind filter) that's a golf-object
+        kind (fairway/green/tee/hole) -- bunker/water/cartpath/etc.
+        are never touched by this, regardless of what the filter
+        happens to show. If any visible golf object is currently
+        unmasked, this masks all of them in; otherwise it masks all
+        of them out (a standard select-all/deselect-all toggle).
+        """
+        wd = self.working_dir.get().strip()
+        if not wd:
+            return
+        visible_ids = {int(iid) for iid in self.splines_tree.get_children()}
+        targets = [
+            f for f in self._splines_features
+            if f.osm_id in visible_ids and f.kind in GOLF_OBJECT_KINDS
+        ]
+        if not targets:
+            return
+        new_state = any(not f.mask for f in targets)
+        for f in targets:
+            f.mask = new_state
+        save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+        self._regenerate_height_mask(Path(wd))
+        self._refresh_splines_list()
         self._show_preview()
 
     def _add_step_button(self, parent: ttk.Frame, label: str, command) -> ttk.Button:
