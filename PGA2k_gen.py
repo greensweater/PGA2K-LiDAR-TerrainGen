@@ -701,6 +701,13 @@ def step_refine_terrain(
         mask_grid = rasterize_mask(mask_geometry, bounds, resolution)
         print(f"  height mask covers {mask_grid.mean():.1%} of the course at this resolution")
 
+    if COURSE_SIZE_M % resolution != 0:
+        cell_size = COURSE_SIZE_M / resolution
+        print(f"  NOTE: resolution={resolution} doesn't evenly divide the {COURSE_SIZE_M:.0f} m course "
+              f"({cell_size:.3f} m cells) -- cell boundaries won't land on whole-meter positions "
+              "matching the ground heightmap's own 1 px = 1 m grid. Not an error, just imprecise; "
+              "an exact divisor (200, 250, 400, 500, 1000, 2000, ...) avoids this.")
+
     print(f"Scanning the error grid ({resolution}x{resolution}, tolerance={tolerance} m)...")
     refined, hotspots = refine_stamps(
         stamps, heights, bounds, tolerance=tolerance,
