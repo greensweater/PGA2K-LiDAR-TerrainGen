@@ -44,7 +44,7 @@ import math
 from pathlib import Path
 from typing import Optional
 
-from ingest.osm import Feature
+from ingest.osm import Feature, GOLF_OBJECT_KINDS
 
 # From tgc_definitions.py (confirmed via direct re-fetch, no drift from
 # an earlier fetch): surface name -> numeric ID the game expects.
@@ -233,10 +233,21 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
 
 
 def build_surface_splines(features: list[Feature]) -> list[dict]:
-    """One spline per handled Feature, skipping ignored features and unsupported kinds (water/hole)."""
+    """
+    One spline per handled Feature (see feature_to_spline for which
+    kinds are supported -- water/hole are not). For golf-object kinds
+    specifically (fairway/green/tee/hole -- see GOLF_OBJECT_KINDS),
+    mask=False excludes the feature entirely -- e.g. a duplicate/extra
+    hole's fairway or tee showing up from a neighboring course on the
+    same OSM map (PGA can't import more than 18 holes). Every other
+    kind (bunker/water/cartpath/path/building/wood) always exports
+    regardless of its own mask value -- mask defaults to False for
+    those (see GOLF_OBJECT_KINDS), and that default isn't meant to
+    silently exclude them from output.
+    """
     splines = []
     for f in features:
-        if getattr(f, "ignored", False):
+        if f.kind in GOLF_OBJECT_KINDS and not f.mask:
             continue
         spline = feature_to_spline(f)
         if spline is not None:
