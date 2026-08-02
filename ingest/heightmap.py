@@ -91,12 +91,16 @@ def load_heightmap(path: Path) -> tuple[np.ndarray, BoundingBox]:
 
 def sample_heightmap_mean(
     heights: np.ndarray, bounds: BoundingBox, x: float, z: float, radius: float,
+    min_valid_cells: int = 1,
 ) -> Optional[float]:
     """
     Mean of every heightmap cell whose center falls within `radius` of
     (x, z) -- the direct, KD-tree-free replacement for querying and
     averaging raw LIDAR points within a stamp's footprint. Returns
-    None if no valid (non-NaN, in-range) cells exist.
+    None if fewer than `min_valid_cells` valid (non-NaN, in-range)
+    cells exist -- e.g. a stamp sitting entirely over a lake or
+    building, where bare-earth points (and therefore heightmap
+    coverage) don't exist.
     """
     resolution_z, resolution_x = heights.shape
     cell_size_x = (bounds.max_x - bounds.min_x) / resolution_x
@@ -121,6 +125,6 @@ def sample_heightmap_mean(
 
     sub_heights = heights[row_min:row_max, col_min:col_max]
     valid = (dist <= radius) & np.isfinite(sub_heights)
-    if not np.any(valid):
+    if np.count_nonzero(valid) < min_valid_cells:
         return None
     return float(np.mean(sub_heights[valid]))
