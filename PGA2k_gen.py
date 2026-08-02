@@ -76,6 +76,7 @@ from terrain.adaptive_refine import (
     DEFAULT_MAX_HOTSPOT_RADIUS_M,
     DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
     DEFAULT_MIN_HOTSPOT_RADIUS_M,
+    DEFAULT_MODEL_REBUILD_INTERVAL,
     DEFAULT_RADIUS_DECAY_PER_PASS,
     DEFAULT_RESOLUTION,
     refine_stamps,
@@ -611,6 +612,7 @@ def step_refine_terrain(
     radius_decay_per_pass: float | None,
     use_height_mask: bool | None,
     mask_buffer_px: float | None = None,
+    model_rebuild_interval: int | None = None,
 ) -> None:
     """
     One adaptive refinement pass (see terrain/adaptive_refine.py): find
@@ -670,6 +672,10 @@ def step_refine_terrain(
         )
     if use_height_mask is None:
         use_height_mask = project.get("refine_use_height_mask", False)
+    if model_rebuild_interval is None:
+        model_rebuild_interval = project.get(
+            "refine_model_rebuild_interval", DEFAULT_MODEL_REBUILD_INTERVAL
+        )
 
     stamps = load_all_stamps(working_dir)
     pass_number = len(_refine_stamps_files(working_dir)) + 1
@@ -717,6 +723,7 @@ def step_refine_terrain(
         brush_radius_spread_ratio=brush_radius_spread_ratio,
         max_new_stamps=max_new_stamps,
         mask=mask_grid,
+        model_rebuild_interval=model_rebuild_interval,
     )
 
     new_stamps = refined[len(stamps):]
@@ -736,6 +743,7 @@ def step_refine_terrain(
         "brush_radius_spread_ratio": brush_radius_spread_ratio,
         "use_height_mask": use_height_mask,
         "mask_buffer_px": mask_buffer_px,
+        "model_rebuild_interval": model_rebuild_interval,
     }
 
     if new_stamps:
@@ -759,6 +767,7 @@ def step_refine_terrain(
         "refine_brush_radius_spread_ratio": brush_radius_spread_ratio,
         "refine_radius_decay_per_pass": radius_decay_per_pass,
         "refine_use_height_mask": use_height_mask,
+        "refine_model_rebuild_interval": model_rebuild_interval,
     })
 
     print("Refreshing previews (parameters used above are now the header on the terrain previews)...")
@@ -967,6 +976,15 @@ def main(argv: list[str] | None = None) -> int:
                               "other parameters so it shows up in preview titles and stamp-file "
                               "metadata. Doesn't affect the mask itself (already baked into "
                               "height_mask.geojson) or any computation here.")
+    parser.add_argument("--model-rebuild-interval", type=int, default=None,
+                         help="refine-terrain: fold every hotspot placed so far this pass into the "
+                              "model (and re-derive the error grid from it) every N new hotspots, "
+                              "instead of only ever fitting against the pre-pass baseline -- fixes a "
+                              "real staleness gap where claim_radius_fraction<1 lets same-pass "
+                              "hotspots overlap, but candidates were fit blind to each other. Lower "
+                              "= more accurate but slower (rebuilds the whole error grid each time); "
+                              f"default: use whatever's saved in project.json, or {DEFAULT_MODEL_REBUILD_INTERVAL} "
+                              "if never set.")
     parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
@@ -1005,7 +1023,8 @@ def main(argv: list[str] | None = None) -> int:
             step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
                                  args.min_hotspot_radius_cells, args.max_new_stamps,
                                  args.claim_radius_fraction, args.brush_radius_spread_ratio,
-                                 args.radius_decay_per_pass, args.use_height_mask, args.mask_buffer_px)
+                                 args.radius_decay_per_pass, args.use_height_mask, args.mask_buffer_px,
+                                 args.model_rebuild_interval)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
         elif args.step == "write-splines":
