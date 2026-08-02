@@ -635,10 +635,10 @@ def step_refine_terrain(
     value to override for this run and persist it as the new default
     for next time.
     """
-    pointcloud_path = working_dir / POINTCLOUD_FILE
-    if not pointcloud_path.exists():
+    heightmap_path = working_dir / HEIGHTMAP_FILE
+    if not heightmap_path.exists():
         raise StepError(
-            f"No {POINTCLOUD_FILE} found under {working_dir}. Run --step ingest-laz first."
+            f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first."
         )
 
     project = load_project(working_dir)
@@ -672,8 +672,7 @@ def step_refine_terrain(
         print(f"  min/max hotspot radius this pass: {min_radius:.2f} / {max_radius:.2f} m "
               f"(decayed {decay:.2f}x from {DEFAULT_MIN_HOTSPOT_RADIUS_M}/{DEFAULT_MAX_HOTSPOT_RADIUS_M})")
 
-    full_cloud = PointCloud.load(pointcloud_path)
-    course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
+    heights, _ = load_heightmap(heightmap_path)
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
 
     mask_grid = None
@@ -690,7 +689,7 @@ def step_refine_terrain(
 
     print(f"Scanning the error grid ({resolution}x{resolution}, tolerance={tolerance} m)...")
     refined, hotspots = refine_stamps(
-        stamps, course_cloud, bounds, tolerance=tolerance,
+        stamps, heights, bounds, tolerance=tolerance,
         resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
         min_radius=min_radius, max_radius=max_radius,
         claim_radius_fraction=claim_radius_fraction,
