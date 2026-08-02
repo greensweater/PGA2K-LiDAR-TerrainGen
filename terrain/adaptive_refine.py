@@ -147,6 +147,7 @@ from terrain.terrain_model import TerrainModel
 
 DEFAULT_RESOLUTION = 200
 DEFAULT_MIN_POINTS = 3
+DEFAULT_MODEL_REBUILD_INTERVAL = 25
 DEFAULT_MIN_HOTSPOT_RADIUS_CELLS = 1.0  # below this (pre-clamp), treat as noise, not a feature
 DEFAULT_CLAIM_RADIUS_FRACTION = 1.0  # 1.0 = claim the whole radius (old behavior, no overlap)
 DEFAULT_BRUSH_RADIUS_SPREAD_RATIO = 1.0  # 1.0 = every brush scored at the same radius (old behavior)
@@ -249,6 +250,7 @@ def find_error_hotspots(
     min_valid_cells: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
+    model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
 ) -> list[ErrorHotspot]:
     """
     Find and fit error hotspots via distance-transform region centering
@@ -273,6 +275,25 @@ def find_error_hotspots(
     mask are treated exactly like invalid/no-data cells: excluded from
     consideration entirely, never becoming a peak or getting claimed,
     rather than being scored and then discarded.
+
+    model_rebuild_interval addresses a real same-pass staleness gap:
+    `model` (built once, from `stamps`, before this pass) is what every
+    candidate's current_at_points/current_at_center is computed
+    against -- it never included hotspots already added earlier in
+    *this same pass*. With claim_radius_fraction < 1 deliberately
+    letting stamps overlap, many same-pass hotspots sit close enough to
+    interact, so a candidate fit against this stale baseline can
+    genuinely conflict with an already-placed neighbor once every
+    stamp from this pass is actually applied together. Every
+    model_rebuild_interval new hotspots, `model` (and the `predicted`/
+    `error` grids derived from it) gets rebuilt to include every
+    hotspot placed so far this pass, so later candidates account for
+    earlier ones -- bounded staleness (up to model_rebuild_interval
+    hotspots' worth) rather than unbounded staleness across an entire
+    pass. Rebuilding every single hotspot instead of periodically would
+    be more accurate still, but re-renders the whole error grid each
+    time, so this trades a small, bounded amount of staleness for not
+    paying that cost thousands of times over in a large pass.
 
     Returns hotspots in the order found (largest inscribed radius
     first, which tracks -- but isn't identical to -- worst peak error).
@@ -440,6 +461,20 @@ def find_error_hotspots(
             n_cells=n_cells, brush=brush, tool=tool, value=value, fit_rms=rms,
         ))
 
+        if len(hotspots) % model_rebuild_interval == 0:
+            # Same-pass staleness fix (see docstring): fold every
+            # hotspot placed so far this pass into the model every
+            # model_rebuild_interval hotspots, and re-derive predicted/
+            # error from that updated model -- both distance-transform
+            # caches are invalidated (not just the peak's own sign),
+            # since the whole error grid just changed, not only the
+            # cells claimed this iteration.
+            model = TerrainModel(list(stamps) + [h.to_stamp() for h in hotspots])
+            predicted = model.render(resolution=resolution, bounds=bounds)
+            error = predicted - actual
+            dist_over = None
+            dist_under = None
+
     return hotspots
 
 
@@ -457,6 +492,7 @@ def refine_stamps(
     min_valid_cells: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
+    model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
 ) -> tuple[list[Stamp], list[ErrorHotspot]]:
     """
     One adaptive refinement pass: find and fit error hotspots (see
@@ -474,6 +510,7 @@ def refine_stamps(
         min_radius=min_radius, max_radius=max_radius,
         claim_radius_fraction=claim_radius_fraction,
         brush_radius_spread_ratio=brush_radius_spread_ratio,
+        model_rebuild_interval=model_rebuild_interval,
         mask=mask,
         min_valid_cells=min_valid_cells,
         max_new_stamps=max_new_stamps,
