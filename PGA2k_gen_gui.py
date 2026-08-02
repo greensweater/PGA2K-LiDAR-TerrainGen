@@ -52,7 +52,7 @@ from constants import (  # noqa: E402
 )
 from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, load_project, save_project  # noqa: E402
 from ingest.osm import (  # noqa: E402
-    merge_height_mask_features, load_features, rasterize_mask_rgba, save_height_mask,
+    merge_height_mask_features, load_features, rasterize_mask_rgba, save_features, save_height_mask,
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
 import visualize as viz  # noqa: E402
@@ -121,6 +121,8 @@ class PGAGenGUI:
         self._cached_mask_geom_working_dir = None
         self._cached_base_thumb = None  # see _show_preview's static-part cache
         self._cached_base_thumb_key = None
+        self._splines_features = []  # loaded features.geojson content, for the Splines tab
+        self._highlighted_feature_osm_id = None  # currently-selected spline, if any, to highlight on the preview
         self._suppress_course_name_save = False
 
         self._build_layout()
@@ -155,15 +157,24 @@ class PGAGenGUI:
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill="both", expand=True)
 
-        left = ttk.Frame(main)
-        left.pack(side="left", fill="y", padx=(0, 8))
+        left = ttk.Notebook(main)
+        left.pack(side="left", fill="both", padx=(0, 8))
+
+        terrain_tab = ttk.Frame(left, padding=4)
+        splines_tab = ttk.Frame(left, padding=4)
+        objects_tab = ttk.Frame(left, padding=4)
+        left.add(terrain_tab, text="Terrain")
+        left.add(splines_tab, text="Splines")
+        left.add(objects_tab, text="Objects")
 
         # Horizontal split: preview (more room, per request) on the left,
         # log on the right; the sash between them resizes width, not height.
         right = ttk.PanedWindow(main, orient="horizontal")
         right.pack(side="left", fill="both", expand=True)
 
-        self._build_step_buttons(left)
+        self._build_step_buttons(terrain_tab)
+        self._build_splines_tab(splines_tab)
+        self._build_objects_tab(objects_tab)
         self._build_preview_panel(right)
         self._build_log_panel(right)
 
@@ -383,6 +394,98 @@ class PGAGenGUI:
         ).pack(side="left", fill="x", expand=True, padx=4)
         self.mask_buffer_preview_label = ttk.Label(mask_row, text="50", width=4)
         self.mask_buffer_preview_label.pack(side="left")
+
+    _SPLINE_KIND_FILTERS = (
+        "All", "green", "tee", "fairway", "rough", "bunker",
+        "water", "cartpath", "path", "building", "wood", "hole",
+    )
+
+    def _build_splines_tab(self, parent: ttk.Frame) -> None:
+        filter_row = ttk.Frame(parent)
+        filter_row.pack(fill="x")
+        ttk.Label(filter_row, text="Filter:").pack(side="left")
+        self.splines_kind_filter_var = tk.StringVar(value="All")
+        filter_box = ttk.Combobox(
+            filter_row, textvariable=self.splines_kind_filter_var, state="readonly", width=12,
+            values=self._SPLINE_KIND_FILTERS,
+        )
+        filter_box.pack(side="left", padx=4)
+        filter_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_splines_list())
+        ttk.Button(filter_row, text="Refresh", command=self._refresh_splines_list).pack(side="left")
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self.splines_tree = ttk.Treeview(
+            tree_frame, columns=("kind", "ignored"), show="headings", height=18, selectmode="browse",
+        )
+        self.splines_tree.heading("kind", text="Kind")
+        self.splines_tree.heading("ignored", text="Ignored")
+        self.splines_tree.column("kind", width=90)
+        self.splines_tree.column("ignored", width=55, anchor="center")
+        self.splines_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.splines_tree.yview)
+        tree_scroll.pack(side="left", fill="y")
+        self.splines_tree["yscrollcommand"] = tree_scroll.set
+        self.splines_tree.bind("<<TreeviewSelect>>", lambda e: self._on_spline_selected())
+
+        button_row = ttk.Frame(parent)
+        button_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(button_row, text="Toggle Ignored", command=self._toggle_selected_ignored).pack(side="left")
+
+        ttk.Label(
+            parent, text="Select a spline to highlight it on the preview (course-cropped previews only).",
+            wraplength=220, foreground="gray",
+        ).pack(anchor="w", pady=(6, 0))
+
+    def _build_objects_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent, text="Trees, buildings, and other placed objects will live here once that "
+            "part of the pipeline is built.", wraplength=220, foreground="gray",
+        ).pack(anchor="w", pady=8)
+
+    def _refresh_splines_list(self) -> None:
+        wd = self.working_dir.get().strip()
+        self.splines_tree.delete(*self.splines_tree.get_children())
+        if not wd or not Path(wd).is_dir():
+            self._splines_features = []
+            return
+
+        features_path = Path(wd) / FEATURES_FILE
+        if not features_path.exists():
+            self._splines_features = []
+            return
+
+        self._splines_features = load_features(features_path)
+        kind_filter = self.splines_kind_filter_var.get()
+        for f in self._splines_features:
+            if kind_filter != "All" and f.kind != kind_filter:
+                continue
+            if f.osm_id is None:
+                continue  # nothing stable to select/highlight/toggle by
+            self.splines_tree.insert(
+                "", "end", iid=str(f.osm_id), values=(f.kind, "yes" if f.ignored else ""),
+            )
+
+    def _on_spline_selected(self) -> None:
+        selection = self.splines_tree.selection()
+        self._highlighted_feature_osm_id = int(selection[0]) if selection else None
+        self._show_preview()
+
+    def _toggle_selected_ignored(self) -> None:
+        wd = self.working_dir.get().strip()
+        selection = self.splines_tree.selection()
+        if not wd or not selection:
+            return
+        osm_id = int(selection[0])
+        feature = next((f for f in self._splines_features if f.osm_id == osm_id), None)
+        if feature is None:
+            return
+        feature.ignored = not feature.ignored
+        save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+        self._refresh_splines_list()
+        if self.splines_tree.exists(str(osm_id)):
+            self.splines_tree.selection_set(str(osm_id))
+        self._show_preview()
 
     def _add_step_button(self, parent: ttk.Frame, label: str, command) -> ttk.Button:
         btn = ttk.Button(parent, text=label, command=command, width=22)
@@ -1064,6 +1167,39 @@ class PGAGenGUI:
                     mask_full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
                     mask_full.paste(mask_data_img, (data_left, data_top), mask_data_img)
                     img = Image.alpha_composite(img, mask_full)
+
+            # Highlight the currently-selected spline (Splines tab),
+            # same _PLOT_RECT-aware positioning as the mask buffer above
+            # -- course-cropped previews only, same reasoning (the
+            # feature geometry is in that frame, not the LIDAR previews'
+            # full-point-cloud one).
+            if self._highlighted_feature_osm_id is not None and viz.strip_preview_version(path.name) not in (
+                PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+            ):
+                feature = next(
+                    (f for f in self._splines_features if f.osm_id == self._highlighted_feature_osm_id), None,
+                )
+                if feature is not None:
+                    highlight_geom = feature.geometry
+                    if highlight_geom.geom_type == "LineString":
+                        # A zero-area line has nothing for
+                        # shapely.vectorized.contains to find "inside" --
+                        # buffer it into a thin ribbon so it's visible.
+                        highlight_geom = highlight_geom.buffer(5.0)
+                    course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+                    left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
+                    data_left = round(img.width * left_frac)
+                    data_top = round(img.height * (1 - bottom_frac - height_frac))
+                    data_width = max(1, round(img.width * width_frac))
+                    data_height = max(1, round(img.height * height_frac))
+                    highlight_rgba = rasterize_mask_rgba(
+                        highlight_geom, course_bounds, data_width, data_height,
+                        color=(0, 255, 255), opacity=0.6, invert=False,
+                    )
+                    highlight_img = Image.fromarray(highlight_rgba, mode="RGBA")
+                    highlight_full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
+                    highlight_full.paste(highlight_img, (data_left, data_top), highlight_img)
+                    img = Image.alpha_composite(img, highlight_full)
 
             self._preview_imgtk = ImageTk.PhotoImage(img)
             self.preview_label.config(image=self._preview_imgtk, text="")
