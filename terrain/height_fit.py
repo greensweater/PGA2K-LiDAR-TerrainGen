@@ -2,13 +2,22 @@
 terrain/height_fit.py
 
 Milestone 3's "initial height fitting": sets each Stamp's value from
-the average nearby LIDAR elevation, in place of hexgrid.py's
+the average nearby ground elevation, in place of hexgrid.py's
 placeholder value=0.0.
 
 This is deliberately naive -- each stamp's target is a simple, unweighted
-average of nearby bare-earth points. The architecture doc calls out
-weighted least-squares as the "eventually" version of this step; this
-is the "for now" one.
+average of nearby heightmap cells (bare-earth points, rasterized once
+at ingest time -- see ingest/heightmap.py). The architecture doc calls
+out weighted least-squares as the "eventually" version of this step;
+this is the "for now" one.
+
+Sampling the pre-rasterized heightmap instead of querying the raw
+point cloud's KD-tree directly is the same "no tree traversal needed
+on a regular grid" idea as the render() optimization, applied to the
+ground-truth side of the fit rather than the predicted side: the
+heightmap is built once (ingest-laz), and every stamp's footprint
+becomes a direct bounding-box array slice instead of a per-stamp
+spatial query.
 
 Naive per-stamp averaging is enough on its own for the initial hex
 grid specifically, because of a property of that layout: stamp radius
@@ -44,7 +53,8 @@ from typing import Sequence
 
 import numpy as np
 
-from ingest.laz_reader import PointCloud
+from ingest.heightmap import sample_heightmap_mean
+from terrain.bounding_box import BoundingBox
 from terrain.brush_profiles import BRUSH_PROFILES
 from terrain.stamp import TOOL_RAISE, Stamp
 from terrain.terrain_kernel import TerrainKernel
@@ -53,16 +63,21 @@ from terrain.terrain_model import TerrainModel
 
 def fit_stamp_heights(
     stamps: Sequence[Stamp],
-    cloud: PointCloud,
-    bare_earth_only: bool = True,
-    min_points: int = 3,
+    heights: np.ndarray,
+    bounds: BoundingBox,
+    min_valid_cells: int = 3,
     existing_stamps: Sequence[Stamp] = (),
 ) -> list[Stamp]:
     """
     Return a new list of Stamps (same order, same length as `stamps`)
     with value replaced by a per-stamp best-fit height (flatten) or
-    delta (raise), estimated from nearby LIDAR points -- see module
+    delta (raise), estimated from nearby heightmap cells -- see module
     docstring for the two formulas.
+
+    `heights`/`bounds` are the rasterized ground heightmap and the
+    bounds it was built over (see ingest/heightmap.py's
+    rasterize_ground_heightmap/load_heightmap) -- bare-earth filtering
+    already happened once, at rasterization time, not per stamp here.
 
     `stamps` are processed in list order, and each one's fit accounts
     for whatever height stamps earlier in the list -- or in
@@ -74,10 +89,11 @@ def fit_stamp_heights(
     baseline that's already there, instead of fitting against a false
     zero baseline.
 
-    Stamps with fewer than `min_points` nearby points are left
-    unchanged (their placeholder value untouched) rather than guessing
-    from sparse or absent data -- left for a later pass (denser
-    sampling, interpolation, or further refinement) to handle.
+    Stamps with fewer than `min_valid_cells` nearby heightmap cells
+    (e.g. sitting entirely over a lake or building, where bare-earth
+    coverage doesn't exist) are left unchanged (their placeholder
+    value untouched) rather than guessing from sparse or absent data
+    -- left for a later pass to handle.
     """
     kernels: dict[int, TerrainKernel] = {}
     fitted: list[Stamp] = list(existing_stamps)
@@ -89,15 +105,12 @@ def fit_stamp_heights(
                 raise ValueError(f"No BrushProfile registered for brush type {stamp.brush}")
             kernels[stamp.brush] = TerrainKernel(BRUSH_PROFILES[stamp.brush])
 
-        idx = cloud.query_radius(stamp.x, stamp.z, stamp.radius)
-        if bare_earth_only and idx.size > 0:
-            idx = idx[cloud.bare_earth_mask()[idx]]
-
-        if idx.size < min_points:
+        target = sample_heightmap_mean(
+            heights, bounds, stamp.x, stamp.z, stamp.radius, min_valid_cells=min_valid_cells,
+        )
+        if target is None:
             fitted.append(stamp)
             continue
-
-        target = float(np.mean(cloud.elevation[idx]))
 
         weight_at_center = kernels[stamp.brush].sample(0.0)
         if weight_at_center <= 0.0:
