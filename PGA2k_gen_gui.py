@@ -240,39 +240,39 @@ class PGAGenGUI:
                   "grid -- other values still work, they just won't align as cleanly (e.g. 1600 gives "
                   "1.25 m cells, straddling heightmap pixel boundaries).", self.resolution_var,
                   required=True, combobox_values=_RESOLUTION_PRESETS)
+
+        self.use_height_mask_var = tk.BooleanVar(value=False)
+        mask_checkbox = ttk.Checkbutton(grid_frame, text="Mask", variable=self.use_height_mask_var)
+        mask_checkbox.grid(row=0, column=2, sticky="w", padx=3, pady=2)
+        _Tooltip(mask_checkbox, "Restrict hotspot placement to inside height_mask.geojson "
+                 "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM). Everything "
+                 "outside is treated like no-data -- never becomes a hotspot.")
+
         add_field(1, 0, "min_hotspot", "HOT m", "Min hotspot radius in cells (pre-clamp). Smaller "
                   "regions are treated as noise, not a real feature.", self.min_hotspot_radius_cells_var,
                   required=True)
         add_field(1, 1, "max_new", "MAX n", "Cap on new stamps this pass. Leave blank for no cap.",
                   self.max_new_var, required=False)
+
+        self.soft_brushes_var = tk.BooleanVar(value=False)
+        soft_checkbox = ttk.Checkbutton(grid_frame, text="Soft", variable=self.soft_brushes_var)
+        soft_checkbox.grid(row=1, column=2, sticky="w", padx=3, pady=2)
+        _Tooltip(soft_checkbox, "Restrict candidate brushes to just types 10 and 54 -- the two with "
+                 "no flat plateau (smooth, cosine-like falloff the whole way from center to edge). "
+                 "Excludes 8/9's wide flat tops, which densely-packed small stamps can turn into a "
+                 "flat-topped 'crater' look; trades some precision at hitting an exact target height "
+                 "across a wide flat area for a smoother result.")
+
         add_field(2, 0, "spread_ratio", "SPR %", "Brush radius spread ratio: each brush's candidate "
                   "radius is scaled by spread_ratio ** rank (ranks 0..3 for types 8/9/10/54). "
                   "1 disables it.", self.spread_ratio_var, required=True)
         add_field(2, 1, "claim_fraction", "EAT %", "Claimed radius fraction: how much of the placed "
                   "radius gets marked done. Below 1 lets neighboring stamps overlap. 1 disables it "
                   "(old behavior).", self.claim_fraction_var, required=True)
-        add_field(3, 0, "radius_decay", "DEC %", "Radius decay per pass: shrinks min/max hotspot "
+        add_field(2, 2, "radius_decay", "DEC %", "Radius decay per pass: shrinks min/max hotspot "
                   "radius by this factor for each prior refine pass already run, so later passes add "
                   "finer detail instead of re-covering the same ground at lower error. 1 disables it "
                   "(every pass uses the same clamps).", self.radius_decay_var, required=True)
-
-        self.use_height_mask_var = tk.BooleanVar(value=False)
-        mask_checkbox = ttk.Checkbutton(
-            grid_frame, text="Use heightmask", variable=self.use_height_mask_var,
-        )
-        mask_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=3, pady=(4, 0))
-        _Tooltip(mask_checkbox, "Restrict hotspot placement to inside height_mask.geojson "
-                 "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM). Everything "
-                 "outside is treated like no-data -- never becomes a hotspot.")
-
-        self.soft_brushes_var = tk.BooleanVar(value=False)
-        soft_checkbox = ttk.Checkbutton(grid_frame, text="Soft", variable=self.soft_brushes_var)
-        soft_checkbox.grid(row=5, column=0, columnspan=2, sticky="w", padx=3, pady=(2, 0))
-        _Tooltip(soft_checkbox, "Restrict candidate brushes to just types 10 and 54 -- the two with "
-                 "no flat plateau (smooth, cosine-like falloff the whole way from center to edge). "
-                 "Excludes 8/9's wide flat tops, which densely-packed small stamps can turn into a "
-                 "flat-topped 'crater' look; trades some precision at hitting an exact target height "
-                 "across a wide flat area for a smoother result.")
 
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
