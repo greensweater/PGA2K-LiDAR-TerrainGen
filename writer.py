@@ -76,7 +76,7 @@ from typing import Sequence
 import numpy as np
 
 from terrain.bounding_box import BoundingBox
-from terrain.stamp import TOOL_RAISE, Stamp
+from terrain.stamp import TOOL_FLATTEN, TOOL_RAISE, Stamp
 from terrain.terrain_model import TerrainModel
 
 HOLE_ID_NONE = -1
@@ -121,6 +121,59 @@ _DECIMALS = 3
 
 def _round(value: float) -> float:
     return round(float(value), _DECIMALS)
+
+
+def build_course_wide_stamp(bounds: BoundingBox, value: float, tool: int) -> Stamp:
+    """
+    A single type-72 (hard square) stamp sized to cover the whole
+    course at full (1.0) weight everywhere -- stamps are fundamentally
+    square bitmaps (circular brushes are just a circle inscribed in
+    that square), so a square stamp's scale is literally its
+    half-width: scale = course half-width gives a stamp exactly as
+    wide as the course. The margin beyond that half-width needs to
+    clear this brush's bevel (see terrain/brush_profiles.py's
+    _hard_edge_profile -- an ESTIMATE, no real measurements exist for
+    this brush yet), not just be "a bit more than zero": at the
+    estimated 3% bevel, a small ~20 m margin still leaves the course
+    corners inside the bevel getting partial weight, not the full 1.0
+    the whole point of this stamp depends on. 100 m comfortably clears
+    that estimate with room to spare in case the real bevel turns out
+    wider.
+
+    Shared by both the zero-height shift shim (raise, applied last)
+    and the baseline-flatten stamp (flatten, applied first) -- same
+    brush, same margin reasoning, only the tool/value/place-in-sequence differ.
+    """
+    half_width = max(bounds.max_x - bounds.min_x, bounds.max_z - bounds.min_z) / 2.0
+    margin = 100.0
+    return Stamp(
+        x=(bounds.min_x + bounds.max_x) / 2.0,
+        z=(bounds.min_z + bounds.max_z) / 2.0,
+        radius=half_width + margin,
+        value=value,
+        brush=72,
+        tool=tool,
+    )
+
+
+def build_baseline_flatten_stamp(bounds: BoundingBox, mean_elevation: float) -> Stamp:
+    """
+    A course-wide type-72 flatten stamp, meant to be placed FIRST in
+    the stamp list (applied before every real, detailed stamp) --
+    makes the model's starting point for its sequential fold explicit
+    (the mean bare-earth elevation) rather than relying on the
+    implicit "start folding from height=0 everywhere" TerrainModel
+    otherwise begins from. Real terrain-shaping stamps still pull
+    every point to wherever the actual LIDAR-fit elevation is
+    regardless of this starting point -- this only matters where stamp
+    coverage isn't complete (rare gaps in the hex grid/refinement
+    passes), where the final blended height partly reflects this
+    baseline. Mean elevation keeps those rare gaps close to correct
+    terrain instead of collapsing toward an arbitrary constant like 0
+    (up to ~200-400 m away from real course elevation, depending on
+    the site).
+    """
+    return build_course_wide_stamp(bounds, value=mean_elevation, tool=TOOL_FLATTEN)
 
 
 def normalize_stamp_heights(
@@ -195,16 +248,7 @@ def normalize_stamp_heights(
     # bevel getting partial weight, not the full 1.0 the whole point of
     # this stamp depends on. 100 m comfortably clears that estimate
     # with room to spare in case the real bevel turns out wider.
-    half_width = max(bounds.max_x - bounds.min_x, bounds.max_z - bounds.min_z) / 2.0
-    shim_margin = 100.0
-    shim = Stamp(
-        x=(bounds.min_x + bounds.max_x) / 2.0,
-        z=(bounds.min_z + bounds.max_z) / 2.0,
-        radius=half_width + shim_margin,
-        value=shift,
-        brush=72,
-        tool=TOOL_RAISE,
-    )
+    shim = build_course_wide_stamp(bounds, value=shift, tool=TOOL_RAISE)
     return list(stamps) + [shim]
 
 
