@@ -251,6 +251,7 @@ def find_error_hotspots(
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
     model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
+    candidate_brushes: Optional[tuple[int, ...]] = None,
 ) -> list[ErrorHotspot]:
     """
     Find and fit error hotspots via distance-transform region centering
@@ -295,9 +296,20 @@ def find_error_hotspots(
     time, so this trades a small, bounded amount of staleness for not
     paying that cost thousands of times over in a large pass.
 
+    candidate_brushes, if given, overrides the module-level
+    CANDIDATE_BRUSHES=(8, 9, 10, 54) default -- e.g. passing (10, 54)
+    restricts refinement to only the two brushes with no flat plateau
+    (a smooth, cosine-like falloff the whole way from center to edge),
+    excluding 8/9's wide flat tops. Densely-packed small stamps using
+    8/9 can visually read as a field of flat-topped "craters" once
+    tightly packed and overlapping; 10/54-only trades some of 8/9's
+    precision at hitting an exact target height across a wide flat
+    area for a smoother-looking result with no plateau edges to show.
+
     Returns hotspots in the order found (largest inscribed radius
     first, which tracks -- but isn't identical to -- worst peak error).
     """
+    brushes = candidate_brushes if candidate_brushes is not None else CANDIDATE_BRUSHES
     actual = downsample_heightmap(heights, bounds, resolution)
     model = TerrainModel(stamps)
     predicted = model.render(resolution=resolution, bounds=bounds)
@@ -317,7 +329,7 @@ def find_error_hotspots(
     sampling = (cell_size_z, cell_size_x)  # (row, col) spacing for distance_transform_edt
 
     max_brush_scale = max(
-        _brush_radius_multiplier(b, brush_radius_spread_ratio) for b in CANDIDATE_BRUSHES
+        _brush_radius_multiplier(b, brush_radius_spread_ratio) for b in brushes
     )
 
     hotspots: list[ErrorHotspot] = []
@@ -399,7 +411,7 @@ def find_error_hotspots(
         target_mean = float(np.mean(actual_pts))
 
         best: Optional[tuple[int, int, float, float, float]] = None  # + candidate_radius
-        for brush in CANDIDATE_BRUSHES:
+        for brush in brushes:
             candidate_radius = base_radius * _brush_radius_multiplier(brush, brush_radius_spread_ratio)
             candidate_radius = max(min_radius, min(candidate_radius, max_radius))
 
@@ -493,6 +505,7 @@ def refine_stamps(
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
     model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
+    candidate_brushes: Optional[tuple[int, ...]] = None,
 ) -> tuple[list[Stamp], list[ErrorHotspot]]:
     """
     One adaptive refinement pass: find and fit error hotspots (see
@@ -511,6 +524,7 @@ def refine_stamps(
         claim_radius_fraction=claim_radius_fraction,
         brush_radius_spread_ratio=brush_radius_spread_ratio,
         model_rebuild_interval=model_rebuild_interval,
+        candidate_brushes=candidate_brushes,
         mask=mask,
         min_valid_cells=min_valid_cells,
         max_new_stamps=max_new_stamps,
