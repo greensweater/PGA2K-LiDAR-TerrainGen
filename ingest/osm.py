@@ -52,7 +52,8 @@ import shapely.vectorized
 
 from terrain.bounding_box import BoundingBox
 
-DEFAULT_HEIGHT_MASK_KINDS = ("fairway", "green")
+DEFAULT_HEIGHT_MASK_KINDS = ("fairway", "green", "tee")
+DEFAULT_HOLE_CORRIDOR_BUFFER_PX = 30.0
 DEFAULT_HEIGHT_MASK_BUFFER_PX = 50.0  # see build_height_mask's docstring for what "pixel" means here
 
 
@@ -278,17 +279,33 @@ def load_features(path: Path) -> list[Feature]:
 def merge_height_mask_features(
     features: list[Feature],
     kinds: tuple[str, ...] = DEFAULT_HEIGHT_MASK_KINDS,
+    hole_corridor_buffer_px: Optional[float] = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
 ) -> Optional[BaseGeometry]:
     """
-    Merge every Feature of the given kinds (default: fairway + green)
-    into one shape (the unary_union), *before* any buffering. Split out
+    Merge every Feature of the given kinds (default: fairway + green +
+    tee) into one shape (the unary_union), *before* any buffering. Split out
     from build_height_mask so this (parsing + union, the relatively
     expensive part) can be done once and cached, then buffered
     repeatedly at different distances cheaply -- e.g. for a live GUI
     slider, where re-parsing features.geojson and re-unioning on every
     tick would be wasted, unnecessary work.
+
+    hole_corridor_buffer_px, if not None, also includes a buffered
+    "corridor" polygon around every "hole" Feature's routing line
+    (tee-to-green centerline) -- golfers don't walk a perfectly
+    straight line, so the unbuffered centerline alone would leave most
+    of the actual playing corridor outside the mask. Buffering a
+    LineString directly with shapely's own .buffer() already produces
+    exactly this ribbon-shaped polygon; no separate line-to-polygon
+    "outline" conversion is needed. Pass None to exclude hole
+    corridors entirely.
     """
     relevant = [f.geometry for f in features if f.kind in kinds]
+    if hole_corridor_buffer_px is not None:
+        relevant += [
+            f.geometry.buffer(hole_corridor_buffer_px)
+            for f in features if f.kind == "hole"
+        ]
     if not relevant:
         return None
     return unary_union(relevant)
@@ -298,12 +315,15 @@ def build_height_mask(
     features: list[Feature],
     buffer_px: float = DEFAULT_HEIGHT_MASK_BUFFER_PX,
     kinds: tuple[str, ...] = DEFAULT_HEIGHT_MASK_KINDS,
+    hole_corridor_buffer_px: Optional[float] = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
 ) -> Optional[BaseGeometry]:
     """
-    Merge every Feature of the given kinds (default: fairway + green --
-    the areas adaptive refinement should actually spend effort on) into
-    one shape, then buffer it outward -- the "merge filled splines, then
-    buffer to create a simple outline" approach.
+    Merge every Feature of the given kinds (default: fairway + green +
+    tee -- the areas adaptive refinement should actually spend effort
+    on -- plus buffered hole-path corridors, see
+    merge_height_mask_features) into one shape, then buffer it
+    outward -- the "merge filled splines, then buffer to create a
+    simple outline" approach.
 
     buffer_px follows the same 1-pixel-per-meter convention the earlier
     generate_height_mask_v3.py script used for its CANVAS_SIZE=2000
@@ -315,7 +335,7 @@ def build_height_mask(
 
     Returns None if no matching features exist (nothing to mask).
     """
-    merged = merge_height_mask_features(features, kinds)
+    merged = merge_height_mask_features(features, kinds, hole_corridor_buffer_px)
     if merged is None:
         return None
     return merged.buffer(buffer_px)
