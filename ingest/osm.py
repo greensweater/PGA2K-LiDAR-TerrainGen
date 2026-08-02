@@ -54,6 +54,7 @@ from terrain.bounding_box import BoundingBox
 
 DEFAULT_HEIGHT_MASK_KINDS = ("fairway", "green", "tee")
 DEFAULT_HOLE_CORRIDOR_BUFFER_PX = 30.0
+GOLF_OBJECT_KINDS = ("fairway", "green", "tee", "hole")  # mask defaults to True for these, False otherwise
 DEFAULT_HEIGHT_MASK_BUFFER_PX = 50.0  # see build_height_mask's docstring for what "pixel" means here
 
 
@@ -63,7 +64,8 @@ class Feature:
     kind: str
     tags: dict
     osm_id: Optional[int] = None  # the original OSM way ID -- lets a specific feature be targeted/re-selected later
-    ignored: bool = False  # e.g. a duplicate hole from a neighboring course showing up on the playfield
+    mask: bool = False  # is this feature part of height_mask.geojson (and, for golf-object kinds, exported at all)?
+                        # defaults set per-kind at parse time -- see parse_osm_features/GOLF_OBJECT_KINDS
 
 
 def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
@@ -208,7 +210,10 @@ def parse_osm_features(
         if bbox is not None and not geometry.intersects(bbox):
             continue
 
-        features.append(Feature(geometry=geometry, kind=kind, tags=dict(way.tags), osm_id=way.id))
+        features.append(Feature(
+            geometry=geometry, kind=kind, tags=dict(way.tags), osm_id=way.id,
+            mask=(kind in GOLF_OBJECT_KINDS),
+        ))
 
     if skipped_nodes:
         printf(f"Skipped {skipped_nodes} way(s) with unresolvable nodes "
@@ -226,7 +231,7 @@ def save_features(features: list[Feature], path: Path) -> None:
                 "type": "Feature",
                 "geometry": mapping(f.geometry),
                 "properties": {
-                    "kind": f.kind, "tags": f.tags, "osm_id": f.osm_id, "ignored": f.ignored,
+                    "kind": f.kind, "tags": f.tags, "osm_id": f.osm_id, "mask": f.mask,
                 },
             }
             for f in features
@@ -250,16 +255,16 @@ def shift_features(features: list[Feature], dx: float, dz: float) -> list[Featur
     """
     return [
         Feature(geometry=translate(f.geometry, xoff=dx, yoff=dz), kind=f.kind, tags=f.tags,
-                osm_id=f.osm_id, ignored=f.ignored)
+                osm_id=f.osm_id, mask=f.mask)
         for f in features
     ]
 
 
-def set_feature_ignored(features: list[Feature], osm_id: int, ignored: bool) -> bool:
-    """Set the ignored flag on the feature with this osm_id, in place. Returns True if a match was found."""
+def set_feature_mask(features: list[Feature], osm_id: int, mask: bool) -> bool:
+    """Set the mask flag on the feature with this osm_id, in place. Returns True if a match was found."""
     for f in features:
         if f.osm_id == osm_id:
-            f.ignored = ignored
+            f.mask = mask
             return True
     return False
 
@@ -270,7 +275,7 @@ def load_features(path: Path) -> list[Feature]:
     return [
         Feature(
             geometry=shape(f["geometry"]), kind=f["properties"]["kind"], tags=f["properties"]["tags"],
-            osm_id=f["properties"].get("osm_id"), ignored=f["properties"].get("ignored", False),
+            osm_id=f["properties"].get("osm_id"), mask=f["properties"].get("mask", False),
         )
         for f in collection["features"]
     ]
@@ -278,34 +283,42 @@ def load_features(path: Path) -> list[Feature]:
 
 def merge_height_mask_features(
     features: list[Feature],
-    kinds: tuple[str, ...] = DEFAULT_HEIGHT_MASK_KINDS,
     hole_corridor_buffer_px: Optional[float] = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
 ) -> Optional[BaseGeometry]:
     """
-    Merge every Feature of the given kinds (default: fairway + green +
-    tee) into one shape (the unary_union), *before* any buffering. Split out
-    from build_height_mask so this (parsing + union, the relatively
+    Merge every Feature with mask=True into one shape (the
+    unary_union), *before* any buffering. Split out from
+    build_height_mask so this (parsing + union, the relatively
     expensive part) can be done once and cached, then buffered
     repeatedly at different distances cheaply -- e.g. for a live GUI
     slider, where re-parsing features.geojson and re-unioning on every
     tick would be wasted, unnecessary work.
 
-    hole_corridor_buffer_px, if not None, also includes a buffered
-    "corridor" polygon around every "hole" Feature's routing line
-    (tee-to-green centerline) -- golfers don't walk a perfectly
-    straight line, so the unbuffered centerline alone would leave most
-    of the actual playing corridor outside the mask. Buffering a
-    LineString directly with shapely's own .buffer() already produces
-    exactly this ribbon-shaped polygon; no separate line-to-polygon
-    "outline" conversion is needed. Pass None to exclude hole
-    corridors entirely.
+    mask defaults to True for fairway/green/tee/hole at parse time
+    (see GOLF_OBJECT_KINDS) and False otherwise, but is a per-feature,
+    independently toggleable flag -- a masked-in bunker would be
+    included here too, and an unmasked (e.g. duplicate/extra) fairway
+    or hole is excluded, regardless of its own kind.
+
+    hole_corridor_buffer_px, if not None, buffers "hole" Features (a
+    routing line, tee-to-green centerline) into a "corridor" polygon
+    rather than including the bare centerline -- golfers don't walk a
+    perfectly straight line, so the unbuffered centerline alone would
+    leave most of the actual playing corridor outside the mask.
+    Buffering a LineString directly with shapely's own .buffer()
+    already produces exactly this ribbon-shaped polygon; no separate
+    line-to-polygon "outline" conversion is needed. Pass None to
+    buffer nothing (hole Features contribute just their bare
+    centerline instead).
     """
-    relevant = [f.geometry for f in features if f.kind in kinds]
-    if hole_corridor_buffer_px is not None:
-        relevant += [
-            f.geometry.buffer(hole_corridor_buffer_px)
-            for f in features if f.kind == "hole"
-        ]
+    relevant = []
+    for f in features:
+        if not f.mask:
+            continue
+        if f.kind == "hole" and hole_corridor_buffer_px is not None:
+            relevant.append(f.geometry.buffer(hole_corridor_buffer_px))
+        else:
+            relevant.append(f.geometry)
     if not relevant:
         return None
     return unary_union(relevant)
@@ -314,16 +327,14 @@ def merge_height_mask_features(
 def build_height_mask(
     features: list[Feature],
     buffer_px: float = DEFAULT_HEIGHT_MASK_BUFFER_PX,
-    kinds: tuple[str, ...] = DEFAULT_HEIGHT_MASK_KINDS,
     hole_corridor_buffer_px: Optional[float] = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
 ) -> Optional[BaseGeometry]:
     """
-    Merge every Feature of the given kinds (default: fairway + green +
-    tee -- the areas adaptive refinement should actually spend effort
-    on -- plus buffered hole-path corridors, see
-    merge_height_mask_features) into one shape, then buffer it
-    outward -- the "merge filled splines, then buffer to create a
-    simple outline" approach.
+    Merge every Feature with mask=True (default: fairway/green/tee/hole
+    -- the areas adaptive refinement should actually spend effort on --
+    plus buffered hole-path corridors, see merge_height_mask_features)
+    into one shape, then buffer it outward -- the "merge filled
+    splines, then buffer to create a simple outline" approach.
 
     buffer_px follows the same 1-pixel-per-meter convention the earlier
     generate_height_mask_v3.py script used for its CANVAS_SIZE=2000
@@ -335,7 +346,7 @@ def build_height_mask(
 
     Returns None if no matching features exist (nothing to mask).
     """
-    merged = merge_height_mask_features(features, kinds, hole_corridor_buffer_px)
+    merged = merge_height_mask_features(features, hole_corridor_buffer_px)
     if merged is None:
         return None
     return merged.buffer(buffer_px)
