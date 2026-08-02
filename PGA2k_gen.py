@@ -64,9 +64,10 @@ from constants import (
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
 from ingest.osm import (
-    DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_height_mask,
+    DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
 )
+from splines import build_surface_splines, feature_to_spline, save_surface_splines
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
     DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
@@ -460,6 +461,48 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
     })
 
 
+def step_write_splines(working_dir: Path) -> None:
+    """
+    Generate PGA surface splines from features.geojson (see splines.py)
+    and write them to course/CourseDescription_nodes/surfaceSplines.json.
+
+    Scope: green/tee/fairway/rough/bunker/cartpath/path/building/wood.
+    Water and hole are deliberately excluded (see splines.py's module
+    docstring) -- neither is handled by this generic writer yet.
+    Features marked "ignored" (e.g. a duplicate hole bleeding in from a
+    neighboring course) are skipped, not just the ones with an
+    unsupported kind.
+
+    This overwrites surfaceSplines.json wholesale -- it's the primary
+    generator for these surface types now, not a merge with whatever
+    was already there (from the blank course template or prior manual
+    edits in the PGA editor).
+    """
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
+
+    features = load_features(features_path)
+    splines = build_surface_splines(features)
+
+    ignored_count = sum(1 for f in features if f.ignored)
+    unsupported: dict[str, int] = {}
+    for f in features:
+        if not f.ignored and feature_to_spline(f) is None:
+            unsupported[f.kind] = unsupported.get(f.kind, 0) + 1
+
+    print(f"Generated {len(splines)} splines from {len(features)} features "
+          f"({ignored_count} ignored, {sum(unsupported.values())} unsupported kind: {unsupported})")
+
+    nodes_dir = working_dir / "course" / "CourseDescription_nodes"
+    if not nodes_dir.is_dir():
+        raise StepError(f"No {nodes_dir} found under {working_dir}. Run --step ingest-course first.")
+
+    out_path = nodes_dir / "surfaceSplines.json"
+    save_surface_splines(splines, out_path)
+    print(f"Wrote {out_path}")
+
+
 def step_generate_terrain(working_dir: Path) -> None:
     pointcloud_path = working_dir / POINTCLOUD_FILE
     if not pointcloud_path.exists():
@@ -814,6 +857,7 @@ STEPS = {
     "generate-terrain": step_generate_terrain,
     "refine-terrain": step_refine_terrain,
     "output-terrain": step_output_terrain,
+    "write-splines": step_write_splines,
     "repack": step_repack,
     "visualize": step_visualize,
 }
@@ -898,6 +942,8 @@ def main(argv: list[str] | None = None) -> int:
                                  args.radius_decay_per_pass, args.use_height_mask)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
+        elif args.step == "write-splines":
+            step_write_splines(working_dir)
         elif args.step == "repack":
             if not args.repack_filename:
                 print("error: --step repack requires --repack-filename <name>", file=sys.stderr)
