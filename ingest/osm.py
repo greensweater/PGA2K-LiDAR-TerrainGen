@@ -61,6 +61,8 @@ class Feature:
     geometry: BaseGeometry
     kind: str
     tags: dict
+    osm_id: Optional[int] = None  # the original OSM way ID -- lets a specific feature be targeted/re-selected later
+    ignored: bool = False  # e.g. a duplicate hole from a neighboring course showing up on the playfield
 
 
 def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
@@ -205,7 +207,7 @@ def parse_osm_features(
         if bbox is not None and not geometry.intersects(bbox):
             continue
 
-        features.append(Feature(geometry=geometry, kind=kind, tags=dict(way.tags)))
+        features.append(Feature(geometry=geometry, kind=kind, tags=dict(way.tags), osm_id=way.id))
 
     if skipped_nodes:
         printf(f"Skipped {skipped_nodes} way(s) with unresolvable nodes "
@@ -222,7 +224,9 @@ def save_features(features: list[Feature], path: Path) -> None:
             {
                 "type": "Feature",
                 "geometry": mapping(f.geometry),
-                "properties": {"kind": f.kind, "tags": f.tags},
+                "properties": {
+                    "kind": f.kind, "tags": f.tags, "osm_id": f.osm_id, "ignored": f.ignored,
+                },
             }
             for f in features
         ],
@@ -243,15 +247,30 @@ def shift_features(features: list[Feature], dx: float, dz: float) -> list[Featur
     used by the LIDAR previews (see PGA2k_gen.py's step_ingest_osm for
     how that shift is derived from the two clouds' own origin_x/origin_y).
     """
-    return [Feature(geometry=translate(f.geometry, xoff=dx, yoff=dz), kind=f.kind, tags=f.tags)
-            for f in features]
+    return [
+        Feature(geometry=translate(f.geometry, xoff=dx, yoff=dz), kind=f.kind, tags=f.tags,
+                osm_id=f.osm_id, ignored=f.ignored)
+        for f in features
+    ]
+
+
+def set_feature_ignored(features: list[Feature], osm_id: int, ignored: bool) -> bool:
+    """Set the ignored flag on the feature with this osm_id, in place. Returns True if a match was found."""
+    for f in features:
+        if f.osm_id == osm_id:
+            f.ignored = ignored
+            return True
+    return False
 
 
 def load_features(path: Path) -> list[Feature]:
     with Path(path).open(encoding="utf-8") as fh:
         collection = json.load(fh)
     return [
-        Feature(geometry=shape(f["geometry"]), kind=f["properties"]["kind"], tags=f["properties"]["tags"])
+        Feature(
+            geometry=shape(f["geometry"]), kind=f["properties"]["kind"], tags=f["properties"]["tags"],
+            osm_id=f["properties"].get("osm_id"), ignored=f["properties"].get("ignored", False),
+        )
         for f in collection["features"]
     ]
 
