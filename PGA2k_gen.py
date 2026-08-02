@@ -52,6 +52,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pyproj
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -63,6 +64,7 @@ from constants import (
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
+from ingest.heightmap import DEFAULT_HEIGHTMAP_RESOLUTION, rasterize_ground_heightmap, save_heightmap
 from ingest.osm import (
     DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
@@ -88,6 +90,7 @@ from writer import normalize_stamp_heights, write_user_layers
 INITIAL_STAMPS_FILE = "initial_stamps.json"
 FEATURES_FILE = "features.geojson"
 HEIGHT_MASK_FILE = "height_mask.geojson"
+HEIGHTMAP_FILE = "heightmap.npz"
 REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
 
 
@@ -334,6 +337,30 @@ def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
 
     cloud.save(working_dir / POINTCLOUD_FILE)
     print(f"  wrote {POINTCLOUD_FILE}")
+
+    # Rasterize once, here, rather than every consumer (height_fit.py,
+    # adaptive_refine.py) separately querying the raw point cloud's
+    # KD-tree -- a regular grid supports direct bounding-box index
+    # arithmetic, no tree traversal needed at all (same idea as the
+    # render() optimization, applied to the "ground truth" side of
+    # every error/fit computation instead of just the "predicted" side).
+    # Cropped to the course area specifically, matching what those
+    # consumers actually operate on.
+    course_cloud_for_heightmap = recentered_crop(cloud, size_m=COURSE_SIZE_M)
+    print(f"Rasterizing ground heightmap ({DEFAULT_HEIGHTMAP_RESOLUTION}x"
+          f"{DEFAULT_HEIGHTMAP_RESOLUTION}, bare-earth points only)...")
+    heightmap = rasterize_ground_heightmap(
+        course_cloud_for_heightmap,
+        BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M),
+        resolution=DEFAULT_HEIGHTMAP_RESOLUTION,
+    )
+    coverage = np.mean(np.isfinite(heightmap))
+    save_heightmap(
+        heightmap,
+        BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M),
+        working_dir / HEIGHTMAP_FILE,
+    )
+    print(f"  wrote {HEIGHTMAP_FILE} ({coverage:.1%} of cells have at least one bare-earth point)")
 
     # Report the merged extent as a lat/lon bbox, since that's what's
     # needed to manually pull an OSM export before the next step.
