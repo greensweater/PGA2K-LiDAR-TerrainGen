@@ -215,12 +215,15 @@ class PGAGenGUI:
         grid_frame = ttk.Frame(parent)
         grid_frame.pack(anchor="w", fill="x")
 
-        def add_field(row, col, key, abbrev, tooltip, variable, required):
+        def add_field(row, col, key, abbrev, tooltip, variable, required, combobox_values=None):
             cell = ttk.Frame(grid_frame)
             cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
             label = ttk.Label(cell, text=abbrev)
             label.pack(anchor="w")
-            entry = ttk.Entry(cell, textvariable=variable, width=8)
+            if combobox_values:
+                entry = ttk.Combobox(cell, textvariable=variable, values=combobox_values, width=7, state="normal")
+            else:
+                entry = ttk.Entry(cell, textvariable=variable, width=8)
             entry.pack(anchor="w")
             full_tooltip = tooltip + ("" if required else " (optional)")
             _Tooltip(label, full_tooltip)
@@ -230,8 +233,13 @@ class PGAGenGUI:
 
         add_field(0, 0, "tolerance", "TOL m", "Error tolerance (m): |predicted - actual| above this "
                   "counts as a hotspot.", self.tolerance_var, required=True)
+        _RESOLUTION_PRESETS = ["25", "50", "100", "125", "200", "250", "400", "500", "1000", "2000"]
         add_field(0, 1, "resolution", "RES px", "Error grid resolution (cells per side) -- same grid "
-                  "preview_error.png uses.", self.resolution_var, required=True)
+                  "preview_error.png uses. Presets are exact divisors of the 2000 m course, so every "
+                  "cell lands on a whole-meter boundary matching the ground heightmap's own 1 px = 1 m "
+                  "grid -- other values still work, they just won't align as cleanly (e.g. 1600 gives "
+                  "1.25 m cells, straddling heightmap pixel boundaries).", self.resolution_var,
+                  required=True, combobox_values=_RESOLUTION_PRESETS)
         add_field(1, 0, "min_hotspot", "HOT m", "Min hotspot radius in cells (pre-clamp). Smaller "
                   "regions are treated as noise, not a real feature.", self.min_hotspot_radius_cells_var,
                   required=True)
