@@ -137,7 +137,7 @@ from typing import Optional, Sequence
 import numpy as np
 from scipy import ndimage
 
-from ingest.laz_reader import PointCloud
+from ingest.heightmap import downsample_heightmap, query_heightmap_cells
 from terrain.bounding_box import BoundingBox
 from terrain.brush_profiles import BRUSH_PROFILES
 from terrain.hexgrid import HEX_STAMP_RADIUS_M
@@ -198,37 +198,6 @@ class ErrorHotspot:
                      brush=self.brush, tool=self.tool)
 
 
-def _bin_actual_elevation(
-    cloud: PointCloud, bounds: BoundingBox, resolution: int, bare_earth_only: bool = True,
-) -> np.ndarray:
-    """
-    Mean LIDAR elevation per grid cell over `bounds`, resolution x
-    resolution, NaN where a cell has no points. Same binning convention
-    as visualize.py's _bin_point_cloud (rows = z, columns = x) so this
-    lines up cell-for-cell with TerrainModel.render()'s own grid.
-
-    bare_earth_only matters a lot here: without it, building roofs and
-    vegetation returns get compared directly against predicted ground
-    height and show up as "error" the refinement pass then tries to
-    correct.
-    """
-    if bare_earth_only:
-        mask = cloud.bare_earth_mask()
-        x, z, elevation = cloud.x[mask], cloud.z[mask], cloud.elevation[mask]
-    else:
-        x, z, elevation = cloud.x, cloud.z, cloud.elevation
-
-    x_edges = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
-    z_edges = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
-
-    sums, _, _ = np.histogram2d(z, x, bins=[z_edges, x_edges], weights=elevation)
-    counts, _, _ = np.histogram2d(z, x, bins=[z_edges, x_edges])
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        means = sums / counts
-    return means
-
-
 def _score_candidate(
     hx: float, hz: float, radius: float, brush: int, tool: int,
     px: np.ndarray, pz: np.ndarray, actual: np.ndarray,
@@ -268,7 +237,7 @@ def _score_candidate(
 
 def find_error_hotspots(
     stamps: Sequence[Stamp],
-    cloud: PointCloud,
+    heights: np.ndarray,
     bounds: BoundingBox,
     tolerance: float,
     resolution: int = DEFAULT_RESOLUTION,
@@ -277,8 +246,7 @@ def find_error_hotspots(
     max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
     claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
     brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
-    bare_earth_only: bool = True,
-    min_points: int = DEFAULT_MIN_POINTS,
+    min_valid_cells: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
 ) -> list[ErrorHotspot]:
@@ -287,7 +255,16 @@ def find_error_hotspots(
     (see module docstring). Each returned ErrorHotspot already carries
     its best-fit brush/tool/value -- no separate fit_stamp_heights()
     call needed afterward, since scoring candidates requires the
-    region's actual LIDAR points anyway and that's already done here.
+    region's actual ground heightmap cells anyway and that's already
+    done here.
+
+    heights/bounds are the rasterized ground heightmap (see
+    ingest/heightmap.py's rasterize_ground_heightmap/load_heightmap) --
+    bare-earth filtering already happened once, at rasterization time,
+    not per hotspot here. Sampling this pre-rasterized grid instead of
+    querying a PointCloud's KD-tree directly is the same "no tree
+    traversal needed on a regular grid" idea as the render()
+    optimization, applied to the ground-truth side of the fit.
 
     mask, if given, is a boolean grid the same (resolution, resolution)
     shape as the error grid -- True where refinement is allowed to
@@ -300,7 +277,7 @@ def find_error_hotspots(
     Returns hotspots in the order found (largest inscribed radius
     first, which tracks -- but isn't identical to -- worst peak error).
     """
-    actual = _bin_actual_elevation(cloud, bounds, resolution, bare_earth_only=bare_earth_only)
+    actual = downsample_heightmap(heights, bounds, resolution)
     model = TerrainModel(stamps)
     predicted = model.render(resolution=resolution, bounds=bounds)
     error = predicted - actual  # NaN where actual has no data
@@ -387,10 +364,8 @@ def find_error_hotspots(
         # given candidate's own radius simply get r_norm=1 (weight 0)
         # for that candidate, which is already correct/harmless.
         query_radius = min(max_radius, base_radius * max_brush_scale)
-        idx = cloud.query_radius(centroid_x, centroid_z, query_radius)
-        if bare_earth_only and idx.size > 0:
-            idx = idx[cloud.bare_earth_mask()[idx]]
-        if idx.size < min_points:
+        px, pz, actual_pts = query_heightmap_cells(heights, bounds, centroid_x, centroid_z, query_radius)
+        if px.size < min_valid_cells:
             claimed[peak_row, peak_col] = True
             if peak_is_over:
                 dist_over = None
@@ -398,8 +373,6 @@ def find_error_hotspots(
                 dist_under = None
             continue
 
-        px, pz = cloud.x[idx], cloud.z[idx]
-        actual_pts = cloud.elevation[idx]
         current_at_points = model.evaluate_many(np.column_stack((px, pz)))
         current_at_center = model.evaluate(centroid_x, centroid_z)
         target_mean = float(np.mean(actual_pts))
@@ -472,7 +445,7 @@ def find_error_hotspots(
 
 def refine_stamps(
     stamps: Sequence[Stamp],
-    cloud: PointCloud,
+    heights: np.ndarray,
     bounds: BoundingBox,
     tolerance: float,
     resolution: int = DEFAULT_RESOLUTION,
@@ -481,8 +454,7 @@ def refine_stamps(
     max_radius: float = DEFAULT_MAX_HOTSPOT_RADIUS_M,
     claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
     brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
-    bare_earth_only: bool = True,
-    min_points: int = DEFAULT_MIN_POINTS,
+    min_valid_cells: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
 ) -> tuple[list[Stamp], list[ErrorHotspot]]:
@@ -497,13 +469,13 @@ def refine_stamps(
     terrain_model.py). Safe to call repeatedly on its own output.
     """
     hotspots = find_error_hotspots(
-        stamps, cloud, bounds, tolerance,
+        stamps, heights, bounds, tolerance,
         resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
         min_radius=min_radius, max_radius=max_radius,
         claim_radius_fraction=claim_radius_fraction,
         brush_radius_spread_ratio=brush_radius_spread_ratio,
         mask=mask,
-        bare_earth_only=bare_earth_only, min_points=min_points,
+        min_valid_cells=min_valid_cells,
         max_new_stamps=max_new_stamps,
     )
 
