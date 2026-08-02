@@ -286,6 +286,7 @@ def step_visualize(working_dir: Path) -> None:
     # run -- self-documenting, without cross-referencing a separate
     # log (see terrain/adaptive_refine.py's stamp-file metadata).
     extra_label = None
+    mask_grid = None
     latest_refine = load_latest_refine_metadata(working_dir)
     if latest_refine is not None:
         p = latest_refine["parameters"]
@@ -293,6 +294,13 @@ def step_visualize(working_dir: Path) -> None:
             f"tol={p['tolerance']} res={p['resolution']} hot={p['min_hotspot_radius_cells']} "
             f"claim={p['claim_radius_fraction']} spread={p['brush_radius_spread_ratio']}"
         )
+        if p.get("use_height_mask"):
+            buffer_note = f" buffer={p['mask_buffer_px']:.0f}px" if p.get("mask_buffer_px") is not None else ""
+            extra_label += f" mask=on{buffer_note}"
+            mask_path = working_dir / HEIGHT_MASK_FILE
+            if mask_path.exists():
+                mask_geometry = load_height_mask(mask_path)
+                mask_grid = rasterize_mask(mask_geometry, bounds, p["resolution"])
 
     print(f"Writing {PREVIEW_HEX}...")
     viz.render_hex_preview(stamps, bounds, preview_dir / PREVIEW_HEX, extra_label=extra_label)
@@ -303,7 +311,11 @@ def step_visualize(working_dir: Path) -> None:
 
     print(f"Writing {PREVIEW_ERROR} (course-cropped point cloud vs. TerrainModel)...")
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
-    viz.render_error_preview(model, course_cloud, bounds, preview_dir / PREVIEW_ERROR, extra_label=extra_label)
+    error_resolution = latest_refine["parameters"]["resolution"] if latest_refine is not None else 200
+    viz.render_error_preview(
+        model, course_cloud, bounds, preview_dir / PREVIEW_ERROR,
+        resolution=error_resolution, extra_label=extra_label, mask=mask_grid,
+    )
 
     print(f"All previews written to {preview_dir}")
 
@@ -472,10 +484,11 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
     mask_path = working_dir / HEIGHT_MASK_FILE
     save_height_mask(mask_geometry, mask_path)
     if mask_geometry is None:
-        print(f"  wrote {mask_path} (no fairway/green features found -- mask is empty, "
+        print(f"  wrote {mask_path} (no fairway/green/tee/hole features found -- mask is empty, "
               "--use-height-mask on refine-terrain would restrict everything)")
     else:
-        print(f"  wrote {mask_path} (fairway + green, buffered {height_mask_buffer_px} m/px)")
+        print(f"  wrote {mask_path} (fairway + green + tee, plus buffered hole-path corridors, "
+              f"then buffered {height_mask_buffer_px} m/px)")
 
     mask_preview_path = working_dir / PREVIEW_DIR / PREVIEW_MASK
     viz.render_mask_preview(mask_geometry, bounds, mask_preview_path)
@@ -597,6 +610,7 @@ def step_refine_terrain(
     brush_radius_spread_ratio: float | None,
     radius_decay_per_pass: float | None,
     use_height_mask: bool | None,
+    mask_buffer_px: float | None = None,
 ) -> None:
     """
     One adaptive refinement pass (see terrain/adaptive_refine.py): find
@@ -713,6 +727,8 @@ def step_refine_terrain(
         "max_new_stamps": max_new_stamps,
         "claim_radius_fraction": claim_radius_fraction,
         "brush_radius_spread_ratio": brush_radius_spread_ratio,
+        "use_height_mask": use_height_mask,
+        "mask_buffer_px": mask_buffer_px,
     }
 
     if new_stamps:
@@ -938,6 +954,12 @@ def main(argv: list[str] | None = None) -> int:
                               "(fairway/green, see ingest-osm) -- everything outside is treated like "
                               "no-data, never becoming a hotspot (default: use whatever's saved in "
                               "project.json, or off if never set)")
+    parser.add_argument("--mask-buffer-px", type=float, default=None,
+                         help="refine-terrain: record-keeping only -- the buffer distance (m) the "
+                              "current height_mask.geojson was built with, saved alongside this pass's "
+                              "other parameters so it shows up in preview titles and stamp-file "
+                              "metadata. Doesn't affect the mask itself (already baked into "
+                              "height_mask.geojson) or any computation here.")
     parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
@@ -976,7 +998,7 @@ def main(argv: list[str] | None = None) -> int:
             step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
                                  args.min_hotspot_radius_cells, args.max_new_stamps,
                                  args.claim_radius_fraction, args.brush_radius_spread_ratio,
-                                 args.radius_decay_per_pass, args.use_height_mask)
+                                 args.radius_decay_per_pass, args.use_height_mask, args.mask_buffer_px)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir)
         elif args.step == "write-splines":
