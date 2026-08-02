@@ -378,7 +378,7 @@ class PGAGenGUI:
         ttk.Label(mask_row, text="Buffer (px):").pack(side="left", padx=(8, 0))
         self.mask_buffer_preview_var = tk.DoubleVar(value=50.0)
         ttk.Scale(
-            mask_row, from_=0.0, to=200.0, orient="horizontal",
+            mask_row, from_=0.0, to=400.0, orient="horizontal",
             variable=self.mask_buffer_preview_var, command=lambda _v: self._show_preview(),
         ).pack(side="left", fill="x", expand=True, padx=4)
         self.mask_buffer_preview_label = ttk.Label(mask_row, text="50", width=4)
