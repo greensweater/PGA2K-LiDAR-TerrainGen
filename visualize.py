@@ -28,7 +28,8 @@ import matplotlib
 matplotlib.use("Agg")  # headless: never opens a window, just writes files
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Rectangle
+from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE
 from matplotlib.collections import PatchCollection
 
 from constants import DEBUG_IMAGE_SIZE, PREVIEW_LIDAR_HEIGHTMAP
@@ -421,9 +422,29 @@ def render_lidar_heightmap(
     _save(fig, path)
 
 
+def _make_stamp_patch(stamp: Stamp):
+    """
+    A Circle for round-brush stamps, or an axis-aligned Rectangle
+    (side = 2*radius, centered on the stamp) for square-brush ones --
+    e.g. type 72, used by the course-wide baseline-flatten stamp and
+    zero-height shim, both of which are square, not circular, and were
+    previously always drawn as a circle regardless of actual brush
+    shape (a real, previously-latent bug: harmless-looking when the
+    only square stamp was the shim, appended after preview_hex.png was
+    already generated, but now visibly wrong now that the baseline
+    stamp -- square, and huge, covering nearly the whole course -- is
+    part of initial_stamps.json from the start).
+    """
+    profile = BRUSH_PROFILES.get(stamp.brush)
+    if profile is not None and profile.shape == SHAPE_SQUARE:
+        side = 2.0 * stamp.radius
+        return Rectangle((stamp.x - stamp.radius, stamp.z - stamp.radius), side, side)
+    return Circle((stamp.x, stamp.z), stamp.radius)
+
+
 def _stamp_patches(stamps: Sequence[Stamp], colors: list[str]) -> PatchCollection:
-    circles = [Circle((s.x, s.z), s.radius) for s in stamps]
-    return PatchCollection(circles, facecolor=colors, edgecolor="black", linewidths=0.3, alpha=0.35)
+    patches = [_make_stamp_patch(s) for s in stamps]
+    return PatchCollection(patches, facecolor=colors, edgecolor="black", linewidths=0.3, alpha=0.35)
 
 
 def _set_title(ax, base_title: str, extra_label: Optional[str] = None) -> None:
@@ -470,7 +491,7 @@ def render_stamps_preview(
     fig, ax = _new_figure(bounds)
 
     values = np.array([s.value for s in stamps])
-    circles = [Circle((s.x, s.z), s.radius) for s in stamps]
+    circles = [_make_stamp_patch(s) for s in stamps]
     coll = PatchCollection(circles, edgecolor="black", linewidths=0.3, alpha=0.6)
     coll.set_array(values)
     coll.set_cmap("terrain")
@@ -540,12 +561,21 @@ def render_error_preview(
     path: Path,
     resolution: int = 200,
     extra_label: Optional[str] = None,
+    mask: Optional[np.ndarray] = None,
 ) -> None:
     """
     Predicted height vs. binned LIDAR elevation, as signed error
     (predicted - actual) on a diverging colormap centered at zero.
     Cells with no LIDAR points are left blank (NaN), not zero -- a
     missing measurement isn't the same as a confirmed-zero error.
+
+    mask, if given (the same resolution x resolution boolean grid
+    refine-terrain's --use-height-mask restricts hotspot placement
+    to), reports RMS two ways: over the whole course, and over just
+    the masked-in area -- without it, RMS was silently computed over
+    the *entire* course regardless of whether refinement was actually
+    restricted to a fraction of it, diluting the number with however
+    much of the un-refined remainder still carried old error.
     """
     actual = _bin_point_cloud(cloud, bounds, resolution, bare_earth_only=True)
     predicted = model.render(resolution=resolution, bounds=bounds)
@@ -564,5 +594,17 @@ def render_error_preview(
     _add_colorbar(fig, im, "predicted - actual (m)")
 
     rms = float(np.sqrt(np.mean(np.square(finite))))
-    _set_title(ax, f"Height error, RMS={rms:.2f} m ({resolution}x{resolution})", extra_label)
+    if mask is not None:
+        masked_finite = error[np.isfinite(error) & mask]
+        if masked_finite.size > 0:
+            masked_rms = float(np.sqrt(np.mean(np.square(masked_finite))))
+            title = (
+                f"Height error, RMS={rms:.2f} m whole course / "
+                f"{masked_rms:.2f} m masked area ({resolution}x{resolution})"
+            )
+        else:
+            title = f"Height error, RMS={rms:.2f} m whole course (mask empty at this resolution)"
+    else:
+        title = f"Height error, RMS={rms:.2f} m ({resolution}x{resolution})"
+    _set_title(ax, title, extra_label)
     _save(fig, path)
