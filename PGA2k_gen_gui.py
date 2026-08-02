@@ -265,6 +265,15 @@ class PGAGenGUI:
                  "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM). Everything "
                  "outside is treated like no-data -- never becomes a hotspot.")
 
+        self.soft_brushes_var = tk.BooleanVar(value=False)
+        soft_checkbox = ttk.Checkbutton(grid_frame, text="Soft", variable=self.soft_brushes_var)
+        soft_checkbox.grid(row=5, column=0, columnspan=2, sticky="w", padx=3, pady=(2, 0))
+        _Tooltip(soft_checkbox, "Restrict candidate brushes to just types 10 and 54 -- the two with "
+                 "no flat plateau (smooth, cosine-like falloff the whole way from center to edge). "
+                 "Excludes 8/9's wide flat tops, which densely-packed small stamps can turn into a "
+                 "flat-topped 'crater' look; trades some precision at hitting an exact target height "
+                 "across a wide flat area for a smoother result.")
+
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -652,6 +661,7 @@ class PGAGenGUI:
         ]
         if self.use_height_mask_var.get():
             args += ["--mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}"]
+        args += ["--candidate-brushes", "10,54" if self.soft_brushes_var.get() else "8,9,10,54"]
         max_new = self.max_new_var.get().strip()
         if max_new:
             args += ["--max-new-stamps", max_new]
