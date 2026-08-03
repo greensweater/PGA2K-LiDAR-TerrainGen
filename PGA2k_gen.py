@@ -66,7 +66,7 @@ import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
 from ingest.heightmap import DEFAULT_HEIGHTMAP_RESOLUTION, load_heightmap, rasterize_ground_heightmap, save_heightmap
 from ingest.osm import (
-    DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_features, load_height_mask,
+    DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, crop_features, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
 )
 from splines import build_surface_splines, feature_to_spline, save_surface_splines
@@ -480,17 +480,21 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
 
     print(f"Found {osm_path} ({osm_path.stat().st_size:,} bytes).")
 
-    # OSM features need to land in the *course-cropped* local frame
-    # (the same one stamps/terrain use, established by recentered_crop),
-    # not the full merged LAZ extent's frame.
+    # features.geojson is now stored in the FULL merged point cloud's
+    # frame, uncropped -- not the course-cropped [0, COURSE_SIZE_M]
+    # frame stamps/terrain use. See parse_osm_features's docstring:
+    # this is so a future manually-repositioned course crop can just
+    # re-crop from this same stored set, not need OSM re-parsed from
+    # scratch. Cropping happens later, at the point of use, via
+    # crop_features.
     full_cloud = PointCloud.load(pointcloud_path)
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
-    bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+    course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
 
-    print("Parsing OSM features into the course's local frame...")
+    print("Parsing OSM features into the full point cloud's local frame...")
     features = parse_osm_features(
-        osm_path, course_cloud.crs, course_cloud.origin_x, course_cloud.origin_y,
-        course_cloud.horizontal_unit_factor, bounds=bounds,
+        osm_path, full_cloud.crs, full_cloud.origin_x, full_cloud.origin_y,
+        full_cloud.horizontal_unit_factor, bounds=full_cloud.bounds,
     )
 
     counts: dict[str, int] = {}
@@ -501,30 +505,42 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
 
     out_path = working_dir / FEATURES_FILE
     save_features(features, out_path)
-    print(f"  wrote {out_path}")
+    print(f"  wrote {out_path} (full point cloud frame, uncropped)")
 
+    # The course crop's own (0, 0), expressed in the full cloud's
+    # frame -- both this shift (full-frame position of the course
+    # crop's origin) and its negation (course-frame position of a
+    # full-frame point) are needed below.
+    course_origin_in_full_x = course_cloud.origin_x - full_cloud.origin_x
+    course_origin_in_full_z = course_cloud.origin_y - full_cloud.origin_y
+
+    course_features = shift_features(features, dx=-course_origin_in_full_x, dz=-course_origin_in_full_z)
+    course_features = crop_features(course_features, course_bounds)
     preview_path = working_dir / PREVIEW_DIR / PREVIEW_OSM
-    viz.render_osm_features(features, bounds, preview_path)
+    viz.render_osm_features(course_features, course_bounds, preview_path)
     print(f"  wrote {preview_path} (transparent overlay -- composite over the course-cropped "
           "previews [hex/stamps/height/error] in the GUI, doesn't stand alone)")
 
-    # The LIDAR previews (preview_lidar.png / preview_lidar_heightmap.png)
-    # render the *full* merged point cloud, in its own local frame --
-    # not the course crop's [0, COURSE_SIZE_M] frame the overlay above
-    # was built in. Both frames share the same real-world origin, just
-    # offset from each other by however far the course crop sits inside
-    # the larger merged extent, so a plain coordinate shift (not a
-    # reprojection) is enough to correctly place the same features
-    # against the full cloud's own bounds.
-    full_shift_x = course_cloud.origin_x - full_cloud.origin_x
-    full_shift_z = course_cloud.origin_y - full_cloud.origin_y
-    full_features = shift_features(features, dx=full_shift_x, dz=full_shift_z)
+    # Unlike the course-cropped overlay above, this one is deliberately
+    # NOT cropped -- it's composited over the *full* LIDAR previews,
+    # where seeing OSM detail beyond the current course crop is exactly
+    # the point (e.g. deciding where a future manually-repositioned
+    # crop should actually go). crop_box draws the current [0, 2000]
+    # crop's own position as a visible rectangle on top, so it's clear
+    # where the boundary sits relative to that detail -- currently
+    # always centered on the point cloud (see recentered_crop), but
+    # this will show a manually-chosen position just as well once that
+    # exists.
     full_preview_path = working_dir / PREVIEW_DIR / PREVIEW_OSM_FULL
-    viz.render_osm_features(full_features, full_cloud.bounds, full_preview_path)
-    print(f"  wrote {full_preview_path} (same overlay, shifted to align with the "
-          "LIDAR previews' full-point-cloud frame instead)")
+    course_crop_box_in_full = BoundingBox(
+        min_x=course_origin_in_full_x, min_z=course_origin_in_full_z,
+        max_x=course_origin_in_full_x + COURSE_SIZE_M, max_z=course_origin_in_full_z + COURSE_SIZE_M,
+    )
+    viz.render_osm_features(features, full_cloud.bounds, full_preview_path, crop_box=course_crop_box_in_full)
+    print(f"  wrote {full_preview_path} (same features, uncropped, in the LIDAR previews' "
+          "full-point-cloud frame instead -- plus the current course crop's own position)")
 
-    mask_geometry = build_height_mask(features, buffer_px=height_mask_buffer_px)
+    mask_geometry = build_height_mask(course_features, buffer_px=height_mask_buffer_px)
     mask_path = working_dir / HEIGHT_MASK_FILE
     save_height_mask(mask_geometry, mask_path)
     if mask_geometry is None:
@@ -536,14 +552,44 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
               f"then buffered {height_mask_buffer_px} m/px)")
 
     mask_preview_path = working_dir / PREVIEW_DIR / PREVIEW_MASK
-    viz.render_mask_preview(mask_geometry, bounds, mask_preview_path)
+    viz.render_mask_preview(mask_geometry, course_bounds, mask_preview_path)
     print(f"  wrote {mask_preview_path} (black/white -- multiply-blend over another "
           "course-cropped preview in the GUI's 'Show mask' toggle)")
 
     save_project(working_dir, {
         "osm_feature_count": len(features), "osm_feature_kinds": counts,
         "height_mask_buffer_px": height_mask_buffer_px,
+        # The course crop's own origin, expressed in the full point
+        # cloud's frame -- features.geojson is stored in that full
+        # frame (see parse_osm_features), so any step that needs the
+        # course-cropped version (write-splines, write-holes) can
+        # shift+crop_features with this saved value instead of
+        # reloading the entire point cloud just to recompute it.
+        "course_crop_origin_in_full_frame_x": course_origin_in_full_x,
+        "course_crop_origin_in_full_frame_z": course_origin_in_full_z,
     })
+
+
+def _crop_features_to_course(working_dir: Path, features: list) -> list:
+    """
+    Shift features (as stored in features.geojson -- the full point
+    cloud's frame, uncropped, see parse_osm_features) into the course
+    crop's own [0, COURSE_SIZE_M] frame, then crop to it -- shared by
+    every step that needs the course-cropped version (write-splines,
+    write-holes) without reloading the entire point cloud just to
+    recompute the shift ingest-osm already saved.
+    """
+    project = load_project(working_dir)
+    shift_x = project.get("course_crop_origin_in_full_frame_x")
+    shift_z = project.get("course_crop_origin_in_full_frame_z")
+    if shift_x is None or shift_z is None:
+        raise StepError(
+            f"No course crop position found in {working_dir}/project.json -- "
+            "run --step ingest-osm again (this project may predate storing it)."
+        )
+    course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+    shifted = shift_features(features, dx=-shift_x, dz=-shift_z)
+    return crop_features(shifted, course_bounds)
 
 
 def step_write_splines(working_dir: Path) -> None:
@@ -569,6 +615,7 @@ def step_write_splines(working_dir: Path) -> None:
         raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
 
     features = load_features(features_path)
+    features = _crop_features_to_course(working_dir, features)
     splines = build_surface_splines(features)
 
     unsupported: dict[str, int] = {}
@@ -613,6 +660,7 @@ def step_write_holes(working_dir: Path) -> None:
         raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
 
     features = load_features(features_path)
+    features = _crop_features_to_course(working_dir, features)
     holes = build_holes(features)
 
     total_hole_features = sum(1 for f in features if f.kind == "hole")
