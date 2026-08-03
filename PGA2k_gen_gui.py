@@ -499,6 +499,21 @@ class PGAGenGUI:
             wraplength=220, foreground="gray",
         ).pack(anchor="w", pady=(6, 0))
 
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._add_step_button(parent, "Write Splines", self._run_write_splines)
+        ttk.Label(
+            parent, text="Generates surfaceSplines.json from features.geojson. Deliberately separate "
+            "from Output Terrain (Terrain tab) -- lets you tweak mask/feature settings here and "
+            "regenerate just the splines, without redoing the terrain height export too. Objects "
+            "will likely get the same treatment once that tab is built.",
+            wraplength=220, foreground="gray",
+        ).pack(anchor="w", pady=(2, 0))
+
+    def _run_write_splines(self) -> None:
+        wd = self._require_working_dir()
+        if wd:
+            self._run_step(["--step", "write-splines"], wd)
+
     def _build_objects_tab(self, parent: ttk.Frame) -> None:
         ttk.Label(
             parent, text="Trees, buildings, and other placed objects will live here once that "
