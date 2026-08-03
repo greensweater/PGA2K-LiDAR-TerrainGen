@@ -56,7 +56,13 @@ _DPI = 100
 # have to correspond to equal absolute sizes, which means computing
 # them from a common plot size in inches, and letting the figure itself
 # be non-square rather than forcing it square and eating the mismatch.
-_PLOT_SIZE_IN = DEBUG_IMAGE_SIZE / _DPI * 0.8   # square plot area
+_PLOT_SIZE_IN = DEBUG_IMAGE_SIZE / _DPI   # square plot area -- exactly 2000x2000 px at _DPI=100,
+                                            # matching the course's native 2000x2000 m size 1:1 (a
+                                            # previous *0.8 factor here left the actual plotted data
+                                            # area at only 1600x1600 px despite the course itself
+                                            # being 2000x2000 -- removed so stamp/heightmap previews
+                                            # actually show native per-meter resolution, not a
+                                            # downscaled version of it).
 _LEFT_MARGIN_IN = 1.2     # y-axis label + tick labels
 _RIGHT_MARGIN_IN = 2.4    # colorbar (or dummy) + its label + tick labels
 _BOTTOM_MARGIN_IN = 1.0   # x-axis label + tick labels
@@ -362,7 +368,7 @@ def render_lidar_preview(cloud: PointCloud, path: Path, max_points: int = 200_00
 
     sc = ax.scatter(
         cloud.x[idx], cloud.z[idx], c=cloud.elevation[idx],
-        s=1, cmap="terrain", linewidths=0,
+        s=3, cmap="terrain", linewidths=0,
     )
     _add_colorbar(fig, sc, "elevation (m)")
     ax.set_title(f"LIDAR point cloud ({n:,} points)")
