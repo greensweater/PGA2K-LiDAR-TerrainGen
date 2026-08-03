@@ -52,8 +52,8 @@ from constants import (  # noqa: E402
 )
 from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, load_project, save_project  # noqa: E402
 from ingest.osm import (  # noqa: E402
-    GOLF_OBJECT_KINDS, build_height_mask, merge_height_mask_features, load_features,
-    rasterize_mask_rgba, save_features, save_height_mask,
+    GOLF_OBJECT_KINDS, build_height_mask, crop_features, merge_height_mask_features, load_features,
+    rasterize_mask_rgba, save_features, save_height_mask, shift_features,
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
 from shapely.ops import unary_union  # noqa: E402
@@ -1197,6 +1197,25 @@ class PGAGenGUI:
             self.preview_choice.set(PREVIEW_FILES[new_idx])
             self._on_preview_choice_changed()
 
+    def _shift_and_crop_to_course(self, working_dir: Path, features: list):
+        """
+        Shift features (as stored in features.geojson -- the full
+        point cloud's frame, uncropped, see ingest/osm.py's
+        parse_osm_features) into the course crop's own
+        [0, COURSE_SIZE_M] frame, then crop to it -- mirrors
+        PGA2k_gen.py's _crop_features_to_course, needed here too since
+        the mask preview and Splines-tab highlighting both render
+        against course-cropped previews.
+        """
+        project = load_project(working_dir)
+        shift_x = project.get("course_crop_origin_in_full_frame_x")
+        shift_z = project.get("course_crop_origin_in_full_frame_z")
+        if shift_x is None or shift_z is None:
+            return features  # pre-dates this being saved; best effort, treat as already course-frame
+        course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+        shifted = shift_features(features, dx=-shift_x, dz=-shift_z)
+        return crop_features(shifted, course_bounds)
+
     def _get_cached_mask_merged_geometry(self, working_dir: Path):
         """
         Lazily load features.geojson and cache the merged (pre-buffer)
@@ -1226,6 +1245,7 @@ class PGAGenGUI:
         merged = None
         if features_path.exists():
             features = load_features(features_path)
+            features = self._shift_and_crop_to_course(working_dir, features)
             merged = merge_height_mask_features(features)
 
         self._cached_mask_merged_geom = merged
@@ -1400,8 +1420,9 @@ class PGAGenGUI:
                 PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
             ):
                 self._ensure_splines_features_fresh(Path(wd))
+                course_features = self._shift_and_crop_to_course(Path(wd), self._splines_features)
                 selected_features = [
-                    f for f in self._splines_features if f.osm_id in self._highlighted_feature_osm_ids
+                    f for f in course_features if f.osm_id in self._highlighted_feature_osm_ids
                 ]
                 if selected_features:
                     geoms = []
