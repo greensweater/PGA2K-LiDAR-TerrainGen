@@ -1,11 +1,11 @@
 """
 io/laz_reader.py
+Based on https://github.com/chadrockey/TGC-Designer-Tools
 
 Reads USGS LAZ/LAS tiles into a merged, origin-aligned point cloud.
 
 The LAZ files are authoritative: they define the CRS, world coordinates,
-and bounding box that every other pipeline stage aligns to (see the
-"Important Design Rules" in the architecture doc).
+and bounding box that every other pipeline stage aligns to.
 
 This module never rasterizes. It reads raw LIDAR points, merges tiles
 that share a common CRS, and hands back plain numpy arrays plus a
@@ -83,10 +83,8 @@ def linear_unit_factors(crs: pyproj.CRS) -> tuple[float, float, str]:
     horizontal_factor comes directly from the CRS's own horizontal axis
     info (e.g. ~0.3048 for a US survey foot state-plane zone).
     vertical_factor is read from a compound CRS's vertical sub-CRS if
-    present ("compound-crs"); otherwise it's assumed equal to
-    horizontal_factor ("assumed-matches-horizontal") -- the common
-    convention for US survey data delivered in feet, but not
-    independently verified from the CRS alone.
+    present ("compound-crs"); otherwise it's ASSUMED equal to
+    horizontal_factor ("assumed-matches-horizontal") per common convention
     """
     horizontal_factor = crs.axis_info[0].unit_conversion_factor
 
@@ -126,7 +124,7 @@ class PointCloud:
     origin_x / origin_y are the true-meters equivalent of the
     projected-CRS coordinates that map to local (0, 0). horizontal_unit_factor
     is kept alongside them specifically so a later reprojection can
-    convert back to the CRS's native unit -- see module docstring.
+    convert back to the CRS's native unit.
     """
 
     x: np.ndarray
@@ -236,7 +234,7 @@ class PointCloud:
                 origin_y=float(data["origin_y"]),
                 horizontal_unit_factor=float(data["horizontal_unit_factor"]) if "horizontal_unit_factor" in keys else 1.0,
                 vertical_unit_factor=float(data["vertical_unit_factor"]) if "vertical_unit_factor" in keys else 1.0,
-                vertical_unit_source=str(data["vertical_unit_source"]) if "vertical_unit_source" in keys else "unknown (pre-unit-fix cache)",
+                vertical_unit_source=str(data["vertical_unit_source"]) if "vertical_unit_source" in keys else "unknown",
             )
 
 
@@ -334,7 +332,7 @@ def load_point_cloud(
 ) -> PointCloud:
     """
     Load every tile in `laz_dir` into one origin-aligned PointCloud, in
-    true meters (see module docstring on unit handling).
+    true meters.
 
     origin_x / origin_y, if given, are interpreted in the CRS's native
     unit (matching what scan_merged_extent's bounds are in) -- same as
