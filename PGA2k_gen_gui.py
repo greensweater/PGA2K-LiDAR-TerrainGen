@@ -872,7 +872,16 @@ class PGAGenGUI:
         self.status_label.config(text=f"Running {step_name}...", foreground="orange")
         self._step_start_time = time.time()
 
-        cmd = [sys.executable, str(CLI_SCRIPT), str(working_dir)] + extra_args
+        # -u forces the child's stdout/stderr to be unbuffered -- without
+        # it, Python fully buffers stdout whenever it isn't a terminal
+        # (exactly the case here, piped to this GUI), so print() calls
+        # (e.g. adaptive_refine.py's periodic progress updates) would sit
+        # in the child's own internal buffer and never actually reach
+        # this process's read loop below until that buffer filled or the
+        # subprocess exited -- regardless of how often _poll_log_queue
+        # itself polls (already every 100ms, so that was never the
+        # bottleneck).
+        cmd = [sys.executable, "-u", str(CLI_SCRIPT), str(working_dir)] + extra_args
         started_at = time.strftime("%H:%M:%S")
         # Log output accumulates across steps (not cleared each run) so
         # earlier results -- stamp counts, hotspot counts, etc. -- stay
