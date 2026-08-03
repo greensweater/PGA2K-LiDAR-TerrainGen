@@ -1,21 +1,43 @@
 """
 osm.py
-Based on https://github.com/chadrockey/TGC-Designer-Tools
 
-Parses an OSM XML export into features.geojson -- Shapely 
-geometries tagged with a `kind` and raw OSM tags, plus properties
+Parses an OSM XML export into this compiler's internal vector Feature
+representation -- Shapely geometries tagged with a `kind` and the raw
+OSM tags, not PGA spline JSON directly (see the architecture doc's
+"Internal Feature Representation": "Everything uses the same vector
+geometry... No repeated spline parsing").
 
-Notes: 
-- Same coordinate transform as ingest.laz_reader, including 
-  US-survey-feet to meters
-- Ignores trees 
+Classification -- which OSM tag combination maps to which `kind`, and
+whether it's an area (polygon) or a line -- is ported from Chad
+Rockey's TGC-Designer-Tools (OSMTGC.py's addOSMToTGC), proven,
+already-tuned tag dispatch for golf-course OSM tagging conventions:
+https://github.com/chadrockey/TGC-Designer-Tools
 
+Coordinate transformation is deliberately NOT ported from that tool,
+though: this project already has its own tested LAZ-CRS-based
+coordinate pipeline (ingest.laz_reader), including the US-survey-feet
+unit-conversion fix that tool's separate GeoPointCloud transform
+doesn't share. OSM features need to land in the exact same local
+frame the point cloud and stamps already use, not a second,
+independently-computed one.
+
+Tree nodes (`natural=tree`) are deliberately not handled here -- the
+architecture doc treats tree placement as staying "largely based on
+Chad's algorithm... independent of terrain optimization," a separate
+concern from this vector-feature ingest.
+
+Output is a features.geojson FeatureCollection (matching the
+architecture doc's project artifact list), with "kind" and the raw OSM
+"tags" stashed in each feature's properties -- surface splines, terrain
+masks, and everything else downstream all read from this same file
+rather than re-parsing OSM XML repeatedly (see the doc's "No repeated
+spline parsing").
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -136,6 +158,61 @@ def latlon_to_local(
     return native_x * horizontal_unit_factor - origin_x, native_y * horizontal_unit_factor - origin_y
 
 
+def _clip_to_bbox(geometry: BaseGeometry, bbox: BaseGeometry) -> Optional[BaseGeometry]:
+    """
+    Clip geometry to bbox (not just check intersection and keep it
+    whole) -- a feature that only partially overlaps some bounds
+    (very common with real OSM data; golf courses aren't neatly
+    bounded rectangles) would otherwise carry its entire, unclipped
+    extent through to spline export, and the game responds to an
+    out-of-bounds spline by silently expanding the whole playfield to
+    fit it -- a real bug, confirmed by a course loading in-game at
+    over 3330m instead of 2000m.
+
+    Returns None if geometry doesn't overlap bbox at all (caller
+    should drop the feature).
+    """
+    if not geometry.intersects(bbox):
+        return None
+    clipped = geometry.intersection(bbox)
+    if clipped.is_empty:
+        return None
+    # Intersection can return a Multi*/GeometryCollection if the
+    # original crossed the boundary in a complex way (rare, but
+    # possible for a long hole routing line or an oddly-shaped
+    # fairway) -- keep just the largest piece, since downstream code
+    # (feature_to_spline, hole waypoint reduction, corridor buffering)
+    # expects one simple Polygon/LineString, not a disconnected
+    # multi-part shape.
+    if clipped.geom_type not in ("Polygon", "LineString"):
+        parts = [g for g in getattr(clipped, "geoms", []) if g.geom_type in ("Polygon", "LineString")]
+        if not parts:
+            return None
+        clipped = max(parts, key=lambda g: g.area if g.geom_type == "Polygon" else g.length)
+    return clipped
+
+
+def crop_features(features: list[Feature], bounds: BoundingBox) -> list[Feature]:
+    """
+    Clip every feature's geometry to bounds, dropping any with no
+    overlap at all. Used at the point of use (write-splines,
+    write-holes, height-mask building, the course-cropped OSM preview
+    overlay) rather than at parse time -- see parse_osm_features's own
+    docstring for why features.geojson itself is kept in the full
+    point cloud's frame, uncropped: so a future manually-repositioned
+    course crop doesn't need OSM re-parsed from scratch, just re-cropped
+    from this same stored, stable feature set.
+    """
+    bbox = box(bounds.min_x, bounds.min_z, bounds.max_x, bounds.max_z)
+    cropped = []
+    for f in features:
+        clipped_geom = _clip_to_bbox(f.geometry, bbox)
+        if clipped_geom is None:
+            continue
+        cropped.append(replace(f, geometry=clipped_geom))
+    return cropped
+
+
 def parse_osm_features(
     osm_xml_path: Path,
     crs: pyproj.CRS,
@@ -146,10 +223,24 @@ def parse_osm_features(
     printf=print,
 ) -> list[Feature]:
     """
-    Parse an OSM XML export into Features in the local course frame.
+    Parse an OSM XML export into Features, shifted into a local frame
+    by (origin_x, origin_y) -- but deliberately NOT cropped to the
+    course's own [0, COURSE_SIZE_M] bounds here, even though `bounds`
+    can still be given to drop/clip against some other, larger extent
+    (e.g. the full merged point cloud's own bounds, to filter out
+    anything OSM returned well outside it).
 
-    If `bounds` is given, drops/crops ways to avoid in-game dynamic resize
-    
+    Cropping to the course-crop bounds specifically happens later, at
+    the point of use (see crop_features) -- write-splines,
+    write-holes, height-mask building, and the course-cropped preview
+    overlay all crop a shifted copy right before they need it. Keeping
+    features.geojson itself in the full point cloud's frame,
+    uncropped, means a future manually-repositioned course crop (see
+    project design notes on selecting the crop within the larger LAZ
+    extent) can just re-crop from this same stored set instead of
+    needing OSM re-parsed from scratch -- cropping at parse time would
+    permanently discard whatever fell outside whichever crop position
+    happened to be current when Ingest OSM was run.
     """
     xml_data = Path(osm_xml_path).read_text(encoding="utf-8")
     result = overpy.Overpass().parse_xml(xml_data)
@@ -187,21 +278,10 @@ def parse_osm_features(
             geometry = LineString(coords)
 
         if bbox is not None:
-            if not geometry.intersects(bbox):
+            clipped = _clip_to_bbox(geometry, bbox)
+            if clipped is None:
                 continue
-            # Clip to bounds, not just check intersection -- avoid in-game dynamic resize
-            geometry = geometry.intersection(bbox)
-            if geometry.is_empty:
-                continue
-            # hack to deal with multigeometry scenarios
-            if geometry.geom_type not in ("Polygon", "LineString"):
-                parts = [
-                    g for g in getattr(geometry, "geoms", [])
-                    if g.geom_type in ("Polygon", "LineString")
-                ]
-                if not parts:
-                    continue
-                geometry = max(parts, key=lambda g: g.area if g.geom_type == "Polygon" else g.length)
+            geometry = clipped
 
         features.append(Feature(
             geometry=geometry, kind=kind, tags=dict(way.tags), osm_id=way.id,
@@ -238,9 +318,13 @@ def save_features(features: list[Feature], path: Path) -> None:
 
 def shift_features(features: list[Feature], dx: float, dz: float) -> list[Feature]:
     """
-    Coordinate shift geometry by (dx, dz) used to align Features from the
-    course-crop-relative frame they're parsed in (see PGA2k_gen.py's step_ingest_osm 
-    for how that shift is derived from the two clouds' own origin_x/origin_y).
+    Translate every feature's geometry by (dx, dz) -- a pure coordinate
+    shift, not a reprojection. Used to move Features from the
+    course-crop-relative frame they're parsed in (see parse_osm_features)
+    into a different local frame that shares the same real-world origin
+    but a different (0, 0), e.g. the full merged point cloud's own frame
+    used by the LIDAR previews (see PGA2k_gen.py's step_ingest_osm for
+    how that shift is derived from the two clouds' own origin_x/origin_y).
     """
     return [
         Feature(geometry=translate(f.geometry, xoff=dx, yoff=dz), kind=f.kind, tags=f.tags,
@@ -275,13 +359,37 @@ def merge_height_mask_features(
     hole_corridor_buffer_px: Optional[float] = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
 ) -> Optional[BaseGeometry]:
     """
-    Merge unmasked features and cache for animation of buffer.
+    Merge every Feature with mask=False (i.e. NOT excluded) into one
+    shape (the unary_union), *before* any buffering. Split out from
+    build_height_mask so this (parsing + union, the relatively
+    expensive part) can be done once and cached, then buffered
+    repeatedly at different distances cheaply -- e.g. for a live GUI
+    slider, where re-parsing features.geojson and re-unioning on every
+    tick would be wasted, unnecessary work.
+
+    mask=True means EXCLUDE -- fairway/green/tee/hole default to
+    mask=False (not excluded, so included here) at parse time (see
+    GOLF_OBJECT_KINDS), everything else defaults to mask=True
+    (excluded). It's a per-feature, independently toggleable flag
+    though -- a masked-out (mask=True) bunker stays out, and
+    unmasking one (mask=False) would include it here too, regardless
+    of kind.
+
+    hole_corridor_buffer_px, if not None, buffers "hole" Features (a
+    routing line, tee-to-green centerline) into a "corridor" polygon
+    rather than including the bare centerline -- golfers don't walk a
+    perfectly straight line, so the unbuffered centerline alone would
+    leave most of the actual playing corridor outside the mask.
+    Buffering a LineString directly with shapely's own .buffer()
+    already produces exactly this ribbon-shaped polygon; no separate
+    line-to-polygon "outline" conversion is needed. Pass None to
+    buffer nothing (hole Features contribute just their bare
+    centerline instead).
     """
     relevant = []
     for f in features:
         if f.mask:
             continue
-        # Add special buffer for hole ways
         if f.kind == "hole" and hole_corridor_buffer_px is not None:
             relevant.append(f.geometry.buffer(hole_corridor_buffer_px))
         else:
