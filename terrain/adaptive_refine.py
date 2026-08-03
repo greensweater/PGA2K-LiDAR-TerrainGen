@@ -80,14 +80,21 @@ that size, since RMS is measured over that one region only, blind to
 how the edge blends into whatever's outside it. Type 8 (wide flat
 plateau, sharp drop) tends to win this way even where a gentler brush
 would blend better -- in practice, one real course's refinement runs
-came out ~98% type 8. brush_radius_spread_ratio scales each brush's
-candidate radius by spread_ratio ** BRUSH_RANK[brush] before scoring
-(rank 0..3 for types 8/9/10/54, so spread_ratio=1 is a no-op and larger
-values progressively favor giving smoother brushes more reach). This
-was originally derived from the measured profiles (each brush's radius
-scaled to reach the same half-weight distance as type 8's), but
-checking Chad's TGC-Designer-Tools source directly showed that isn't
-actually how his tool achieves smooth results -- he uses exactly one
+came out ~98% type 8. brush_radius_spread_ratio addresses this not by
+changing how candidates are scored (every brush is still scored at
+the same base_radius -- a fair, same-scale comparison of which brush
+shape fits the region's actual detail best; an earlier version scored
+each brush at its own already-inflated radius instead, which changed
+which brush won for reasons having nothing to do with fit quality, a
+real bug found and fixed directly) but by scaling only the *winning*
+brush's placement radius by spread_ratio ** BRUSH_RANK[brush] (rank
+0..3 for types 8/9/10/54, so spread_ratio=1 is a no-op and larger
+values progressively place smoother-falloff brushes wider once they've
+already won on fit quality alone). This was originally derived from
+the measured profiles (each brush's radius scaled to reach the same
+half-weight distance as type 8's), but checking Chad's TGC-Designer-Tools
+source directly showed that isn't actually how his tool achieves
+smooth results -- he uses exactly one
 brush type (10) everywhere, with a single fixed rule (stamp radius =
 2x its placement grid spacing), not a per-brush-type multiplier table.
 So rather than chase a "correct" derived table, this is exposed as a
@@ -132,7 +139,9 @@ were already correctly fit by an earlier, more targeted pass.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
+
+import time
 
 import numpy as np
 from scipy import ndimage
@@ -154,13 +163,16 @@ DEFAULT_BRUSH_RADIUS_SPREAD_RATIO = 1.0  # 1.0 = every brush scored at the same 
 DEFAULT_RADIUS_DECAY_PER_PASS = 1.0  # 1.0 = every refine-terrain pass uses the same clamps (old behavior)
 
 # Candidate brushes/tools tried per hotspot; whichever combination
-# gives the lowest RMS over the region's actual LIDAR points wins.
-# BRUSH_RANK orders them for brush_radius_spread_ratio (see
-# _brush_radius_multiplier): candidate_radius = base_radius *
-# spread_ratio ** BRUSH_RANK[brush], so spread_ratio=1 means every
-# brush gets the same radius (multiplier 1 regardless of rank) and
-# larger values progressively favor giving smoother-falloff brushes
-# (higher rank) more reach. This is a deliberately simple, tunable
+# gives the lowest RMS over the region's actual LIDAR points wins --
+# every candidate scored at the same base_radius, a fair comparison
+# independent of brush_radius_spread_ratio (see _score_candidate's
+# call site). BRUSH_RANK only affects the WINNING brush's placement
+# radius afterward (see _brush_radius_multiplier): candidate_radius =
+# base_radius * spread_ratio ** BRUSH_RANK[brush], so spread_ratio=1
+# means every brush is placed at the same radius (multiplier 1
+# regardless of rank) and larger values progressively place
+# smoother-falloff brushes (higher rank) wider once they've already
+# won on fit quality. This is a deliberately simple, tunable
 # parameterization rather than a fixed per-brush table -- see module
 # docstring for why: it turned out not to match how Chad's tool
 # actually achieves smooth results (a single always-radius-2x-spacing
@@ -252,6 +264,7 @@ def find_error_hotspots(
     mask: Optional[np.ndarray] = None,
     model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
     candidate_brushes: Optional[tuple[int, ...]] = None,
+    progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> list[ErrorHotspot]:
     """
     Find and fit error hotspots via distance-transform region centering
@@ -306,6 +319,15 @@ def find_error_hotspots(
     precision at hitting an exact target height across a wide flat
     area for a smoother-looking result with no plateau edges to show.
 
+    progress_callback, if given, is called periodically (time-throttled,
+    not every iteration) with (hotspots_found_so_far, fraction_of_
+    valid_area_claimed) -- the fraction is a genuinely meaningful
+    completion estimate, unlike raw iteration count against the
+    resolution*resolution loop bound below (the loop almost never
+    runs anywhere near that many iterations in practice; it exits once
+    everything valid is either within tolerance or claimed, which is
+    exactly what this fraction tracks).
+
     Returns hotspots in the order found (largest inscribed radius
     first, which tracks -- but isn't identical to -- worst peak error).
     """
@@ -319,6 +341,7 @@ def find_error_hotspots(
     if mask is not None:
         valid = valid & mask
     claimed = ~valid
+    valid_count = int(np.sum(valid))  # denominator for progress_callback's completion fraction
 
     edges_x = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
     edges_z = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
@@ -345,10 +368,17 @@ def find_error_hotspots(
     # after an iteration actually claims cells of its matching sign.
     dist_over: Optional[np.ndarray] = None
     dist_under: Optional[np.ndarray] = None
+    last_progress_time = time.time()
+    progress_interval_s = 10.0
 
     for _ in range(resolution * resolution):
         if max_new_stamps is not None and len(hotspots) >= max_new_stamps:
             break
+
+        if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
+            claimed_fraction = float(np.sum(claimed & valid)) / valid_count if valid_count else 1.0
+            progress_callback(len(hotspots), claimed_fraction)
+            last_progress_time = time.time()
 
         if dist_over is None:
             over_mask = (error > tolerance) & ~claimed
@@ -412,12 +442,30 @@ def find_error_hotspots(
 
         best: Optional[tuple[int, int, float, float, float]] = None  # + candidate_radius
         for brush in brushes:
+            # Score at base_radius -- the SAME radius for every brush,
+            # regardless of brush_radius_spread_ratio -- so the
+            # comparison is apples-to-apples (which brush *shape* fits
+            # this region's actual detail best), not biased by
+            # different brushes being scored over different-sized
+            # areas. A previous version scored each brush at its own
+            # already-inflated candidate_radius, which could and did
+            # change which brush won (confirmed directly: a synthetic
+            # region with a real, gentle slope selected a different
+            # winner depending on which radius was used for scoring),
+            # for reasons having nothing to do with which brush shape
+            # actually fits the terrain best.
+            #
+            # value only depends on weight_center = kernel.sample(0.0)
+            # (r=0 always maps to r_norm=0 regardless of what `radius`
+            # is), so it's already correct for placement at any radius
+            # -- no need to re-fit once the winner is chosen from this
+            # fair, same-radius scoring.
             candidate_radius = base_radius * _brush_radius_multiplier(brush, brush_radius_spread_ratio)
             candidate_radius = max(min_radius, min(candidate_radius, max_radius))
 
             for tool in CANDIDATE_TOOLS:
                 result = _score_candidate(
-                    centroid_x, centroid_z, candidate_radius, brush, tool,
+                    centroid_x, centroid_z, base_radius, brush, tool,
                     px, pz, actual_pts, current_at_points, current_at_center, target_mean,
                 )
                 if result is None:
@@ -506,6 +554,7 @@ def refine_stamps(
     mask: Optional[np.ndarray] = None,
     model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
     candidate_brushes: Optional[tuple[int, ...]] = None,
+    progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> tuple[list[Stamp], list[ErrorHotspot]]:
     """
     One adaptive refinement pass: find and fit error hotspots (see
@@ -528,6 +577,7 @@ def refine_stamps(
         mask=mask,
         min_valid_cells=min_valid_cells,
         max_new_stamps=max_new_stamps,
+        progress_callback=progress_callback,
     )
 
     new_stamps = [h.to_stamp() for h in hotspots]
