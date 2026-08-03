@@ -239,12 +239,35 @@ def step_init(working_dir: Path) -> None:
               f"{working_dir} --step ingest-laz --projection <EPSG code>")
 
 
-def step_visualize(working_dir: Path) -> None:
+def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -> None:
     """
     Generate every diagnostic preview PNG this pipeline can currently
     produce, against whatever artifacts already exist in working_dir.
     Never a prerequisite for other steps -- purely for inspection (see
     "never behave as a black box").
+
+    overwrite_current_version distinguishes this function's two kinds
+    of caller. generate-terrain/refine-terrain call this automatically
+    right after producing genuinely new stamp data -- that should keep
+    appending a new preview version, matching the new stamp version
+    they just created (the default, False). But a manual, standalone
+    --step visualize / GUI "Visualize" click doesn't change stamps at
+    all -- appending yet another preview version there would leave a
+    "phantom" version with no corresponding stamp file, which broke
+    Undo: it independently finds the latest stamp file and the latest
+    preview of each kind, so a mismatched extra preview version meant
+    undoing the actual latest refine pass left the *previous* pass's
+    preview on screen instead of reverting to it, silently looking
+    like undo had done nothing. Passing True here instead overwrites
+    the current latest version in place (delete-then-rerender, so the
+    same version number gets reused, not incremented), keeping preview
+    version aligned with stamp version the way Undo assumes.
+
+    This also forces the LIDAR previews to regenerate unconditionally,
+    bypassing their own pointcloud-mtime staleness check -- a manual
+    "Visualize" is an explicit refresh-everything action, and that
+    check exists to avoid redundant work on the frequent, automatic
+    calls above, not to second-guess an explicit one.
     """
 
     pointcloud_path = working_dir / POINTCLOUD_FILE
@@ -257,17 +280,26 @@ def step_visualize(working_dir: Path) -> None:
     full_cloud = PointCloud.load(pointcloud_path)
     print(f"Loaded {pointcloud_path} ({full_cloud.count:,} points)")
 
+    def _overwrite_latest(kind: str) -> None:
+        latest = viz.find_latest_preview(preview_dir, kind)
+        if latest is not None:
+            latest.unlink()
+
     pointcloud_mtime = pointcloud_path.stat().st_mtime
     latest_lidar = viz.find_latest_preview(preview_dir, PREVIEW_LIDAR)
     latest_lidar_heightmap = viz.find_latest_preview(preview_dir, PREVIEW_LIDAR_HEIGHTMAP)
     lidar_previews_stale = (
-        latest_lidar is None or latest_lidar.stat().st_mtime < pointcloud_mtime
+        overwrite_current_version
+        or latest_lidar is None or latest_lidar.stat().st_mtime < pointcloud_mtime
         or latest_lidar_heightmap is None or latest_lidar_heightmap.stat().st_mtime < pointcloud_mtime
     )
 
     if lidar_previews_stale:
         print(f"Writing {PREVIEW_LIDAR} and {PREVIEW_LIDAR_HEIGHTMAP} "
               "(full merged point cloud, not just the course crop)...")
+        if overwrite_current_version:
+            _overwrite_latest(PREVIEW_LIDAR)
+            _overwrite_latest(PREVIEW_LIDAR_HEIGHTMAP)
         viz.render_lidar_preview(full_cloud, preview_dir / PREVIEW_LIDAR)
         viz.render_lidar_heightmap(full_cloud, full_cloud.bounds, preview_dir / PREVIEW_LIDAR_HEIGHTMAP)
     else:
@@ -304,13 +336,23 @@ def step_visualize(working_dir: Path) -> None:
                 mask_geometry = load_height_mask(mask_path)
                 mask_grid = rasterize_mask(mask_geometry, bounds, p["resolution"])
 
+    if overwrite_current_version:
+        _overwrite_latest(PREVIEW_HEX)
     print(f"Writing {PREVIEW_HEX}...")
     viz.render_hex_preview(stamps, bounds, preview_dir / PREVIEW_HEX, extra_label=extra_label)
+
+    if overwrite_current_version:
+        _overwrite_latest(PREVIEW_STAMPS)
     print(f"Writing {PREVIEW_STAMPS}...")
     viz.render_stamps_preview(stamps, bounds, preview_dir / PREVIEW_STAMPS, extra_label=extra_label)
+
+    if overwrite_current_version:
+        _overwrite_latest(PREVIEW_HEIGHT)
     print(f"Writing {PREVIEW_HEIGHT}...")
     viz.render_height_preview(model, bounds, preview_dir / PREVIEW_HEIGHT, extra_label=extra_label)
 
+    if overwrite_current_version:
+        _overwrite_latest(PREVIEW_ERROR)
     print(f"Writing {PREVIEW_ERROR} (course-cropped point cloud vs. TerrainModel)...")
     course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
     error_resolution = latest_refine["parameters"]["resolution"] if latest_refine is not None else 200
@@ -1111,7 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             step_repack(working_dir, args.repack_filename)
         elif args.step == "visualize":
-            step_visualize(working_dir)
+            step_visualize(working_dir, overwrite_current_version=True)
     except StepError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
