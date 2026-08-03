@@ -126,6 +126,7 @@ class PGAGenGUI:
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._suppress_course_name_save = False
+        self._suppress_repack_filename_save = False
 
         self._build_layout()
         self._poll_log_queue()
@@ -288,6 +289,7 @@ class PGAGenGUI:
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.repack_filename_var = tk.StringVar()
+        self.repack_filename_var.trace_add("write", lambda *a: self._on_repack_filename_changed())
         ttk.Label(parent, text="Repack filename:").pack(anchor="w")
         ttk.Entry(parent, textvariable=self.repack_filename_var, width=20).pack(anchor="w")
         self._add_step_button(parent, "Repack", self._run_repack)
@@ -375,14 +377,42 @@ class PGAGenGUI:
             widget.bind("<Shift-Button-4>", self._on_preview_type_scroll)
             widget.bind("<Shift-Button-5>", self._on_preview_type_scroll)
 
-        self.preview_label = ttk.Label(frame, text="(no preview loaded)", anchor="center")
-        self.preview_label.pack(fill="both", expand=True)
-        self.preview_label.bind("<MouseWheel>", self._on_preview_scroll)
-        self.preview_label.bind("<Button-4>", self._on_preview_scroll)
-        self.preview_label.bind("<Button-5>", self._on_preview_scroll)
-        self.preview_label.bind("<Shift-MouseWheel>", self._on_preview_type_scroll)
-        self.preview_label.bind("<Shift-Button-4>", self._on_preview_type_scroll)
-        self.preview_label.bind("<Shift-Button-5>", self._on_preview_type_scroll)
+        ttk.Label(header, text="Zoom:").pack(side="left", padx=(8, 0))
+        self.preview_zoom_var = tk.DoubleVar(value=1.0)
+        zoom_scale = ttk.Scale(
+            header, from_=0.25, to=3.0, orient="horizontal",
+            variable=self.preview_zoom_var, command=lambda _v: self._show_preview(),
+        )
+        zoom_scale.pack(side="left", padx=(2, 0))
+        self.preview_zoom_label = ttk.Label(header, text="100%", width=5)
+        self.preview_zoom_label.pack(side="left")
+        ttk.Button(header, text="Reset", width=6, command=self._reset_preview_zoom).pack(side="left", padx=(2, 0))
+
+        canvas_frame = ttk.Frame(frame)
+        canvas_frame.pack(fill="both", expand=True)
+        self.preview_canvas = tk.Canvas(canvas_frame, background="gray85", highlightthickness=0)
+        h_scroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.preview_canvas.xview)
+        v_scroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.preview_canvas.yview)
+        self.preview_canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
+        self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        canvas_frame.grid_rowconfigure(0, weight=1)
+        canvas_frame.grid_columnconfigure(0, weight=1)
+        self._preview_canvas_image_id = None
+
+        # Plain scroll still cycles versions, Shift+scroll still cycles
+        # preview type (both unchanged) -- Ctrl+scroll is new, and zooms
+        # instead, so none of the existing scroll behavior is disturbed.
+        self.preview_canvas.bind("<MouseWheel>", self._on_preview_scroll)
+        self.preview_canvas.bind("<Button-4>", self._on_preview_scroll)
+        self.preview_canvas.bind("<Button-5>", self._on_preview_scroll)
+        self.preview_canvas.bind("<Shift-MouseWheel>", self._on_preview_type_scroll)
+        self.preview_canvas.bind("<Shift-Button-4>", self._on_preview_type_scroll)
+        self.preview_canvas.bind("<Shift-Button-5>", self._on_preview_type_scroll)
+        self.preview_canvas.bind("<Control-MouseWheel>", self._on_preview_zoom_scroll)
+        self.preview_canvas.bind("<Control-Button-4>", self._on_preview_zoom_scroll)
+        self.preview_canvas.bind("<Control-Button-5>", self._on_preview_zoom_scroll)
 
         overlay_row = ttk.Frame(frame)
         overlay_row.pack(fill="x", pady=(4, 0))
@@ -596,8 +626,20 @@ class PGAGenGUI:
             self.course_name.set(project.get("course_name", ""))
         finally:
             self._suppress_course_name_save = False
-        self.repack_filename_var.set(project.get("repack_filename", ""))
+        self._suppress_repack_filename_save = True
+        try:
+            self.repack_filename_var.set(project.get("repack_filename", ""))
+        finally:
+            self._suppress_repack_filename_save = False
         self._refresh_preview_and_slider()
+
+    def _on_repack_filename_changed(self) -> None:
+        if self._suppress_repack_filename_save:
+            return
+        wd = self.working_dir.get().strip()
+        if not wd or not Path(wd).is_dir():
+            return
+        save_project(Path(wd), {"repack_filename": self.repack_filename_var.get()})
 
     def _on_course_name_changed(self) -> None:
         if self._suppress_course_name_save:
@@ -1088,6 +1130,23 @@ class PGAGenGUI:
         v = int(round(self.preview_version.get()))
         self.preview_version_label.config(text="current" if v == 0 else f"-{v}")
 
+    def _on_preview_zoom_scroll(self, event) -> None:
+        """Ctrl+scroll zooms the preview (see _on_preview_scroll for the plain-scroll version control)."""
+        if event.num == 4:
+            step = 0.1
+        elif event.num == 5:
+            step = -0.1
+        else:
+            step = 0.1 if event.delta > 0 else -0.1
+
+        new_zoom = max(0.25, min(3.0, self.preview_zoom_var.get() + step))
+        self.preview_zoom_var.set(new_zoom)
+        self._show_preview()
+
+    def _reset_preview_zoom(self) -> None:
+        self.preview_zoom_var.set(1.0)
+        self._show_preview()
+
     def _on_preview_scroll(self, event) -> None:
         """
         Cross-platform scroll handling: Windows/Mac send <MouseWheel>
@@ -1153,20 +1212,30 @@ class PGAGenGUI:
         self._cached_mask_geom_working_dir = working_dir
         return merged
 
+    def _set_preview_text(self, text: str) -> None:
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_text(10, 10, anchor="nw", text=text, fill="black")
+        self.preview_canvas.configure(scrollregion=(0, 0, 400, 60))
+        self._preview_imgtk = None
+
+    def _set_preview_image(self, pil_image) -> None:
+        self._preview_imgtk = ImageTk.PhotoImage(pil_image)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_imgtk)
+        self.preview_canvas.configure(scrollregion=(0, 0, pil_image.width, pil_image.height))
+
     def _show_preview(self) -> None:
         wd = self.working_dir.get().strip()
         if not wd:
             return
         if not _HAVE_PIL:
-            self.preview_label.config(
-                text="(Pillow not installed -- pip install pillow for image previews)", image=""
-            )
+            self._set_preview_text("(Pillow not installed -- pip install pillow for image previews)")
             return
 
         version = int(round(self.preview_version.get()))
         path = self._versioned_preview_path(Path(wd), version)
         if not path.exists():
-            self.preview_label.config(text=f"(no {path.name} yet)", image="")
+            self._set_preview_text(f"(no {path.name} yet)")
             self._preview_imgtk = None
             return
 
@@ -1179,9 +1248,12 @@ class PGAGenGUI:
             # measured at hundreds of ms combined) was the actual
             # bottleneck, not the mask rasterization itself (~5 ms).
             overlay_on = self.overlay_osm_var.get()
+            zoom = self.preview_zoom_var.get()
+            self.preview_zoom_label.config(text=f"{zoom*100:.0f}%")
             cache_key = (
                 str(path), path.stat().st_mtime, overlay_on,
                 self.overlay_opacity_var.get() if overlay_on else None,
+                zoom,
             )
             if getattr(self, "_cached_base_thumb_key", None) == cache_key:
                 base_thumb = self._cached_base_thumb
@@ -1216,7 +1288,16 @@ class PGAGenGUI:
                             overlay = Image.merge("RGBA", (r, g, b, a))
                             img = Image.alpha_composite(img, overlay)
 
-                img.thumbnail((900, 900), Image.LANCZOS)
+                # zoom=1.0 shows the image at its actual native
+                # resolution (1959x1780) rather than the old fixed
+                # 900x900 cap -- previously nearly 80% of the real
+                # pixel area was being thrown away before the user ever
+                # saw it. Scrollbars (see _build_preview_panel) handle
+                # the case where the zoomed image no longer fits the
+                # visible area.
+                target_w = max(1, round(img.width * zoom))
+                target_h = max(1, round(img.height * zoom))
+                img = img.resize((target_w, target_h), Image.LANCZOS)
                 base_thumb = img
                 self._cached_base_thumb = img
                 self._cached_base_thumb_key = cache_key
@@ -1296,10 +1377,9 @@ class PGAGenGUI:
                     highlight_full.paste(highlight_img, (data_left, data_top), highlight_img)
                     img = Image.alpha_composite(img, highlight_full)
 
-            self._preview_imgtk = ImageTk.PhotoImage(img)
-            self.preview_label.config(image=self._preview_imgtk, text="")
+            self._set_preview_image(img)
         except Exception as e:
-            self.preview_label.config(text=f"(couldn't load {path.name}: {e})", image="")
+            self._set_preview_text(f"(couldn't load {path.name}: {e})")
 
 
 def main() -> int:
