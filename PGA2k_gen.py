@@ -722,6 +722,13 @@ def step_refine_terrain(
               "an exact divisor (200, 250, 400, 500, 1000, 2000, ...) avoids this.")
 
     print(f"Scanning the error grid ({resolution}x{resolution}, tolerance={tolerance} m)...")
+    progress_start_time = time.time()
+
+    def _print_refine_progress(hotspot_count: int, claimed_fraction: float) -> None:
+        elapsed = time.time() - progress_start_time
+        print(f"  ... {elapsed:.0f}s elapsed: {hotspot_count} hotspots so far, "
+              f"{claimed_fraction:.1%} of the searchable area resolved")
+
     refined, hotspots = refine_stamps(
         stamps, heights, bounds, tolerance=tolerance,
         resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
@@ -732,6 +739,7 @@ def step_refine_terrain(
         mask=mask_grid,
         model_rebuild_interval=model_rebuild_interval,
         candidate_brushes=candidate_brushes,
+        progress_callback=_print_refine_progress,
     )
 
     new_stamps = refined[len(stamps):]
