@@ -117,6 +117,8 @@ class PGAGenGUI:
         self.course_name = tk.StringVar()
         self.log_queue: queue.Queue = queue.Queue()
         self.running = False
+        self._current_proc = None  # see _stop_current_step
+        self._stop_requested = False
         self._step_start_time = 0.0
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
         self._cached_mask_merged_geom = None  # see _get_cached_mask_merged_geometry
@@ -308,8 +310,12 @@ class PGAGenGUI:
         self._add_step_button(parent, "Visualize", self._run_visualize)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=10)
-        self.status_label = ttk.Label(parent, text="Idle", foreground="gray")
-        self.status_label.pack(anchor="w")
+        status_row = ttk.Frame(parent)
+        status_row.pack(fill="x")
+        self.status_label = ttk.Label(status_row, text="Idle", foreground="gray")
+        self.status_label.pack(side="left")
+        self.stop_button = ttk.Button(status_row, text="Stop", command=self._stop_current_step, state="disabled")
+        self.stop_button.pack(side="right")
         self.play_sound_var = tk.BooleanVar(value=True)
         sound_row = ttk.Frame(parent)
         sound_row.pack(anchor="w", fill="x")
@@ -868,6 +874,8 @@ class PGAGenGUI:
             return
 
         self.running = True
+        self._stop_requested = False
+        self.stop_button.config(state="normal")
         step_name = extra_args[1]
         self.status_label.config(text=f"Running {step_name}...", foreground="orange")
         self._step_start_time = time.time()
@@ -897,12 +905,33 @@ class PGAGenGUI:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
             )
+            self._current_proc = proc
             for line in proc.stdout:
                 self.log_queue.put(("line", line))
             proc.wait()
             self.log_queue.put(("done", proc.returncode))
         except Exception as e:
             self.log_queue.put(("error", str(e)))
+        finally:
+            self._current_proc = None
+
+    def _stop_current_step(self) -> None:
+        """
+        Kill the running subprocess. terminate() sends SIGTERM on
+        Unix / calls TerminateProcess on Windows -- both end the
+        process immediately regardless of what it's doing (a tight
+        numpy loop included), since Python doesn't install a custom
+        SIGTERM handler by default. The read loop in _run_subprocess
+        just sees EOF once the process dies and falls through to
+        proc.wait()/the "done" message as usual -- no special handling
+        needed there, only here (to label it distinctly from a normal
+        finish or an actual failure) and in _poll_log_queue.
+        """
+        if self._current_proc is None:
+            return
+        self._stop_requested = True
+        self._current_proc.terminate()
+        self.stop_button.config(state="disabled")
 
     def _poll_log_queue(self) -> None:
         try:
@@ -912,18 +941,24 @@ class PGAGenGUI:
                     self._append_log(payload)
                 elif kind == "done":
                     self.running = False
+                    self.stop_button.config(state="disabled")
                     elapsed = time.time() - self._step_start_time
-                    if payload == 0:
+                    if self._stop_requested:
+                        self.status_label.config(text=f"Stopped ({elapsed:.1f}s)", foreground="gray")
+                        self._append_log(f"\n[stopped by user after {elapsed:.1f}s]\n")
+                    elif payload == 0:
                         self.status_label.config(text=f"Done ({elapsed:.1f}s)", foreground="green")
+                        self._append_log(f"\n[finished in {elapsed:.1f}s]\n")
                     else:
                         self.status_label.config(
                             text=f"Failed (exit {payload}, {elapsed:.1f}s)", foreground="red"
                         )
-                    self._append_log(f"\n[finished in {elapsed:.1f}s]\n")
+                        self._append_log(f"\n[finished in {elapsed:.1f}s]\n")
                     self._refresh_preview_and_slider()
                     self._ring_bell()
                 elif kind == "error":
                     self.running = False
+                    self.stop_button.config(state="disabled")
                     elapsed = time.time() - self._step_start_time
                     self.status_label.config(text=f"Error ({elapsed:.1f}s)", foreground="red")
                     self._append_log(f"\n[GUI error] {payload}\n[finished in {elapsed:.1f}s]\n")
