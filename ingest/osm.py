@@ -170,9 +170,13 @@ def parse_osm_features(
     """
     Parse an OSM XML export into Features in the local course frame.
 
-    If `bounds` is given, ways that don't intersect it are dropped
-    (same "off of map, skip" idea as Chad's tool, but checked against
-    our own course bounds rather than the LAZ extent).
+    If `bounds` is given, ways that don't intersect it at all are
+    dropped, and ways that only partially overlap it are CLIPPED to it
+    (not just checked for intersection and then kept whole) -- a
+    feature that pokes outside the course crop would otherwise carry
+    its entire unclipped extent through to spline export, and the game
+    responds to an out-of-bounds spline by silently expanding the
+    whole playfield to fit it.
     """
     xml_data = Path(osm_xml_path).read_text(encoding="utf-8")
     result = overpy.Overpass().parse_xml(xml_data)
@@ -209,8 +213,36 @@ def parse_osm_features(
         else:
             geometry = LineString(coords)
 
-        if bbox is not None and not geometry.intersects(bbox):
-            continue
+        if bbox is not None:
+            if not geometry.intersects(bbox):
+                continue
+            # Clip to bounds, not just check intersection -- a feature
+            # that only partially overlaps the course crop (very common
+            # with real OSM data; golf courses aren't neatly bounded
+            # rectangles) would otherwise be included with its ENTIRE
+            # unclipped extent, carrying coordinates far outside
+            # [0, 2000]. Splines built from that extend outside the
+            # course, and the game responds by silently expanding the
+            # whole playfield to fit them -- a real bug, confirmed by a
+            # course loading in-game at over 3330m instead of 2000m.
+            geometry = geometry.intersection(bbox)
+            if geometry.is_empty:
+                continue
+            # Intersection can return a Multi*/GeometryCollection if the
+            # original crossed the boundary in a complex way (rare, but
+            # possible for a long hole routing line or an oddly-shaped
+            # fairway) -- keep just the largest piece, since downstream
+            # code (feature_to_spline, hole waypoint reduction, corridor
+            # buffering) expects one simple Polygon/LineString, not a
+            # disconnected multi-part shape.
+            if geometry.geom_type not in ("Polygon", "LineString"):
+                parts = [
+                    g for g in getattr(geometry, "geoms", [])
+                    if g.geom_type in ("Polygon", "LineString")
+                ]
+                if not parts:
+                    continue
+                geometry = max(parts, key=lambda g: g.area if g.geom_type == "Polygon" else g.length)
 
         features.append(Feature(
             geometry=geometry, kind=kind, tags=dict(way.tags), osm_id=way.id,
