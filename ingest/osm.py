@@ -54,7 +54,7 @@ from terrain.bounding_box import BoundingBox
 
 DEFAULT_HEIGHT_MASK_KINDS = ("fairway", "green", "tee")
 DEFAULT_HOLE_CORRIDOR_BUFFER_PX = 30.0
-GOLF_OBJECT_KINDS = ("fairway", "green", "tee", "hole")  # mask defaults to True for these, False otherwise
+GOLF_OBJECT_KINDS = ("fairway", "green", "tee", "hole")  # mask (=excluded) defaults False for these, True otherwise
 DEFAULT_HEIGHT_MASK_BUFFER_PX = 50.0  # see build_height_mask's docstring for what "pixel" means here
 
 
@@ -64,8 +64,10 @@ class Feature:
     kind: str
     tags: dict
     osm_id: Optional[int] = None  # the original OSM way ID -- lets a specific feature be targeted/re-selected later
-    mask: bool = False  # is this feature part of height_mask.geojson (and, for golf-object kinds, exported at all)?
-                        # defaults set per-kind at parse time -- see parse_osm_features/GOLF_OBJECT_KINDS
+    mask: bool = False  # EXCLUDE this feature? True = leave it out of height_mask.geojson, and (holes
+                        # only) leave it out of holes.json too -- e.g. a duplicate hole bleeding in
+                        # from a neighboring course. Non-hole splines always export regardless of mask.
+                        # Defaults set per-kind at parse time -- see parse_osm_features/GOLF_OBJECT_KINDS.
 
 
 def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
@@ -212,7 +214,7 @@ def parse_osm_features(
 
         features.append(Feature(
             geometry=geometry, kind=kind, tags=dict(way.tags), osm_id=way.id,
-            mask=(kind in GOLF_OBJECT_KINDS),
+            mask=(kind not in GOLF_OBJECT_KINDS),
         ))
 
     if skipped_nodes:
@@ -286,19 +288,21 @@ def merge_height_mask_features(
     hole_corridor_buffer_px: Optional[float] = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
 ) -> Optional[BaseGeometry]:
     """
-    Merge every Feature with mask=True into one shape (the
-    unary_union), *before* any buffering. Split out from
+    Merge every Feature with mask=False (i.e. NOT excluded) into one
+    shape (the unary_union), *before* any buffering. Split out from
     build_height_mask so this (parsing + union, the relatively
     expensive part) can be done once and cached, then buffered
     repeatedly at different distances cheaply -- e.g. for a live GUI
     slider, where re-parsing features.geojson and re-unioning on every
     tick would be wasted, unnecessary work.
 
-    mask defaults to True for fairway/green/tee/hole at parse time
-    (see GOLF_OBJECT_KINDS) and False otherwise, but is a per-feature,
-    independently toggleable flag -- a masked-in bunker would be
-    included here too, and an unmasked (e.g. duplicate/extra) fairway
-    or hole is excluded, regardless of its own kind.
+    mask=True means EXCLUDE -- fairway/green/tee/hole default to
+    mask=False (not excluded, so included here) at parse time (see
+    GOLF_OBJECT_KINDS), everything else defaults to mask=True
+    (excluded). It's a per-feature, independently toggleable flag
+    though -- a masked-out (mask=True) bunker stays out, and
+    unmasking one (mask=False) would include it here too, regardless
+    of kind.
 
     hole_corridor_buffer_px, if not None, buffers "hole" Features (a
     routing line, tee-to-green centerline) into a "corridor" polygon
@@ -313,7 +317,7 @@ def merge_height_mask_features(
     """
     relevant = []
     for f in features:
-        if not f.mask:
+        if f.mask:
             continue
         if f.kind == "hole" and hole_corridor_buffer_px is not None:
             relevant.append(f.geometry.buffer(hole_corridor_buffer_px))
@@ -330,11 +334,12 @@ def build_height_mask(
     hole_corridor_buffer_px: Optional[float] = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
 ) -> Optional[BaseGeometry]:
     """
-    Merge every Feature with mask=True (default: fairway/green/tee/hole
-    -- the areas adaptive refinement should actually spend effort on --
-    plus buffered hole-path corridors, see merge_height_mask_features)
-    into one shape, then buffer it outward -- the "merge filled
-    splines, then buffer to create a simple outline" approach.
+    Merge every Feature with mask=False, i.e. NOT excluded (default:
+    fairway/green/tee/hole -- the areas adaptive refinement should
+    actually spend effort on -- plus buffered hole-path corridors, see
+    merge_height_mask_features) into one shape, then buffer it
+    outward -- the "merge filled splines, then buffer to create a
+    simple outline" approach.
 
     buffer_px follows the same 1-pixel-per-meter convention the earlier
     generate_height_mask_v3.py script used for its CANVAS_SIZE=2000
