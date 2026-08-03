@@ -66,10 +66,11 @@ import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
 from ingest.heightmap import DEFAULT_HEIGHTMAP_RESOLUTION, load_heightmap, rasterize_ground_heightmap, save_heightmap
 from ingest.osm import (
-    DEFAULT_HEIGHT_MASK_BUFFER_PX, GOLF_OBJECT_KINDS, build_height_mask, load_features, load_height_mask,
+    DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
 )
 from splines import build_surface_splines, feature_to_spline, save_surface_splines
+from holes import build_holes, save_holes
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
     DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
@@ -485,11 +486,11 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
     mask_path = working_dir / HEIGHT_MASK_FILE
     save_height_mask(mask_geometry, mask_path)
     if mask_geometry is None:
-        print(f"  wrote {mask_path} (no masked-in features found -- mask is empty, "
+        print(f"  wrote {mask_path} (no not-excluded features found -- mask is empty, "
               "--use-height-mask on refine-terrain would restrict everything)")
     else:
-        print(f"  wrote {mask_path} (every feature with mask=True -- defaults to fairway/green/tee/hole, "
-              f"individually overridable per-feature in the GUI's Splines tab -- "
+        print(f"  wrote {mask_path} (every feature with mask=False, i.e. NOT excluded -- defaults to "
+              f"fairway/green/tee/hole, individually overridable per-feature in the GUI's Splines tab -- "
               f"then buffered {height_mask_buffer_px} m/px)")
 
     mask_preview_path = working_dir / PREVIEW_DIR / PREVIEW_MASK
@@ -510,11 +511,11 @@ def step_write_splines(working_dir: Path) -> None:
 
     Scope: green/tee/fairway/rough/bunker/cartpath/path/building/wood.
     Water and hole are deliberately excluded (see splines.py's module
-    docstring) -- neither is handled by this generic writer yet.
-    Golf-object features (fairway/green/tee/hole) with mask=False are
-    also skipped -- e.g. a duplicate hole's fairway/tee bleeding in
-    from a neighboring course (PGA can't import more than 18 holes).
-    Every other kind exports regardless of its own mask value.
+    docstring) -- neither is handled by this generic writer yet. mask
+    is NOT checked here -- every feature feature_to_spline can handle
+    exports regardless of its own mask value (mask only affects
+    height_mask.geojson membership and, separately, hole export --
+    see holes.py's step_write_holes).
 
     This overwrites surfaceSplines.json wholesale -- it's the primary
     generator for these surface types now, not a merge with whatever
@@ -528,15 +529,13 @@ def step_write_splines(working_dir: Path) -> None:
     features = load_features(features_path)
     splines = build_surface_splines(features)
 
-    excluded_count = sum(1 for f in features if f.kind in GOLF_OBJECT_KINDS and not f.mask)
     unsupported: dict[str, int] = {}
     for f in features:
-        excluded = f.kind in GOLF_OBJECT_KINDS and not f.mask
-        if not excluded and feature_to_spline(f) is None:
+        if feature_to_spline(f) is None:
             unsupported[f.kind] = unsupported.get(f.kind, 0) + 1
 
     print(f"Generated {len(splines)} splines from {len(features)} features "
-          f"({excluded_count} excluded via mask, {sum(unsupported.values())} unsupported kind: {unsupported})")
+          f"({sum(unsupported.values())} unsupported kind: {unsupported})")
 
     nodes_dir = working_dir / "course" / "CourseDescription_nodes"
     if not nodes_dir.is_dir():
@@ -544,6 +543,50 @@ def step_write_splines(working_dir: Path) -> None:
 
     out_path = nodes_dir / "surfaceSplines.json"
     save_surface_splines(splines, out_path)
+    print(f"Wrote {out_path}")
+
+
+def step_write_holes(working_dir: Path) -> None:
+    """
+    Generate holes.json (routing waypoints + par/tee/pin metadata --
+    see holes.py) from features.geojson's "hole" ways, matching Chad's
+    TGC-Designer-Tools OSMTGC.py newHole() conversion exactly.
+
+    Only "hole" features with mask=False (NOT excluded) are included --
+    a masked-out (mask=True) hole is treated as a duplicate/extra hole
+    bleeding in from a neighboring course on the same OSM map, and PGA
+    can't import more than 18 holes. This is the one place mask
+    actually gates export (everything else in surfaceSplines.json
+    exports regardless -- see step_write_splines).
+
+    Deliberately separate from step_write_splines/step_output_terrain --
+    lets mask settings be tweaked and holes.json regenerated on its
+    own, without redoing the terrain height export or surface splines.
+
+    This overwrites holes.json wholesale, same as step_write_splines
+    does for surfaceSplines.json.
+    """
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
+
+    features = load_features(features_path)
+    holes = build_holes(features)
+
+    total_hole_features = sum(1 for f in features if f.kind == "hole")
+    excluded_count = sum(1 for f in features if f.kind == "hole" and f.mask)
+    print(f"Generated {len(holes)} holes from {total_hole_features} hole features "
+          f"({excluded_count} excluded via mask)")
+    if len(holes) > 18:
+        print(f"  WARNING: {len(holes)} holes exceeds PGA's 18-hole limit -- "
+              "mask off (exclude) the extras in the GUI's Splines tab before importing")
+
+    nodes_dir = working_dir / "course" / "CourseDescription_nodes"
+    if not nodes_dir.is_dir():
+        raise StepError(f"No {nodes_dir} found under {working_dir}. Run --step ingest-course first.")
+
+    out_path = nodes_dir / "holes.json"
+    save_holes(holes, out_path)
     print(f"Wrote {out_path}")
 
 
@@ -945,6 +988,7 @@ STEPS = {
     "refine-terrain": step_refine_terrain,
     "output-terrain": step_output_terrain,
     "write-splines": step_write_splines,
+    "write-holes": step_write_holes,
     "repack": step_repack,
     "visualize": step_visualize,
 }
@@ -1059,6 +1103,8 @@ def main(argv: list[str] | None = None) -> int:
             step_output_terrain(working_dir)
         elif args.step == "write-splines":
             step_write_splines(working_dir)
+        elif args.step == "write-holes":
+            step_write_holes(working_dir)
         elif args.step == "repack":
             if not args.repack_filename:
                 print("error: --step repack requires --repack-filename <name>", file=sys.stderr)
