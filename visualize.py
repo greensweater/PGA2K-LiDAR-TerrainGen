@@ -276,12 +276,22 @@ def _draw_osm_feature(ax, feature: Feature) -> None:
             ax.plot(xs, zs, color=color, linewidth=2.0, alpha=0.85, solid_capstyle="round")
 
 
-def render_osm_features(features: Sequence[Feature], bounds: BoundingBox, path: Path) -> None:
+def render_osm_features(
+    features: Sequence[Feature], bounds: BoundingBox, path: Path,
+    crop_box: Optional[BoundingBox] = None,
+) -> None:
     """
     Transparent PNG of every OSM Feature (see ingest/osm.py), colored by
     kind, at the exact same plot-area position/size every other preview
     uses -- meant to be alpha-composited over any of them (in the GUI,
     not baked into a new file per base preview), not viewed standalone.
+
+    crop_box, if given, draws a dashed rectangle outline (no fill) at
+    that position/size, in the same coordinate frame as `bounds` --
+    meant for showing where the [0, COURSE_SIZE_M] course crop
+    currently sits within the full merged point cloud's own, larger
+    frame (features here are typically uncropped in that case, so
+    detail beyond the crop is visible too -- see step_ingest_osm).
     """
     fig, ax = _new_overlay_figure(bounds)
 
@@ -289,6 +299,13 @@ def render_osm_features(features: Sequence[Feature], bounds: BoundingBox, path: 
     for feature in features:
         _draw_osm_feature(ax, feature)
         kinds_present.add(feature.kind)
+
+    if crop_box is not None:
+        ax.add_patch(Rectangle(
+            (crop_box.min_x, crop_box.min_z),
+            crop_box.max_x - crop_box.min_x, crop_box.max_z - crop_box.min_z,
+            fill=False, edgecolor="red", linewidth=2.0, linestyle="--", zorder=10,
+        ))
 
     if kinds_present:
         handles = [
@@ -299,6 +316,8 @@ def render_osm_features(features: Sequence[Feature], bounds: BoundingBox, path: 
             )
             for kind in sorted(kinds_present)
         ]
+        if crop_box is not None:
+            handles.append(Line2D([0], [0], color="red", linestyle="--", linewidth=2.0, label="course crop"))
         ax.legend(handles=handles, loc="upper right", fontsize=6, framealpha=0.7)
 
     _save_transparent(fig, path)
