@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 from ingest.osm import Feature
+from writer import GRID_ORIGIN_OFFSET
 
 _HOLE_JSON_TEMPLATE = {
     "waypoints": [],
@@ -127,7 +128,12 @@ def build_holes(features: list[Feature]) -> list[dict]:
         except (TypeError, ValueError):
             hole_num = -1
 
-        points = list(f.geometry.coords)
+        # Same offset writer.py applies to terrain stamps and
+        # splines.py now applies to splines -- PGA's grid is centered
+        # on the origin ([-1000, 1000] for a 2000 m course), not
+        # [0, 2000] like our local frame. Without this, hole waypoints
+        # would be off by +1000 in both x and z, same bug as splines.
+        points = [(x - GRID_ORIGIN_OFFSET, z - GRID_ORIGIN_OFFSET) for x, z in f.geometry.coords]
         hole = new_hole(userpar, points)
         if hole is None:
             continue
