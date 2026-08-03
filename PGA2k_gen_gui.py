@@ -56,6 +56,7 @@ from ingest.osm import (  # noqa: E402
     rasterize_mask_rgba, save_features, save_height_mask,
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
+from shapely.ops import unary_union  # noqa: E402
 import visualize as viz  # noqa: E402
 
 PREVIEW_FILES = [
@@ -123,7 +124,7 @@ class PGAGenGUI:
         self._cached_base_thumb = None  # see _show_preview's static-part cache
         self._cached_base_thumb_key = None
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
-        self._highlighted_feature_osm_id = None  # currently-selected spline, if any, to highlight on the preview
+        self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._suppress_course_name_save = False
 
         self._build_layout()
@@ -249,7 +250,9 @@ class PGAGenGUI:
                  "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM). Everything "
                  "outside is treated like no-data -- never becomes a hotspot.")
 
-        add_field(1, 0, "min_hotspot", "HOT m", "Min hotspot radius in cells (pre-clamp). Smaller "
+        add_field(1, 0, "min_hotspot", "HOT px", "Min hotspot radius, in cells at the CURRENT "
+                  "resolution (not meters -- a cell is 2000/RES m, so this floor scales with "
+                  "resolution, not tied to a fixed real-world size). Smaller "
                   "regions are treated as noise, not a real feature.", self.min_hotspot_radius_cells_var,
                   required=True)
         add_field(1, 1, "max_new", "MAX n", "Cap on new stamps this pass. Leave blank for no cap.",
@@ -264,9 +267,12 @@ class PGAGenGUI:
                  "flat-topped 'crater' look; trades some precision at hitting an exact target height "
                  "across a wide flat area for a smoother result.")
 
-        add_field(2, 0, "spread_ratio", "SPR %", "Brush radius spread ratio: each brush's candidate "
-                  "radius is scaled by spread_ratio ** rank (ranks 0..3 for types 8/9/10/54). "
-                  "1 disables it.", self.spread_ratio_var, required=True)
+        add_field(2, 0, "spread_ratio", "SPR %", "Brush radius spread ratio: every brush is scored "
+                  "at the same base radius (a fair comparison of which brush shape fits best), but the "
+                  "winning brush is PLACED at radius scaled by spread_ratio ** rank (ranks 0..3 for "
+                  "types 8/9/10/54) -- higher-rank (smoother) brushes end up placed wider, forcing "
+                  "more overlap as the falloff gets gentler. 1 disables it.", self.spread_ratio_var,
+                  required=True)
         add_field(2, 1, "claim_fraction", "EAT %", "Claimed radius fraction: how much of the placed "
                   "radius gets marked done. Below 1 lets neighboring stamps overlap. 1 disables it "
                   "(old behavior).", self.claim_fraction_var, required=True)
@@ -434,7 +440,7 @@ class PGAGenGUI:
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.splines_tree = ttk.Treeview(
-            tree_frame, columns=("kind", "mask"), show="headings", height=18, selectmode="browse",
+            tree_frame, columns=("kind", "mask"), show="headings", height=18, selectmode="extended",
         )
         self.splines_tree.heading("kind", text="Kind")
         self.splines_tree.heading("mask", text="Mask")
@@ -494,7 +500,7 @@ class PGAGenGUI:
 
     def _on_spline_selected(self) -> None:
         selection = self.splines_tree.selection()
-        self._highlighted_feature_osm_id = int(selection[0]) if selection else None
+        self._highlighted_feature_osm_ids = {int(s) for s in selection}
         self._show_preview()
 
     def _regenerate_height_mask(self, working_dir: Path) -> None:
@@ -515,20 +521,30 @@ class PGAGenGUI:
         self._cached_mask_geom_working_dir = None
 
     def _toggle_selected_mask(self) -> None:
+        """
+        Toggle mask for every currently-selected row (multi-select, so
+        this can be several at once) -- unlike Toggle All, not scoped
+        to golf-object kinds only, since the user explicitly selected
+        these themselves. Same select-all/deselect-all pattern: if any
+        selected feature is currently unmasked, masks all of them in;
+        otherwise masks all of them out.
+        """
         wd = self.working_dir.get().strip()
-        selection = self.splines_tree.selection()
-        if not wd or not selection:
+        selected_ids = {int(s) for s in self.splines_tree.selection()}
+        if not wd or not selected_ids:
             return
-        osm_id = int(selection[0])
-        feature = next((f for f in self._splines_features if f.osm_id == osm_id), None)
-        if feature is None:
+        targets = [f for f in self._splines_features if f.osm_id in selected_ids]
+        if not targets:
             return
-        feature.mask = not feature.mask
+        new_state = any(not f.mask for f in targets)
+        for f in targets:
+            f.mask = new_state
         save_features(self._splines_features, Path(wd) / FEATURES_FILE)
         self._regenerate_height_mask(Path(wd))
         self._refresh_splines_list()
-        if self.splines_tree.exists(str(osm_id)):
-            self.splines_tree.selection_set(str(osm_id))
+        for osm_id in selected_ids:
+            if self.splines_tree.exists(str(osm_id)):
+                self.splines_tree.selection_add(str(osm_id))
         self._show_preview()
 
     def _toggle_all_mask(self) -> None:
@@ -1248,19 +1264,23 @@ class PGAGenGUI:
             # -- course-cropped previews only, same reasoning (the
             # feature geometry is in that frame, not the LIDAR previews'
             # full-point-cloud one).
-            if self._highlighted_feature_osm_id is not None and viz.strip_preview_version(path.name) not in (
+            if self._highlighted_feature_osm_ids and viz.strip_preview_version(path.name) not in (
                 PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
             ):
-                feature = next(
-                    (f for f in self._splines_features if f.osm_id == self._highlighted_feature_osm_id), None,
-                )
-                if feature is not None:
-                    highlight_geom = feature.geometry
-                    if highlight_geom.geom_type == "LineString":
-                        # A zero-area line has nothing for
-                        # shapely.vectorized.contains to find "inside" --
-                        # buffer it into a thin ribbon so it's visible.
-                        highlight_geom = highlight_geom.buffer(5.0)
+                selected_features = [
+                    f for f in self._splines_features if f.osm_id in self._highlighted_feature_osm_ids
+                ]
+                if selected_features:
+                    geoms = []
+                    for f in selected_features:
+                        g = f.geometry
+                        if g.geom_type == "LineString":
+                            # A zero-area line has nothing for
+                            # shapely.vectorized.contains to find "inside" --
+                            # buffer it into a thin ribbon so it's visible.
+                            g = g.buffer(5.0)
+                        geoms.append(g)
+                    highlight_geom = geoms[0] if len(geoms) == 1 else unary_union(geoms)
                     course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
                     left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
                     data_left = round(img.width * left_frac)
