@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Optional
 
 from ingest.osm import Feature
+from writer import GRID_ORIGIN_OFFSET
 
 # From tgc_definitions.py (confirmed via direct re-fetch, no drift from
 # an earlier fetch): surface name -> numeric ID the game expects.
@@ -204,7 +205,16 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
     """
     geom = feature.geometry
     is_area = geom.geom_type == "Polygon"
-    points = list(geom.exterior.coords[:-1]) if is_area else list(geom.coords)
+    raw_points = list(geom.exterior.coords[:-1]) if is_area else list(geom.coords)
+    # PGA's grid is centered on the origin ([-1000, 1000] for a 2000 m
+    # course); this compiler works in a local [0, COURSE_SIZE_M] frame
+    # throughout, same as the terrain stamps (see writer.py's
+    # GRID_ORIGIN_OFFSET / module docstring). Splines were missing this
+    # same conversion -- every spline coordinate was being written raw
+    # in [0, 2000] space instead, offset +1000 from where the game
+    # expects it, which is what was causing the game to expand the
+    # whole playfield to fit them.
+    points = [(x - GRID_ORIGIN_OFFSET, z - GRID_ORIGIN_OFFSET) for x, z in raw_points]
     if len(points) < 2:
         return None
 
