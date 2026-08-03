@@ -2,24 +2,9 @@
 ingest/heightmap.py
 
 Rasterizes bare-earth LIDAR points into a single, persistent height
-grid -- computed once, then reused everywhere a "what's the real
-ground elevation here" answer is needed (height_fit.py's stamp
-fitting, adaptive_refine.py's error scoring), instead of every
-consumer separately querying the raw point cloud's KD-tree (built
-over however many million points a real course's LAZ tiles contain).
+grid -- computed and cached for height_fit.py's stamp fitting, 
+adaptive_refine.py's error scoring, etc. vs. KD-Tree walking
 
-Same motivation as the render() optimization a few turns back: a
-regular grid supports direct bounding-box index arithmetic, with no
-tree traversal needed at all -- this is that same idea applied to the
-"ground truth" side of every error computation, not just the
-"predicted" (stamp-driven) side.
-
-Default resolution is 2000 (1 pixel per meter for a 2000x2000 course) --
-finer than the 200x200 error grid adaptive_refine.py currently scores
-against, which is itself part of what's been causing the "cheese
-grater" grid-snapping artifact: rasterizing "actual" this finely means
-a coarser error-grid resolution is no longer forced to also be the
-resolution ground-truth elevation gets sampled at.
 """
 
 from __future__ import annotations
