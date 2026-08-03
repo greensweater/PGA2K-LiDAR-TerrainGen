@@ -120,10 +120,11 @@ class PGAGenGUI:
         self._step_start_time = 0.0
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
         self._cached_mask_merged_geom = None  # see _get_cached_mask_merged_geometry
-        self._cached_mask_geom_working_dir = None
+        self._cached_mask_geom_key = None
         self._cached_base_thumb = None  # see _show_preview's static-part cache
         self._cached_base_thumb_key = None
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
+        self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._suppress_course_name_save = False
         self._suppress_repack_filename_save = False
@@ -517,14 +518,17 @@ class PGAGenGUI:
         self.splines_tree.delete(*self.splines_tree.get_children())
         if not wd or not Path(wd).is_dir():
             self._splines_features = []
+            self._splines_features_mtime = None
             return
 
         features_path = Path(wd) / FEATURES_FILE
         if not features_path.exists():
             self._splines_features = []
+            self._splines_features_mtime = None
             return
 
         self._splines_features = load_features(features_path)
+        self._splines_features_mtime = features_path.stat().st_mtime
         kind_filter = self.splines_kind_filter_var.get()
         for f in self._splines_features:
             if kind_filter != "All" and f.kind != kind_filter:
@@ -555,7 +559,7 @@ class PGAGenGUI:
         )
         save_height_mask(mask_geometry, working_dir / HEIGHT_MASK_FILE)
         self._cached_mask_merged_geom = None
-        self._cached_mask_geom_working_dir = None
+        self._cached_mask_geom_key = None
 
     def _toggle_selected_mask(self) -> None:
         """
@@ -626,7 +630,7 @@ class PGAGenGUI:
         if not wd or not Path(wd).is_dir():
             return
         self._cached_mask_merged_geom = None
-        self._cached_mask_geom_working_dir = None
+        self._cached_mask_geom_key = None
         project = load_project(Path(wd))
         self._suppress_course_name_save = True
         try:
@@ -1203,20 +1207,29 @@ class PGAGenGUI:
         ingest.osm.rasterize_mask_rgba), not re-parsing/re-unioning
         from scratch each time.
 
+        Cache key includes the file's mtime, not just working_dir --
+        without that, re-running Ingest OSM (e.g. to pick up a
+        corrected map.osm) while pointed at the same directory would
+        never invalidate this cache, silently serving stale geometry
+        indefinitely (confirmed as a real cause of the mask/highlight
+        going out of register after a re-ingest).
+
         Returns None if there's no features.geojson yet, or it has no
         fairway/green features to mask.
         """
-        if self._cached_mask_geom_working_dir == working_dir:
+        features_path = working_dir / FEATURES_FILE
+        mtime = features_path.stat().st_mtime if features_path.exists() else None
+        cache_key = (working_dir, mtime)
+        if getattr(self, "_cached_mask_geom_key", None) == cache_key:
             return self._cached_mask_merged_geom
 
-        features_path = working_dir / FEATURES_FILE
         merged = None
         if features_path.exists():
             features = load_features(features_path)
             merged = merge_height_mask_features(features)
 
         self._cached_mask_merged_geom = merged
-        self._cached_mask_geom_working_dir = working_dir
+        self._cached_mask_geom_key = cache_key
         return merged
 
     def _set_preview_text(self, text: str) -> None:
@@ -1230,6 +1243,24 @@ class PGAGenGUI:
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_imgtk)
         self.preview_canvas.configure(scrollregion=(0, 0, pil_image.width, pil_image.height))
+
+    def _ensure_splines_features_fresh(self, working_dir: Path) -> None:
+        """
+        Auto-refresh self._splines_features (used for Splines-tab
+        highlighting) if features.geojson has changed on disk since it
+        was last loaded -- e.g. after re-running Ingest OSM from a step
+        button, which doesn't otherwise touch the Splines tab at all.
+        Without this, highlighting would keep using stale geometry
+        (confirmed as a real cause of the highlight going out of
+        register relative to a freshly re-ingested/cropped feature)
+        until the user happened to click Refresh or change directories.
+        """
+        features_path = working_dir / FEATURES_FILE
+        if not features_path.exists():
+            return
+        mtime = features_path.stat().st_mtime
+        if mtime != self._splines_features_mtime:
+            self._refresh_splines_list()
 
     def _show_preview(self) -> None:
         wd = self.working_dir.get().strip()
@@ -1294,6 +1325,19 @@ class PGAGenGUI:
                             a = a.point(lambda v: int(v * opacity))
                             overlay = Image.merge("RGBA", (r, g, b, a))
                             img = Image.alpha_composite(img, overlay)
+                        else:
+                            # A previous version of this check failed
+                            # silently on a size mismatch -- no error,
+                            # overlay just didn't appear, with nothing
+                            # to indicate why (confirmed as the actual
+                            # cause of exactly this: a stale
+                            # preview_osm.png from before the preview
+                            # resolution change, mismatching newer base
+                            # previews). Surfacing it now instead.
+                            print(f"NOTE: skipped OSM overlay -- {overlay_path.name} is "
+                                  f"{overlay.size[0]}x{overlay.size[1]}, but the base preview is "
+                                  f"{img.size[0]}x{img.size[1]}. Re-run Ingest OSM to regenerate it "
+                                  "at the current size.")
 
                 # zoom=1.0 shows the image at its actual native
                 # resolution (1959x1780) rather than the old fixed
@@ -1355,6 +1399,7 @@ class PGAGenGUI:
             if self._highlighted_feature_osm_ids and viz.strip_preview_version(path.name) not in (
                 PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
             ):
+                self._ensure_splines_features_fresh(Path(wd))
                 selected_features = [
                     f for f in self._splines_features if f.osm_id in self._highlighted_feature_osm_ids
                 ]
