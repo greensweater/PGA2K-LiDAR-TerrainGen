@@ -420,6 +420,11 @@ class PGAGenGUI:
         self.preview_canvas.bind("<Control-MouseWheel>", self._on_preview_zoom_scroll)
         self.preview_canvas.bind("<Control-Button-4>", self._on_preview_zoom_scroll)
         self.preview_canvas.bind("<Control-Button-5>", self._on_preview_zoom_scroll)
+        # Middle-click-drag pans the view -- scan_mark/scan_dragto are
+        # tkinter Canvas's own built-in support for exactly this, so no
+        # manual scroll-position math is needed here.
+        self.preview_canvas.bind("<Button-2>", lambda e: self.preview_canvas.scan_mark(e.x, e.y))
+        self.preview_canvas.bind("<B2-Motion>", lambda e: self.preview_canvas.scan_dragto(e.x, e.y, gain=1))
 
         overlay_row = ttk.Frame(frame)
         overlay_row.pack(fill="x", pady=(4, 0))
