@@ -1,8 +1,8 @@
 """
 terrain/brush_profiles.py
 
-Empirically measured brush falloff curves, used as pull-toward-value
-weights under PGA's "flatten" tool semantics (see terrain_model.py):
+Brush falloff curves, used as pull-toward-value weights under PGA's
+"flatten" tool semantics (see terrain_model.py):
 
     new_height = old_height + (stamp.value - old_height) * kernel.sample(r)
 
@@ -14,51 +14,54 @@ Each BrushProfile.samples holds (r, weight) rows where:
               should fully commit the terrain under the cursor to the
               typed value, not just partially pull toward it.
 
-Measurement method (see the architecture doc's "ADDENDUM: Stamp
-measurements"): stakes were placed every 10 m out from center, and the
-in-game feet value recorded at each stake is the height *drop from the
-previous stake toward the edge* -- i.e. the values are ring-to-ring
-deltas, read from the outside in. r=1.0 (the full scale radius) is true
-ground level (weight 0) by definition; every ring's weight is built by
-walking inward from that zero point and subtracting each recorded delta:
+Sourced directly from each brush's real PNG asset now, not sparse
+manual stake measurements: a one-off, offline script
+(extract_brush_profiles.py) scans a single radius of each 512x512
+brush PNG, edge to center, giving 256 real, precisely measured
+grayscale values per brush -- committed here as brush_profiles.json,
+loaded once at import time. This replaced an earlier version based on
+manually-measured ring-to-ring drops (stakes placed every 10 m, only
+10 rings per brush) for types 8/9/10/54, and an analytical flat-1.0
+approximation for 72/73 (no measured data existed for those at all).
+Both are superseded entirely by this real data: confirmed directly
+(via composite_render.py's independent, real-2D-image-compositing
+renderer) that the kernel-based model this module feeds was already
+close to what real brush compositing produces, so this isn't fixing a
+significant accuracy problem -- it's replacing a 10-point interpolated
+approximation with the real, exact curve now that it's available, at
+effectively no cost.
 
-    height(r=0.9) = 0        - delta[9]
-    height(r=0.8) = height(r=0.9) - delta[8]
-    ...
-    height(r=0.0) = height(r=0.1) - delta[0]
-
-Type 10 has no flat plateau (a cosine-like falloff), so its steepest
-ring-to-ring drop lands right at the edge, not the center. Type 54
-shares that same shape. Only 9 of type 54's 10 rings were measured
-(r=0..0.8); its r=0.9 ring was back-solved so the reconstructed center
-matched its separately-measured 392 ft plateau.
-
-No terrain-noise correction is applied (an earlier version corrected
-for terrainNoise.json's always-on ambient bias, back-solved from these
-same stake measurements). That correction doesn't make sense once
-these measured-and-reconstructed profiles are replaced by the real
-brush alpha masks extracted directly from the game's own assets (see
-the "stamp and check" rework this module is slated for) -- those are
-the raw, noise-free brush data itself, not a reading taken through the
-in-game noise layer, so there's nothing left to correct for. In the
-meantime, the reconstructed centers for types 8 and 9 come out just
-under 1.0 (raw ~0.986 / ~0.988) rather than exactly 1.0, purely from
-compounding rounding error across many independently-measured ring
-deltas -- used as-is rather than force-normalized to exactly 1.0.
+The one thing this can't do that direct 2D PNG compositing (see
+composite_render.py) can: represent a brush that ISN'T radially
+symmetric. Type 72 (square) is the one real example -- a single-radius
+scan can't capture "square", so this profile is only ever a faithful
+model of type 72 at exactly the angle it was measured along, elsewhere
+it's an approximation. In practice this doesn't matter: type 72 is
+only ever used for the whole-course-covering special-purpose stamps
+(baseline flatten, the write-time normalization shim, registration
+marks) with a radius so much larger than the course itself that every
+point actually rendered sits deep in the brush's fully-saturated
+interior, never near the corner-vs-edge transition where its squareness
+would actually show up.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
-FEET_TO_METERS = 0.3048
-REFERENCE_AMPLITUDE_M = 200.0
-
-
 SHAPE_CIRCLE = "circle"
 SHAPE_SQUARE = "square"
+
+# Real brush PNG assets (and, alongside them, brush_profiles.json --
+# the output of running extract_brush_profiles.py once against those
+# same PNGs) live in a "brushes/" folder at the project root -- see
+# composite_render.py's DEFAULT_BRUSH_DIR, the same convention.
+BRUSH_ASSETS_DIR = Path(__file__).resolve().parent.parent / "brushes"
+BRUSH_PROFILES_JSON = BRUSH_ASSETS_DIR / "brush_profiles.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,85 +75,33 @@ class BrushProfile:
         return self.samples[np.argsort(self.samples[:, 0])]
 
 
-def _profile_from_ring_deltas(
-    brush_id: int,
-    delta_ft: list[float],
-) -> BrushProfile:
+def _profile_from_pixel_scan(brush_id: int, values: list[int], shape: str = SHAPE_CIRCLE) -> BrushProfile:
     """
-    Convert measured ring-to-ring feet deltas (r = 0, 10, 20, ... m, read
-    outside-in) into a normalized (r, weight) sample table, anchored at
-    weight=0 at r=1.0 (the true edge).
+    Build a BrushProfile from one real brush PNG's own pixel values --
+    `values` is grayscale intensity (0-255), one sample per pixel,
+    ordered from the brush's outer edge (index 0) in to its center
+    (the last index) -- extract_brush_profiles.py's own output format,
+    a plain horizontal scan across the source 512x512 image's middle
+    row from the left edge to the center.
     """
-    deltas_m = np.asarray(delta_ft, dtype=np.float64) * FEET_TO_METERS
-    heights_m = -np.cumsum(deltas_m[::-1])[::-1]
-
-    radii = np.arange(len(delta_ft), dtype=np.float64) * 0.1
-    heights = heights_m / REFERENCE_AMPLITUDE_M
-
-    # Append the r=1.0 anchor point itself -- unshifted, since it was
-    # never a measurement (see module docstring).
-    radii = np.append(radii, 1.0)
-    heights = np.append(heights, 0.0)
-
-    return BrushProfile(brush_id=brush_id, samples=np.column_stack((radii, heights)))
+    n = len(values)
+    # Reverse to center-to-edge (matching this module's own r=0-at-center
+    # convention) and normalize the raw 0-255 grayscale scale to a 0-1
+    # weight.
+    weights = np.asarray(values[::-1], dtype=np.float64) / 255.0
+    radii = np.linspace(0.0, 1.0, n)
+    return BrushProfile(brush_id=brush_id, samples=np.column_stack((radii, weights)), shape=shape)
 
 
-# ---------------------------------------------------------------------------
-# Raw measurements: ring-to-ring drops in in-game feet, r = 0, 10, ... 90 m
-# ---------------------------------------------------------------------------
-
-# Type 8 -- large plateau, smooth S-shaped falloff (measured center ~650 ft)
-_TYPE_8_DELTAS_FT = [0, 0, 0, 0, -2.1, -55.7, -209.7, -239.7, -117.7, -22.1]
-
-# Type 9 -- smaller plateau, smoother falloff (measured center ~650 ft)
-_TYPE_9_DELTAS_FT = [0, 0, 0, -7.5, -62.8, -154.7, -183.9, -138.8, -78.7, -21.8]
-
-# Type 10 -- approximately cosine radial falloff, no flat plateau
-# (measured center ~630 ft)
-_TYPE_10_DELTAS_FT = [-28.1, -66.5, -91.3, -102.8, -97.5, -79.7, -63.2, -50.8, -44.8, -14.8]
-
-# Type 54 -- same profile shape as type 10, ~62% vertical amplitude.
-# Only 9 rings were measured (r=0..0.8); r=0.9 is back-solved below so the
-# reconstructed center matches the separately-measured 392 ft plateau.
-_TYPE_54_DELTAS_FT = [-19.9, -48.5, -71.6, -63.9, -51.3, -33.4, -21.6, -7.5, -0.4]
-_TYPE_54_MEASURED_CENTER_FT = 392.0
-_TYPE_54_R90_DELTA_FT = -(_TYPE_54_MEASURED_CENTER_FT + sum(_TYPE_54_DELTAS_FT))
+def _load_all_profiles() -> dict[int, BrushProfile]:
+    entries = json.loads(BRUSH_PROFILES_JSON.read_text())
+    shapes = {72: SHAPE_SQUARE}  # every other brush is a circle; see SHAPE_CIRCLE/SHAPE_SQUARE above
+    return {
+        entry["type"]: _profile_from_pixel_scan(
+            entry["type"], entry["values"], shape=shapes.get(entry["type"], SHAPE_CIRCLE),
+        )
+        for entry in entries
+    }
 
 
-def _hard_edge_profile(brush_id: int, shape: str) -> BrushProfile:
-    """
-    A "hard" stamp: full weight (1.0) everywhere within the stamp,
-    with no falloff ramp at all -- not even a thin one. An earlier
-    version of this modeled a small bevel near the edge, on the
-    (reasonable-sounding) assumption that "vertical walls with a tiny
-    beveled edge" meant the brush's own alpha mask had a soft edge.
-    Direct evidence points the other way: the apparent softness is
-    much more likely an artifact of the game's own sub-1m terrain
-    surface smoothing, not the stamp itself -- confirmed by directly
-    counting individual pixels on a hard-edged circle stamp scaled to
-    R=100m (128x128px), which wouldn't be possible to do cleanly if
-    the mask itself were blurred at the edge. TerrainModel.evaluate()
-    already treats anything beyond the stamp's radius as unaffected
-    (dist > stamp.radius skips it entirely), so this only ever gets
-    sampled for r in [0, 1] -- a flat 1.0 across that whole range is
-    the correct hard-edge shape, not an approximation of one.
-    """
-    samples = np.array([
-        [0.0, 1.0],
-        [1.0, 1.0],
-    ])
-    return BrushProfile(brush_id=brush_id, samples=samples, shape=shape)
-
-
-# ---------------------------------------------------------------------------
-# Build the lookup table
-# ---------------------------------------------------------------------------
-
-BRUSH_PROFILES: dict[int, BrushProfile] = {
-    8: _profile_from_ring_deltas(8, _TYPE_8_DELTAS_FT),
-    9: _profile_from_ring_deltas(9, _TYPE_9_DELTAS_FT),
-    10: _profile_from_ring_deltas(10, _TYPE_10_DELTAS_FT),
-    54: _profile_from_ring_deltas(54, _TYPE_54_DELTAS_FT + [_TYPE_54_R90_DELTA_FT]),
-    72: _hard_edge_profile(72, SHAPE_SQUARE),  # hard square -- ESTIMATED, see _hard_edge_profile
-    73: _hard_edge_profile(73, SHAPE_CIRCLE),  # hard circle -- ESTIMATED, see _hard_edge_profile
-}
+BRUSH_PROFILES: dict[int, BrushProfile] = _load_all_profiles()
