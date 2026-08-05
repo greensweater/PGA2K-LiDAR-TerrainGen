@@ -242,6 +242,69 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
     return None  # water, hole, or anything unrecognized -- see module docstring
 
 
+_BEZIER_CIRCLE_KAPPA = 0.5522847498307936  # standard 4-anchor-point cubic-bezier circle approximation
+
+
+def _circle_spline(cx: float, cz: float, radius: float) -> dict:
+    """
+    A near-perfect circle (4 anchor points -- N/E/S/W -- with cubic-
+    bezier handles sized by the standard "kappa" constant; numerically
+    verified to track a true circle to within ~0.03% of radius) as a
+    cart path spline, for registration marks (see
+    writer.py's build_registration_mark_stamps for the matching
+    terrain bump at the same position).
+
+    Reuses _build_spline/_build_waypoints rather than bespoke bezier
+    math: with exactly 4 equally-spaced points on a circle, the
+    existing tangent-from-neighbors formula (_tangent_angle(prev,
+    next), used for every other spline kind) already gives the
+    mathematically correct tangent direction at each of the 4 points --
+    the chord between a point's two neighbors on a circle is parallel
+    to the true tangent at that point when equally spaced -- so no
+    circle-specific tangent handling was needed, only the right
+    handle_length.
+
+    shrink_distance=0.0 (not the usual path-width-based default) keeps
+    the radius exact -- the whole point of a registration mark is
+    precise, known geometry.
+
+    cx, cz are in the local [0, COURSE_SIZE_M] frame, same as every
+    other input to this module -- shifted by GRID_ORIGIN_OFFSET here,
+    same as feature_to_spline does, since this bypasses
+    feature_to_spline entirely (there's no Feature/OSM geometry behind
+    a registration mark) and would otherwise skip that conversion.
+    """
+    cx -= GRID_ORIGIN_OFFSET
+    cz -= GRID_ORIGIN_OFFSET
+    points = [
+        (cx, cz + radius),  # N
+        (cx + radius, cz),  # E
+        (cx, cz - radius),  # S
+        (cx - radius, cz),  # W
+    ]
+    return _build_spline(
+        points, surface="cartpath", path_width=2.0,
+        shrink_distance=0.0, handle_length=radius * _BEZIER_CIRCLE_KAPPA,
+        tight_splines=False, secondary_surface="", secondary_width=0.0,
+        state=3, is_closed=True, is_filled=True,
+    )
+
+
+def build_registration_mark_splines(course_size_m: float) -> list[dict]:
+    """
+    4 circle splines (cart path surface), one at each course corner --
+    the spline counterpart to writer.py's
+    build_registration_mark_stamps, at the exact same corner positions
+    (registration_mark_corners), for visually confirming in-game that
+    terrain and splines land where expected relative to each other.
+    """
+    from writer import registration_mark_corners, REGISTRATION_MARK_CIRCLE_RADIUS_M
+    return [
+        _circle_spline(x, z, REGISTRATION_MARK_CIRCLE_RADIUS_M)
+        for x, z in registration_mark_corners(course_size_m)
+    ]
+
+
 def build_surface_splines(features: list[Feature]) -> list[dict]:
     """
     One spline per handled Feature (see feature_to_spline for which
