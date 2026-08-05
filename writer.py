@@ -123,6 +123,58 @@ def _round(value: float) -> float:
     return round(float(value), _DECIMALS)
 
 
+REGISTRATION_MARK_INSET_M = 5.0  # distance from each course edge to a corner mark's center
+REGISTRATION_MARK_STAMP_RADIUS_M = 2.0
+REGISTRATION_MARK_STAMP_HEIGHT_M = 0.3  # subtle -- just enough to spot deliberately, not a real bump
+REGISTRATION_MARK_TYPE_73_CIRCLE = 73
+REGISTRATION_MARK_CIRCLE_RADIUS_M = 5.0  # radius of the matching spline circle (see splines.py)
+
+
+def registration_mark_corners(
+    course_size_m: float, inset_m: float = REGISTRATION_MARK_INSET_M,
+) -> list[tuple[float, float]]:
+    """
+    4 corner positions, each inset by inset_m from both edges, in the
+    course-local [0, course_size_m] frame -- shared by
+    build_registration_mark_stamps here and splines.py's
+    build_registration_mark_splines, so the terrain bump and the
+    spline circle at each corner land at the exact same point.
+    """
+    return [
+        (inset_m, inset_m),
+        (course_size_m - inset_m, inset_m),
+        (inset_m, course_size_m - inset_m),
+        (course_size_m - inset_m, course_size_m - inset_m),
+    ]
+
+
+def build_registration_mark_stamps(course_size_m: float) -> list[Stamp]:
+    """
+    4 small, subtle type-73 (circle) RAISE stamps, one at each course
+    corner -- opt-in (see Write Terrain's registration_marks flag), for
+    visually confirming in-game that terrain and splines land exactly
+    where expected, and that the game isn't scaling/repositioning
+    either one unexpectedly. Paired with a same-position circle spline
+    (see splines.py's build_registration_mark_splines) using cart path
+    surface, so each corner shows both a small raised bump and a
+    visible ring around it.
+
+    Type 73 (not 8) specifically requested: circular falloff reads as
+    a clean, symmetric bump, not 8's flat-topped plateau silhouette --
+    matters here since the whole point is an unambiguous, deliberately
+    placed landmark, not something that could be mistaken for a
+    refinement artifact.
+    """
+    return [
+        Stamp(
+            x=x, z=z, radius=REGISTRATION_MARK_STAMP_RADIUS_M,
+            value=REGISTRATION_MARK_STAMP_HEIGHT_M, brush=REGISTRATION_MARK_TYPE_73_CIRCLE,
+            tool=TOOL_RAISE,
+        )
+        for x, z in registration_mark_corners(course_size_m)
+    ]
+
+
 def build_course_wide_stamp(bounds: BoundingBox, value: float, tool: int) -> Stamp:
     """
     A single type-72 (hard square) stamp sized to cover the whole
