@@ -1,6 +1,6 @@
 This is a PGA2k utility to generate .course files from USGS LiDAR and OpenStreetView OSM, based on Chad Rockey's excellent [TCG Designer Tools](https://github.com/chadrockey/TGC-Designer-Tools).
 
-#How-To
+## How-To
 
 This Python app needs the following libs:
 
@@ -34,7 +34,7 @@ Steps:
 16. Click "Repack" to output the .course file to the working directory (give it a name first; ".course" suffix is not needed).
 17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. Only v2019 is supported but .course can be opened in v2021. (TODO: compatibility)
 
-#TODO
+### TODO
 
 - Trees from LiDAR
 - Water bodies & streams with procedural-generated nature
