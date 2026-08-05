@@ -286,7 +286,7 @@ def _circle_spline(cx: float, cz: float, radius: float) -> dict:
         points, surface="cartpath", path_width=1.7,
         shrink_distance=0.0, handle_length=radius * _BEZIER_CIRCLE_KAPPA,
         tight_splines=False, secondary_surface="", secondary_width=0.0,
-        state=3, is_closed=True, is_filled=True,
+        state=0, is_closed=false, is_filled=false,
     )
 
 
