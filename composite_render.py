@@ -36,6 +36,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 
 from terrain.bounding_box import BoundingBox
 from terrain.stamp import Stamp, TOOL_RAISE
@@ -119,78 +120,99 @@ def composite_stamps_to_canvas(
     Only rounded and clipped to a true uint16 range at the point of
     display (see visualize.py's render_composite_preview).
 
+    For each stamp, samples the brush image DIRECTLY at each affected
+    canvas cell's own coordinate (mapped into the brush's own 512x512
+    pixel space via scipy.ndimage.map_coordinates, bilinear, 0 outside
+    the brush's own extent) -- not a pre-resize-then-crop of the whole
+    512x512 image. An earlier version did resize first; confirmed
+    directly this was a real, significant bug: PIL's resize to a very
+    small target (e.g. a sub-meter-radius stamp, common late in a
+    heavily-refined session once DEC has shrunk hotspot radius a lot)
+    averages the ENTIRE source image -- including the brush's own
+    far-outside-the-circle black background -- into each output pixel,
+    rather than representing the true value at that precise location.
+    Measured directly: resizing type8's PNG to 1x1 gave 138, not the
+    true center value of 255. Direct per-cell sampling is correct
+    regardless of how small or large the stamp's own pixel footprint
+    is, so this isn't a special case for tiny stamps -- it replaces
+    the resize approach entirely, for every stamp size.
+
     Same bounding-box clipping principle as TerrainModel.render(): only
-    the canvas sub-region actually covered by each stamp's (resized)
-    brush footprint gets touched, not the whole canvas -- though unlike
-    render(), which tests each cell's precise distance against a
-    mathematical falloff formula, here the brush PNG's own pixels
-    already encode the falloff directly, so resizing the image to the
-    stamp's exact pixel footprint is sufficient on its own.
+    the canvas sub-region actually covered by each stamp's own radius
+    gets touched, not the whole canvas.
 
     rotation (Stamp.rotation) is accepted but not yet applied -- every
     stamp we've seen in practice so far uses rotation=0; stubbed in
     for later rather than silently ignored, so it's an easy, contained
-    change when it's actually needed.
+    change when it's actually needed (rotate the normalized offset
+    (nx, nz) below by -rotation before mapping to brush pixel
+    coordinates, matching how a rotated stamp's footprint would need
+    to be sampled).
     """
     cell_size_x = (bounds.max_x - bounds.min_x) / resolution
     cell_size_z = (bounds.max_z - bounds.min_z) / resolution
+    edges_x = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
+    edges_z = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
+    x_centers = (edges_x[:-1] + edges_x[1:]) / 2.0
+    z_centers = (edges_z[:-1] + edges_z[1:]) / 2.0
+
     canvas = np.zeros((resolution, resolution), dtype=np.float64)
 
     brush_cache: dict[int, np.ndarray] = {}
 
     def get_brush(brush_type: int) -> np.ndarray:
         if brush_type not in brush_cache:
-            brush_cache[brush_type] = load_brush_image(brush_type, brush_dir)
+            # Keep on a 0-255 scale here (not the [0,1] load_brush_image
+            # itself returns) since map_coordinates below samples this
+            # directly -- normalizing to a 0-1 weight happens once, after
+            # sampling, not before.
+            brush_cache[brush_type] = load_brush_image(brush_type, brush_dir) * 255.0
         return brush_cache[brush_type]
+
+    brush_size = None  # set from the first loaded brush; all 6 assets are the same 512x512
 
     for stamp in stamps:
         brush_img = get_brush(stamp.brush)
+        if brush_size is None:
+            brush_size = brush_img.shape[0]
+        brush_center_px = (brush_size - 1) / 2.0
+        brush_radius_px = brush_size / 2.0  # brush's own radius reaches to the image edge
 
         if stamp.rotation != 0.0:
-            # Stubbed in, not yet applied -- see docstring. When this
-            # is wired up: rotate the *resized* brush image (not the
-            # 512x512 source) via PIL's Image.rotate, before computing
-            # the canvas bounding box below, since rotation can change
-            # the tight bounding box's own extent for non-circular
-            # brushes (72/73).
+            # Stubbed in, not yet applied -- see docstring.
             pass
 
-        # Brush PNGs are a fixed 512x512 regardless of the stamp's own
-        # radius -- resize to the pixel footprint this specific stamp
-        # actually occupies on this canvas.
-        diameter_px_x = max(1, round(2 * stamp.radius / cell_size_x))
-        diameter_px_z = max(1, round(2 * stamp.radius / cell_size_z))
-        brush_uint8 = (brush_img * 255).astype(np.uint8)
-        resized = np.asarray(
-            Image.fromarray(brush_uint8).resize((diameter_px_x, diameter_px_z), Image.BILINEAR),
-            dtype=np.float64,
-        ) / 255.0
-
-        # Stamp center in canvas pixel coordinates; row=z, col=x, row 0
-        # = bounds.min_z -- same convention as TerrainModel.render().
-        center_col = (stamp.x - bounds.min_x) / cell_size_x
-        center_row = (stamp.z - bounds.min_z) / cell_size_z
-        left = round(center_col - diameter_px_x / 2.0)
-        top = round(center_row - diameter_px_z / 2.0)
-
-        # Bounding-box clip: only the overlap between this stamp's own
-        # footprint and the canvas extent gets touched.
-        canvas_col0, canvas_col1 = max(0, left), min(resolution, left + diameter_px_x)
-        canvas_row0, canvas_row1 = max(0, top), min(resolution, top + diameter_px_z)
-        if canvas_col0 >= canvas_col1 or canvas_row0 >= canvas_row1:
+        col_min = max(0, int((stamp.x - stamp.radius - bounds.min_x) / cell_size_x))
+        col_max = min(resolution, int((stamp.x + stamp.radius - bounds.min_x) / cell_size_x) + 1)
+        row_min = max(0, int((stamp.z - stamp.radius - bounds.min_z) / cell_size_z))
+        row_max = min(resolution, int((stamp.z + stamp.radius - bounds.min_z) / cell_size_z) + 1)
+        if col_min >= col_max or row_min >= row_max:
             continue  # entirely off-canvas
 
-        brush_col0, brush_col1 = canvas_col0 - left, canvas_col1 - left
-        brush_row0, brush_row1 = canvas_row0 - top, canvas_row1 - top
-        weight = resized[brush_row0:brush_row1, brush_col0:brush_col1]
+        sub_x = x_centers[col_min:col_max]
+        sub_z = z_centers[row_min:row_max]
+        xx, zz = np.meshgrid(sub_x, sub_z)  # shape (n_rows, n_cols)
 
-        region = canvas[canvas_row0:canvas_row1, canvas_col0:canvas_col1]
+        # Normalized offset from stamp center, in [-1, 1] across the
+        # stamp's own radius.
+        nx = (xx - stamp.x) / stamp.radius
+        nz = (zz - stamp.z) / stamp.radius
+
+        # Map into the brush image's own pixel coordinates.
+        brush_rows = brush_center_px + nz * brush_radius_px
+        brush_cols = brush_center_px + nx * brush_radius_px
+
+        weight = ndimage.map_coordinates(
+            brush_img, [brush_rows, brush_cols], order=1, mode="constant", cval=0.0,
+        ) / 255.0
+
+        region = canvas[row_min:row_max, col_min:col_max]
         target = stamp.value / max_height_m * UINT16_MAX
 
         if stamp.tool == TOOL_RAISE:
-            canvas[canvas_row0:canvas_row1, canvas_col0:canvas_col1] = region + target * weight
+            canvas[row_min:row_max, col_min:col_max] = region + target * weight
         else:
-            canvas[canvas_row0:canvas_row1, canvas_col0:canvas_col1] = region + (target - region) * weight
+            canvas[row_min:row_max, col_min:col_max] = region + (target - region) * weight
 
     return canvas
 
