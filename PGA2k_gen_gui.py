@@ -288,6 +288,15 @@ class PGAGenGUI:
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self.registration_marks_var = tk.BooleanVar(value=False)
+        reg_marks_checkbox = ttk.Checkbutton(
+            parent, text="Registration marks", variable=self.registration_marks_var,
+        )
+        reg_marks_checkbox.pack(anchor="w")
+        _Tooltip(reg_marks_checkbox, "Add a small type-73 (circle) raise stamp and a matching 5m "
+                 "circle spline (cart path surface) at each of the 4 course corners -- for visually "
+                 "confirming in-game that terrain and splines land exactly where expected. Shared "
+                 "with the same checkbox in the Splines tab (one setting, both places).")
         self._add_step_button(parent, "Write Terrain", self._run_output_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -505,13 +514,24 @@ class PGAGenGUI:
                  "of them out.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        reg_marks_checkbox2 = ttk.Checkbutton(
+            parent, text="Registration marks", variable=self.registration_marks_var,
+        )
+        reg_marks_checkbox2.pack(anchor="w")
+        _Tooltip(reg_marks_checkbox2, "Add a small type-73 (circle) raise stamp and a matching 5m "
+                 "circle spline (cart path surface) at each of the 4 course corners -- for visually "
+                 "confirming in-game that terrain and splines land exactly where expected. Shared "
+                 "with the same checkbox in the Terrain tab (one setting, both places).")
         self._add_step_button(parent, "Write Splines", self._run_write_splines)
         self._add_step_button(parent, "Write Holes", self._run_write_holes)
 
     def _run_write_splines(self) -> None:
         wd = self._require_working_dir()
         if wd:
-            self._run_step(["--step", "write-splines"], wd)
+            args = ["--step", "write-splines"]
+            if self.registration_marks_var.get():
+                args.append("--registration-marks")
+            self._run_step(args, wd)
 
     def _run_write_holes(self) -> None:
         wd = self._require_working_dir()
@@ -805,7 +825,10 @@ class PGAGenGUI:
     def _run_output_terrain(self) -> None:
         wd = self._require_working_dir()
         if wd:
-            self._run_step(["--step", "output-terrain"], wd)
+            args = ["--step", "output-terrain"]
+            if self.registration_marks_var.get():
+                args.append("--registration-marks")
+            self._run_step(args, wd)
 
     def _run_repack(self) -> None:
         wd = self._require_working_dir()
