@@ -532,13 +532,26 @@ def render_height_preview(
     model: TerrainModel,
     bounds: BoundingBox,
     path: Path,
-    resolution: int = 400,
+    resolution: int = 2000,
     extra_label: Optional[str] = None,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
 ) -> None:
     """
     TerrainModel's predicted height field over `bounds`.
+
+    resolution defaults to 2000 (native, 1 px = 1 m), matching
+    render_ground_lidar_preview/render_composite_preview -- previously
+    400, traded off against model.render()'s real, non-trivial cost at
+    high resolution with a large stamp count (unlike plain point
+    binning, which is cheap regardless of resolution -- see
+    render_ground_lidar_preview's own docstring). Measured directly at
+    a realistic 22,573-stamp course: 884ms at 400 vs 3087ms at 2000 --
+    a real ~2.2s added to every refine-terrain pass's auto-visualize
+    call, not free, but small next to how long a refine-terrain pass
+    itself takes, and worth it for comparing against
+    preview_lidar_ground.png/preview_composite.png (both already
+    native) at full, matching detail rather than a blurrier 400x400.
 
     vmin/vmax, if given, fix the color scale instead of the default
     auto-scale-to-this-image's-own-data-range -- pass the same values
