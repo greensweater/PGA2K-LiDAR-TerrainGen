@@ -125,9 +125,9 @@ def _round(value: float) -> float:
 
 REGISTRATION_MARK_INSET_M = 5.0  # distance from each course edge to a corner mark's center
 REGISTRATION_MARK_STAMP_RADIUS_M = 2.0
-REGISTRATION_MARK_STAMP_HEIGHT_M = 0.3  # subtle -- just enough to spot deliberately, not a real bump
+REGISTRATION_MARK_STAMP_HEIGHT_M = 5.0
 REGISTRATION_MARK_TYPE_73_CIRCLE = 73
-REGISTRATION_MARK_CIRCLE_RADIUS_M = 5.0  # radius of the matching spline circle (see splines.py)
+REGISTRATION_MARK_CIRCLE_RADIUS_M = 10.0  # radius of the matching spline circle (see splines.py) -- 20m diameter
 
 
 def registration_mark_corners(
@@ -156,7 +156,8 @@ def build_registration_mark_stamps(course_size_m: float) -> list[Stamp]:
     where expected, and that the game isn't scaling/repositioning
     either one unexpectedly. Paired with a same-position circle spline
     (see splines.py's build_registration_mark_splines) using cart path
-    surface, so each corner shows both a small raised bump and a
+    surface, so each corner shows both a deliberately-visible bump and
+    a
     visible ring around it.
 
     Type 73 (not 8) specifically requested: circular falloff reads as
