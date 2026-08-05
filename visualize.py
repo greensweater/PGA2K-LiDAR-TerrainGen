@@ -634,9 +634,10 @@ def render_composite_preview(
     the same way those two are meant to be compared against each other.
 
     Manual/opt-in only (see PGA2k_gen.py's step_visualize) -- a per-
-    stamp PIL resize+paste loop is meaningfully slower than
-    TerrainModel's vectorized render(), fine for an explicit trigger,
-    not for automatic regeneration after every refine pass.
+    stamp scipy.ndimage.map_coordinates sampling loop is meaningfully
+    slower than TerrainModel's vectorized render(), fine for an
+    explicit trigger, not for automatic regeneration after every
+    refine pass.
 
     Requires the real brush PNG assets -- see composite_render.py's
     module docstring for where to place them. Raises a clear,
@@ -651,6 +652,13 @@ def render_composite_preview(
     grid = canvas_to_meters(
         composite_stamps_to_canvas(stamps, bounds, resolution, brush_dir or DEFAULT_BRUSH_DIR)
     )
+    # Printed unconditionally (not just on some verbose flag) so a
+    # wrong-looking preview is immediately diagnosable from the
+    # console log alone: are the actual computed values wrong, or is
+    # the shared vmin/vmax color scale (see render_height_preview's
+    # docstring) just not matching this data's own range?
+    print(f"  composite canvas: min={grid.min():.2f}m max={grid.max():.2f}m mean={grid.mean():.2f}m "
+          f"(display range: vmin={vmin}, vmax={vmax})")
 
     fig, ax = _new_figure(bounds)
     im = ax.imshow(
