@@ -170,6 +170,8 @@ def composite_stamps_to_canvas(
         return brush_cache[brush_type]
 
     brush_size = None  # set from the first loaded brush; all 6 assets are the same 512x512
+    print(f"  composite_render: direct-coordinate-sampling method, {len(stamps)} stamps, "
+          f"resolution={resolution}")
 
     for stamp in stamps:
         brush_img = get_brush(stamp.brush)
