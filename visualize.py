@@ -614,6 +614,54 @@ def render_ground_lidar_preview(
     _save(fig, path)
 
 
+def render_composite_preview(
+    stamps,
+    bounds: BoundingBox,
+    path: Path,
+    resolution: int = 2000,
+    brush_dir: Optional[Path] = None,
+    extra_label: Optional[str] = None,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+) -> None:
+    """
+    Terrain height from composite_render.py's real-PNG-compositing
+    renderer, not TerrainModel's kernel-based one -- an independent
+    cross-check of "what we think the stamps do" (TerrainKernel's
+    measured/interpolated 1D radial profiles) against real 2D brush
+    image compositing, same stamp list, same tool semantics. Meant to
+    be flipped against preview_height.png (and preview_lidar_ground.png)
+    the same way those two are meant to be compared against each other.
+
+    Manual/opt-in only (see PGA2k_gen.py's step_visualize) -- a per-
+    stamp PIL resize+paste loop is meaningfully slower than
+    TerrainModel's vectorized render(), fine for an explicit trigger,
+    not for automatic regeneration after every refine pass.
+
+    Requires the real brush PNG assets -- see composite_render.py's
+    module docstring for where to place them. Raises a clear,
+    actionable FileNotFoundError (from load_brush_image) if missing,
+    rather than silently producing a blank or wrong preview.
+
+    vmin/vmax: see render_height_preview's own docstring -- pass the
+    same values here too for a 3-way color-comparable set.
+    """
+    from composite_render import composite_stamps_to_canvas, canvas_to_meters, DEFAULT_BRUSH_DIR
+
+    grid = canvas_to_meters(
+        composite_stamps_to_canvas(stamps, bounds, resolution, brush_dir or DEFAULT_BRUSH_DIR)
+    )
+
+    fig, ax = _new_figure(bounds)
+    im = ax.imshow(
+        grid, origin="lower", cmap="terrain", vmin=vmin, vmax=vmax,
+        extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
+    )
+    _add_colorbar(fig, im, "composited height (m)")
+    _set_title(ax, f"Composited terrain height, real brush PNGs ({resolution}x{resolution})", extra_label)
+    _save(fig, path)
+
+
 def _bin_point_cloud(
     cloud: PointCloud, bounds: BoundingBox, resolution: int, bare_earth_only: bool = False,
 ) -> np.ndarray:
