@@ -364,6 +364,29 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
     ground_elevation = course_cloud.elevation[course_cloud.bare_earth_mask()]
     model_grid_for_range = model.render(resolution=400, bounds=bounds)
     model_min, model_max = float(np.nanmin(model_grid_for_range)), float(np.nanmax(model_grid_for_range))
+
+    # Normalize height/ground-lidar/composite all the same way before
+    # computing the shared color scale -- same shift writer.py's
+    # normalize_stamp_heights applies for the real export (so the
+    # minimum resolved height lands at 0), applied here to all 3
+    # terrain-comparison previews' own data too, not just the
+    # composite one. Without this, preview_height.png/
+    # preview_lidar_ground.png show raw, un-normalized real-world
+    # elevation (e.g. 268-393m) while the composite preview (which
+    # DOES need to normalize, to match what the real 16-bit export
+    # actually operates on) ends up in a completely different range --
+    # confirmed directly as a real bug: a real course's composite
+    # canvas correctly computed 0-124m after normalizing, but the
+    # shared color scale was still 268-393m from the un-normalized
+    # model, making the (correctly computed!) composite look like a
+    # solid, washed-out color with no visible variation at all.
+    shift = -model_min
+    normalized_stamps = normalize_stamp_heights(stamps, bounds)
+    normalized_model = TerrainModel(normalized_stamps)
+    model_min, model_max = model_min + shift, model_max + shift
+    ground_elevation = ground_elevation + shift
+    shifted_course_cloud = dataclasses.replace(course_cloud, elevation=course_cloud.elevation + shift)
+
     if ground_elevation.size:
         shared_vmin = min(model_min, float(ground_elevation.min()))
         shared_vmax = max(model_max, float(ground_elevation.max()))
@@ -372,14 +395,14 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
 
     print(f"Writing {PREVIEW_HEIGHT}...")
     viz.render_height_preview(
-        model, bounds, preview_dir / PREVIEW_HEIGHT, extra_label=extra_label,
+        normalized_model, bounds, preview_dir / PREVIEW_HEIGHT, extra_label=extra_label,
         vmin=shared_vmin, vmax=shared_vmax,
     )
 
     print(f"Writing {PREVIEW_LIDAR_GROUND} (course-cropped, ground-only -- for comparing "
           f"against {PREVIEW_HEIGHT})...")
     viz.render_ground_lidar_preview(
-        course_cloud, bounds, preview_dir / PREVIEW_LIDAR_GROUND, extra_label=extra_label,
+        shifted_course_cloud, bounds, preview_dir / PREVIEW_LIDAR_GROUND, extra_label=extra_label,
         vmin=shared_vmin, vmax=shared_vmax,
     )
 
@@ -394,7 +417,7 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
               f"{PREVIEW_HEIGHT})...")
         try:
             viz.render_composite_preview(
-                stamps, bounds, preview_dir / PREVIEW_COMPOSITE, extra_label=extra_label,
+                normalized_stamps, bounds, preview_dir / PREVIEW_COMPOSITE, extra_label=extra_label,
                 vmin=shared_vmin, vmax=shared_vmax,
             )
         except (FileNotFoundError, ValueError) as e:
