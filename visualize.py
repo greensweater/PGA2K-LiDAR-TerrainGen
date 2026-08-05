@@ -534,17 +534,67 @@ def render_height_preview(
     path: Path,
     resolution: int = 400,
     extra_label: Optional[str] = None,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
 ) -> None:
-    """TerrainModel's predicted height field over `bounds`."""
+    """
+    TerrainModel's predicted height field over `bounds`.
+
+    vmin/vmax, if given, fix the color scale instead of the default
+    auto-scale-to-this-image's-own-data-range -- pass the same values
+    to render_ground_lidar_preview's own vmin/vmax so the two are
+    color-comparable at a glance (a mismatch that looks dramatic in
+    one could otherwise look subtle in the other, or vice versa,
+    purely from each image picking its own independent range).
+    """
     grid = model.render(resolution=resolution, bounds=bounds)
 
     fig, ax = _new_figure(bounds)
     im = ax.imshow(
-        grid, origin="lower", cmap="terrain",
+        grid, origin="lower", cmap="terrain", vmin=vmin, vmax=vmax,
         extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
     )
     _add_colorbar(fig, im, "predicted height (m)")
     _set_title(ax, f"Predicted terrain height ({resolution}x{resolution})", extra_label)
+    _save(fig, path)
+
+
+def render_ground_lidar_preview(
+    cloud: PointCloud,
+    bounds: BoundingBox,
+    path: Path,
+    resolution: int = 400,
+    extra_label: Optional[str] = None,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+) -> None:
+    """
+    Actual (not predicted) ground-only LIDAR height, binned over
+    `bounds` at the same resolution/course-cropped frame/colormap as
+    render_height_preview -- the direct "ground truth vs. our fitted
+    model" comparison, meant to be flipped back and forth against
+    preview_height.png (unlike render_lidar_heightmap/
+    render_lidar_preview, which show the *full*, uncropped merged
+    cloud and every classification, for orientation/coverage checks,
+    not this kind of apples-to-apples shape comparison).
+
+    Ground-only (bare_earth_only=True, see _bin_point_cloud) for the
+    same reason render_error_preview filters this way: comparing our
+    predicted terrain against building-roof or treetop elevation isn't
+    a meaningful signal for how well the terrain itself was fit.
+
+    vmin/vmax: see render_height_preview's own docstring -- pass the
+    same values to both for a directly color-comparable pair.
+    """
+    grid = _bin_point_cloud(cloud, bounds, resolution, bare_earth_only=True)
+
+    fig, ax = _new_figure(bounds)
+    im = ax.imshow(
+        grid, origin="lower", cmap="terrain", vmin=vmin, vmax=vmax,
+        extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
+    )
+    _add_colorbar(fig, im, "ground elevation (m)")
+    _set_title(ax, f"Ground-only LIDAR height, actual ({resolution}x{resolution})", extra_label)
     _save(fig, path)
 
 
