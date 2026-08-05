@@ -59,6 +59,7 @@ PREVIEW_DIR = "preview"
 
 PREVIEW_LIDAR = "preview_lidar.png"
 PREVIEW_LIDAR_HEIGHTMAP = "preview_lidar_heightmap.png"
+PREVIEW_LIDAR_GROUND = "preview_lidar_ground.png"
 PREVIEW_HEX = "preview_hex.png"
 PREVIEW_HEIGHT = "preview_height.png"
 PREVIEW_ERROR = "preview_error.png"
