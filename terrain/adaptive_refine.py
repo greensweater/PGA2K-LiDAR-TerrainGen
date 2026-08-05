@@ -125,6 +125,46 @@ tolerance rather than the mask-driven per-region tolerances the doc
 describes as the eventual design -- this is the "for now" version,
 same spirit as height_fit.py's naive averaging.
 
+ADDENDUM -- planarity gating (max_planar_rms, feature-flagged):
+
+The distance-transform sizing above (step 2) has a real blind spot:
+peak_dist is entirely a function of the over/under-tolerance mask's
+shape, which only encodes error *sign*, never slope. A valley's
+V-shaped cross-section is one contiguous same-sign region from floor
+to rim (predicted is "too high" -- or too low -- everywhere in it),
+so the distance transform happily grows a single stamp's radius all
+the way to the rim. Averaging (or flattening) the floor and the rim
+together under one stamp doesn't reduce error there so much as
+relocate it: the floor gets pulled toward the average (up) and the
+rim gets pulled toward the same average (down), each moving further
+from truth than before. "Grows until the error changes sign" and
+"grows until the region stops being flat" are simply different
+conditions, and only the second is what a flatten/raise-type stamp
+can actually represent well.
+
+max_planar_rms, when set, closes this gap directly: once base_radius
+and its query points are in hand, fit a single tilted plane to the
+region's actual (ground-truth) LIDAR heights and check the fit's RMS
+residual. If it exceeds max_planar_rms, shrink base_radius by
+planar_shrink_factor and re-check against the same (already-queried)
+point set -- filtering by distance, no re-query needed -- repeating
+until either the fit is acceptable or min_radius is hit. A region
+straddling a crease fails this check at nearly any radius that
+crosses the crease, so it shrinks down toward min_radius; a genuinely
+flat basin of the same footprint passes immediately at its full
+distance-transform radius. This directly produces "more, smaller
+stamps where the terrain's own slope/curvature is largest, fewer,
+larger stamps where it's smallest" -- the actual goal -- without
+touching how peaks are selected or claimed, and it composes cleanly
+with claim_radius_fraction/brush_radius_spread_ratio (shrinking
+happens to base_radius before either of those apply).
+
+Disabled by default (max_planar_rms=None) so existing tuned behavior
+is unaffected until a caller opts in; a sensible starting point is
+something modestly larger than the height-fit tolerance already in
+use elsewhere in the pipeline, tightened once preview_error.png shows
+it's working as expected.
+
 Designed to run repeatedly: each call re-scores the *current* terrain
 (coarse stamps plus any previously-added detail stamps) against the
 same grid, so "largest error -> split -> repeat" falls out of just
@@ -189,9 +229,40 @@ BRUSH_RANK = {8: 0, 9: 1, 10: 2, 54: 3}
 DEFAULT_MAX_HOTSPOT_RADIUS_M = HEX_STAMP_RADIUS_M / 2.0
 DEFAULT_MIN_HOTSPOT_RADIUS_M = DEFAULT_MAX_HOTSPOT_RADIUS_M / 2.0
 
+# Planarity gating (feature-flagged, see module docstring addendum
+# below): disabled by default (None) so existing behavior/tuning is
+# unaffected unless a caller opts in.
+DEFAULT_MAX_PLANAR_RMS: Optional[float] = None
+DEFAULT_PLANAR_SHRINK_FACTOR = 0.75  # < 1.0; how hard each shrink step bites
+
 
 def _brush_radius_multiplier(brush: int, spread_ratio: float) -> float:
     return spread_ratio ** BRUSH_RANK[brush]
+
+
+def _planar_fit_rms(px: np.ndarray, pz: np.ndarray, actual_pts: np.ndarray) -> float:
+    """
+    RMS residual of fitting the region's actual (ground-truth) LIDAR
+    heights to a single tilted plane -- a direct measure of how
+    "flat" the region is in the sense that matters for a flatten/
+    raise-type stamp, independent of the current terrain model or
+    predicted-vs-actual error.
+
+    This is what error-sign-based region growth (over/under vs.
+    tolerance) structurally can't see: a V-shaped valley cross-section
+    is all one sign of error from floor to rim, so it never trips a
+    sign-change boundary -- but it fits a plane terribly at almost any
+    radius that spans the crease, since a plane can't represent a
+    fold. A gentle, genuinely flat basin of the same *size* fits a
+    plane just fine. Gating on this residual is therefore a size cue
+    that tracks slope/curvature, not error magnitude or region area.
+    """
+    if px.size < 3:
+        return 0.0
+    design = np.column_stack((px, pz, np.ones_like(px)))
+    coeffs, *_ = np.linalg.lstsq(design, actual_pts, rcond=None)
+    residual = actual_pts - design @ coeffs
+    return float(np.sqrt(np.mean(residual ** 2)))
 
 
 @dataclass(slots=True)
@@ -264,6 +335,8 @@ def find_error_hotspots(
     mask: Optional[np.ndarray] = None,
     model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
     candidate_brushes: Optional[tuple[int, ...]] = None,
+    max_planar_rms: Optional[float] = DEFAULT_MAX_PLANAR_RMS,
+    planar_shrink_factor: float = DEFAULT_PLANAR_SHRINK_FACTOR,
     progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> list[ErrorHotspot]:
     """
@@ -436,6 +509,27 @@ def find_error_hotspots(
                 dist_under = None
             continue
 
+        if max_planar_rms is not None:
+            # Shrink base_radius until the region's actual LIDAR
+            # heights fit a single tilted plane within tolerance (see
+            # module docstring addendum). Filters the already-queried
+            # superset by distance rather than re-querying the
+            # heightmap -- query_radius was already sized to cover the
+            # largest radius any candidate could need.
+            dist_from_center = np.hypot(px - centroid_x, pz - centroid_z)
+            while base_radius > min_radius:
+                in_radius = dist_from_center <= base_radius
+                if np.count_nonzero(in_radius) < min_valid_cells:
+                    break
+                if _planar_fit_rms(px[in_radius], pz[in_radius], actual_pts[in_radius]) <= max_planar_rms:
+                    break
+                base_radius = max(base_radius * planar_shrink_factor, min_radius)
+            # query_radius/px/pz/actual_pts stay as the original
+            # (larger) superset -- brush candidates below still score
+            # correctly against it since points beyond a given
+            # candidate's own (possibly now-shrunk) radius just get
+            # r_norm=1 / weight 0, same as always.
+
         current_at_points = model.evaluate_many(np.column_stack((px, pz)))
         current_at_center = model.evaluate(centroid_x, centroid_z)
         target_mean = float(np.mean(actual_pts))
@@ -554,6 +648,8 @@ def refine_stamps(
     mask: Optional[np.ndarray] = None,
     model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
     candidate_brushes: Optional[tuple[int, ...]] = None,
+    max_planar_rms: Optional[float] = DEFAULT_MAX_PLANAR_RMS,
+    planar_shrink_factor: float = DEFAULT_PLANAR_SHRINK_FACTOR,
     progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> tuple[list[Stamp], list[ErrorHotspot]]:
     """
@@ -574,6 +670,8 @@ def refine_stamps(
         brush_radius_spread_ratio=brush_radius_spread_ratio,
         model_rebuild_interval=model_rebuild_interval,
         candidate_brushes=candidate_brushes,
+        max_planar_rms=max_planar_rms,
+        planar_shrink_factor=planar_shrink_factor,
         mask=mask,
         min_valid_cells=min_valid_cells,
         max_new_stamps=max_new_stamps,
