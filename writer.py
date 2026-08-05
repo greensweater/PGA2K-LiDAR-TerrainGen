@@ -123,8 +123,8 @@ def _round(value: float) -> float:
     return round(float(value), _DECIMALS)
 
 
-REGISTRATION_MARK_INSET_M = 5.0  # distance from each course edge to a corner mark's center
-REGISTRATION_MARK_STAMP_RADIUS_M = 2.0
+REGISTRATION_MARK_INSET_M = 20.0  # distance from each course edge to a corner mark's center
+REGISTRATION_MARK_STAMP_RADIUS_M = 10
 REGISTRATION_MARK_STAMP_HEIGHT_M = 5.0
 REGISTRATION_MARK_TYPE_73_CIRCLE = 73
 REGISTRATION_MARK_CIRCLE_RADIUS_M = 10.0  # radius of the matching spline circle (see splines.py) -- 20m diameter
