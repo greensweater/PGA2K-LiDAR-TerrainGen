@@ -2,7 +2,7 @@ This is a PGA2k utility to generate .course files from USGS LiDAR and OpenStreet
 
 ## How-To
 
-This Python app needs the following libs:
+This Python app needs the following libs: (TODO: VENV with all deps)
 
 - numpy (math)
 - scipy (math)
@@ -17,7 +17,7 @@ This Python app needs the following libs:
 Steps:
 
 1. Get LAZ files from [USGS Downloader](https://apps.nationalmap.gov/downloader/). Download at least 2km^2 extent.
-2. Draw your course for OSM using [OpenStreetMap](https://openstreetmap.org/). Tag everything for golf - fairways, holes, etc.
+2. Draw your course for OSM using [OpenStreetMap](https://openstreetmap.org/). Tag everything for golf features - fairways, holes, etc.
 3. Open the app & select your working folder.
 4. Click "Init" to initialize the working folder. This adds some subfolders and a project file.
 5. Put your LAZ files into "laz".
@@ -26,7 +26,7 @@ Steps:
 8. Click "Ingest OSM" to load the course map.
 9. Click "Ingest Course" to unpack a .course file. Start from a blank that you created in TCG 2019. (TODO: add template to source)
 10. Click "Generate Terrain" to do a coarse (~500 stamp) hex grid to roughly match LAZ.
-11. Click "Refine Terrain" to create smaller stamps to add detail. Play with the settings for best results; rollover for details. Use mask to refine selected areas, and adjust buffer to include or exclude areas. Select mask objects under "Splines" tab.
+11. Click "Refine Terrain" to create smaller stamps to add detail. Play with the settings for best results; rollover for details. Use the mask to refine selected areas, and adjust buffer to include or exclude areas. Select mask objects under "Splines" tab.
 12. Shortcuts: mouse wheel toggles preview versions; shift-wheel changes preview; ctrl-wheel zooms; wheel click moves map.
 13. Click "Write Terrain" to create the heightmap.
 14. Under "Splines", click "Write Splines" to generate course objects from OSM.
@@ -37,6 +37,6 @@ Steps:
 ### TODO
 
 - Trees from LiDAR
-- Water bodies & streams with procedural-generated nature
+- Water bodies & streams with procedurally-generated natural features
 - Assign tree types & vegetation using customized OSM ways
 - Assign heavy rough to clear built-in natural objects and create OB
