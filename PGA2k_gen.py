@@ -69,7 +69,9 @@ from ingest.osm import (
     DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, crop_features, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
 )
-from splines import build_surface_splines, feature_to_spline, save_surface_splines
+from splines import (
+    build_registration_mark_splines, build_surface_splines, feature_to_spline, save_surface_splines,
+)
 from holes import build_holes, save_holes
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -87,7 +89,10 @@ from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
-from writer import build_baseline_flatten_stamp, normalize_stamp_heights, write_user_layers
+from writer import (
+    build_baseline_flatten_stamp, build_registration_mark_stamps, normalize_stamp_heights,
+    write_user_layers,
+)
 
 INITIAL_STAMPS_FILE = "initial_stamps.json"
 FEATURES_FILE = "features.geojson"
@@ -592,7 +597,7 @@ def _crop_features_to_course(working_dir: Path, features: list) -> list:
     return crop_features(shifted, course_bounds)
 
 
-def step_write_splines(working_dir: Path) -> None:
+def step_write_splines(working_dir: Path, registration_marks: bool = False) -> None:
     """
     Generate PGA surface splines from features.geojson (see splines.py)
     and write them to course/CourseDescription_nodes/surfaceSplines.json.
@@ -617,6 +622,11 @@ def step_write_splines(working_dir: Path) -> None:
     features = load_features(features_path)
     features = _crop_features_to_course(working_dir, features)
     splines = build_surface_splines(features)
+
+    if registration_marks:
+        marks = build_registration_mark_splines(COURSE_SIZE_M)
+        splines = splines + marks
+        print(f"  + {len(marks)} registration-mark circle splines (one per corner)")
 
     unsupported: dict[str, int] = {}
     for f in features:
@@ -946,12 +956,17 @@ def _set_course_name_in_file(path: Path, course_name: str, key: str) -> None:
     print(f"Set course name to '{course_name}' in {path}")
 
 
-def step_output_terrain(working_dir: Path) -> None:
+def step_output_terrain(working_dir: Path, registration_marks: bool = False) -> None:
     course_dir = working_dir / "course"
 
     print(f"Loading stamps from {working_dir} (initial + all refine passes)...")
     stamps = load_all_stamps(working_dir)
     print(f"  {len(stamps)} stamps")
+
+    if registration_marks:
+        marks = build_registration_mark_stamps(COURSE_SIZE_M)
+        stamps = list(stamps) + marks
+        print(f"  + {len(marks)} registration-mark stamps (one per corner)")
 
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
     heights = TerrainModel(stamps).render(resolution=200, bounds=bounds)
@@ -1145,6 +1160,13 @@ def main(argv: list[str] | None = None) -> int:
                               "8/9 stamps can produce, at some cost to how precisely a wide flat area "
                               "can hit an exact target height. Default: use whatever's saved in "
                               "project.json, or all four (8,9,10,54) if never set.")
+    parser.add_argument("--registration-marks", action="store_true",
+                         help="output-terrain/write-splines: add a small type-73 (circle) raise "
+                              "stamp and a matching 5m circle spline (cart path surface) at each of "
+                              "the 4 course corners (5m inset from each edge) -- for visually "
+                              "confirming in-game that terrain and splines land exactly where "
+                              "expected, and that the game isn't scaling/repositioning either one "
+                              "unexpectedly. Opt-in; off by default.")
     parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
@@ -1190,9 +1212,9 @@ def main(argv: list[str] | None = None) -> int:
                                  args.radius_decay_per_pass, args.use_height_mask, args.mask_buffer_px,
                                  args.model_rebuild_interval, parsed_candidate_brushes)
         elif args.step == "output-terrain":
-            step_output_terrain(working_dir)
+            step_output_terrain(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-splines":
-            step_write_splines(working_dir)
+            step_write_splines(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-holes":
             step_write_holes(working_dir)
         elif args.step == "repack":
