@@ -78,9 +78,11 @@ from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
     DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
     DEFAULT_MAX_HOTSPOT_RADIUS_M,
+    DEFAULT_MAX_PLANAR_RMS,
     DEFAULT_MIN_HOTSPOT_RADIUS_CELLS,
     DEFAULT_MIN_HOTSPOT_RADIUS_M,
     DEFAULT_MODEL_REBUILD_INTERVAL,
+    DEFAULT_PLANAR_SHRINK_FACTOR,
     DEFAULT_RADIUS_DECAY_PER_PASS,
     DEFAULT_RESOLUTION,
     refine_stamps,
@@ -334,6 +336,8 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
             f"tol={p['tolerance']} res={p['resolution']} hot={p['min_hotspot_radius_cells']} "
             f"claim={p['claim_radius_fraction']} spread={p['brush_radius_spread_ratio']}"
         )
+        if p.get("max_planar_rms") is not None:
+            extra_label += f" planar_rms={p['max_planar_rms']} shrink={p.get('planar_shrink_factor')}"
         if p.get("use_height_mask"):
             buffer_note = f" buffer={p['mask_buffer_px']:.0f}px" if p.get("mask_buffer_px") is not None else ""
             extra_label += f" mask=on{buffer_note}"
@@ -826,6 +830,8 @@ def step_refine_terrain(
     mask_buffer_px: float | None = None,
     model_rebuild_interval: int | None = None,
     candidate_brushes: tuple[int, ...] | None = None,
+    max_planar_rms: float | None = None,
+    planar_shrink_factor: float | None = None,
 ) -> None:
     """
     One adaptive refinement pass (see terrain/adaptive_refine.py): find
@@ -857,12 +863,22 @@ def step_refine_terrain(
     re-covering the same ground at a smaller value. 1.0 disables this
     (every pass uses the same clamps -- the old default behavior).
 
-    claim_radius_fraction / brush_radius_spread_ratio / radius_decay_per_pass
-    are feature-flagged via project.json rather than always needing a
-    CLI value: pass None here to use whatever was last saved
-    (defaulting to the old/off behavior if never set), or an explicit
-    value to override for this run and persist it as the new default
-    for next time.
+    claim_radius_fraction / brush_radius_spread_ratio / radius_decay_per_pass /
+    max_planar_rms / planar_shrink_factor are feature-flagged via
+    project.json rather than always needing a CLI value: pass None
+    here to use whatever was last saved (defaulting to the old/off
+    behavior if never set), or an explicit value to override for this
+    run and persist it as the new default for next time.
+
+    max_planar_rms shrinks a hotspot's radius (before
+    claim_radius_fraction / brush_radius_spread_ratio are applied to
+    it -- see adaptive_refine.py) until the region's actual LIDAR
+    heights fit a single tilted plane within this RMS (m), catching
+    cases the error-sign-based sizing above can't: a valley's V-shaped
+    cross-section is one contiguous same-sign error region from floor
+    to rim, so it grows a stamp radius all the way to the rim with no
+    planarity check, pulling the floor up and the rim down under one
+    averaged stamp. None (default) disables this -- old behavior.
     """
     heightmap_path = working_dir / HEIGHTMAP_FILE
     if not heightmap_path.exists():
@@ -892,6 +908,12 @@ def step_refine_terrain(
     if candidate_brushes is None:
         saved_brushes = project.get("refine_candidate_brushes")
         candidate_brushes = tuple(saved_brushes) if saved_brushes is not None else None
+    if max_planar_rms is None:
+        max_planar_rms = project.get("refine_max_planar_rms", DEFAULT_MAX_PLANAR_RMS)
+    if planar_shrink_factor is None:
+        planar_shrink_factor = project.get(
+            "refine_planar_shrink_factor", DEFAULT_PLANAR_SHRINK_FACTOR
+        )
 
     stamps = load_all_stamps(working_dir)
     pass_number = len(_refine_stamps_files(working_dir)) + 1
@@ -900,6 +922,8 @@ def step_refine_terrain(
           f"brush_radius_spread_ratio={brush_radius_spread_ratio}  "
           f"radius_decay_per_pass={radius_decay_per_pass} (this is pass {pass_number})  "
           f"use_height_mask={use_height_mask}")
+    if max_planar_rms is not None:
+        print(f"  max_planar_rms={max_planar_rms}  planar_shrink_factor={planar_shrink_factor}")
 
     decay = radius_decay_per_pass ** (pass_number - 1)
     min_radius = DEFAULT_MIN_HOTSPOT_RADIUS_M / decay
@@ -948,6 +972,8 @@ def step_refine_terrain(
         mask=mask_grid,
         model_rebuild_interval=model_rebuild_interval,
         candidate_brushes=candidate_brushes,
+        max_planar_rms=max_planar_rms,
+        planar_shrink_factor=planar_shrink_factor,
         progress_callback=_print_refine_progress,
     )
 
@@ -970,6 +996,8 @@ def step_refine_terrain(
         "mask_buffer_px": mask_buffer_px,
         "model_rebuild_interval": model_rebuild_interval,
         "candidate_brushes": list(candidate_brushes) if candidate_brushes is not None else None,
+        "max_planar_rms": max_planar_rms,
+        "planar_shrink_factor": planar_shrink_factor,
     }
 
     if new_stamps:
@@ -995,6 +1023,8 @@ def step_refine_terrain(
         "refine_use_height_mask": use_height_mask,
         "refine_model_rebuild_interval": model_rebuild_interval,
         "refine_candidate_brushes": list(candidate_brushes) if candidate_brushes is not None else None,
+        "refine_max_planar_rms": max_planar_rms,
+        "refine_planar_shrink_factor": planar_shrink_factor,
     })
 
     print("Refreshing previews (parameters used above are now the header on the terrain previews)...")
@@ -1237,6 +1267,19 @@ def main(argv: list[str] | None = None) -> int:
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
                               f"2000x2000 m (default: {DEFAULT_HEIGHT_MASK_BUFFER_PX})")
+    parser.add_argument("--max-planar-rms", type=float, default=None,
+                         help="refine-terrain: shrink a hotspot's radius (before claim_radius_fraction/ "
+                              "brush_radius_spread_ratio apply) until the region's actual LIDAR heights "
+                              "fit a single tilted plane within this RMS (m) -- catches valleys/ridges/"
+                              "creases that an error-sign-only region never stops growing across (a "
+                              "V-shaped cross-section stays one sign from floor to rim, so it gets "
+                              "averaged into one stamp that pulls the floor up and the rim down). "
+                              "Default: use whatever's saved in project.json, or off (None) if never set.")
+    parser.add_argument("--planar-shrink-factor", type=float, default=None,
+                         help="refine-terrain: multiplier (< 1.0) applied to a hotspot's radius each "
+                              "time it fails the max_planar_rms check, until it passes or hits "
+                              "min_radius. Only matters when --max-planar-rms is set. Default: use "
+                              f"whatever's saved in project.json, or {DEFAULT_PLANAR_SHRINK_FACTOR} if never set.")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
@@ -1276,7 +1319,8 @@ def main(argv: list[str] | None = None) -> int:
                                  args.min_hotspot_radius_cells, args.max_new_stamps,
                                  args.claim_radius_fraction, args.brush_radius_spread_ratio,
                                  args.radius_decay_per_pass, args.use_height_mask, args.mask_buffer_px,
-                                 args.model_rebuild_interval, parsed_candidate_brushes)
+                                 args.model_rebuild_interval, parsed_candidate_brushes,
+                                 args.max_planar_rms, args.planar_shrink_factor)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-splines":
