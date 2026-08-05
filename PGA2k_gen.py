@@ -59,7 +59,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 from constants import (
     COURSE_SIZE_M, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
-    PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_MASK, PREVIEW_OSM, PREVIEW_OSM_FULL, PREVIEW_STAMPS,
+    PREVIEW_LIDAR, PREVIEW_LIDAR_GROUND, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_MASK, PREVIEW_OSM,
+    PREVIEW_OSM_FULL, PREVIEW_STAMPS,
     POINTCLOUD_FILE, PREVIEW_DIR, PROJECT_FILE, STAMPS_DIR,
 )
 import visualize as viz
@@ -353,13 +354,38 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
 
     if overwrite_current_version:
         _overwrite_latest(PREVIEW_HEIGHT)
+        _overwrite_latest(PREVIEW_LIDAR_GROUND)
+    # Shared color scale between predicted height and actual ground-only
+    # LIDAR height, so the two are directly comparable at a glance when
+    # flipped back and forth -- each auto-scaling to its own independent
+    # range could make an identical-looking pair appear different, or a
+    # real discrepancy look subtle, purely from the color mapping.
+    course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
+    ground_elevation = course_cloud.elevation[course_cloud.bare_earth_mask()]
+    model_grid_for_range = model.render(resolution=400, bounds=bounds)
+    model_min, model_max = float(np.nanmin(model_grid_for_range)), float(np.nanmax(model_grid_for_range))
+    if ground_elevation.size:
+        shared_vmin = min(model_min, float(ground_elevation.min()))
+        shared_vmax = max(model_max, float(ground_elevation.max()))
+    else:
+        shared_vmin, shared_vmax = model_min, model_max
+
     print(f"Writing {PREVIEW_HEIGHT}...")
-    viz.render_height_preview(model, bounds, preview_dir / PREVIEW_HEIGHT, extra_label=extra_label)
+    viz.render_height_preview(
+        model, bounds, preview_dir / PREVIEW_HEIGHT, extra_label=extra_label,
+        vmin=shared_vmin, vmax=shared_vmax,
+    )
+
+    print(f"Writing {PREVIEW_LIDAR_GROUND} (course-cropped, ground-only -- for comparing "
+          f"against {PREVIEW_HEIGHT})...")
+    viz.render_ground_lidar_preview(
+        course_cloud, bounds, preview_dir / PREVIEW_LIDAR_GROUND, extra_label=extra_label,
+        vmin=shared_vmin, vmax=shared_vmax,
+    )
 
     if overwrite_current_version:
         _overwrite_latest(PREVIEW_ERROR)
     print(f"Writing {PREVIEW_ERROR} (course-cropped point cloud vs. TerrainModel)...")
-    course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
     error_resolution = latest_refine["parameters"]["resolution"] if latest_refine is not None else 200
     viz.render_error_preview(
         model, course_cloud, bounds, preview_dir / PREVIEW_ERROR,
