@@ -646,9 +646,25 @@ def render_composite_preview(
 
     vmin/vmax: see render_height_preview's own docstring -- pass the
     same values here too for a 3-way color-comparable set.
+
+    Normalizes stamps the same way the real export does (writer.py's
+    normalize_stamp_heights: shift so the minimum resolved height lands
+    at 0) before compositing -- without this, stamp.value is whatever
+    raw, un-normalized height TerrainModel.render() itself produces
+    (which is what preview_height.png shows, and can be well above
+    275m or even negative; that shift only happens at actual export
+    time), while composite_stamps_to_canvas's 16-bit conversion assumes
+    values are already in the final [0, 275m] in-game range. Skipping
+    this step was a real bug, confirmed directly: a real course's
+    un-normalized model output reached 393.75m, and every stamp value
+    above the 275m ceiling was getting silently clipped to it, pinning
+    almost the entire canvas at the max -- exactly the "all blue" (or
+    however it lands relative to the shared color scale) symptom.
     """
     from composite_render import composite_stamps_to_canvas, canvas_to_meters, DEFAULT_BRUSH_DIR
+    from writer import normalize_stamp_heights
 
+    stamps = normalize_stamp_heights(stamps, bounds)
     grid = canvas_to_meters(
         composite_stamps_to_canvas(stamps, bounds, resolution, brush_dir or DEFAULT_BRUSH_DIR)
     )
