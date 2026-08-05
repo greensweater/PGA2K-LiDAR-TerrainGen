@@ -218,6 +218,8 @@ class PGAGenGUI:
         self.spread_ratio_var = tk.StringVar(value="1")
         self.claim_fraction_var = tk.StringVar(value="1")
         self.radius_decay_var = tk.StringVar(value="1")
+        self.max_planar_rms_var = tk.StringVar(value="")  # blank = off (old behavior)
+        self.planar_shrink_var = tk.StringVar(value="0.75")
         self.refine_labels: dict[str, ttk.Label] = {}
 
         grid_frame = ttk.Frame(parent)
@@ -286,6 +288,18 @@ class PGAGenGUI:
                   "radius by this factor for each prior refine pass already run, so later passes add "
                   "finer detail instead of re-covering the same ground at lower error. 1 disables it "
                   "(every pass uses the same clamps).", self.radius_decay_var, required=True)
+
+        add_field(3, 0, "max_planar_rms", "PLN m", "Max planar-fit RMS (m): shrinks a hotspot's radius "
+                  "until the region's actual LIDAR heights fit a single tilted plane within this "
+                  "tolerance -- catches valleys/ridges/creases an error-sign-only region never stops "
+                  "growing across (e.g. a V-shaped valley cross-section stays one sign of error from "
+                  "floor to rim, so without this it gets averaged into one stamp that pulls the floor "
+                  "up and the rim down). Leave blank to disable (old behavior).",
+                  self.max_planar_rms_var, required=False)
+        add_field(3, 1, "planar_shrink", "SHR %", "Planar shrink factor: how much to shrink a "
+                  "hotspot's radius each time it fails the max planar-fit RMS check, repeating until "
+                  "it passes or hits the min radius. Only used when PLN m is set.",
+                  self.planar_shrink_var, required=False)
 
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
@@ -822,6 +836,10 @@ class PGAGenGUI:
         max_new = self.max_new_var.get().strip()
         if max_new:
             args += ["--max-new-stamps", max_new]
+        max_planar_rms = self.max_planar_rms_var.get().strip()
+        if max_planar_rms:
+            args += ["--max-planar-rms", max_planar_rms,
+                      "--planar-shrink-factor", self.planar_shrink_var.get().strip()]
         self._run_step(args, wd)
 
     def _run_output_terrain(self) -> None:
