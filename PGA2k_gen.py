@@ -397,7 +397,7 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
                 stamps, bounds, preview_dir / PREVIEW_COMPOSITE, extra_label=extra_label,
                 vmin=shared_vmin, vmax=shared_vmax,
             )
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ValueError) as e:
             print(f"  skipped -- {e}")
 
     if overwrite_current_version:
