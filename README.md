@@ -29,7 +29,7 @@ Steps:
 11. Click "Refine Terrain" to create smaller stamps to add detail. Play with the settings for best results; rollover for details. Use mask to refine selected areas, and adjust buffer to include or exclude areas. Select mask objects under "Splines" tab.
 12. Shortcuts: mouse wheel toggles preview versions; shift-wheel changes preview; ctrl-wheel zooms; wheel click moves map.
 13. Click "Write Terrain" to create the heightmap.
-14. Click "Write Splines" to generate course objects.
+14. Under "Splines", click "Write Splines" to generate course objects from OSM.
 15. Under "Splines", filter by "hole" to select up to 18 holes for your course (apply Mask to exclude holes). Click "Write Holes" to add holes.
 16. Click "Repack" to output the .course file to the working directory (give it a name first; ".course" suffix is not needed).
 17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. Only v2019 is supported but .course can be opened in v2021. (TODO: compatibility)
