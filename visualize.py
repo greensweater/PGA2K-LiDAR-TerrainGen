@@ -563,20 +563,36 @@ def render_ground_lidar_preview(
     cloud: PointCloud,
     bounds: BoundingBox,
     path: Path,
-    resolution: int = 400,
+    resolution: int = 2000,
     extra_label: Optional[str] = None,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
 ) -> None:
     """
     Actual (not predicted) ground-only LIDAR height, binned over
-    `bounds` at the same resolution/course-cropped frame/colormap as
+    `bounds` at the same course-cropped frame/colormap as
     render_height_preview -- the direct "ground truth vs. our fitted
     model" comparison, meant to be flipped back and forth against
     preview_height.png (unlike render_lidar_heightmap/
     render_lidar_preview, which show the *full*, uncropped merged
     cloud and every classification, for orientation/coverage checks,
     not this kind of apples-to-apples shape comparison).
+
+    resolution defaults to 2000 (native, 1 px = 1 m), NOT
+    render_height_preview's own 400 -- that 400 is a real, deliberate
+    tradeoff there (model.render() gets genuinely expensive at high
+    resolution with a large stamp count, and it runs automatically
+    after every refine pass), but plain point binning has no such
+    cost (confirmed directly: 2 million points bin in ~1.6s at either
+    400 or 2000, i.e. resolution isn't what's expensive here, point
+    count is). Worse, a coarser grid actively works against this
+    preview's whole purpose -- at 400, each cell averages a 5x5m
+    patch together, smoothing away exactly the high-frequency
+    noise-vs-signal detail this preview exists to let you inspect.
+    The comparison against preview_height.png stays valid despite the
+    resolution mismatch (color scale, not grid density, is what makes
+    two images comparable) -- if anything, it's informative: this one
+    can show real noise the smooth fitted surface never will.
 
     Ground-only (bare_earth_only=True, see _bin_point_cloud) for the
     same reason render_error_preview filters this way: comparing our
