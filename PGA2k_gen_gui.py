@@ -64,10 +64,10 @@ PREVIEW_FILES = [
     "preview_lidar.png",
     "preview_hex.png",
     "preview_stamps.png",
-    "preview_height.png",
-    "preview_lidar_ground.png",
-    "preview_composite.png",
     "preview_error.png",
+    "preview_lidar_ground.png",
+    "preview_height.png",
+    "preview_composite.png",
 ]
 
 # Game version -> Courses folder name under .../AppData/LocalLow/2K/.
