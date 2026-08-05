@@ -283,7 +283,7 @@ def _circle_spline(cx: float, cz: float, radius: float) -> dict:
         (cx - radius, cz),  # W
     ]
     return _build_spline(
-        points, surface="cartpath", path_width=2.0,
+        points, surface="cartpath", path_width=1.7,
         shrink_distance=0.0, handle_length=radius * _BEZIER_CIRCLE_KAPPA,
         tight_splines=False, secondary_surface="", secondary_width=0.0,
         state=3, is_closed=True, is_filled=True,
