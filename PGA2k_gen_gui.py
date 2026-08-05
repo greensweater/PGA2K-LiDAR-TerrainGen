@@ -46,7 +46,7 @@ CLI_SCRIPT = SCRIPT_DIR / "PGA2k_gen.py"
 # JSON helpers already tested as part of the CLI (see PGA2k_gen.py).
 sys.path.insert(0, str(SCRIPT_DIR))
 from constants import (  # noqa: E402
-    COURSE_SIZE_M, PREVIEW_DIR, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
+    COURSE_SIZE_M, PREVIEW_COMPOSITE, PREVIEW_DIR, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
     PREVIEW_LIDAR, PREVIEW_LIDAR_GROUND, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
     PREVIEW_STAMPS, STAMPS_DIR,
 )
@@ -66,6 +66,7 @@ PREVIEW_FILES = [
     "preview_stamps.png",
     "preview_height.png",
     "preview_lidar_ground.png",
+    "preview_composite.png",
     "preview_error.png",
 ]
 
@@ -1097,7 +1098,9 @@ class PGAGenGUI:
         return max(0, len(versions) - 1)
 
     _UNDO_SUFFIX_RE = re.compile(r"^(.*)\.(\d{14})\.undo$")
-    _TERRAIN_PREVIEW_KINDS = (PREVIEW_HEX, PREVIEW_STAMPS, PREVIEW_HEIGHT, PREVIEW_LIDAR_GROUND, PREVIEW_ERROR)
+    _TERRAIN_PREVIEW_KINDS = (
+        PREVIEW_HEX, PREVIEW_STAMPS, PREVIEW_HEIGHT, PREVIEW_LIDAR_GROUND, PREVIEW_COMPOSITE, PREVIEW_ERROR,
+    )
 
     def _find_latest_refine_stamps(self, working_dir: Path) -> Path | None:
         stamps_dir = working_dir / STAMPS_DIR
