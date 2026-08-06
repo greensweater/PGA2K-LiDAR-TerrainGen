@@ -13,11 +13,16 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from scipy import ndimage
 
 from ingest.laz_reader import PointCloud
 from terrain.bounding_box import BoundingBox
 
 DEFAULT_HEIGHTMAP_RESOLUTION = 2000
+
+DEFAULT_FILL_MAX_ITERATIONS_PER_LEVEL = 200
+DEFAULT_FILL_TOLERANCE = 1e-4
+DEFAULT_FILL_MIN_COARSE_RESOLUTION = 32
 
 
 def rasterize_ground_heightmap(
@@ -108,6 +113,161 @@ def downsample_heightmap(
     with np.errstate(invalid="ignore", divide="ignore"):
         means = sums / counts
     return means
+
+
+def _jacobi_relax(
+    seeded: np.ndarray, missing: np.ndarray, iterations: int, tol: float,
+) -> np.ndarray:
+    """
+    In-place-equivalent harmonic relaxation: repeatedly replace every
+    `missing` cell with the plain mean of its 4-connected neighbors
+    (edge-replicated at the grid boundary), leaving every other cell
+    fixed at whatever value `seeded` already gives it. This is Jacobi
+    iteration for Laplace's equation with `~missing` cells as fixed
+    (Dirichlet) boundary values -- the well-behaved, direction-blind
+    version of "flood-fill with the average of adjacent points": a
+    single raster-scan flood-fill pass would bias the result toward
+    whichever direction got filled first, since later cells in the
+    scan order see already-filled neighbors while earlier ones don't.
+    Relaxing repeatedly (rather than filling once and stopping)
+    removes that bias -- every missing cell converges toward a value
+    consistent with the whole boundary around it, not just whichever
+    neighbor happened to be filled first.
+
+    `seeded` must have no NaNs left in it (see fill_heightmap_gaps'
+    initial nearest-valid seeding and coarse-to-fine prolongation) --
+    only `missing` says which cells are still free to move; the actual
+    array values are used directly in the neighbor-mean arithmetic
+    every iteration, so a stray NaN here would poison every cell it
+    touches, not just the one it started in.
+
+    Stops early once the largest single-cell change between
+    iterations (over just the `missing` cells) drops below `tol`.
+    """
+    filled = seeded
+    if not missing.any():
+        return filled
+    for _ in range(iterations):
+        padded = np.pad(filled, 1, mode="edge")
+        neighbor_avg = (
+            padded[:-2, 1:-1] + padded[2:, 1:-1] +
+            padded[1:-1, :-2] + padded[1:-1, 2:]
+        ) / 4.0
+        new_filled = filled.copy()
+        new_filled[missing] = neighbor_avg[missing]
+        delta = float(np.max(np.abs(new_filled[missing] - filled[missing])))
+        filled = new_filled
+        if delta < tol:
+            break
+    return filled
+
+
+def fill_heightmap_gaps(
+    heights: np.ndarray,
+    bounds: BoundingBox,
+    max_iterations_per_level: int = DEFAULT_FILL_MAX_ITERATIONS_PER_LEVEL,
+    tol: float = DEFAULT_FILL_TOLERANCE,
+    min_coarse_resolution: int = DEFAULT_FILL_MIN_COARSE_RESOLUTION,
+) -> np.ndarray:
+    """
+    Harmonic (Laplace-equation) inpainting of every NaN cell in
+    `heights` -- water, buildings, and any other no-ground-points gap
+    -- via iterative neighbor-average relaxation (see _jacobi_relax),
+    not a single-pass flood-fill. Every originally-valid cell is left
+    completely untouched, exactly as measured; only NaN cells are ever
+    written.
+
+    This deliberately does NOT special-case water polygons to a flat
+    constant height: the in-game water is a separately-placed, sized
+    plane object that gets fit into whatever recess the terrain
+    itself has, so what this needs to produce under a pond is a
+    plausible *recessed basin* shape blending in from the shore all
+    around -- not a flat disc -- and one fill rule for every kind of
+    gap (water, buildings, anything else) is simpler to reason about
+    than remembering which kind gets which treatment.
+
+    Solved as a coarse-to-fine pyramid rather than plain relaxation at
+    the full resolution directly: same-resolution Jacobi relaxation
+    converges in roughly (hole diameter in cells)^2 iterations, which
+    is fine for a building footprint (tens of cells across) but far
+    too slow for a wide lake spanning hundreds of meters (hundreds of
+    cells across, at this module's default 2000x2000 resolution).
+    Downsampling first (via downsample_heightmap, which already means
+    only over genuinely valid data) shrinks every hole by the same
+    factor, so the coarse solve converges fast; upsampling that coarse
+    solution back up seeds the next-finer level already close to
+    right, needing only a handful of refining iterations rather than
+    solving from scratch -- a standard multigrid trick, applied here
+    to this specific fill instead of a general PDE solver.
+
+    Raises ValueError if `heights` isn't square (the pyramid halves
+    both axes together) or has no valid cells at all to fill from.
+    """
+    if heights.shape[0] != heights.shape[1]:
+        raise ValueError(
+            f"fill_heightmap_gaps expects a square heightmap, got shape {heights.shape}"
+        )
+    resolution = heights.shape[0]
+
+    missing_full = ~np.isfinite(heights)
+    if not missing_full.any():
+        return heights.copy()
+    if missing_full.all():
+        raise ValueError("heightmap has no valid cells at all to fill from")
+
+    # Pyramid of resolutions, coarsest first, halving down to
+    # min_coarse_resolution (or landing above it if resolution isn't
+    # a clean power-of-two multiple -- max() keeps every step a real
+    # reduction without ever going below the floor).
+    resolutions = [resolution]
+    while resolutions[-1] > min_coarse_resolution:
+        resolutions.append(max(min_coarse_resolution, resolutions[-1] // 2))
+    resolutions = resolutions[::-1]
+
+    # Coarsest level: downsample straight from the original data (or
+    # use it directly if the heightmap is already <= the coarse
+    # floor), seed any still-missing coarse cell with its nearest
+    # valid coarse cell (a much better starting guess than a flat 0 --
+    # converges faster and never introduces an artificial flat patch),
+    # then relax to convergence -- cheap, since this grid is small.
+    current = heights if resolutions[0] == resolution else downsample_heightmap(heights, bounds, resolutions[0])
+    current_missing = ~np.isfinite(current)
+    if current_missing.all():
+        # Entire course has no bare-earth coverage at all at even the
+        # coarsest level (shouldn't happen in practice, but a global
+        # mean is a safe, inert fallback rather than raising here).
+        current = np.full_like(current, float(np.nanmean(heights)), dtype=np.float64)
+    else:
+        nearest_idx = ndimage.distance_transform_edt(
+            current_missing, return_distances=False, return_indices=True
+        )
+        seeded = np.where(current_missing, current[tuple(nearest_idx)], current)
+        current = _jacobi_relax(seeded, current_missing, max_iterations_per_level * 4, tol)
+
+    # Refine level by level: upsample the previous (coarser) solution
+    # as the initial guess for every still-missing cell at this level,
+    # re-impose this level's own actually-known cells exactly (from a
+    # fresh downsample of the original data, not from the coarser
+    # estimate), then relax a bit more to correct whatever the
+    # upsample interpolation got wrong right at the real boundary.
+    for target_res in resolutions[1:]:
+        zoom_factor = target_res / current.shape[0]
+        upsampled = ndimage.zoom(current, zoom_factor, order=1)
+        if upsampled.shape != (target_res, target_res):
+            # ndimage.zoom can land one cell off target_res due to
+            # rounding -- force the exact shape needed to align with
+            # this level's own known-data grid.
+            upsampled = ndimage.zoom(
+                current, (target_res / current.shape[0], target_res / current.shape[1]), order=1
+            )
+            upsampled = upsampled[:target_res, :target_res]
+
+        this_level_actual = heights if target_res == resolution else downsample_heightmap(heights, bounds, target_res)
+        this_level_missing = ~np.isfinite(this_level_actual)
+        seeded = np.where(this_level_missing, upsampled, this_level_actual)
+        current = _jacobi_relax(seeded, this_level_missing, max_iterations_per_level, tol)
+
+    return current
 
 
 def query_heightmap_cells(
