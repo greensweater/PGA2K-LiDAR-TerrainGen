@@ -193,6 +193,15 @@ class PGAGenGUI:
         self.projection_var = tk.StringVar()
         ttk.Label(parent, text="Projection EPSG (optional):").pack(anchor="w")
         ttk.Entry(parent, textvariable=self.projection_var, width=14).pack(anchor="w")
+        self.fill_heightmap_gaps_var = tk.BooleanVar(value=True)
+        fill_gaps_checkbox = ttk.Checkbutton(
+            parent, text="Fill heightmap gaps", variable=self.fill_heightmap_gaps_var
+        )
+        fill_gaps_checkbox.pack(anchor="w")
+        _Tooltip(fill_gaps_checkbox, "Fill NaN heightmap gaps (water, buildings, other no-ground-"
+                 "point areas) via harmonic inpainting -- iterative neighbor-average relaxation, "
+                 "not a single-pass flood-fill. On by default; uncheck to leave gaps as NaN, "
+                 "excluded from error scoring/fitting downstream (old behavior).")
         self._add_step_button(parent, "Ingest LAZ", self._run_ingest_laz)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -748,6 +757,8 @@ class PGAGenGUI:
         proj = self.projection_var.get().strip()
         if proj:
             args += ["--projection", proj]
+        if not self.fill_heightmap_gaps_var.get():
+            args += ["--no-fill-heightmap-gaps"]
         self._run_step(args, wd)
 
     def _run_ingest_osm(self) -> None:
