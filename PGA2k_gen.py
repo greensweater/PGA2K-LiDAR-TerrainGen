@@ -7,7 +7,7 @@ directory, running one pipeline step at a time:
 
     PGA2k_gen.py <working_dir>                       (same as --step init)
     PGA2k_gen.py <working_dir> --step init
-    PGA2k_gen.py <working_dir> --step ingest-laz [--projection <EPSG>]
+    PGA2k_gen.py <working_dir> --step ingest-laz [--projection <EPSG>] [--no-fill-heightmap-gaps]
     PGA2k_gen.py <working_dir> --step ingest-osm
     PGA2k_gen.py <working_dir> --step ingest-course --course-file <path>
     PGA2k_gen.py <working_dir> --step generate-terrain
@@ -65,7 +65,11 @@ from constants import (
 )
 import visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
-from ingest.heightmap import DEFAULT_HEIGHTMAP_RESOLUTION, load_heightmap, rasterize_ground_heightmap, save_heightmap
+from ingest.heightmap import (
+    DEFAULT_FILL_MAX_ITERATIONS_PER_LEVEL, DEFAULT_FILL_MIN_COARSE_RESOLUTION,
+    DEFAULT_FILL_TOLERANCE, DEFAULT_HEIGHTMAP_RESOLUTION,
+    fill_heightmap_gaps, load_heightmap, rasterize_ground_heightmap, save_heightmap,
+)
 from ingest.osm import (
     DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, crop_features, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
@@ -439,7 +443,9 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
     print(f"All previews written to {preview_dir}")
 
 
-def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
+def step_ingest_laz(
+    working_dir: Path, projection: int | None, fill_heightmap: bool = True,
+) -> None:
     laz_dir = working_dir / "laz"
     if not laz_dir.is_dir():
         raise StepError(f"No laz/ folder found under {working_dir} -- expected {laz_dir}")
@@ -486,12 +492,32 @@ def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
         resolution=DEFAULT_HEIGHTMAP_RESOLUTION,
     )
     coverage = np.mean(np.isfinite(heightmap))
+    print(f"  {coverage:.1%} of cells have at least one bare-earth point "
+          f"({(1 - coverage):.1%} gap -- water, buildings, other no-data areas)")
+
+    if fill_heightmap and coverage < 1.0:
+        print("  Filling gaps via harmonic (Laplace) inpainting -- iterative "
+              "neighbor-average relaxation, not a single-pass flood-fill (see "
+              "ingest/heightmap.py's fill_heightmap_gaps for why that "
+              "distinction matters). Water and buildings get the same "
+              "treatment: water is a separately-placed, sized plane object in "
+              "the game, so what's needed here is a plausible recessed-basin "
+              "shape under it, not a flat constant fill.")
+        heightmap = fill_heightmap_gaps(
+            heightmap,
+            BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M),
+        )
+        print(f"  filled -- {np.mean(np.isfinite(heightmap)):.1%} of cells now valid")
+    elif not fill_heightmap and coverage < 1.0:
+        print("  --no-fill-heightmap-gaps set -- leaving gaps as NaN "
+              "(excluded from error scoring/fitting downstream, as before).")
+
     save_heightmap(
         heightmap,
         BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M),
         working_dir / HEIGHTMAP_FILE,
     )
-    print(f"  wrote {HEIGHTMAP_FILE} ({coverage:.1%} of cells have at least one bare-earth point)")
+    print(f"  wrote {HEIGHTMAP_FILE}")
 
     # Report the merged extent as a lat/lon bbox, since that's what's
     # needed to manually pull an OSM export before the next step.
@@ -532,6 +558,8 @@ def step_ingest_laz(working_dir: Path, projection: int | None) -> None:
         "merged_bounds_local": dataclasses.asdict(cloud.bounds),
         "origin_x": cloud.origin_x,
         "origin_y": cloud.origin_y,
+        "heightmap_gaps_filled": fill_heightmap and coverage < 1.0,
+        "heightmap_raw_coverage": float(coverage),
         "lat_lon_bbox": {
             "min_lon": min(lons), "max_lon": max(lons),
             "min_lat": min(lats), "max_lat": max(lats),
@@ -1203,6 +1231,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--projection", type=int, default=None,
                          help="EPSG code to force for ingest-laz (optional -- "
                               "auto-detected from LAZ headers if omitted)")
+    parser.add_argument("--fill-heightmap-gaps", action=argparse.BooleanOptionalAction, default=True,
+                         help="ingest-laz: fill NaN heightmap gaps (water, buildings, other no-ground-"
+                              "point areas) via harmonic inpainting -- iterative neighbor-average "
+                              "relaxation, converging coarse-to-fine rather than a single-pass "
+                              "flood-fill (see ingest/heightmap.py's fill_heightmap_gaps). On by "
+                              "default; pass --no-fill-heightmap-gaps to leave gaps as NaN, excluded "
+                              "from error scoring/fitting downstream (old behavior).")
     parser.add_argument("--error-tolerance", type=float, default=2.0,
                          help="refine-terrain: |predicted - actual| (m) above which a grid "
                               "cell counts as a hotspot (default: 2.0)")
@@ -1300,7 +1335,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.step == "ingest-laz":
-            step_ingest_laz(working_dir, args.projection)
+            step_ingest_laz(working_dir, args.projection, args.fill_heightmap_gaps)
         elif args.step == "ingest-osm":
             step_ingest_osm(working_dir, args.height_mask_buffer_px)
         elif args.step == "ingest-course":
