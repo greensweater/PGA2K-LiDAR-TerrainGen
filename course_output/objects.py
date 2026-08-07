@@ -1,786 +1,467 @@
 """
-visualize.py
+objects.py
 
-Diagnostic PNG previews for every major pipeline stage. These are
-output-only: nothing here is ever read back in as terrain data (see
-"Important Design Rules": never rasterize terrain internally, and
-terrain_model.py's own render() docstring -- these images exist so the
-compiler is never a black box, not to feed later stages).
+Placed objects -- trees to start, plus building corner stakes -- for
+the game's placedObjects2.json (course/CourseDescription_nodes/).
 
-Five previews, one per stage:
-    preview_lidar.png    -- raw point cloud, colored by elevation
-    preview_hex.png      -- stamp layout: center + radius per stamp
-    preview_stamps.png   -- same layout, colored by fitted value instead
-                            of brush type, so mis-fits are visible at a
-                            glance
-    preview_height.png   -- TerrainModel's predicted height field
-    preview_error.png    -- predicted height vs. binned LIDAR elevation,
-                            diverging colormap centered on zero error
+VERSIONING: PGA 2K's .course schema (this file included) is NOT one
+fixed thing -- it diverges across the game's own version history
+(2019 -> 2021 -> 2023 -> 2025), and this project's whole export
+pipeline (userLayers.py, splines.py, objects.py) will eventually need to
+be version-aware for exactly that reason. objects.py is the first
+place that divergence is confirmed concretely:
+
+  - v2019 keys a placedObjects2 group by {"category", "type", "theme"}
+    -- a numeric prefab-catalog triple. This is Chad Rockey's
+    TGC-Designer-Tools (OSMTGC.py's newTree/get_trees,
+    tgc_definitions.py's normal_trees/skinny_trees/THEMES tables)
+    exactly, since v2019 is the version his tool targeted -- see
+    build_tree_objects_v2019.
+
+  - v2021+ keys a group by {"path": "Assets/..."} -- a Unity asset
+    path string -- confirmed directly from this project's own
+    sort_objects_v3.py/generate_rough_border_v2.py utilities, which
+    read/write real v2021+(?) course files against exactly this
+    shape. v2021 also introduces object splines (density-fill scatter
+    regions, not individual placed instances -- see
+    generate_rough_border_v2.py's NATURE-list pattern under
+    Value.splines), which v2019 has no equivalent for at all. See
+    build_tree_objects_v2021.
+
+v2023 (spline fences) and v2025 (terrain painting, spline water) are
+NOT implemented here yet -- their placedObjects2 schema hasn't been
+confirmed against a real extracted .course file from those versions,
+so IMPLEMENTED_GAME_VERSIONS deliberately excludes them rather than
+guessing. GAME_VERSIONS lists all four for UI/CLI purposes (so a
+version can be selected and stored even before it's implemented);
+IMPLEMENTED_GAME_VERSIONS is the subset this module can actually
+build output for right now.
+
+The position/rotation/scale shape of one placed-object *item* --
+{"position": {x, y: "-Infinity", z}, "rotation": {x,y,z}, "scale":
+{x,y,z}} -- is assumed shared across every version (it's the
+underlying engine primitive both known schemas above already agree
+on, just grouped under a different Key), and every position has
+GRID_ORIGIN_OFFSET subtracted, same as splines.py/holes.py -- the
+game's grid is centered on the origin ([-1000, 1000] for a 2000 m
+course), not this compiler's local [0, COURSE_SIZE_M] working frame.
+sort_objects_v3.py's own in_bounds check (MAP_MIN=-1000, MAP_MAX=1000)
+confirms placed objects need this same shift regardless of version.
+
+The uniform x=y=z scale-from-height rule (see build_tree_objects_v2019
+/ _v2021) is applied identically in both versions, and turns out to
+already be established practice for v2021+ specifically --
+sort_objects_v3.py's normalize_scale() does exactly this as a cleanup
+pass over an existing file. Building it in at generation time means
+that cleanup pass has nothing left to fix.
+
+Trees are parsed here directly from OSM node data (natural=tree),
+deliberately NOT through ingest/osm.py's Feature/parse_osm_features
+pipeline -- see that module's docstring: tree nodes are a separate
+concern from the way-based vector features (splines, masks,
+water/building/wood polygons) osm.py handles. This module does its
+own minimal, tree-only OSM XML parse instead, reusing osm.py's
+latlon_to_local for the actual coordinate transform (the same tested,
+LAZ-CRS-based local frame every other feature already lands in)
+rather than duplicating that math. Custom tags on a tree node (e.g. a
+tree-type tag picking a specific asset) are preserved through this
+parse -- see TREE_TYPE_TAG/TREE_HEIGHT_TAG -- version-independent,
+since which tags exist on an OSM node has nothing to do with which
+.course schema they eventually feed.
+
+Deliberately NOT built yet (see conversation, pending v2021+ schema
+confirmation beyond what generate_rough_border_v2.py already reverse-
+engineered): a generalized object-spline "scatter template" builder
+(e.g. a named recipe like "grass1, bush2, tree3" at various
+densities, applied to any OSM area instead of the hardcoded NATURE
+list), and area-based tree-species "hints" (an OSM polygon tagged
+conifer/deciduous/maple/etc., visible from satellite imagery, that an
+untagged tree node falling inside it inherits for asset selection --
+a natural companion to TREE_TYPE_TAG's per-node override, at the area
+level instead). Both are v2021+-only concepts (object splines don't
+exist in v2019 at all) and are next up once v2019 is solid.
 """
 
 from __future__ import annotations
 
-import re
+import json
+import random
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
-import matplotlib
-matplotlib.use("Agg")  # headless: never opens a window, just writes files
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.patches import Circle, Rectangle
-from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE
-from matplotlib.collections import PatchCollection
+import overpy
+import pyproj
 
-from constants import DEBUG_IMAGE_SIZE, PREVIEW_LIDAR_HEIGHTMAP
-from ingest.laz_reader import PointCloud
-from ingest.osm import Feature
-from shapely.geometry.base import BaseGeometry
+from ingest.osm import Feature, latlon_to_local
 from terrain.bounding_box import BoundingBox
-from terrain.stamp import Stamp
-from terrain.terrain_model import TerrainModel
-from matplotlib.lines import Line2D
+from course_output.userLayers import GRID_ORIGIN_OFFSET
 
-_DPI = 100
+# All versions this project knows *about*; only IMPLEMENTED_GAME_VERSIONS
+# can actually be built for right now (see module docstring). Kept as
+# strings (not ints) since "2019" etc. are display/config labels, not
+# quantities -- nothing here does arithmetic on a version.
+GAME_VERSIONS = ("2019", "2021", "2023", "2025")
+IMPLEMENTED_GAME_VERSIONS = ("2019", "2021")
+DEFAULT_GAME_VERSION = "2019"
 
-# Margins defined in absolute inches, not figure fractions -- this is
-# what actually eliminates wasted padding, not just relocates it. Course
-# bounds are always square (2000x2000) and every plot uses
-# ax.set_aspect("equal"), so if the allocated axes rect isn't ALSO
-# square in absolute terms, matplotlib shrinks the plot to fit the
-# smaller dimension and centers it, leaving the mismatch as blank
-# padding inside the rect (measured directly: ~140px of exactly this,
-# landing almost entirely at the top, before this fix). Forcing a
-# square *figure* and picking fractions independently for width vs.
-# height (the previous approach) can't avoid this -- the fractions
-# have to correspond to equal absolute sizes, which means computing
-# them from a common plot size in inches, and letting the figure itself
-# be non-square rather than forcing it square and eating the mismatch.
-_PLOT_SIZE_IN = DEBUG_IMAGE_SIZE / _DPI   # square plot area -- exactly 2000x2000 px at _DPI=100,
-                                            # matching the course's native 2000x2000 m size 1:1 (a
-                                            # previous *0.8 factor here left the actual plotted data
-                                            # area at only 1600x1600 px despite the course itself
-                                            # being 2000x2000 -- removed so stamp/heightmap previews
-                                            # actually show native per-meter resolution, not a
-                                            # downscaled version of it).
-_LEFT_MARGIN_IN = 1.2     # y-axis label + tick labels
-_RIGHT_MARGIN_IN = 2.4    # colorbar (or dummy) + its label + tick labels
-_BOTTOM_MARGIN_IN = 1.0   # x-axis label + tick labels
-_TOP_MARGIN_IN = 0.8      # title
+# Generic tree size -- used only when a tree has no more specific size
+# info (see TREE_HEIGHT_TAG). OSM tree nodes carry no real size data by
+# default, so every plain OSM-sourced tree gets the same stand-in
+# radius/height, same idea as Chad's OSMTGC.py newTree() used.
+TREE_RADIUS_M = 7.0
+TREE_HEIGHT_M = 10.0
 
-_FIG_W_IN = _LEFT_MARGIN_IN + _PLOT_SIZE_IN + _RIGHT_MARGIN_IN
-_FIG_H_IN = _BOTTOM_MARGIN_IN + _PLOT_SIZE_IN + _TOP_MARGIN_IN
-_FIGSIZE = (_FIG_W_IN, _FIG_H_IN)
+# Custom OSM tag keys this module looks for on natural=tree nodes, on
+# top of the standard natural=tree itself -- lets a hand-placed OSM
+# node opt into a specific asset/type (rather than a random pick from
+# the general pool) and/or a real height for the scale calculation.
+# These are just this project's own convention (not an OSM standard
+# tag), free to rename -- see parse_osm_trees. Version-independent:
+# which tree_type value maps to which theme-id (v2019) or asset path
+# (v2021+) is resolved separately per version, see below.
+TREE_TYPE_TAG = "pga_tree_type"
+TREE_HEIGHT_TAG = "pga_tree_height"
 
-# Distinct colors per brush type, for preview_hex.png
-_BRUSH_COLORS = {8: "#4C72B0", 9: "#55A868", 10: "#C44E52", 54: "#8172B2"}
-_DEFAULT_BRUSH_COLOR = "#888888"
+MIN_HEIGHT_SCALE = 0.5
+MAX_HEIGHT_SCALE = 1.2
 
+# ---------------------------------------------------------------------------
+# v2019 -- Chad Rockey's TGC-Designer-Tools category/type/theme scheme,
+# ported from OSMTGC.py's newTree()/tgc_image_terrain.py's get_trees(),
+# tables from tgc_definitions.py (confirmed via direct fetch).
+# ---------------------------------------------------------------------------
 
-# Fixed plot-area and colorbar positions, in figure-fraction coordinates
-# -- every preview uses the exact same rectangle (in absolute inches,
-# per _FIG_W_IN/_FIG_H_IN above) for its main plot and its colorbar
-# (real or dummy), so no preview's pixel dimensions or internal layout
-# depend on its own data (e.g. a wider "-10.0" tick label vs "1.0" on a
-# different preview). This is what actually fixes switching-between-
-# previews reflow in the GUI, which bbox_inches="tight" (removed from
-# _save below) could not: tight-bbox crops to the rendered content's
-# own bounding box, which shifts with tick label width -- exactly the
-# thing being fixed here.
-_PLOT_RECT = (
-    _LEFT_MARGIN_IN / _FIG_W_IN, _BOTTOM_MARGIN_IN / _FIG_H_IN,
-    _PLOT_SIZE_IN / _FIG_W_IN, _PLOT_SIZE_IN / _FIG_H_IN,
-)
-_COLORBAR_RECT = (
-    (_LEFT_MARGIN_IN + _PLOT_SIZE_IN + 0.3) / _FIG_W_IN, _BOTTOM_MARGIN_IN / _FIG_H_IN,
-    0.35 / _FIG_W_IN, _PLOT_SIZE_IN / _FIG_H_IN,
-)
-
-
-def _new_figure(bounds: BoundingBox):
-    fig = plt.figure(figsize=_FIGSIZE, dpi=_DPI)
-    ax = fig.add_axes(_PLOT_RECT)
-    ax.set_xlim(bounds.min_x, bounds.max_x)
-    ax.set_ylim(bounds.min_z, bounds.max_z)
-    ax.set_aspect("equal")
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("z (m)")
-    return fig, ax
-
-
-def _add_colorbar(fig, mappable, label: str) -> None:
-    cax = fig.add_axes(_COLORBAR_RECT)
-    fig.colorbar(mappable, cax=cax, label=label)
-
-
-def _add_dummy_scale(fig) -> None:
-    """
-    Blank placeholder occupying the same rectangle _add_colorbar would
-    -- so preview_hex.png (brush-type legend, not a continuous
-    colorbar) still reserves identical space, and its plot area ends
-    up pixel-identical in size/position to every colorbar-having
-    preview.
-    """
-    cax = fig.add_axes(_COLORBAR_RECT)
-    cax.axis("off")
-
-
-_VERSION_SUFFIX_RE = re.compile(r"^(.*)_(\d+)(\.[^.]+)$")
-
-
-def strip_preview_version(filename: str) -> str:
-    """
-    'preview_lidar_5.png' -> 'preview_lidar.png' -- recovers the
-    logical preview "kind" from a versioned filename, for callers that
-    need to know which series a file belongs to (e.g. picking the
-    right OSM overlay variant) without caring which version it is.
-    """
-    m = _VERSION_SUFFIX_RE.match(filename)
-    if not m:
-        return filename
-    stem, _n, suffix = m.groups()
-    return f"{stem}{suffix}"
-
-
-def find_all_preview_versions(directory: Path, base_name: str) -> list:
-    """
-    Every existing version of `base_name`'s series (e.g.
-    "preview_lidar.png" finds preview_lidar_0.png, _1.png, ...) in
-    `directory`, sorted by version number descending -- index 0 is
-    always the latest.
-    """
-    stem, suffix = Path(base_name).stem, Path(base_name).suffix
-    if not directory.is_dir():
-        return []
-    pattern = re.compile(rf"^{re.escape(stem)}_(\d+){re.escape(suffix)}$")
-    found = []
-    for f in directory.iterdir():
-        m = pattern.match(f.name)
-        if m:
-            found.append((int(m.group(1)), f))
-    found.sort(key=lambda t: t[0], reverse=True)
-    return [f for _n, f in found]
-
-
-def find_latest_preview(directory: Path, base_name: str):
-    """The highest-numbered existing version of `base_name`'s series, or None if none exists yet."""
-    versions = find_all_preview_versions(directory, base_name)
-    return versions[0] if versions else None
-
-
-def _next_version_path(path: Path) -> Path:
-    """
-    Every preview is written as {stem}_{N}{suffix} (N starting at 0),
-    never as a bare unsuffixed name -- "latest" is simply whichever N
-    is highest on disk. This replaces an earlier scheme that kept the
-    current file unsuffixed and shifted every archived version up by
-    one on each write (path -> path_1, existing path_1 -> path_2, and
-    so on): that cascaded through the *entire* history on every single
-    write, and made "undo" a two-step delete-then-rename dance instead
-    of just deleting the newest file. Append-only means there is
-    nothing to rename, ever, in either direction -- writing a new
-    version never touches an existing file, and undoing the latest
-    version is exactly one delete, nothing else.
-    """
-    stem, suffix, parent = path.stem, path.suffix, path.parent
-    existing = find_all_preview_versions(parent, path.name)
-    next_n = 0
-    if existing:
-        m = _VERSION_SUFFIX_RE.match(existing[0].name)
-        next_n = int(m.group(2)) + 1
-    return parent / f"{stem}_{next_n}{suffix}"
-
-
-def _save(fig, path: Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path = _next_version_path(path)
-    # No bbox_inches="tight": that crops to the rendered content's own
-    # bounding box, which shifts with tick-label width -- exactly what
-    # causes different previews to come out at different pixel sizes.
-    # _PLOT_RECT/_COLORBAR_RECT (see _new_figure) already give a fixed,
-    # tight-looking layout without being content-dependent.
-    fig.savefig(path, facecolor="white")
-    plt.close(fig)
-
-
-def _save_transparent(fig, path: Path) -> None:
-    """Like _save, but with a transparent background -- for the OSM overlay, meant to be composited over another preview, not viewed alone."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path = _next_version_path(path)
-    fig.savefig(path, transparent=True)
-    plt.close(fig)
-
-
-def _new_overlay_figure(bounds: BoundingBox):
-    """
-    Same _PLOT_RECT position/size as _new_figure (so content lines up
-    pixel-for-pixel with every other preview when composited), with a
-    transparent background and no axis chrome (ticks/labels/spines) --
-    those would double up visually on top of whatever base preview this
-    gets composited over, which already has its own.
-
-    Callers that need an opaque (not transparent) background -- e.g.
-    render_mask_preview -- can override fig.patch/ax.patch after
-    getting these back; NOT via ax.axis("off"), which also calls
-    set_frame_on(False) and hides the axes' own background patch
-    entirely (confirmed directly: ax.set_facecolor(...) has no visible
-    effect at all with axis("off") on). Hiding just the ticks/spines
-    keeps the patch intact either way, transparent or not.
-    """
-    fig = plt.figure(figsize=_FIGSIZE, dpi=_DPI)
-    fig.patch.set_alpha(0.0)
-    ax = fig.add_axes(_PLOT_RECT)
-    ax.patch.set_alpha(0.0)
-    ax.set_xlim(bounds.min_x, bounds.max_x)
-    ax.set_ylim(bounds.min_z, bounds.max_z)
-    ax.set_aspect("equal")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    return fig, ax
-
-
-# Distinct colors per OSM feature kind (see ingest/osm.py's classify_way).
-# Deliberately saturated/high-contrast, since this overlay is meant to
-# be composited at partial opacity over another preview -- muted colors
-# would wash out and become hard to distinguish once blended.
-_OSM_FEATURE_COLORS = {
-    "green": "#3CB371",
-    "tee": "#2E8B57",
-    "fairway": "#7CFC00",
-    "rough": "#556B2F",
-    "bunker": "#EDC9AF",
-    "water": "#4682B4",
-    "cartpath": "#8B7355",
-    "path": "#A9A9A9",
-    "building": "#B22222",
-    "wood": "#228B22",
-    "hole": "#FFD700",
+THEMES_V2019 = {
+    2: "desert", 5: "boreal", 6: "tropical", 7: "countryside", 8: "harvest",
+    10: "delta", 11: "rustic", 12: "swiss", 13: "steppe", 14: "autumn", 15: "highlands",
 }
-_OSM_DEFAULT_COLOR = "#FF00FF"  # unclassified kind -- deliberately jarring so it's obvious
+
+NORMAL_TREES_V2019 = {
+    2: [0, 1, 2, 3, 9],
+    5: [0, 1],
+    6: [0, 1, 2, 3, 4, 5, 6, 7],
+    7: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16],
+    8: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+    10: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12],
+    11: [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    12: [0, 1, 3, 4, 7, 8, 10],
+    13: [0, 1, 2, 3, 4, 5, 6, 7],
+    14: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    15: [0, 1, 6, 7],
+}
+
+SKINNY_TREES_V2019 = {
+    2: [10, 11, 12, 13, 14, 15, 16],
+    5: [3, 4, 5, 9, 10, 11, 12, 13, 14, 15, 16],
+    6: [8, 9, 13, 14, 15, 16, 17, 18, 19],
+    7: [13, 14],
+    8: [0, 1, 2],
+    10: [],
+    11: [13, 14, 16],
+    12: [2, 5, 9],
+    13: [8, 9, 10, 11, 12, 13, 14, 15],
+    14: [12, 15],
+    15: [2, 3, 8, 9, 10, 22],
+}
+
+SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019 = 2.5  # h/r >= this -> classified "skinny", per Chad's get_trees()
 
 
-def _draw_osm_feature(ax, feature: Feature) -> None:
-    color = _OSM_FEATURE_COLORS.get(feature.kind, _OSM_DEFAULT_COLOR)
-    geom = feature.geometry
-    parts = geom.geoms if hasattr(geom, "geoms") else [geom]
-    for part in parts:
-        if part.geom_type == "Polygon":
-            xs, zs = part.exterior.xy
-            ax.fill(xs, zs, facecolor=color, edgecolor=color, alpha=0.55, linewidth=1.2)
-        elif part.geom_type == "LineString":
-            xs, zs = part.xy
-            ax.plot(xs, zs, color=color, linewidth=2.0, alpha=0.85, solid_capstyle="round")
-
-
-def render_osm_features(
-    features: Sequence[Feature], bounds: BoundingBox, path: Path,
-    crop_box: Optional[BoundingBox] = None,
-) -> None:
+def parse_osm_trees(
+    osm_xml_path: Path,
+    crs: pyproj.CRS,
+    origin_x: float,
+    origin_y: float,
+    horizontal_unit_factor: float,
+    bounds: Optional[BoundingBox] = None,
+    printf=print,
+) -> list[tuple[float, float, dict]]:
     """
-    Transparent PNG of every OSM Feature (see ingest/osm.py), colored by
-    kind, at the exact same plot-area position/size every other preview
-    uses -- meant to be alpha-composited over any of them (in the GUI,
-    not baked into a new file per base preview), not viewed standalone.
-
-    crop_box, if given, draws a dashed rectangle outline (no fill) at
-    that position/size, in the same coordinate frame as `bounds` --
-    meant for showing where the [0, COURSE_SIZE_M] course crop
-    currently sits within the full merged point cloud's own, larger
-    frame (features here are typically uncropped in that case, so
-    detail beyond the crop is visible too -- see step_ingest_osm).
+    (x, z, tags) in the given local frame for every OSM node tagged
+    natural=tree, optionally dropping any outside `bounds` -- the
+    tree-only counterpart to osm.py's parse_osm_features, which
+    deliberately skips node data entirely (see that module's and this
+    one's own docstring). tags is the node's full raw OSM tag dict
+    (including natural=tree itself), so callers can read
+    TREE_TYPE_TAG/TREE_HEIGHT_TAG or any other custom tag without a
+    second parse. Version-independent -- the OSM data itself doesn't
+    change per game version, only how build_tree_objects_v2019/_v2021
+    turn it into placedObjects2 entries.
     """
-    fig, ax = _new_overlay_figure(bounds)
+    xml_data = Path(osm_xml_path).read_text(encoding="utf-8")
+    result = overpy.Overpass().parse_xml(xml_data)
+    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
 
-    kinds_present = set()
-    for feature in features:
-        _draw_osm_feature(ax, feature)
-        kinds_present.add(feature.kind)
-
-    if crop_box is not None:
-        ax.add_patch(Rectangle(
-            (crop_box.min_x, crop_box.min_z),
-            crop_box.max_x - crop_box.min_x, crop_box.max_z - crop_box.min_z,
-            fill=False, edgecolor="red", linewidth=2.0, linestyle="--", zorder=10,
-        ))
-
-    if kinds_present:
-        handles = [
-            Line2D(
-                [0], [0], marker="s", linestyle="", markersize=8,
-                markerfacecolor=_OSM_FEATURE_COLORS.get(kind, _OSM_DEFAULT_COLOR),
-                markeredgecolor="black", label=kind,
+    trees: list[tuple[float, float, dict]] = []
+    skipped = 0
+    for node in result.nodes:
+        if node.tags.get("natural") != "tree":
+            continue
+        try:
+            x, z = latlon_to_local(
+                float(node.lat), float(node.lon), origin_x, origin_y, horizontal_unit_factor, transformer,
             )
-            for kind in sorted(kinds_present)
-        ]
-        if crop_box is not None:
-            handles.append(Line2D([0], [0], color="red", linestyle="--", linewidth=2.0, label="course crop"))
-        ax.legend(handles=handles, loc="upper right", fontsize=6, framealpha=0.7)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if bounds is not None and not (bounds.min_x <= x <= bounds.max_x and bounds.min_z <= z <= bounds.max_z):
+            continue
+        trees.append((x, z, dict(node.tags)))
 
-    _save_transparent(fig, path)
+    if skipped:
+        printf(f"Skipped {skipped} tree node(s) with unusable coordinates")
+    printf(f"Parsed {len(trees)} tree(s) from {len(result.nodes)} OSM node(s)")
+    return trees
 
 
-def render_mask_preview(mask_geometry: Optional[BaseGeometry], bounds: BoundingBox, path: Path) -> None:
+def _placed_item(x: float, z: float, scale: float, rotation_degrees: float = 0.0) -> dict:
+    """One placed-object instance, position shifted into the game's
+    origin-centered grid (see module docstring), scale.x = scale.y =
+    scale.z = `scale`. Shared by every version's builder -- see module
+    docstring on why this shape is assumed version-independent."""
+    return {
+        "position": {"x": x - GRID_ORIGIN_OFFSET, "y": "-Infinity", "z": z - GRID_ORIGIN_OFFSET},
+        "rotation": {"x": 0.0, "y": rotation_degrees, "z": 0.0},
+        "scale": {"x": scale, "y": scale, "z": scale},
+    }
+
+
+def _height_scale_lookup(
+    trees: list[tuple[float, float, dict]],
+) -> tuple[list[float], float, float, float]:
     """
-    Plain black/white PNG for use as a PIL ImageChops.multiply mask --
-    same "black conceals, white reveals" convention as a Photoshop layer
-    mask: white wherever the buffered fairway/green outline (see
-    ingest/osm.py's build_height_mask) covers, black everywhere else.
-    Multiplying another image by this one crushes everything outside
-    the mask to black while leaving everything inside it unchanged
-    (white * x = x; black * x = 0).
-
-    Rendered directly from the vector geometry, not the lower-resolution
-    boolean grid find_error_hotspots actually rasterizes internally --
-    the boundary stays crisp/exact here rather than blocky, since this
-    is for looking at, not for the algorithm to consume.
-
-    mask_geometry=None (no fairway/green features found) renders solid
-    white -- "no mask" means "don't restrict/darken anything", matching
-    ingest/osm.py's rasterize_mask same-situation convention.
+    (heights, min_h, min_scale, scale_multiplier) for the shared
+    height-driven uniform-scale rule (see module docstring) --
+    scale = (h - min_h) * scale_multiplier + min_scale gives every
+    tree's single x=y=z scale factor. Factored out since both
+    version-specific builders use the exact same rule, just grouping
+    the result differently afterward.
     """
-    fig, ax = _new_overlay_figure(bounds)
-    # _new_overlay_figure defaults to transparent -- override to opaque
-    # here: white margin (pass-through, so multiplying this against a
-    # base image doesn't blacken its labels/border area), black data
-    # area by default (masked-out), with the mask polygon(s) filled
-    # white (masked-in) on top.
-    fig.patch.set_alpha(1.0)
-    fig.patch.set_facecolor("white")
-    ax.patch.set_alpha(1.0)
-    ax.set_facecolor("black")
-
-    if mask_geometry is None:
-        ax.axhspan(bounds.min_z, bounds.max_z, facecolor="white")
-    else:
-        parts = mask_geometry.geoms if hasattr(mask_geometry, "geoms") else [mask_geometry]
-        for part in parts:
-            if part.geom_type != "Polygon":
-                continue
-            xs, zs = part.exterior.xy
-            ax.fill(xs, zs, facecolor="white", edgecolor="none")
-            for interior in part.interiors:
-                ixs, izs = interior.xy
-                ax.fill(ixs, izs, facecolor="black", edgecolor="none")
-
-    _save(fig, path)
+    heights = []
+    for _, _, tags in trees:
+        try:
+            heights.append(float(tags.get(TREE_HEIGHT_TAG, TREE_HEIGHT_M)))
+        except (TypeError, ValueError):
+            heights.append(TREE_HEIGHT_M)
+    min_h, max_h = min(heights), max(heights)
+    height_range = max_h - min_h
+    if height_range > 0.01:
+        return heights, min_h, MIN_HEIGHT_SCALE, (MAX_HEIGHT_SCALE - MIN_HEIGHT_SCALE) / height_range
+    # All (nearly) the same height -- e.g. every tree here is still the
+    # generic OSM-node placeholder size -- scale to a neutral 1.0
+    # rather than an arbitrary point in the range.
+    return heights, min_h, 1.0, 0.0
 
 
-def render_lidar_preview(cloud: PointCloud, path: Path, max_points: int = 200_000) -> None:
+def build_tree_objects_v2019(
+    trees: list[tuple[float, float, dict]],
+    theme: Optional[int],
+    tree_variety: bool = False,
+    rng: Optional[random.Random] = None,
+) -> list[dict]:
     """
-    Scatter the point cloud in the x/z plane, colored by elevation.
+    v2019 placedObjects2 groups -- Key is {"category": 0, "type": id,
+    "theme": true} (see module docstring), ported from Chad's
+    get_trees(). theme selects which of THEMES_V2019's tree "type" ids
+    are available; an unrecognized/None theme falls back to a single
+    generic type (id 0), matching Chad's own `.get(theme, [0])`
+    fallback exactly. tree_variety=False (the default, matching the
+    original) also forces that single generic type regardless of
+    theme, and disables the skinny-tree pool entirely.
 
-    Subsamples to max_points for large clouds -- this is a diagnostic
-    image, not a data product, so it doesn't need every point.
+    A tree's TREE_TYPE_TAG is NOT consulted here -- v2019's catalog is
+    numeric ids per theme, not asset names, so there's no meaningful
+    way to map an OSM tag value onto it; that per-tree override only
+    applies to v2021+ (see build_tree_objects_v2021).
+
+    Classification as "normal" vs. "skinny" uses height/radius (h/r
+    >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019), same as Chad's original --
+    radius comes from TREE_RADIUS_M (no per-tree override tag exists
+    for this, matching upstream OSM's own lack of a tree-radius
+    concept). Scale is the same shared height-driven uniform x=y=z
+    rule every version uses (see _height_scale_lookup / module
+    docstring) -- Chad's original v2019 tool scaled x/z from radius
+    independently of y from height; this project deliberately does not
+    reproduce that (see prior conversation: scale should track height
+    alone, uniformly, not stretch/squash per axis).
     """
-    bounds = cloud.bounds
-    fig, ax = _new_figure(bounds)
+    if rng is None:
+        rng = random.Random()
+    if not trees:
+        return []
 
-    n = cloud.count
-    if n > max_points:
-        idx = np.random.default_rng(0).choice(n, size=max_points, replace=False)
-    else:
-        idx = slice(None)
+    normal_tree_ids = NORMAL_TREES_V2019.get(theme, [0])
+    if (not tree_variety) or len(normal_tree_ids) == 0:
+        normal_tree_ids = [0]
+    skinny_tree_ids = SKINNY_TREES_V2019.get(theme, normal_tree_ids)
+    if (not tree_variety) or len(skinny_tree_ids) == 0:
+        skinny_tree_ids = []
 
-    sc = ax.scatter(
-        cloud.x[idx], cloud.z[idx], c=cloud.elevation[idx],
-        s=3, cmap="terrain", linewidths=0,
-    )
-    _add_colorbar(fig, sc, "elevation (m)")
-    ax.set_title(f"LIDAR point cloud ({n:,} points)")
-    _save(fig, path)
+    def _group(tree_type: int) -> dict:
+        return {"Key": {"category": 0, "type": tree_type, "theme": True}, "Value": {"items": [], "clusters": []}}
 
+    normal_groups = {t: _group(t) for t in normal_tree_ids}
+    skinny_groups = {t: _group(t) for t in skinny_tree_ids}
 
-def _add_compass_labels(ax, bounds: BoundingBox) -> None:
-    """
-    Burn N/S/E/W labels onto the plot edges, per this pipeline's
-    coordinate convention: +z = north, +x = east (inherited directly
-    from the source LAZ's projected northing/easting, never flipped in
-    ingest.laz_reader or terrain_model.py). This lets a rendered image
-    be checked against known site geography to confirm whether PGA's
-    own grid actually matches this convention once exported (see
-    userLayers.py's NOTE on sign convention) -- if compass directions don't
-    match reality in-game, the mismatch is in the game's own grid
-    mapping or the writer's position transform, not in this image.
-    """
-    cx = (bounds.min_x + bounds.max_x) / 2.0
-    cz = (bounds.min_z + bounds.max_z) / 2.0
-    style = dict(color="red", fontsize=14, fontweight="bold")
-    ax.text(cx, bounds.max_z, "N", **style, ha="center", va="bottom")
-    ax.text(cx, bounds.min_z, "S", **style, ha="center", va="top")
-    ax.text(bounds.max_x, cz, "E", **style, ha="left", va="center")
-    ax.text(bounds.min_x, cz, "W", **style, ha="right", va="center")
+    heights, min_h, min_scale, scale_multiplier = _height_scale_lookup(trees)
 
-
-def render_lidar_heightmap(
-    cloud: PointCloud,
-    bounds: BoundingBox,
-    path: Path,
-    resolution: int = 800,
-) -> None:
-    """
-    Grayscale binned heightmap of the point cloud, with N/S/E/W labels
-    burned in (see _add_compass_labels), for checking against known
-    site geography whether PGA's in-game grid orientation actually
-    matches this pipeline's -z=south/+z=north/-x=west/+x=east
-    convention once exported and viewed in-editor.
-
-    Distinct from render_lidar_preview(): that's a scatter plot colored
-    by a perceptual colormap (good for spotting classification/coverage
-    issues); this is a proper binned grid in true grayscale, which
-    reads more like an actual heightmap/DEM and is easier to compare
-    shape-for-shape against an in-game view.
-    """
-    heights = _bin_point_cloud(cloud, bounds, resolution)
-
-    fig, ax = _new_figure(bounds)
-    im = ax.imshow(
-        heights, origin="lower", cmap="gray",
-        extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
-    )
-    _add_colorbar(fig, im, "elevation (m)")
-    _add_compass_labels(ax, bounds)
-    ax.set_title(f"LIDAR heightmap ({resolution}x{resolution})")
-    _save(fig, path)
-
-
-def _make_stamp_patch(stamp: Stamp):
-    """
-    A Circle for round-brush stamps, or an axis-aligned Rectangle
-    (side = 2*radius, centered on the stamp) for square-brush ones --
-    e.g. type 72, used by the course-wide baseline-flatten stamp and
-    zero-height shim, both of which are square, not circular, and were
-    previously always drawn as a circle regardless of actual brush
-    shape (a real, previously-latent bug: harmless-looking when the
-    only square stamp was the shim, appended after preview_hex.png was
-    already generated, but now visibly wrong now that the baseline
-    stamp -- square, and huge, covering nearly the whole course -- is
-    part of initial_stamps.json from the start).
-    """
-    profile = BRUSH_PROFILES.get(stamp.brush)
-    if profile is not None and profile.shape == SHAPE_SQUARE:
-        side = 2.0 * stamp.radius
-        return Rectangle((stamp.x - stamp.radius, stamp.z - stamp.radius), side, side)
-    return Circle((stamp.x, stamp.z), stamp.radius)
-
-
-def _stamp_patches(stamps: Sequence[Stamp], colors: list[str]) -> PatchCollection:
-    patches = [_make_stamp_patch(s) for s in stamps]
-    return PatchCollection(patches, facecolor=colors, edgecolor="black", linewidths=0.3, alpha=0.35)
-
-
-def _set_title(ax, base_title: str, extra_label: Optional[str] = None) -> None:
-    """
-    Set the plot title, with an optional second line summarizing
-    whatever parameters actually produced this preview (e.g. the
-    refine-terrain settings used for the latest pass) -- so a preview
-    is self-documenting about what generated it without needing to
-    cross-reference a separate log.
-    """
-    ax.set_title(f"{base_title}\n{extra_label}" if extra_label else base_title, fontsize=10)
-
-
-def render_hex_preview(
-    stamps: Sequence[Stamp], bounds: BoundingBox, path: Path, extra_label: Optional[str] = None,
-) -> None:
-    """Stamp layout: one circle per stamp (center + radius), colored by brush type."""
-    fig, ax = _new_figure(bounds)
-
-    colors = [_BRUSH_COLORS.get(s.brush, _DEFAULT_BRUSH_COLOR) for s in stamps]
-    ax.add_collection(_stamp_patches(stamps, colors))
-    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=2, zorder=3)
-
-    used_brushes = sorted(set(s.brush for s in stamps))
-    handles = [
-        plt.Line2D([0], [0], marker="o", linestyle="", markerfacecolor=_BRUSH_COLORS.get(b, _DEFAULT_BRUSH_COLOR),
-                   markeredgecolor="black", label=f"type {b}")
-        for b in used_brushes
-    ]
-    ax.legend(handles=handles, loc="upper right", fontsize=6)
-    _set_title(ax, f"Stamp layout ({len(stamps)} stamps)", extra_label)
-    _add_dummy_scale(fig)
-    _save(fig, path)
-
-
-def render_stamps_preview(
-    stamps: Sequence[Stamp], bounds: BoundingBox, path: Path, extra_label: Optional[str] = None,
-) -> None:
-    """
-    Same layout as preview_hex.png, but colored by fitted value instead
-    of brush type -- makes unfit stamps (still at their placeholder,
-    typically 0.0) and outlier fits visually obvious.
-    """
-    fig, ax = _new_figure(bounds)
-
-    values = np.array([s.value for s in stamps])
-    circles = [_make_stamp_patch(s) for s in stamps]
-    coll = PatchCollection(circles, edgecolor="black", linewidths=0.3, alpha=0.6)
-    coll.set_array(values)
-    coll.set_cmap("terrain")
-    ax.add_collection(coll)
-    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=2, zorder=3)
-
-    _add_colorbar(fig, coll, "fitted value (m)")
-    _set_title(ax, f"Stamp values ({len(stamps)} stamps)", extra_label)
-    _save(fig, path)
-
-
-def render_height_preview(
-    model: TerrainModel,
-    bounds: BoundingBox,
-    path: Path,
-    resolution: int = 2000,
-    extra_label: Optional[str] = None,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-) -> None:
-    """
-    TerrainModel's predicted height field over `bounds`.
-
-    resolution defaults to 2000 (native, 1 px = 1 m), matching
-    render_ground_lidar_preview/render_composite_preview -- previously
-    400, traded off against model.render()'s real, non-trivial cost at
-    high resolution with a large stamp count (unlike plain point
-    binning, which is cheap regardless of resolution -- see
-    render_ground_lidar_preview's own docstring). Measured directly at
-    a realistic 22,573-stamp course: 884ms at 400 vs 3087ms at 2000 --
-    a real ~2.2s added to every refine-terrain pass's auto-visualize
-    call, not free, but small next to how long a refine-terrain pass
-    itself takes, and worth it for comparing against
-    preview_lidar_ground.png/preview_composite.png (both already
-    native) at full, matching detail rather than a blurrier 400x400.
-
-    vmin/vmax, if given, fix the color scale instead of the default
-    auto-scale-to-this-image's-own-data-range -- pass the same values
-    to render_ground_lidar_preview's own vmin/vmax so the two are
-    color-comparable at a glance (a mismatch that looks dramatic in
-    one could otherwise look subtle in the other, or vice versa,
-    purely from each image picking its own independent range).
-    """
-    grid = model.render(resolution=resolution, bounds=bounds)
-
-    fig, ax = _new_figure(bounds)
-    im = ax.imshow(
-        grid, origin="lower", cmap="terrain", vmin=vmin, vmax=vmax,
-        extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
-    )
-    _add_colorbar(fig, im, "predicted height (m)")
-    _set_title(ax, f"Predicted terrain height ({resolution}x{resolution})", extra_label)
-    _save(fig, path)
-
-
-def render_ground_lidar_preview(
-    cloud: PointCloud,
-    bounds: BoundingBox,
-    path: Path,
-    resolution: int = 2000,
-    extra_label: Optional[str] = None,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-) -> None:
-    """
-    Actual (not predicted) ground-only LIDAR height, binned over
-    `bounds` at the same course-cropped frame/colormap as
-    render_height_preview -- the direct "ground truth vs. our fitted
-    model" comparison, meant to be flipped back and forth against
-    preview_height.png (unlike render_lidar_heightmap/
-    render_lidar_preview, which show the *full*, uncropped merged
-    cloud and every classification, for orientation/coverage checks,
-    not this kind of apples-to-apples shape comparison).
-
-    resolution defaults to 2000 (native, 1 px = 1 m), NOT
-    render_height_preview's own 400 -- that 400 is a real, deliberate
-    tradeoff there (model.render() gets genuinely expensive at high
-    resolution with a large stamp count, and it runs automatically
-    after every refine pass), but plain point binning has no such
-    cost (confirmed directly: 2 million points bin in ~1.6s at either
-    400 or 2000, i.e. resolution isn't what's expensive here, point
-    count is). Worse, a coarser grid actively works against this
-    preview's whole purpose -- at 400, each cell averages a 5x5m
-    patch together, smoothing away exactly the high-frequency
-    noise-vs-signal detail this preview exists to let you inspect.
-    The comparison against preview_height.png stays valid despite the
-    resolution mismatch (color scale, not grid density, is what makes
-    two images comparable) -- if anything, it's informative: this one
-    can show real noise the smooth fitted surface never will.
-
-    Ground-only (bare_earth_only=True, see _bin_point_cloud) for the
-    same reason render_error_preview filters this way: comparing our
-    predicted terrain against building-roof or treetop elevation isn't
-    a meaningful signal for how well the terrain itself was fit.
-
-    vmin/vmax: see render_height_preview's own docstring -- pass the
-    same values to both for a directly color-comparable pair.
-    """
-    grid = _bin_point_cloud(cloud, bounds, resolution, bare_earth_only=True)
-
-    fig, ax = _new_figure(bounds)
-    im = ax.imshow(
-        grid, origin="lower", cmap="terrain", vmin=vmin, vmax=vmax,
-        extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
-    )
-    _add_colorbar(fig, im, "ground elevation (m)")
-    _set_title(ax, f"Ground-only LIDAR height, actual ({resolution}x{resolution})", extra_label)
-    _save(fig, path)
-
-
-def render_composite_preview(
-    stamps,
-    bounds: BoundingBox,
-    path: Path,
-    resolution: int = 2000,
-    brush_dir: Optional[Path] = None,
-    extra_label: Optional[str] = None,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None,
-) -> None:
-    """
-    Terrain height from composite_render.py's real-PNG-compositing
-    renderer, not TerrainModel's kernel-based one -- an independent
-    cross-check of "what we think the stamps do" (TerrainKernel's
-    measured/interpolated 1D radial profiles) against real 2D brush
-    image compositing, same stamp list, same tool semantics. Meant to
-    be flipped against preview_height.png (and preview_lidar_ground.png)
-    the same way those two are meant to be compared against each other.
-
-    Manual/opt-in only (see PGA2k_gen.py's step_visualize) -- a per-
-    stamp scipy.ndimage.map_coordinates sampling loop is meaningfully
-    slower than TerrainModel's vectorized render(), fine for an
-    explicit trigger, not for automatic regeneration after every
-    refine pass.
-
-    Requires the real brush PNG assets -- see composite_render.py's
-    module docstring for where to place them. Raises a clear,
-    actionable FileNotFoundError (from load_brush_image) if missing,
-    rather than silently producing a blank or wrong preview.
-
-    vmin/vmax: see render_height_preview's own docstring -- pass the
-    same values here too for a 3-way color-comparable set.
-
-    Normalizes stamps the same way the real export does (userLayers.py's
-    normalize_stamp_heights: shift so the minimum resolved height lands
-    at 0) before compositing -- without this, stamp.value is whatever
-    raw, un-normalized height TerrainModel.render() itself produces
-    (which is what preview_height.png shows, and can be well above
-    275m or even negative; that shift only happens at actual export
-    time), while composite_stamps_to_canvas's 16-bit conversion assumes
-    values are already in the final [0, 275m] in-game range. Skipping
-    this step was a real bug, confirmed directly: a real course's
-    un-normalized model output reached 393.75m, and every stamp value
-    above the 275m ceiling was getting silently clipped to it, pinning
-    almost the entire canvas at the max -- exactly the "all blue" (or
-    however it lands relative to the shared color scale) symptom.
-    """
-    from viz.composite_render import composite_stamps_to_canvas, canvas_to_meters, DEFAULT_BRUSH_DIR
-    from course_output.userLayers import normalize_stamp_heights
-
-    stamps = normalize_stamp_heights(stamps, bounds)
-    grid = canvas_to_meters(
-        composite_stamps_to_canvas(stamps, bounds, resolution, brush_dir or DEFAULT_BRUSH_DIR)
-    )
-    # Printed unconditionally (not just on some verbose flag) so a
-    # wrong-looking preview is immediately diagnosable from the
-    # console log alone: are the actual computed values wrong, or is
-    # the shared vmin/vmax color scale (see render_height_preview's
-    # docstring) just not matching this data's own range?
-    print(f"  composite canvas: min={grid.min():.2f}m max={grid.max():.2f}m mean={grid.mean():.2f}m "
-          f"(display range: vmin={vmin}, vmax={vmax})")
-
-    fig, ax = _new_figure(bounds)
-    im = ax.imshow(
-        grid, origin="lower", cmap="terrain", vmin=vmin, vmax=vmax,
-        extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
-    )
-    _add_colorbar(fig, im, "composited height (m)")
-    _set_title(ax, f"Composited terrain height, real brush PNGs ({resolution}x{resolution})", extra_label)
-    _save(fig, path)
-
-
-def _bin_point_cloud(
-    cloud: PointCloud, bounds: BoundingBox, resolution: int, bare_earth_only: bool = False,
-) -> np.ndarray:
-    """
-    Bin cloud.elevation into a resolution x resolution grid over bounds
-    (mean elevation per cell, NaN where a cell has no points).
-
-    bare_earth_only defaults to False here since render_lidar_heightmap
-    (the general orientation/inspection view) benefits from showing
-    buildings and vegetation, not hiding them. render_error_preview
-    passes True explicitly -- comparing predicted terrain against
-    building-roof or treetop elevation isn't a meaningful error signal
-    (see terrain/adaptive_refine.py, which had this exact bug).
-    """
-    if bare_earth_only:
-        mask = cloud.bare_earth_mask()
-        x, z, elevation = cloud.x[mask], cloud.z[mask], cloud.elevation[mask]
-    else:
-        x, z, elevation = cloud.x, cloud.z, cloud.elevation
-
-    x_edges = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
-    z_edges = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
-
-    sums, _, _ = np.histogram2d(z, x, bins=[z_edges, x_edges], weights=elevation)
-    counts, _, _ = np.histogram2d(z, x, bins=[z_edges, x_edges])
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        means = sums / counts
-    return means  # NaN where counts == 0
-
-
-def render_error_preview(
-    model: TerrainModel,
-    cloud: PointCloud,
-    bounds: BoundingBox,
-    path: Path,
-    resolution: int = 200,
-    extra_label: Optional[str] = None,
-    mask: Optional[np.ndarray] = None,
-) -> None:
-    """
-    Predicted height vs. binned LIDAR elevation, as signed error
-    (predicted - actual) on a diverging colormap centered at zero.
-    Cells with no LIDAR points are left blank (NaN), not zero -- a
-    missing measurement isn't the same as a confirmed-zero error.
-
-    mask, if given (the same resolution x resolution boolean grid
-    refine-terrain's --use-height-mask restricts hotspot placement
-    to), reports RMS two ways: over the whole course, and over just
-    the masked-in area -- without it, RMS was silently computed over
-    the *entire* course regardless of whether refinement was actually
-    restricted to a fraction of it, diluting the number with however
-    much of the un-refined remainder still carried old error.
-    """
-    actual = _bin_point_cloud(cloud, bounds, resolution, bare_earth_only=True)
-    predicted = model.render(resolution=resolution, bounds=bounds)
-    error = predicted - actual
-
-    finite = error[np.isfinite(error)]
-    if finite.size == 0:
-        raise ValueError("No overlapping LIDAR coverage in bounds -- can't compute error preview.")
-    vmax = np.percentile(np.abs(finite), 98)  # robust to a few outlier cells
-
-    fig, ax = _new_figure(bounds)
-    im = ax.imshow(
-        error, origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax,
-        extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
-    )
-    _add_colorbar(fig, im, "predicted - actual (m)")
-
-    rms = float(np.sqrt(np.mean(np.square(finite))))
-    if mask is not None:
-        masked_finite = error[np.isfinite(error) & mask]
-        if masked_finite.size > 0:
-            masked_rms = float(np.sqrt(np.mean(np.square(masked_finite))))
-            title = (
-                f"Height error, RMS={rms:.2f} m whole course / "
-                f"{masked_rms:.2f} m masked area ({resolution}x{resolution})"
-            )
+    for (x, z, _tags), h in zip(trees, heights):
+        scale = (h - min_h) * scale_multiplier + min_scale
+        item = _placed_item(x, z, scale, rng.uniform(0, 359))
+        if TREE_RADIUS_M > 0 and h / TREE_RADIUS_M >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019 and skinny_groups:
+            group = rng.choice(list(skinny_groups.values()))
         else:
-            title = f"Height error, RMS={rms:.2f} m whole course (mask empty at this resolution)"
-    else:
-        title = f"Height error, RMS={rms:.2f} m ({resolution}x{resolution})"
-    _set_title(ax, title, extra_label)
-    _save(fig, path)
+            group = rng.choice(list(normal_groups.values()))
+        group["Value"]["items"].append(item)
+
+    return [g for g in list(normal_groups.values()) + list(skinny_groups.values()) if g["Value"]["items"]]
+
+
+# ---------------------------------------------------------------------------
+# v2021+ -- real Unity asset-path scheme, confirmed against this
+# project's own sort_objects_v3.py/generate_rough_border_v2.py.
+# ---------------------------------------------------------------------------
+
+
+def _placed_object_group_v2021(asset_path: str) -> dict:
+    """One placedObjects2.json group entry, empty of items -- v2021+'s
+    Key.path/Value.{items,clusters,splines} schema (see module
+    docstring), not v2019's category/type/theme scheme."""
+    return {"Key": {"path": asset_path}, "Value": {"items": [], "clusters": [], "splines": []}}
+
+
+def build_tree_objects_v2021(
+    trees: list[tuple[float, float, dict]],
+    tree_asset_paths: list[str],
+    tree_type_asset_paths: Optional[dict[str, str]] = None,
+    rng: Optional[random.Random] = None,
+) -> list[dict]:
+    """
+    v2021+ placedObjects2 groups -- Key is {"path": asset_path} (see
+    module docstring), one group per asset path actually used.
+
+    tree_asset_paths is the general pool a tree is randomly assigned
+    from when it has no more specific pick -- REQUIRED and must be
+    non-empty (or tree_type_asset_paths must cover every tree that
+    needs one); there's no generic fallback path to invent (see module
+    docstring), so this raises ValueError if neither is usable.
+
+    tree_type_asset_paths, if given, maps a tree node's TREE_TYPE_TAG
+    value to a specific asset path, overriding the random pool pick
+    for just that tree -- e.g. a hand-tagged pga_tree_type=oak node
+    always gets whatever path tree_type_asset_paths["oak"] is, while
+    untagged trees still draw from tree_asset_paths.
+
+    Scale is the same shared height-driven uniform x=y=z rule every
+    version uses (see _height_scale_lookup / module docstring).
+    """
+    if rng is None:
+        rng = random.Random()
+    if not trees:
+        return []
+    tree_type_asset_paths = tree_type_asset_paths or {}
+    if not tree_asset_paths and not tree_type_asset_paths:
+        raise ValueError(
+            "build_tree_objects_v2021 needs at least one real asset path -- pass tree_asset_paths "
+            "(a general pool) and/or tree_type_asset_paths (per pga_tree_type tag). There's no "
+            "built-in catalog to fall back to; v2021+ placed objects are keyed by real Unity asset "
+            "paths, not a numeric id this project could guess at."
+        )
+
+    heights, min_h, min_scale, scale_multiplier = _height_scale_lookup(trees)
+
+    groups: dict[str, dict] = {}
+
+    def _group_for(path: str) -> dict:
+        if path not in groups:
+            groups[path] = _placed_object_group_v2021(path)
+        return groups[path]
+
+    for (x, z, tags), h in zip(trees, heights):
+        tree_type = tags.get(TREE_TYPE_TAG)
+        if tree_type is not None and tree_type in tree_type_asset_paths:
+            path = tree_type_asset_paths[tree_type]
+        elif tree_asset_paths:
+            path = rng.choice(tree_asset_paths)
+        else:
+            # Tagged with a tree_type that isn't in
+            # tree_type_asset_paths, and no general pool to fall back
+            # to -- skip rather than guess at a path.
+            continue
+        scale = (h - min_h) * scale_multiplier + min_scale
+        item = _placed_item(x, z, scale, rng.uniform(0, 359))
+        _group_for(path)["Value"]["items"].append(item)
+
+    return [g for g in groups.values() if g["Value"]["items"]]
+
+
+def build_building_stake_objects_v2021(features: list[Feature], stake_asset_path: str) -> list[dict]:
+    """
+    One stake instance at every exterior vertex of every "building"
+    Feature (see ingest/osm.py) -- a single placedObjects2.json group
+    (one asset path, so one group covers every building). No rotation
+    (a stake has no meaningful facing), scale left at 1.0.
+
+    v2021+ ONLY: this needs an arbitrary asset path, which only
+    v2021+'s Key.path scheme supports -- v2019's numeric category/type
+    catalog has no known "stake" (or generic decorative object) id, so
+    there's currently no way to do this for a v2019 target at all.
+
+    Only Polygon-geometry building features contribute vertices --
+    matches how splines.py's feature_to_spline already only handles
+    building as an area/fairway-like shape, never a bare line.
+    """
+    if not stake_asset_path:
+        raise ValueError("build_building_stake_objects_v2021 needs a real stake asset path -- see module docstring.")
+
+    group = _placed_object_group_v2021(stake_asset_path)
+    for f in features:
+        if f.kind != "building" or f.geometry.geom_type != "Polygon":
+            continue
+        for x, z in f.geometry.exterior.coords[:-1]:  # [:-1] drops the closing repeat of the first point
+            group["Value"]["items"].append(_placed_item(x, z, scale=1.0))
+
+    return [group] if group["Value"]["items"] else []
+
+
+def object_counts(objects: list[dict]) -> list[tuple[str, int, int, int]]:
+    """
+    (label, item_count, cluster_count, spline_count) per group -- same
+    enrichment sort_objects_v3.py computes for its summary table,
+    reused here so the GUI's object selector (mirroring the existing
+    Splines tab's feature list) can show the same counts without
+    duplicating that logic. label is Key["path"] for v2021+ groups, or
+    a "category/type" string built from Key["category"]/Key["type"]
+    for v2019 groups (which have no "path") -- so this works for
+    either version's placedObjects2.json without the caller needing to
+    know which one it's looking at.
+    """
+    counts = []
+    for g in objects:
+        key = g.get("Key", {})
+        if "path" in key:
+            label = key["path"]
+        else:
+            label = f"category={key.get('category')}/type={key.get('type')}"
+        value = g.get("Value", {})
+        counts.append((
+            label,
+            len(value.get("items", [])),
+            len(value.get("clusters", [])),
+            len(value.get("splines", [])),
+        ))
+    return counts
+
+
+def save_placed_objects(objects: list[dict], path: Path) -> None:
+    """Write placedObjects2.json -- a plain JSON array, matching the
+    same one-key-per-file convention as surfaceSplines.json/holes.json."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(objects, fh, indent=2)
+
+
+def load_placed_objects(path: Path) -> list[dict]:
+    with Path(path).open(encoding="utf-8") as fh:
+        return json.load(fh)
