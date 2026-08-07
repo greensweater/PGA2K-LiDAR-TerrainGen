@@ -13,6 +13,10 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step generate-terrain
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
     PGA2k_gen.py <working_dir> --step output-terrain
+    PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023|2025>]
+                                 [--theme <id-or-name>] [--tree-variety]              (2019)
+                                 [--tree-asset-path <path>]...
+                                 [--tree-type-asset-path <TAG=path>]... [--stake-asset-path <path>]  (2021+)
     PGA2k_gen.py <working_dir> --step repack --repack-filename <name>
 
 Each step reads/writes plain-file artifacts in <working_dir> instead of
@@ -78,6 +82,11 @@ from splines import (
     build_registration_mark_splines, build_surface_splines, feature_to_spline, save_surface_splines,
 )
 from holes import build_holes, save_holes
+from objects import (
+    DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019,
+    build_building_stake_objects_v2021, build_tree_objects_v2019, build_tree_objects_v2021,
+    object_counts, parse_osm_trees, save_placed_objects,
+)
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
     DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
@@ -106,6 +115,7 @@ FEATURES_FILE = "features.geojson"
 HEIGHT_MASK_FILE = "height_mask.geojson"
 HEIGHTMAP_FILE = "heightmap.npz"
 REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
+PLACED_OBJECTS_FILE = "placedObjects2.json"
 
 
 def _stamps_dir(working_dir: Path) -> Path:
@@ -788,6 +798,187 @@ def step_write_holes(working_dir: Path) -> None:
     print(f"Wrote {out_path}")
 
 
+def _resolve_theme(theme_arg: str | None) -> int | None:
+    """
+    Accept either a theme id (e.g. "7") or a theme name (e.g.
+    "countryside", case-insensitive) on the CLI -- see objects.py's
+    THEMES_V2019 for the full list (v2019 only -- v2021+ doesn't use
+    a theme concept, see build_tree_objects_v2021). Returns None
+    (meaning "unrecognized/not set", which build_tree_objects_v2019
+    treats as a single generic tree type, not an error) if theme_arg
+    is None or doesn't match either.
+    """
+    if theme_arg is None:
+        return None
+    theme_arg = theme_arg.strip()
+    if theme_arg.isdigit():
+        return int(theme_arg)
+    for theme_id, name in THEMES_V2019.items():
+        if name.lower() == theme_arg.lower():
+            return theme_id
+    return None
+
+
+def step_write_objects(
+    working_dir: Path,
+    game_version: str | None = None,
+    theme: int | None = None,
+    tree_variety: bool | None = None,
+    tree_asset_paths: list[str] | None = None,
+    tree_type_asset_paths: dict[str, str] | None = None,
+    stake_asset_path: str | None = None,
+) -> None:
+    """
+    Generate placedObjects2.json -- trees (from map.osm's natural=tree
+    nodes) plus, optionally (v2021+ only), a stake at every building
+    corner (from features.geojson's "building" ways).
+
+    game_version selects which of objects.py's two confirmed schemas
+    to write (see that module's docstring: v2019 is Chad Rockey's
+    numeric category/type/theme catalog; v2021+ is a real Unity asset
+    path). It's a project-level setting, same as course_name -- the
+    GUI sets it once near the top (not per-step) and it's read from
+    project.json here, same as every other value below. Raises
+    StepError up front if game_version isn't in
+    objects.IMPLEMENTED_GAME_VERSIONS (v2023/v2025 aren't confirmed
+    yet -- see objects.py's module docstring) rather than silently
+    guessing at an unconfirmed schema.
+
+    theme / tree_variety (v2019) and tree_asset_paths /
+    tree_type_asset_paths / stake_asset_path (v2021+) are all feature-
+    flagged via project.json, same pattern as refine-terrain's
+    parameters: pass None here to use whatever was last saved, or an
+    explicit value (an empty list/dict counts as explicit) to override
+    for this run and persist it as the new default for next time. Only
+    the parameters relevant to the resolved game_version are actually
+    used; the others are still accepted (and persisted, if given) so a
+    project can carry both versions' settings across a future
+    game_version switch without losing them.
+
+    Trees are parsed directly from map.osm, NOT features.geojson --
+    osm.py deliberately doesn't parse node data (a separate concern
+    from the way-based vector features everything else here reads
+    from -- see osm.py's own docstring).
+
+    This overwrites placedObjects2.json wholesale, same as
+    step_write_splines/step_write_holes do for their own files.
+    """
+    osm_path = working_dir / "map.osm"
+    if not osm_path.exists():
+        raise StepError(f"No map.osm found at {osm_path}. Run --step ingest-laz first.")
+
+    project = load_project(working_dir)
+    if game_version is None:
+        game_version = project.get("game_version", DEFAULT_GAME_VERSION)
+    if game_version not in IMPLEMENTED_GAME_VERSIONS:
+        raise StepError(
+            f"game_version={game_version!r} isn't implemented yet (only {IMPLEMENTED_GAME_VERSIONS} "
+            "are) -- see objects.py's module docstring. Set --game-version explicitly, or fix "
+            "project.json's saved 'game_version' if this project predates it."
+        )
+    if theme is None:
+        theme = project.get("objects_theme")
+    if tree_variety is None:
+        tree_variety = project.get("objects_tree_variety", False)
+    if tree_asset_paths is None:
+        tree_asset_paths = project.get("objects_tree_asset_paths", [])
+    if tree_type_asset_paths is None:
+        tree_type_asset_paths = project.get("objects_tree_type_asset_paths", {})
+    if stake_asset_path is None:
+        stake_asset_path = project.get("objects_stake_asset_path")
+
+    required = ["crs_wkt", "origin_x", "origin_y", "horizontal_unit_factor", "merged_bounds_local"]
+    missing = [k for k in required if k not in project]
+    if missing:
+        raise StepError(
+            f"project.json is missing {missing} -- run --step ingest-laz first (or again, "
+            "if this project predates saving them)."
+        )
+    shift_x = project.get("course_crop_origin_in_full_frame_x")
+    shift_z = project.get("course_crop_origin_in_full_frame_z")
+    if shift_x is None or shift_z is None:
+        raise StepError(
+            f"No course crop position found in {working_dir}/project.json -- run --step ingest-osm first."
+        )
+
+    crs = pyproj.CRS.from_wkt(project["crs_wkt"])
+    full_bounds = BoundingBox(**project["merged_bounds_local"])
+
+    print(f"game_version={game_version}")
+    print(f"Parsing tree nodes from {osm_path}...")
+    full_frame_trees = parse_osm_trees(
+        osm_path, crs, project["origin_x"], project["origin_y"], project["horizontal_unit_factor"],
+        bounds=full_bounds,
+    )
+
+    course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+    trees = []
+    for x, z, tags in full_frame_trees:
+        cx, cz = x - shift_x, z - shift_z
+        if course_bounds.min_x <= cx <= course_bounds.max_x and course_bounds.min_z <= cz <= course_bounds.max_z:
+            trees.append((cx, cz, tags))
+    print(f"  {len(trees)} of {len(full_frame_trees)} tree(s) fall inside the current "
+          f"{COURSE_SIZE_M:.0f}x{COURSE_SIZE_M:.0f} m course crop")
+
+    placed_objects: list[dict] = []
+
+    if game_version == "2019":
+        if trees:
+            print(f"  theme={theme}  tree_variety={tree_variety}")
+            placed_objects += build_tree_objects_v2019(trees, theme=theme, tree_variety=tree_variety)
+        if stake_asset_path:
+            print("  NOTE: --stake-asset-path is set but ignored for game_version=2019 -- "
+                  "building stakes need v2021+'s asset-path scheme (see objects.py's "
+                  "build_building_stake_objects_v2021 docstring).")
+    else:  # 2021+ (only "2021" itself is in IMPLEMENTED_GAME_VERSIONS right now)
+        if trees:
+            if not tree_asset_paths and not tree_type_asset_paths:
+                raise StepError(
+                    f"{len(trees)} tree(s) found in the current course crop, but no tree asset path "
+                    "is set -- pass --tree-asset-path (repeatable) and/or --tree-type-asset-path "
+                    "TAG=path (repeatable). See objects.py's module docstring: there's no built-in "
+                    "catalog to fall back to, v2021+ placed objects need real Unity asset paths."
+                )
+            print(f"  tree_asset_paths={tree_asset_paths}  tree_type_asset_paths={tree_type_asset_paths}")
+            placed_objects += build_tree_objects_v2021(trees, tree_asset_paths, tree_type_asset_paths)
+
+        if stake_asset_path:
+            features_path = working_dir / FEATURES_FILE
+            if not features_path.exists():
+                raise StepError(
+                    f"--stake-asset-path was given but no {FEATURES_FILE} found under {working_dir} "
+                    "(needed for building corners) -- run --step ingest-osm first."
+                )
+            features = load_features(features_path)
+            features = _crop_features_to_course(working_dir, features)
+            building_count = sum(1 for f in features if f.kind == "building")
+            stakes = build_building_stake_objects_v2021(features, stake_asset_path)
+            stake_count = sum(len(g["Value"]["items"]) for g in stakes)
+            print(f"  {stake_count} stake(s) at corners of {building_count} building(s)")
+            placed_objects += stakes
+
+    for label, item_count, cluster_count, spline_count in object_counts(placed_objects):
+        print(f"    {label}: {item_count} item(s), {cluster_count} cluster(s), {spline_count} spline(s)")
+
+    nodes_dir = working_dir / "course" / "CourseDescription_nodes"
+    if not nodes_dir.is_dir():
+        raise StepError(f"No {nodes_dir} found under {working_dir}. Run --step ingest-course first.")
+
+    out_path = nodes_dir / PLACED_OBJECTS_FILE
+    save_placed_objects(placed_objects, out_path)
+    print(f"Wrote {out_path}")
+
+    save_project(working_dir, {
+        "game_version": game_version,
+        "objects_theme": theme,
+        "objects_tree_variety": tree_variety,
+        "objects_tree_asset_paths": tree_asset_paths,
+        "objects_tree_type_asset_paths": tree_type_asset_paths,
+        "objects_stake_asset_path": stake_asset_path,
+        "objects_tree_count": len(trees),
+    })
+
+
 def step_generate_terrain(working_dir: Path) -> None:
     pointcloud_path = working_dir / POINTCLOUD_FILE
     if not pointcloud_path.exists():
@@ -1218,6 +1409,7 @@ STEPS = {
     "output-terrain": step_output_terrain,
     "write-splines": step_write_splines,
     "write-holes": step_write_holes,
+    "write-objects": step_write_objects,
     "repack": step_repack,
     "visualize": step_visualize,
 }
@@ -1319,6 +1511,40 @@ def main(argv: list[str] | None = None) -> int:
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
                          help="ingest-course: path to the .course file to extract")
+    parser.add_argument("--game-version", type=str, default=None, choices=GAME_VERSIONS,
+                         help="Project-level target game version -- selects which of objects.py's "
+                              f"placedObjects2 schemas write-objects writes (implemented: "
+                              f"{IMPLEMENTED_GAME_VERSIONS}; the rest are accepted here but will "
+                              "raise a clear error until their schema is confirmed -- see "
+                              "objects.py's module docstring). Persists to project.json when given, "
+                              "same as the GUI's top-level Game version selector. Default: use "
+                              f"whatever's saved in project.json, or {DEFAULT_GAME_VERSION} if never set.")
+    parser.add_argument("--theme", type=str, default=None,
+                         help="write-objects (game_version=2019 only): theme id or name (see "
+                              "objects.py's THEMES_V2019) controlling which tree types are available. "
+                              "Default: use whatever's saved in project.json, or a single generic tree "
+                              "type if never set (not an error).")
+    parser.add_argument("--tree-variety", action=argparse.BooleanOptionalAction, default=None,
+                         help="write-objects (game_version=2019 only): use the full set of the "
+                              "theme's tree types (normal + skinny) instead of one generic type. "
+                              "Default: use whatever's saved in project.json, or off if never set.")
+    parser.add_argument("--tree-asset-path", dest="tree_asset_paths", action="append", default=None,
+                         help="write-objects (game_version=2021+ only): a Unity asset path (e.g. "
+                              "'Assets/Trees/OakA') to draw "
+                              "from for any tree without a more specific --tree-type-asset-path match. "
+                              "Repeatable for a variety pool. Default: use whatever's saved in "
+                              "project.json, or none if never set.")
+    parser.add_argument("--tree-type-asset-path", dest="tree_type_asset_paths", action="append", default=None,
+                         metavar="TAG=PATH",
+                         help="write-objects (game_version=2021+ only): map a tree node's "
+                              "pga_tree_type tag value to a specific "
+                              "asset path, e.g. 'oak=Assets/Trees/BigOak' -- overrides the general "
+                              "--tree-asset-path pool for just that tree. Repeatable. Default: use "
+                              "whatever's saved in project.json, or none if never set.")
+    parser.add_argument("--stake-asset-path", type=str, default=None,
+                         help="write-objects: Unity asset path for a stake placed at every corner of "
+                              "every 'building' feature. Omit to skip stakes entirely. Default: use "
+                              "whatever's saved in project.json, or none if never set.")
     parser.add_argument("--repack-filename", type=str, default=None,
                          help="repack: output filename (without .course extension)")
     args = parser.parse_args(argv)
@@ -1362,6 +1588,19 @@ def main(argv: list[str] | None = None) -> int:
             step_write_splines(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-holes":
             step_write_holes(working_dir)
+        elif args.step == "write-objects":
+            tree_type_asset_paths = None
+            if args.tree_type_asset_paths is not None:
+                tree_type_asset_paths = {}
+                for pair in args.tree_type_asset_paths:
+                    if "=" not in pair:
+                        raise StepError(f"--tree-type-asset-path expects TAG=PATH, got: {pair!r}")
+                    tag, _, asset_path = pair.partition("=")
+                    tree_type_asset_paths[tag] = asset_path
+            step_write_objects(
+                working_dir, args.game_version, _resolve_theme(args.theme), args.tree_variety,
+                args.tree_asset_paths, tree_type_asset_paths, args.stake_asset_path,
+            )
         elif args.step == "repack":
             if not args.repack_filename:
                 print("error: --step repack requires --repack-filename <name>", file=sys.stderr)
