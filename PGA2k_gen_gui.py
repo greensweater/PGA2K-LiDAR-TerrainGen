@@ -52,7 +52,7 @@ from constants import (  # noqa: E402
     PREVIEW_STAMPS, STAMPS_DIR,
 )
 from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, PLACED_OBJECTS_FILE, load_project, save_project  # noqa: E402
-from objects import (  # noqa: E402
+from course_output.objects import (  # noqa: E402
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019,
     load_placed_objects, object_counts,
 )
@@ -62,7 +62,7 @@ from ingest.osm import (  # noqa: E402
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
 from shapely.ops import unary_union  # noqa: E402
-import visualize as viz  # noqa: E402
+import viz.visualize as viz  # noqa: E402
 
 PREVIEW_FILES = [
     "preview_lidar_heightmap.png",
@@ -852,7 +852,7 @@ class PGAGenGUI:
         """
         game_version is a project-level setting, same tier as
         course_name -- not tied to any one step, since (per the
-        conversation that established this) writer.py/splines.py/
+        conversation that established this) userLayers.py/splines.py/
         objects.py will all eventually need to target it for "write"
         and "move"/repack steps alike. Saved immediately on change,
         same pattern as course_name, rather than only being passed as
