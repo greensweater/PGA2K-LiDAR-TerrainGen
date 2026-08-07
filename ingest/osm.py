@@ -79,7 +79,25 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     (path width, handle length, tight vs. loose curves) are a later
     concern for whatever actually builds PGA splines from these
     Features, not part of ingest.
+
+    pga_scatter is this project's own tag (not an OSM standard), for
+    hand-drawn ways meant to seed a scattered planting -- fescue,
+    brambles, a named tree grove, etc. -- rather than a single golf
+    surface. Always classified as an area (a scatter needs a region to
+    fill, never a bare line) regardless of any area=yes/no tag, with
+    kind fixed at "vegetation" for every pga_scatter value -- the
+    specific value stays in the Feature's own tags (see
+    parse_osm_features) for whatever actually builds the scatter
+    (individual tree instances, or ring/fillPct object-splines like
+    generate_rough_border_v2.py's NATURE pattern) to read. That
+    builder doesn't exist yet -- this is groundwork so pga_scatter ways
+    survive ingest (features.geojson) rather than being silently
+    dropped, not a claim the scatter itself is implemented.
     """
+    scatter_type = tags.get("pga_scatter")
+    if scatter_type is not None:
+        return ("vegetation", True)
+
     golf_type = tags.get("golf")
     waterway_type = tags.get("waterway")
     building_type = tags.get("building")
