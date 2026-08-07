@@ -81,7 +81,7 @@ _STATIC_SPLINE_PARAMS: dict[str, dict] = {
                      tight_splines=False, secondary_surface="rough", secondary_width=5.0),
     "rough": dict(surface="rough", path_width=1.7, handle_length=3.0,
                    tight_splines=False, secondary_surface="", secondary_width=0.0),
-    "building": dict(surface="surface1", path_width=0.01, handle_length=0.2,
+    "building": dict(surface="surface2", path_width=0.01, handle_length=0.2,
                       tight_splines=True, secondary_surface="", secondary_width=0.0),
     "wood": dict(surface="surface1", path_width=0.01, handle_length=0.2,
                   tight_splines=True, secondary_surface="", secondary_width=0.0),
