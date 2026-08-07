@@ -21,6 +21,7 @@ still works without Pillow, previews just won't render).
 
 from __future__ import annotations
 
+import json
 import platform
 import queue
 import re
@@ -50,7 +51,11 @@ from constants import (  # noqa: E402
     PREVIEW_LIDAR, PREVIEW_LIDAR_GROUND, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
     PREVIEW_STAMPS, STAMPS_DIR,
 )
-from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, load_project, save_project  # noqa: E402
+from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, PLACED_OBJECTS_FILE, load_project, save_project  # noqa: E402
+from objects import (  # noqa: E402
+    DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019,
+    load_placed_objects, object_counts,
+)
 from ingest.osm import (  # noqa: E402
     GOLF_OBJECT_KINDS, build_height_mask, crop_features, merge_height_mask_features, load_features,
     rasterize_mask_rgba, save_features, save_height_mask, shift_features,
@@ -73,9 +78,14 @@ PREVIEW_FILES = [
 # Game version -> Courses folder name under .../AppData/LocalLow/2K/.
 # Windows-specific path (AppData/LocalLow only exists on Windows, which is
 # also the only platform The Golf Club / PGA 2K actually runs on) -- only
-# 2019 is wired up for now, per the request to add 2K21/23/25 later.
-GAME_VERSIONS = {
-    "The Golf Club 2019": "The Golf Club 2019",
+# 2019 is wired up for now, per the request to add 2K21/23/25 later. Keyed
+# by the SAME canonical version strings as objects.py's GAME_VERSIONS
+# ("2019", "2021", ...), not a display name -- this is looked up directly
+# from the single elevated Game version selector (self.game_version) at
+# the top of the window, same value write-objects targets, so "write" and
+# "move" (Copy to Game Folder) always agree on which version they mean.
+GAME_VERSION_FOLDERS = {
+    "2019": "The Golf Club 2019",
 }
 
 
@@ -117,6 +127,7 @@ class PGAGenGUI:
 
         self.working_dir = tk.StringVar()
         self.course_name = tk.StringVar()
+        self.game_version = tk.StringVar(value=DEFAULT_GAME_VERSION)
         self.log_queue: queue.Queue = queue.Queue()
         self.running = False
         self._current_proc = None  # see _stop_current_step
@@ -132,12 +143,14 @@ class PGAGenGUI:
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._suppress_course_name_save = False
         self._suppress_repack_filename_save = False
+        self._suppress_game_version_save = False
 
         self._build_layout()
         self._poll_log_queue()
 
         self.working_dir.trace_add("write", lambda *a: self._on_working_dir_changed())
         self.course_name.trace_add("write", lambda *a: self._on_course_name_changed())
+        self.game_version.trace_add("write", lambda *a: self._on_game_version_changed())
 
     # ------------------------------------------------------------------
     # Layout
@@ -161,6 +174,17 @@ class PGAGenGUI:
         ttk.Entry(row2, textvariable=self.course_name, width=40).pack(
             side="left", padx=4, fill="x"
         )
+        ttk.Label(row2, text="Game version:").pack(side="left", padx=(12, 0))
+        game_version_box = ttk.Combobox(
+            row2, textvariable=self.game_version, state="readonly", width=6, values=list(GAME_VERSIONS),
+        )
+        game_version_box.pack(side="left", padx=4)
+        _Tooltip(game_version_box, "PGA 2K's .course schema diverges across versions -- currently "
+                 f"only {IMPLEMENTED_GAME_VERSIONS} are actually implemented (see objects.py's "
+                 "module docstring); the others can be selected and saved, but write/repack steps "
+                 "will raise a clear error until their schema is confirmed. Project-level, same tier "
+                 "as course name -- saved immediately, used by write-objects and (eventually) "
+                 "write-splines/output-terrain/repack.")
 
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill="both", expand=True)
@@ -332,12 +356,6 @@ class PGAGenGUI:
         self._add_step_button(parent, "Repack", self._run_repack)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self.game_version_var = tk.StringVar(value=next(iter(GAME_VERSIONS)))
-        ttk.Label(parent, text="Game version:").pack(anchor="w")
-        ttk.Combobox(
-            parent, textvariable=self.game_version_var, values=list(GAME_VERSIONS),
-            state="readonly", width=20,
-        ).pack(anchor="w")
         self._add_step_button(parent, "Copy to Game Folder", self._run_copy_to_game)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -565,9 +583,118 @@ class PGAGenGUI:
 
     def _build_objects_tab(self, parent: ttk.Frame) -> None:
         ttk.Label(
-            parent, text="Trees, buildings, and other placed objects will live here once that "
-            "part of the pipeline is built.", wraplength=220, foreground="gray",
-        ).pack(anchor="w", pady=8)
+            parent, text="Trees (from map.osm's natural=tree nodes) plus, for 2021+, optional "
+            "building-corner stakes. Which fields below apply depends on the Game version selector "
+            "at the top -- see objects.py's module docstring for why the schema differs per version.",
+            wraplength=220, foreground="gray", justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(parent, text="2019 -- theme:", font=("", 9, "bold")).pack(anchor="w", pady=(0, 2))
+        self._theme_name_to_id = {"(not set)": None}
+        self._theme_name_to_id.update({name: theme_id for theme_id, name in THEMES_V2019.items()})
+        self.objects_theme_var = tk.StringVar(value="(not set)")
+        theme_box = ttk.Combobox(
+            parent, textvariable=self.objects_theme_var, state="readonly", width=16,
+            values=list(self._theme_name_to_id.keys()),
+        )
+        theme_box.pack(anchor="w")
+        _Tooltip(theme_box, "Controls which of the game's tree types are available (see objects.py's "
+                 "THEMES_V2019). Leave as '(not set)' to use a single generic tree type.")
+
+        self.objects_tree_variety_var = tk.BooleanVar(value=False)
+        variety_checkbox = ttk.Checkbutton(
+            parent, text="Tree variety", variable=self.objects_tree_variety_var,
+        )
+        variety_checkbox.pack(anchor="w", pady=(2, 8))
+        _Tooltip(variety_checkbox, "Use the theme's full set of tree types (normal + skinny), "
+                 "randomly assigned per tree, instead of one generic type for every tree.")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=2)
+        ttk.Label(parent, text="2021+ -- asset paths:", font=("", 9, "bold")).pack(anchor="w", pady=(6, 2))
+        ttk.Label(parent, text="Tree asset paths (one per line, general pool):").pack(anchor="w")
+        self.tree_asset_paths_text = tk.Text(parent, height=3, width=28, wrap="none")
+        self.tree_asset_paths_text.pack(anchor="w", fill="x", pady=(2, 6))
+        _Tooltip(self.tree_asset_paths_text, "Real Unity asset paths, e.g. 'Assets/Trees/OakA' -- a "
+                 "tree with no pga_tree_type match below is randomly assigned one of these.")
+
+        ttk.Label(parent, text="Tree type overrides (one per line, TAG=path):").pack(anchor="w")
+        self.tree_type_asset_paths_text = tk.Text(parent, height=3, width=28, wrap="none")
+        self.tree_type_asset_paths_text.pack(anchor="w", fill="x", pady=(2, 6))
+        _Tooltip(self.tree_type_asset_paths_text, "e.g. 'oak=Assets/Trees/BigOak' -- overrides the "
+                 "general pool for any tree node hand-tagged pga_tree_type=oak in OSM.")
+
+        ttk.Label(parent, text="Building stake asset path (optional):").pack(anchor="w")
+        self.stake_asset_path_var = tk.StringVar(value="")
+        stake_entry = ttk.Entry(parent, textvariable=self.stake_asset_path_var, width=28)
+        stake_entry.pack(anchor="w", pady=(2, 6))
+        _Tooltip(stake_entry, "If set, places this asset at every corner of every 'building' feature "
+                 "from features.geojson. Leave blank to skip stakes entirely. 2021+ only.")
+
+        self._add_step_button(parent, "Write Objects", self._run_write_objects)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        obj_filter_row = ttk.Frame(parent)
+        obj_filter_row.pack(fill="x")
+        ttk.Label(obj_filter_row, text="Placed objects:").pack(side="left")
+        ttk.Button(obj_filter_row, text="Refresh", command=self._refresh_objects_list).pack(side="left", padx=4)
+
+        obj_tree_frame = ttk.Frame(parent)
+        obj_tree_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self.objects_tree = ttk.Treeview(
+            obj_tree_frame, columns=("items", "clusters", "splines"), show="tree headings", height=10,
+        )
+        self.objects_tree.heading("#0", text="Asset path")
+        self.objects_tree.heading("items", text="Items")
+        self.objects_tree.heading("clusters", text="Clusters")
+        self.objects_tree.heading("splines", text="Splines")
+        self.objects_tree.column("#0", width=140)
+        self.objects_tree.column("items", width=45, anchor="center")
+        self.objects_tree.column("clusters", width=55, anchor="center")
+        self.objects_tree.column("splines", width=50, anchor="center")
+        self.objects_tree.pack(side="left", fill="both", expand=True)
+        obj_tree_scroll = ttk.Scrollbar(obj_tree_frame, orient="vertical", command=self.objects_tree.yview)
+        obj_tree_scroll.pack(side="left", fill="y")
+        self.objects_tree["yscrollcommand"] = obj_tree_scroll.set
+
+    def _run_write_objects(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = ["--step", "write-objects"]
+        theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
+        if theme_id is not None:
+            args += ["--theme", str(theme_id)]
+        args.append("--tree-variety" if self.objects_tree_variety_var.get() else "--no-tree-variety")
+        for line in self.tree_asset_paths_text.get("1.0", "end").splitlines():
+            line = line.strip()
+            if line:
+                args += ["--tree-asset-path", line]
+        for line in self.tree_type_asset_paths_text.get("1.0", "end").splitlines():
+            line = line.strip()
+            if line:
+                args += ["--tree-type-asset-path", line]
+        stake_path = self.stake_asset_path_var.get().strip()
+        if stake_path:
+            args += ["--stake-asset-path", stake_path]
+        self._run_step(args, wd)
+        self._refresh_objects_list()
+
+    def _refresh_objects_list(self) -> None:
+        wd = self.working_dir.get().strip()
+        self.objects_tree.delete(*self.objects_tree.get_children())
+        if not wd or not Path(wd).is_dir():
+            return
+        objects_path = Path(wd) / "course" / "CourseDescription_nodes" / PLACED_OBJECTS_FILE
+        if not objects_path.exists():
+            return
+        try:
+            objects = load_placed_objects(objects_path)
+        except (json.JSONDecodeError, OSError):
+            return
+        for path, item_count, cluster_count, spline_count in object_counts(objects):
+            self.objects_tree.insert(
+                "", "end", text=path, values=(item_count, cluster_count, spline_count),
+            )
 
     def _refresh_splines_list(self) -> None:
         wd = self.working_dir.get().strip()
@@ -698,6 +825,11 @@ class PGAGenGUI:
             self.repack_filename_var.set(project.get("repack_filename", ""))
         finally:
             self._suppress_repack_filename_save = False
+        self._suppress_game_version_save = True
+        try:
+            self.game_version.set(project.get("game_version", DEFAULT_GAME_VERSION))
+        finally:
+            self._suppress_game_version_save = False
         self._refresh_preview_and_slider()
 
     def _on_repack_filename_changed(self) -> None:
@@ -715,6 +847,23 @@ class PGAGenGUI:
         if not wd or not Path(wd).is_dir():
             return
         save_project(Path(wd), {"course_name": self.course_name.get()})
+
+    def _on_game_version_changed(self) -> None:
+        """
+        game_version is a project-level setting, same tier as
+        course_name -- not tied to any one step, since (per the
+        conversation that established this) writer.py/splines.py/
+        objects.py will all eventually need to target it for "write"
+        and "move"/repack steps alike. Saved immediately on change,
+        same pattern as course_name, rather than only being passed as
+        a per-step CLI flag.
+        """
+        if self._suppress_game_version_save:
+            return
+        wd = self.working_dir.get().strip()
+        if not wd or not Path(wd).is_dir():
+            return
+        save_project(Path(wd), {"game_version": self.game_version.get()})
 
     # ------------------------------------------------------------------
     # Folder / file pickers
@@ -901,8 +1050,17 @@ class PGAGenGUI:
             messagebox.showerror("File not found", f"Expected {source} but it doesn't exist.")
             return
 
-        version = self.game_version_var.get()
-        folder_name = GAME_VERSIONS[version]
+        version = self.game_version.get()
+        folder_name = GAME_VERSION_FOLDERS.get(version)
+        if folder_name is None:
+            messagebox.showerror(
+                "Unknown game folder for this version",
+                f"No Courses-folder mapping is known yet for game_version={version!r} "
+                f"(only {list(GAME_VERSION_FOLDERS)} are wired up). Set Game version (top of "
+                "window) to one of those, or add this version's folder name to "
+                "GAME_VERSION_FOLDERS once it's confirmed.",
+            )
+            return
         dest_dir = Path.home() / "AppData" / "LocalLow" / "2K" / folder_name / "Courses"
         dest_path = dest_dir / source.name
 
