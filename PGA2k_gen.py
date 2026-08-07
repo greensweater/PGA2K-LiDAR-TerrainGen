@@ -67,7 +67,7 @@ from constants import (
     PREVIEW_OSM_FULL, PREVIEW_STAMPS,
     POINTCLOUD_FILE, PREVIEW_DIR, PROJECT_FILE, STAMPS_DIR,
 )
-import visualize as viz
+import viz.visualize as viz
 from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recentered_crop
 from ingest.heightmap import (
     DEFAULT_FILL_MAX_ITERATIONS_PER_LEVEL, DEFAULT_FILL_MIN_COARSE_RESOLUTION,
@@ -78,11 +78,11 @@ from ingest.osm import (
     DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, crop_features, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
 )
-from splines import (
+from course_output.splines import (
     build_registration_mark_splines, build_surface_splines, feature_to_spline, save_surface_splines,
 )
-from holes import build_holes, save_holes
-from objects import (
+from course_output.holes import build_holes, save_holes
+from course_output.objects import (
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019,
     build_building_stake_objects_v2021, build_tree_objects_v2019, build_tree_objects_v2021,
     object_counts, parse_osm_trees, save_placed_objects,
@@ -105,7 +105,7 @@ from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import generate_hex_grid
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
-from writer import (
+from course_output.userLayers import (
     build_baseline_flatten_stamp, build_registration_mark_stamps, normalize_stamp_heights,
     write_user_layers,
 )
@@ -196,7 +196,7 @@ def save_project(working_dir: Path, updates: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stamp list <-> JSON (internal artifact format, distinct from writer.py's
+# Stamp list <-> JSON (internal artifact format, distinct from userLayers.py's
 # userLayers.json -- this is our own working representation, not PGA's).
 #
 # Each file is self-contained: whatever step/parameters produced these
@@ -384,7 +384,7 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
     model_min, model_max = float(np.nanmin(model_grid_for_range)), float(np.nanmax(model_grid_for_range))
 
     # Normalize height/ground-lidar/composite all the same way before
-    # computing the shared color scale -- same shift writer.py's
+    # computing the shared color scale -- same shift userLayers.py's
     # normalize_stamp_heights applies for the real export (so the
     # minimum resolved height lands at 0), applied here to all 3
     # terrain-comparison previews' own data too, not just the
