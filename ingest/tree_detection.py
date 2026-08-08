@@ -89,6 +89,25 @@ CLASS_MEDIUM_VEGETATION = 4
 CLASS_HIGH_VEGETATION = 5
 VEGETATION_CLASSIFICATIONS = (CLASS_LOW_VEGETATION, CLASS_MEDIUM_VEGETATION, CLASS_HIGH_VEGETATION)
 
+# Fallback classes, used only when VEGETATION_CLASSIFICATIONS (3/4/5)
+# matches zero points in the whole cloud -- confirmed to happen in
+# practice: not every real-world LAZ delivery runs fine vegetation
+# sub-classification at all, some only ever distinguish ground (2)
+# from everything else, leaving would-be tree returns sitting in class
+# 1 ("unclassified") or 0 ("never classified") instead of 3/4/5. This
+# is a pragmatic "better than nothing" heuristic, not a guaranteed-
+# correct one -- if the source data lumps buildings/noise/water into
+# class 0/1 too (a real risk when classification is this incomplete),
+# those would get treated as candidate canopy along with genuine
+# vegetation. Always logged loudly when it triggers (see
+# rasterize_canopy_heightmap_with_fallback) rather than silently
+# swapped in, specifically so a bad result here is traceable back to
+# "the fallback fired" instead of looking like a detection-algorithm
+# bug.
+CLASS_NEVER_CLASSIFIED = 0
+CLASS_UNCLASSIFIED = 1
+FALLBACK_VEGETATION_CLASSIFICATIONS = (CLASS_NEVER_CLASSIFIED, CLASS_UNCLASSIFIED)
+
 # Tuning constants -- Chad's own defaults (tree_mapper.py), kept as
 # the starting point, but redefined in real-world units (meters)
 # rather than his raw pixel counts, since this port takes an explicit
@@ -160,6 +179,48 @@ def rasterize_canopy_heightmap(
     flat_canopy = canopy.reshape(-1)
     flat_canopy[flat_idx_sorted[is_last_in_bin]] = elevation_sorted[is_last_in_bin]
     return canopy
+
+
+def rasterize_canopy_heightmap_with_fallback(
+    cloud: PointCloud,
+    bounds: BoundingBox,
+    resolution: int,
+    printf=print,
+) -> np.ndarray:
+    """
+    rasterize_canopy_heightmap, but with real visibility into WHY it
+    might come back empty, and an automatic (loudly-logged) retry
+    against FALLBACK_VEGETATION_CLASSIFICATIONS if VEGETATION_
+    CLASSIFICATIONS (3/4/5) matches zero points in the whole cloud --
+    confirmed as a real, not hypothetical, failure mode: some LAZ
+    deliveries never run fine vegetation sub-classification at all
+    (see FALLBACK_VEGETATION_CLASSIFICATIONS's own docstring).
+
+    Always prints the cloud's full classification histogram first,
+    regardless of whether a fallback ends up being needed -- so "why
+    did detection find nothing" is answerable directly from the
+    console output next time, instead of needing to re-derive it from
+    scratch each time this comes up.
+    """
+    values, counts = np.unique(cloud.classification, return_counts=True)
+    printf("  Point cloud classification histogram:")
+    for value, count in zip(values, counts):
+        printf(f"    class {int(value)}: {count:,} point(s)")
+
+    vegetation_count = int(np.isin(cloud.classification, VEGETATION_CLASSIFICATIONS).sum())
+    printf(f"  {vegetation_count:,} point(s) match VEGETATION_CLASSIFICATIONS {VEGETATION_CLASSIFICATIONS}")
+
+    if vegetation_count > 0:
+        return rasterize_canopy_heightmap(cloud, bounds, resolution, VEGETATION_CLASSIFICATIONS)
+
+    fallback_count = int(np.isin(cloud.classification, FALLBACK_VEGETATION_CLASSIFICATIONS).sum())
+    printf(f"  WARNING: no points classified as vegetation (3/4/5) at all -- this LAZ source likely "
+           f"never ran fine vegetation sub-classification. Falling back to classes "
+           f"{FALLBACK_VEGETATION_CLASSIFICATIONS} ({fallback_count:,} point(s)) instead -- this is a "
+           "broader, less precise proxy (it can't distinguish real vegetation from any other "
+           "not-otherwise-classified return, e.g. noise), so detection results are worth a closer "
+           "look via the ground-only LIDAR preview than usual.")
+    return rasterize_canopy_heightmap(cloud, bounds, resolution, FALLBACK_VEGETATION_CLASSIFICATIONS)
 
 
 def _cell_size(bounds: BoundingBox, resolution: int) -> float:
