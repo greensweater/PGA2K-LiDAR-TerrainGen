@@ -380,14 +380,25 @@ class PGAGenGUI:
         add_field(1, 1, "max_new", "MAX n", "Cap on new stamps this pass. Leave blank for no cap.",
                   self.max_new_var, required=False)
 
-        self.soft_brushes_var = tk.BooleanVar(value=False)
-        soft_checkbox = ttk.Checkbutton(grid_frame, text="Soft", variable=self.soft_brushes_var)
-        soft_checkbox.grid(row=1, column=2, sticky="w", padx=3, pady=2)
-        _Tooltip(soft_checkbox, "Restrict candidate brushes to just types 10 and 54 -- the two with "
-                 "no flat plateau (smooth, cosine-like falloff the whole way from center to edge). "
-                 "Excludes 8/9's wide flat tops, which densely-packed small stamps can turn into a "
-                 "flat-topped 'crater' look; trades some precision at hitting an exact target height "
-                 "across a wide flat area for a smoother result.")
+        self.brush_type_vars: dict[int, tk.BooleanVar] = {
+            b: tk.BooleanVar(value=True) for b in self.BRUSH_TYPE_ORDER
+        }
+        self.brush_types_menubutton = ttk.Menubutton(grid_frame, text="", direction="below")
+        brush_menu = tk.Menu(self.brush_types_menubutton, tearoff=False)
+        for b in self.BRUSH_TYPE_ORDER:
+            brush_menu.add_checkbutton(
+                label=f"type {b}: {self.BRUSH_TYPE_LABELS[b]}",
+                variable=self.brush_type_vars[b],
+                command=lambda b=b: self._on_brush_type_toggled(b),
+            )
+        self.brush_types_menubutton["menu"] = brush_menu
+        self.brush_types_menubutton.grid(row=1, column=2, sticky="w", padx=3, pady=2)
+        self._update_brush_types_label()
+        _Tooltip(self.brush_types_menubutton, "Which brush shapes refine-terrain is allowed to place "
+                 "at a hotspot (candidate_brushes -- every checked type is scored, the best fit wins). "
+                 "type 10 alone approximates Chad's smooth 2m-grid raster result (uniform small "
+                 "stamps, no flat plateau); mixing in 8/9 trades some of that smoothness for better "
+                 "fit against sharp features. At least one type must stay checked.")
 
         add_field(2, 0, "spread_ratio", "SPR %", "Brush radius spread ratio: every brush is scored "
                   "at the same base radius (a fair comparison of which brush shape fits best), but the "
@@ -428,6 +439,25 @@ class PGAGenGUI:
                  "confirming in-game that terrain and splines land exactly where expected. Shared "
                  "with the same checkbox in the Splines tab (one setting, both places).")
         self._add_step_button(parent, "Write Terrain", self._run_output_terrain)
+
+    def _on_brush_type_toggled(self, changed_brush: int) -> None:
+        if not any(v.get() for v in self.brush_type_vars.values()):
+            # Keep at least one brush type checked -- an empty
+            # --candidate-brushes would leave refine-terrain with
+            # nothing to score/place at any hotspot. Revert whichever
+            # checkbox was just unchecked to cause this.
+            self.brush_type_vars[changed_brush].set(True)
+            return
+        self._update_brush_types_label()
+
+    def _update_brush_types_label(self) -> None:
+        selected = [b for b in self.BRUSH_TYPE_ORDER if self.brush_type_vars[b].get()]
+        if len(selected) == len(self.BRUSH_TYPE_ORDER):
+            text = "All (hard/medium/soft/smooth)"
+        else:
+            text = ", ".join(self.BRUSH_TYPE_LABELS[b] for b in selected)
+        self.brush_types_menubutton.config(text=text)
+
     def _build_log_panel(self, paned: ttk.PanedWindow) -> None:
         frame = ttk.Frame(paned)
         paned.add(frame, weight=1)
@@ -571,6 +601,9 @@ class PGAGenGUI:
         "All", "green", "tee", "fairway", "rough", "bunker",
         "water", "cartpath", "path", "building", "wood", "hole",
     )
+
+    BRUSH_TYPE_ORDER = (8, 9, 10, 54)
+    BRUSH_TYPE_LABELS = {8: "hard", 9: "medium", 10: "soft", 54: "smooth"}
 
     def _build_splines_tab(self, parent: ttk.Frame) -> None:
         filter_row = ttk.Frame(parent)
@@ -1068,7 +1101,8 @@ class PGAGenGUI:
         ]
         if self.use_height_mask_var.get():
             args += ["--mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}"]
-        args += ["--candidate-brushes", "10,54" if self.soft_brushes_var.get() else "8,9,10,54"]
+        selected_brushes = [b for b in self.BRUSH_TYPE_ORDER if self.brush_type_vars[b].get()]
+        args += ["--candidate-brushes", ",".join(str(b) for b in selected_brushes)]
         max_new = self.max_new_var.get().strip()
         if max_new:
             args += ["--max-new-stamps", max_new]
