@@ -117,6 +117,7 @@ from course_output.userLayers import (
     build_baseline_flatten_stamp, build_registration_mark_stamps, normalize_stamp_heights,
     write_user_layers,
 )
+from course_output.water import build_water_objects
 
 INITIAL_STAMPS_FILE = "initial_stamps.json"
 FEATURES_FILE = "features.geojson"
@@ -1457,6 +1458,18 @@ def step_output_terrain(working_dir: Path, registration_marks: bool = False) -> 
     except ValueError as e:
         raise StepError(str(e)) from e
 
+    water_entries: list[dict] = []
+    features_path = working_dir / FEATURES_FILE
+    if features_path.exists():
+        print("Building water objects from OSM water features (course_output/water.py)...")
+        features = load_features(features_path)
+        features = _crop_features_to_course(working_dir, features)
+        water_features = [f for f in features if f.kind == "water"]
+        water_entries = build_water_objects(water_features, stamps)
+    else:
+        print(f"  No {FEATURES_FILE} found -- skipping water objects (run --step ingest-osm first "
+              "if this course has water hazards).")
+
     nodes_dir = course_dir / "CourseDescription_nodes"
     if not nodes_dir.is_dir():
         raise StepError(
@@ -1465,7 +1478,7 @@ def step_output_terrain(working_dir: Path, registration_marks: bool = False) -> 
         )
 
     out_path = nodes_dir / "userLayers.json"
-    write_user_layers(stamps, out_path)
+    write_user_layers(stamps, out_path, water=water_entries)
     print(f"Wrote {out_path}")
 
     # If a course name has been set (see the GUI's "Course name" field /
