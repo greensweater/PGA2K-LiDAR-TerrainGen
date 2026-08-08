@@ -325,13 +325,28 @@ class PGAGenGUI:
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        method_row = ttk.Frame(parent)
+        method_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(method_row, text="Method:").pack(side="left")
+        self.refine_method_var = tk.StringVar(value="adaptive")
+        method_box = ttk.Combobox(
+            method_row, textvariable=self.refine_method_var, state="readonly", width=10,
+            values=["adaptive", "scatter"],
+        )
+        method_box.pack(side="left", padx=4)
+        method_box.bind("<<ComboboxSelected>>", lambda e: self._on_refine_method_changed())
+        _Tooltip(method_box, "adaptive: targets error hotspots (the original behavior). "
+                 "scatter: ignores error, places well-spaced random stamps flattened to the real "
+                 "local LIDAR average -- closer in spirit to Chad's fixed-grid raster approach, "
+                 "just organically spaced instead of on a fixed lattice.")
+
         self.tolerance_var = tk.StringVar(value="2")
         self.resolution_var = tk.StringVar(value="200")
         self.min_hotspot_radius_cells_var = tk.StringVar(value="1.0")
         self.max_new_var = tk.StringVar()
         self.spread_ratio_var = tk.StringVar(value="1")
         self.claim_fraction_var = tk.StringVar(value="1")
-        self.radius_decay_var = tk.StringVar(value="1")
+        self.rad_var = tk.StringVar(value="25")
         self.max_planar_rms_var = tk.StringVar(value="")  # blank = off (old behavior)
         self.planar_shrink_var = tk.StringVar(value="0.75")
         self.refine_labels: dict[str, ttk.Label] = {}
@@ -407,12 +422,17 @@ class PGAGenGUI:
                   "more overlap as the falloff gets gentler. 1 disables it.", self.spread_ratio_var,
                   required=True)
         add_field(2, 1, "claim_fraction", "EAT %", "Claimed radius fraction: how much of the placed "
-                  "radius gets marked done. Below 1 lets neighboring stamps overlap. 1 disables it "
-                  "(old behavior).", self.claim_fraction_var, required=True)
-        add_field(2, 2, "radius_decay", "DEC %", "Radius decay per pass: shrinks min/max hotspot "
-                  "radius by this factor for each prior refine pass already run, so later passes add "
-                  "finer detail instead of re-covering the same ground at lower error. 1 disables it "
-                  "(every pass uses the same clamps).", self.radius_decay_var, required=True)
+                  "radius gets marked done. Below 1 lets neighboring stamps overlap. adaptive: 1 "
+                  "disables it (old behavior). scatter: RAD * EAT is the minimum center-to-center "
+                  "spacing between stamps (the actual Poisson-disc constraint) AND the radius within "
+                  "which real LIDAR points are averaged for each stamp's flatten target.",
+                  self.claim_fraction_var, required=True)
+        add_field(2, 2, "rad", "RAD m", "Literal target stamp radius (m) for this pass. adaptive: "
+                  "becomes max_radius (min_radius derives from the same fixed 0.5 ratio as before). "
+                  "scatter: the literal per-stamp placement radius before jitter. Replaces the old "
+                  "DEC % (radius_decay_per_pass) -- the implied decay vs. the last run is now shown "
+                  "as a computed, read-only value below instead of being something you type in.",
+                  self.rad_var, required=True)
 
         add_field(3, 0, "max_planar_rms", "PLN m", "Max planar-fit RMS (m): shrinks a hotspot's radius "
                   "until the region's actual LIDAR heights fit a single tilted plane within this "
@@ -421,9 +441,11 @@ class PGAGenGUI:
                   "floor to rim, so without this it gets averaged into one stamp that pulls the floor "
                   "up and the rim down). Leave blank to disable (old behavior).",
                   self.max_planar_rms_var, required=False)
-        add_field(3, 1, "planar_shrink", "SHR %", "Planar shrink factor: how much to shrink a "
-                  "hotspot's radius each time it fails the max planar-fit RMS check, repeating until "
-                  "it passes or hits the min radius. Only used when PLN m is set.",
+        add_field(3, 1, "planar_shrink", "SHR %", "adaptive: how much to shrink a hotspot's radius "
+                  "each time it fails the max planar-fit RMS check (only used when PLN m is set). "
+                  "scatter: repurposed as radius jitter -- each stamp's radius is randomized within "
+                  "[RAD * SHR%, RAD], so centers arrange themselves organically instead of a visibly "
+                  "uniform lattice. 1.0 disables jitter (every stamp is exactly RAD).",
                   self.planar_shrink_var, required=False)
 
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
@@ -439,6 +461,15 @@ class PGAGenGUI:
                  "confirming in-game that terrain and splines land exactly where expected. Shared "
                  "with the same checkbox in the Splines tab (one setting, both places).")
         self._add_step_button(parent, "Write Terrain", self._run_output_terrain)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Refinement values:").pack(anchor="w")
+        self.refine_stats_text = tk.Text(
+            parent, height=11, width=28, wrap="none", state="disabled",
+            font=("TkFixedFont", 9), background="#f0f0f0",
+        )
+        self.refine_stats_text.pack(anchor="w", fill="x", pady=(2, 0))
+        self._refresh_refine_stats()
 
     def _on_brush_type_toggled(self, changed_brush: int) -> None:
         if not any(v.get() for v in self.brush_type_vars.values()):
@@ -939,6 +970,7 @@ class PGAGenGUI:
             self.game_version.set(project.get("game_version", DEFAULT_GAME_VERSION))
         finally:
             self._suppress_game_version_save = False
+        self._refresh_refine_stats()
         self._refresh_preview_and_slider()
 
     def _on_repack_filename_changed(self) -> None:
@@ -1051,7 +1083,7 @@ class PGAGenGUI:
             "min_hotspot": self.min_hotspot_radius_cells_var,
             "spread_ratio": self.spread_ratio_var,
             "claim_fraction": self.claim_fraction_var,
-            "radius_decay": self.radius_decay_var,
+            "rad": self.rad_var,
         }
         all_valid = True
         for key, label in self.refine_labels.items():
@@ -1061,6 +1093,11 @@ class PGAGenGUI:
                 label.configure(foreground="red")
                 all_valid = False
         return all_valid
+
+    def _on_refine_method_changed(self) -> None:
+        """No functional effect on its own (method is only actually read when Refine Terrain
+        runs) -- just keeps the read-only stats panel's method-specific note current."""
+        self._refresh_refine_stats()
 
     def _run_refine_terrain(self) -> None:
         wd = self._require_working_dir()
@@ -1091,12 +1128,13 @@ class PGAGenGUI:
 
         args = [
             "--step", "refine-terrain",
+            "--method", self.refine_method_var.get(),
             "--error-tolerance", self.tolerance_var.get().strip(),
             "--resolution", self.resolution_var.get().strip(),
             "--min-hotspot-radius-cells", self.min_hotspot_radius_cells_var.get().strip(),
             "--brush-radius-spread-ratio", self.spread_ratio_var.get().strip(),
             "--claim-radius-fraction", self.claim_fraction_var.get().strip(),
-            "--radius-decay-per-pass", self.radius_decay_var.get().strip(),
+            "--rad-m", self.rad_var.get().strip(),
             "--use-height-mask" if self.use_height_mask_var.get() else "--no-use-height-mask",
         ]
         if self.use_height_mask_var.get():
@@ -1111,6 +1149,50 @@ class PGAGenGUI:
             args += ["--max-planar-rms", max_planar_rms,
                       "--planar-shrink-factor", self.planar_shrink_var.get().strip()]
         self._run_step(args, wd)
+        self._refresh_refine_stats()
+
+    def _refresh_refine_stats(self) -> None:
+        """
+        Populate the read-only Refinement values panel from
+        project.json -- implied decay (last_refine_rad_m / this run's
+        RAD, see PGA2k_gen.py's step_refine_terrain), current vs.
+        last-run stamp counts, last-run params, and RMS fit quality.
+        Called after every Refine Terrain run, and on working-dir
+        change, so the panel reflects whatever's actually on disk
+        rather than only updating within this GUI session.
+        """
+        self.refine_stats_text.config(state="normal")
+        self.refine_stats_text.delete("1.0", "end")
+
+        wd = self.working_dir.get().strip()
+        if not wd or not Path(wd).is_dir():
+            self.refine_stats_text.insert("1.0", "(no working directory)")
+            self.refine_stats_text.config(state="disabled")
+            return
+        project = load_project(Path(wd))
+        if "last_refine_rad_m" not in project:
+            self.refine_stats_text.insert("1.0", "(no refine-terrain run yet)")
+            self.refine_stats_text.config(state="disabled")
+            return
+
+        last_rad = project.get("last_refine_rad_m")
+        implied_decay = project.get("last_refine_implied_decay")
+        decay_line = f"{implied_decay:.3f}x" if implied_decay is not None else "n/a (first run)"
+        lines = [
+            f"Last method:      {project.get('last_refine_method', 'adaptive')}",
+            f"Last RAD (m):     {last_rad}",
+            f"Implied decay:    {decay_line}",
+            f"Last tolerance:   {project.get('last_refine_tolerance_m')}",
+            "",
+            f"Stamps this run:  {project.get('last_refine_added_count', 0)}",
+            f"Total stamps:     {project.get('total_stamp_count', 0)}",
+            f"Hotspots/sites:   {project.get('last_refine_hotspot_count', 0)}",
+            "",
+            f"Fit RMS (mean):   {project.get('last_refine_mean_fit_rms')}",
+            f"Fit RMS (max):    {project.get('last_refine_max_fit_rms')}",
+        ]
+        self.refine_stats_text.insert("1.0", "\n".join(lines))
+        self.refine_stats_text.config(state="disabled")
 
     def _run_output_terrain(self) -> None:
         wd = self._require_working_dir()
