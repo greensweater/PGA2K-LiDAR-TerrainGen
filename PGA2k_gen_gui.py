@@ -252,9 +252,26 @@ class PGAGenGUI:
         vscroll = ttk.Scrollbar(
             container, orient="vertical", command=canvas.yview, style="Thin.Vertical.TScrollbar",
         )
-        canvas.configure(yscrollcommand=vscroll.set)
+
+        def _on_vscroll_set(lo: str, hi: str) -> None:
+            # Autohide: yscrollcommand fires with fractions spanning
+            # the full 0.0-1.0 range whenever all content already fits
+            # in the visible canvas height -- nothing to scroll, so
+            # there's nothing useful the scrollbar can do. Packed/
+            # forgotten here instead of always-visible; canvas still
+            # packs with expand=True, so it reclaims the freed strip
+            # automatically when the scrollbar disappears.
+            lo_f, hi_f = float(lo), float(hi)
+            if lo_f <= 0.0 and hi_f >= 1.0:
+                vscroll.pack_forget()
+            elif not vscroll.winfo_ismapped():
+                vscroll.pack(side="right", fill="y")
+            vscroll.set(lo, hi)
+
+        canvas.configure(yscrollcommand=_on_vscroll_set)
         canvas.pack(side="left", fill="both", expand=True)
-        vscroll.pack(side="right", fill="y")
+        # Not packed here -- _on_vscroll_set packs it only once tk
+        # reports there's actually something to scroll.
 
         inner = ttk.Frame(canvas)
         inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
