@@ -51,10 +51,10 @@ from constants import (  # noqa: E402
     PREVIEW_LIDAR, PREVIEW_LIDAR_GROUND, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
     PREVIEW_STAMPS, STAMPS_DIR,
 )
-from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, PLACED_OBJECTS_FILE, load_project, save_project  # noqa: E402
+from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, OBJECT_LIST_FILE, load_project, save_project  # noqa: E402
 from course_output.objects import (  # noqa: E402
-    DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019,
-    load_placed_objects, object_counts,
+    DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_HEIGHT_TAG,
+    TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, save_object_list,
 )
 from ingest.osm import (  # noqa: E402
     GOLF_OBJECT_KINDS, build_height_mask, crop_features, merge_height_mask_features, load_features,
@@ -140,6 +140,7 @@ class PGAGenGUI:
         self._cached_base_thumb_key = None
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
+        self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._suppress_course_name_save = False
         self._suppress_repack_filename_save = False
@@ -689,6 +690,8 @@ class PGAGenGUI:
     BRUSH_TYPE_ORDER = (8, 9, 10, 54)
     BRUSH_TYPE_LABELS = {8: "hard", 9: "med", 10: "soft", 54: "smooth"}
 
+    _OBJECT_SOURCE_FILTERS = ("All", "OSM", "LIDAR")
+
     def _build_splines_tab(self, parent: ttk.Frame) -> None:
         filter_row = ttk.Frame(parent)
         filter_row.pack(fill="x")
@@ -798,7 +801,7 @@ class PGAGenGUI:
         self.objects_filter_var = tk.StringVar(value="All")
         self.objects_filter_box = ttk.Combobox(
             obj_filter_row, textvariable=self.objects_filter_var, state="readonly", width=14,
-            values=["All"],
+            values=self._OBJECT_SOURCE_FILTERS,
         )
         self.objects_filter_box.pack(side="left", padx=4)
         self.objects_filter_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_objects_list())
@@ -807,20 +810,30 @@ class PGAGenGUI:
         obj_tree_frame = ttk.Frame(parent)
         obj_tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.objects_tree = ttk.Treeview(
-            obj_tree_frame, columns=("items", "clusters", "splines"), show="tree headings", height=10,
+            obj_tree_frame, columns=("x", "z", "source", "detail"), show="headings",
+            height=18, selectmode="extended",
         )
-        self.objects_tree.heading("#0", text="Asset path")
-        self.objects_tree.heading("items", text="Items")
-        self.objects_tree.heading("clusters", text="Clusters")
-        self.objects_tree.heading("splines", text="Splines")
-        self.objects_tree.column("#0", width=140)
-        self.objects_tree.column("items", width=45, anchor="center")
-        self.objects_tree.column("clusters", width=55, anchor="center")
-        self.objects_tree.column("splines", width=50, anchor="center")
+        self.objects_tree.heading("x", text="X")
+        self.objects_tree.heading("z", text="Z")
+        self.objects_tree.heading("source", text="Source")
+        self.objects_tree.heading("detail", text="Detail")
+        self.objects_tree.column("x", width=60, anchor="center")
+        self.objects_tree.column("z", width=60, anchor="center")
+        self.objects_tree.column("source", width=55, anchor="center")
+        self.objects_tree.column("detail", width=110)
         self.objects_tree.pack(side="left", fill="both", expand=True)
         obj_tree_scroll = ttk.Scrollbar(obj_tree_frame, orient="vertical", command=self.objects_tree.yview)
         obj_tree_scroll.pack(side="left", fill="y")
         self.objects_tree["yscrollcommand"] = obj_tree_scroll.set
+
+        obj_button_row = ttk.Frame(parent)
+        obj_button_row.pack(fill="x", pady=(6, 0))
+        clear_all_btn = ttk.Button(obj_button_row, text="Clear All", command=self._clear_filtered_objects)
+        clear_all_btn.pack(side="left")
+        _Tooltip(clear_all_btn, "Delete every tree currently shown (i.e. matching the active Filter) "
+                 "from object_list.json permanently, then re-run Write Objects to pick up the change. "
+                 "Set Filter to 'LIDAR' first to dump only auto-detected trees, keeping any hand-tagged "
+                 "OSM ones -- useful for clearing out a bad detection run without losing curated data.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._add_step_button(parent, "Write Objects", self._run_write_objects)
@@ -841,6 +854,7 @@ class PGAGenGUI:
             "--detect-lidar-trees" if self.detect_lidar_trees_var.get() else "--no-detect-lidar-trees",
         ]
         self._run_step(args, wd)
+        self._refresh_objects_list()
 
     def _run_write_objects(self) -> None:
         wd = self._require_working_dir()
@@ -853,28 +867,72 @@ class PGAGenGUI:
         self._run_step(args, wd)
         self._refresh_objects_list()
 
+    @staticmethod
+    def _object_source(tags: dict) -> str:
+        """LIDAR-detected trees always carry TREE_RADIUS_TAG/TREE_HEIGHT_TAG
+        (see objects.py's lidar_trees_to_tagged); anything else came from
+        an OSM natural=tree node."""
+        return "LIDAR" if TREE_RADIUS_TAG in tags or TREE_HEIGHT_TAG in tags else "OSM"
+
+    @staticmethod
+    def _object_detail(tags: dict) -> str:
+        tree_type = tags.get(TREE_TYPE_TAG)
+        height = tags.get(TREE_HEIGHT_TAG)
+        radius = tags.get(TREE_RADIUS_TAG)
+        parts = []
+        if tree_type:
+            parts.append(str(tree_type))
+        if height:
+            parts.append(f"h={float(height):.1f}m")
+        if radius:
+            parts.append(f"r={float(radius):.1f}m")
+        return " ".join(parts)
+
     def _refresh_objects_list(self) -> None:
         wd = self.working_dir.get().strip()
         self.objects_tree.delete(*self.objects_tree.get_children())
+        self._objects_tree_list = []
         if not wd or not Path(wd).is_dir():
             return
-        objects_path = Path(wd) / "course" / "CourseDescription_nodes" / PLACED_OBJECTS_FILE
-        if not objects_path.exists():
+        object_list_path = Path(wd) / OBJECT_LIST_FILE
+        if not object_list_path.exists():
             return
         try:
-            objects = load_placed_objects(objects_path)
-        except (json.JSONDecodeError, OSError):
+            self._objects_tree_list = load_object_list(object_list_path)
+        except (json.JSONDecodeError, OSError, KeyError):
             return
-        counts = object_counts(objects)
-        self.objects_filter_box["values"] = ["All"] + sorted({path for path, *_ in counts})
+
         filter_val = self.objects_filter_var.get()
-        for path, item_count, cluster_count, spline_count in counts:
-            if filter_val != "All" and path != filter_val:
+        for i, (x, z, tags) in enumerate(self._objects_tree_list):
+            source = self._object_source(tags)
+            if filter_val != "All" and source != filter_val:
                 continue
             self.objects_tree.insert(
-                "", "end", text=path, values=(item_count, cluster_count, spline_count),
+                "", "end", iid=str(i), values=(f"{x:.1f}", f"{z:.1f}", source, self._object_detail(tags)),
             )
 
+    def _clear_filtered_objects(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        visible_iids = self.objects_tree.get_children()
+        if not visible_iids:
+            messagebox.showinfo("Nothing to clear", "No trees are currently shown for the active filter.")
+            return
+        if not messagebox.askyesno(
+            "Clear filtered trees",
+            f"Permanently delete {len(visible_iids)} tree(s) currently shown (filter="
+            f"{self.objects_filter_var.get()!r}) from object_list.json? This can't be undone -- "
+            "re-run Generate Trees to get them back.",
+        ):
+            return
+        remove_indices = {int(iid) for iid in visible_iids}
+        self._objects_tree_list = [
+            tree for i, tree in enumerate(self._objects_tree_list) if i not in remove_indices
+        ]
+        save_object_list(self._objects_tree_list, Path(wd) / OBJECT_LIST_FILE)
+        self._append_log(f"\n[cleared {len(remove_indices)} tree(s) from {OBJECT_LIST_FILE}]\n")
+        self._refresh_objects_list()
 
     def _refresh_splines_list(self) -> None:
         wd = self.working_dir.get().strip()
