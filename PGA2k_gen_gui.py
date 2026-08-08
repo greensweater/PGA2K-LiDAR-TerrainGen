@@ -161,11 +161,21 @@ class PGAGenGUI:
         footer.pack(side="bottom", fill="x")
         self._build_footer(footer)
 
+        style = ttk.Style()
+        style.configure("Thin.Vertical.TScrollbar", width=10)
+
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill="both", expand=True)
 
-        left = ttk.Notebook(main)
-        left.pack(side="left", fill="both", padx=(0, 8))
+        # Outer horizontal split: sidebar (Notebook) on the left, the
+        # preview/log split on the right -- a draggable sash between
+        # them, same resizable-pane pattern as the preview/log split
+        # itself (see `right` below), instead of the sidebar's old
+        # fixed natural width.
+        outer = ttk.PanedWindow(main, orient="horizontal")
+        outer.pack(fill="both", expand=True)
+
+        left = ttk.Notebook(outer)
 
         file_tab = ttk.Frame(left, padding=4)
         terrain_tab = ttk.Frame(left, padding=4)
@@ -178,8 +188,10 @@ class PGAGenGUI:
 
         # Horizontal split: preview (more room, per request) on the left,
         # log on the right; the sash between them resizes width, not height.
-        right = ttk.PanedWindow(main, orient="horizontal")
-        right.pack(side="left", fill="both", expand=True)
+        right = ttk.PanedWindow(outer, orient="horizontal")
+
+        outer.add(left, weight=0)
+        outer.add(right, weight=1)
 
         self._build_file_tab(self._make_scrollable_tab(file_tab))
         self._build_terrain_tab(self._make_scrollable_tab(terrain_tab))
@@ -191,22 +203,24 @@ class PGAGenGUI:
     def _make_scrollable_tab(self, parent: ttk.Frame) -> ttk.Frame:
         """
         Wrap one Notebook tab in a vertically scrollable canvas, so a
-        tab's fields can exceed the visible window height without
-        forcing the whole window to grow -- previously every step's
-        fields lived in one flat stack per tab with no scrolling at
-        all, so seeing everything at once needed a tall window.
-        Returns the inner frame callers should actually build into.
+        tab's fields can exceed the visible pane height without
+        forcing the whole window to grow. Returns the inner frame
+        callers should actually build into.
 
-        Mousewheel binding is scoped to only while the pointer is over
-        THIS canvas (bind/unbind on Enter/Leave), not bound globally --
-        binding globally would make scrolling over the log panel, or
-        a different tab entirely, also scroll this canvas underneath
-        whatever's actually visible.
+        Deliberately no mousewheel binding: an earlier version bound
+        the wheel globally while the pointer was over the canvas, but
+        that's too broad -- it intercepts wheel events meant for a
+        widget nested inside the tab (a Treeview's own scrollbar, a
+        Combobox's wheel-to-cycle-values behavior) instead of letting
+        them reach it. Scrolling is drag-the-scrollbar (or resize the
+        pane -- see the outer PanedWindow in _build_layout) only.
         """
         container = ttk.Frame(parent)
         container.pack(fill="both", expand=True)
         canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
-        vscroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        vscroll = ttk.Scrollbar(
+            container, orient="vertical", command=canvas.yview, style="Thin.Vertical.TScrollbar",
+        )
         canvas.configure(yscrollcommand=vscroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         vscroll.pack(side="right", fill="y")
@@ -224,19 +238,6 @@ class PGAGenGUI:
             # width instead of just their own natural content width.
             canvas.itemconfig(inner_id, width=event.width)
         canvas.bind("<Configure>", _on_canvas_configure)
-
-        def _bind_mousewheel(_event=None):
-            canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
-            canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
-            canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
-
-        def _unbind_mousewheel(_event=None):
-            canvas.unbind_all("<MouseWheel>")
-            canvas.unbind_all("<Button-4>")
-            canvas.unbind_all("<Button-5>")
-
-        canvas.bind("<Enter>", _bind_mousewheel)
-        canvas.bind("<Leave>", _unbind_mousewheel)
 
         return inner
 
@@ -340,6 +341,29 @@ class PGAGenGUI:
                  "local LIDAR average -- closer in spirit to Chad's fixed-grid raster approach, "
                  "just organically spaced instead of on a fixed lattice.")
 
+        brush_type_row = ttk.Frame(parent)
+        brush_type_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(brush_type_row, text="Brush type:").pack(side="left")
+        self.brush_type_vars: dict[int, tk.BooleanVar] = {
+            b: tk.BooleanVar(value=True) for b in self.BRUSH_TYPE_ORDER
+        }
+        self.brush_types_menubutton = ttk.Menubutton(brush_type_row, text="", direction="below")
+        brush_menu = tk.Menu(self.brush_types_menubutton, tearoff=False)
+        for b in self.BRUSH_TYPE_ORDER:
+            brush_menu.add_checkbutton(
+                label=f"{b}: {self.BRUSH_TYPE_LABELS[b]}",
+                variable=self.brush_type_vars[b],
+                command=lambda b=b: self._on_brush_type_toggled(b),
+            )
+        self.brush_types_menubutton["menu"] = brush_menu
+        self.brush_types_menubutton.pack(side="left", padx=4)
+        self._update_brush_types_label()
+        _Tooltip(self.brush_types_menubutton, "Which brush shapes refine-terrain is allowed to place "
+                 "at a hotspot (candidate_brushes -- every checked type is scored, the best fit wins). "
+                 "type 10 alone approximates Chad's smooth 2m-grid raster result (uniform small "
+                 "stamps, no flat plateau); mixing in 8/9 trades some of that smoothness for better "
+                 "fit against sharp features. At least one type must stay checked.")
+
         self.tolerance_var = tk.StringVar(value="2")
         self.resolution_var = tk.StringVar(value="200")
         self.min_hotspot_radius_cells_var = tk.StringVar(value="1.0")
@@ -394,26 +418,6 @@ class PGAGenGUI:
                   required=True)
         add_field(1, 1, "max_new", "MAX n", "Cap on new stamps this pass. Leave blank for no cap.",
                   self.max_new_var, required=False)
-
-        self.brush_type_vars: dict[int, tk.BooleanVar] = {
-            b: tk.BooleanVar(value=True) for b in self.BRUSH_TYPE_ORDER
-        }
-        self.brush_types_menubutton = ttk.Menubutton(grid_frame, text="", direction="below")
-        brush_menu = tk.Menu(self.brush_types_menubutton, tearoff=False)
-        for b in self.BRUSH_TYPE_ORDER:
-            brush_menu.add_checkbutton(
-                label=f"type {b}: {self.BRUSH_TYPE_LABELS[b]}",
-                variable=self.brush_type_vars[b],
-                command=lambda b=b: self._on_brush_type_toggled(b),
-            )
-        self.brush_types_menubutton["menu"] = brush_menu
-        self.brush_types_menubutton.grid(row=1, column=2, sticky="w", padx=3, pady=2)
-        self._update_brush_types_label()
-        _Tooltip(self.brush_types_menubutton, "Which brush shapes refine-terrain is allowed to place "
-                 "at a hotspot (candidate_brushes -- every checked type is scored, the best fit wins). "
-                 "type 10 alone approximates Chad's smooth 2m-grid raster result (uniform small "
-                 "stamps, no flat plateau); mixing in 8/9 trades some of that smoothness for better "
-                 "fit against sharp features. At least one type must stay checked.")
 
         add_field(2, 0, "spread_ratio", "SPR %", "Brush radius spread ratio: every brush is scored "
                   "at the same base radius (a fair comparison of which brush shape fits best), but the "
@@ -484,9 +488,9 @@ class PGAGenGUI:
     def _update_brush_types_label(self) -> None:
         selected = [b for b in self.BRUSH_TYPE_ORDER if self.brush_type_vars[b].get()]
         if len(selected) == len(self.BRUSH_TYPE_ORDER):
-            text = "All (hard/medium/soft/smooth)"
+            text = "all"
         else:
-            text = ", ".join(self.BRUSH_TYPE_LABELS[b] for b in selected)
+            text = ", ".join(str(b) for b in selected)
         self.brush_types_menubutton.config(text=text)
 
     def _build_log_panel(self, paned: ttk.PanedWindow) -> None:
@@ -634,7 +638,7 @@ class PGAGenGUI:
     )
 
     BRUSH_TYPE_ORDER = (8, 9, 10, 54)
-    BRUSH_TYPE_LABELS = {8: "hard", 9: "medium", 10: "soft", 54: "smooth"}
+    BRUSH_TYPE_LABELS = {8: "hard", 9: "med", 10: "soft", 54: "smooth"}
 
     def _build_splines_tab(self, parent: ttk.Frame) -> None:
         filter_row = ttk.Frame(parent)
