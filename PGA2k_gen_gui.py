@@ -190,7 +190,7 @@ class PGAGenGUI:
         # log on the right; the sash between them resizes width, not height.
         right = ttk.PanedWindow(outer, orient="horizontal")
 
-        outer.add(left, weight=0)
+        outer.add(left, weight=0, minsize=250)
         outer.add(right, weight=1)
 
         self._build_file_tab(self._make_scrollable_tab(file_tab))
@@ -199,6 +199,24 @@ class PGAGenGUI:
         self._build_objects_tab(self._make_scrollable_tab(objects_tab))
         self._build_preview_panel(right)
         self._build_log_panel(right)
+
+        # Belt-and-suspenders alongside the working-dir-change trace
+        # (_on_working_dir_changed already calls _refresh_refine_stats):
+        # also refresh whenever the Terrain tab itself becomes the
+        # selected tab, so the panel is never stale if something else
+        # changed project.json's refine-terrain values while a
+        # different tab was showing.
+        self._terrain_tab_widget = terrain_tab
+        left.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+
+    def _on_notebook_tab_changed(self, event) -> None:
+        notebook = event.widget
+        try:
+            current = notebook.nametowidget(notebook.select())
+        except (tk.TclError, KeyError):
+            return
+        if current is self._terrain_tab_widget:
+            self._refresh_refine_stats()
 
     def _make_scrollable_tab(self, parent: ttk.Frame) -> ttk.Frame:
         """
@@ -596,6 +614,7 @@ class PGAGenGUI:
         # manual scroll-position math is needed here.
         self.preview_canvas.bind("<Button-2>", lambda e: self.preview_canvas.scan_mark(e.x, e.y))
         self.preview_canvas.bind("<B2-Motion>", lambda e: self.preview_canvas.scan_dragto(e.x, e.y, gain=1))
+        self.preview_canvas.bind("<Configure>", self._center_preview_image)
 
         overlay_row = ttk.Frame(frame)
         overlay_row.pack(fill="x", pady=(4, 0))
@@ -1707,12 +1726,46 @@ class PGAGenGUI:
         self.preview_canvas.create_text(10, 10, anchor="nw", text=text, fill="black")
         self.preview_canvas.configure(scrollregion=(0, 0, 400, 60))
         self._preview_imgtk = None
+        self._preview_canvas_image_id = None
 
     def _set_preview_image(self, pil_image) -> None:
         self._preview_imgtk = ImageTk.PhotoImage(pil_image)
         self.preview_canvas.delete("all")
-        self.preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_imgtk)
-        self.preview_canvas.configure(scrollregion=(0, 0, pil_image.width, pil_image.height))
+        self._preview_canvas_image_id = self.preview_canvas.create_image(
+            0, 0, anchor="nw", image=self._preview_imgtk,
+        )
+        self._center_preview_image()
+
+    def _center_preview_image(self, event=None) -> None:
+        """
+        Center the current preview image within the canvas's visible
+        viewport when the image is smaller than the viewport, instead
+        of leaving it glued to the canvas's (0,0) origin -- previously
+        the image always rendered in the upper-left corner of the
+        preview pane whenever the pane was larger than the image
+        itself. Only repositions the image's existing canvas item (via
+        coords(), not a delete+recreate), so this is cheap enough to
+        call on every pane resize (bound to <Configure> below) without
+        flicker, and never touches zoom/pan (Ctrl+scroll, middle-drag)
+        -- those already work by scrolling/scaling within whatever
+        scrollregion is set here, independent of this offset.
+
+        event is the <Configure> event when bound as a resize handler
+        (its width/height are the new canvas size, already current at
+        the time the event fires); called with no event (from
+        _set_preview_image) it falls back to querying the canvas
+        directly.
+        """
+        if self._preview_canvas_image_id is None or self._preview_imgtk is None:
+            return
+        canvas_w = event.width if event is not None else self.preview_canvas.winfo_width()
+        canvas_h = event.height if event is not None else self.preview_canvas.winfo_height()
+        img_w = self._preview_imgtk.width()
+        img_h = self._preview_imgtk.height()
+        offset_x = max((canvas_w - img_w) // 2, 0)
+        offset_y = max((canvas_h - img_h) // 2, 0)
+        self.preview_canvas.coords(self._preview_canvas_image_id, offset_x, offset_y)
+        self.preview_canvas.configure(scrollregion=(0, 0, max(canvas_w, img_w), max(canvas_h, img_h)))
 
     def _ensure_splines_features_fresh(self, working_dir: Path) -> None:
         """
