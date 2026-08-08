@@ -480,6 +480,40 @@ def object_counts(objects: list[dict]) -> list[tuple[str, int, int, int]]:
     return counts
 
 
+def save_object_list(trees: list[tuple[float, float, dict]], path: Path) -> None:
+    """
+    Write the intermediate, VERSION-AGNOSTIC object list (see module
+    docstring's version-dispatch discussion) -- the combined result of
+    OSM natural=tree parsing and, optionally, LIDAR canopy detection,
+    already unified into one (x, z, tags) list (see
+    lidar_trees_to_tagged) -- to object_list.json, BEFORE either
+    build_tree_objects_v2019 or _v2021 ever runs.
+
+    Deliberately not GeoJSON: these are scalar points with a flat tag
+    dict, not polygon/line geometry, so GeoJSON's FeatureCollection
+    generality buys nothing here -- a plain JSON list matches this
+    project's own convention for non-vector-feature data (see
+    initial_stamps.json's Stamp list).
+
+    Kept separate from a specific game_version on purpose: this is the
+    one-time-expensive step (OSM parse, LIDAR watershed detection);
+    switching game_version later only needs to re-run the (cheap)
+    build_tree_objects_v20XX formatting step against this same file,
+    not redo detection from scratch.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [{"x": x, "z": z, "tags": tags} for x, z, tags in trees]
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(entries, fh, indent=2)
+
+
+def load_object_list(path: Path) -> list[tuple[float, float, dict]]:
+    with Path(path).open(encoding="utf-8") as fh:
+        entries = json.load(fh)
+    return [(e["x"], e["z"], e["tags"]) for e in entries]
+
+
 def save_placed_objects(objects: list[dict], path: Path) -> None:
     """Write placedObjects2.json -- a plain JSON array, matching the
     same one-key-per-file convention as surfaceSplines.json/holes.json."""
