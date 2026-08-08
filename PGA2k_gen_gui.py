@@ -630,6 +630,17 @@ class PGAGenGUI:
         _Tooltip(stake_entry, "If set, places this asset at every corner of every 'building' feature "
                  "from features.geojson. Leave blank to skip stakes entirely. 2021+ only.")
 
+        self.detect_lidar_trees_var = tk.BooleanVar(value=False)
+        lidar_trees_checkbox = ttk.Checkbutton(
+            parent, text="Detect trees from LIDAR canopy", variable=self.detect_lidar_trees_var,
+        )
+        lidar_trees_checkbox.pack(anchor="w", pady=(2, 6))
+        _Tooltip(lidar_trees_checkbox, "Also detect individual trees directly from LIDAR canopy "
+                 "points (ingest/tree_detection.py), on top of any OSM natural=tree nodes. Confined "
+                 "to height_mask.geojson's core-play-area polygon if one exists -- the game's own "
+                 "procedural vegetation fill is expected to handle everywhere else. Needs "
+                 "heightmap.npz and pointcloud.npz (Ingest LAZ).")
+
         self._add_step_button(parent, "Write Objects", self._run_write_objects)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -676,6 +687,7 @@ class PGAGenGUI:
         stake_path = self.stake_asset_path_var.get().strip()
         if stake_path:
             args += ["--stake-asset-path", stake_path]
+        args.append("--detect-lidar-trees" if self.detect_lidar_trees_var.get() else "--no-detect-lidar-trees")
         self._run_step(args, wd)
         self._refresh_objects_list()
 
