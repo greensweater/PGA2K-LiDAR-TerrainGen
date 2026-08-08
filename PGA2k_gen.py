@@ -74,6 +74,10 @@ from ingest.heightmap import (
     DEFAULT_FILL_TOLERANCE, DEFAULT_HEIGHTMAP_RESOLUTION,
     fill_heightmap_gaps, load_heightmap, rasterize_ground_heightmap, save_heightmap,
 )
+from ingest.tree_detection import (
+    DEFAULT_MIN_HEIGHT_M as DEFAULT_LIDAR_TREE_MIN_HEIGHT_M,
+    detect_trees_from_lidar, rasterize_canopy_heightmap,
+)
 from ingest.osm import (
     DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, crop_features, load_features, load_height_mask,
     parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
@@ -85,7 +89,7 @@ from course_output.holes import build_holes, save_holes
 from course_output.objects import (
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019,
     build_building_stake_objects_v2021, build_tree_objects_v2019, build_tree_objects_v2021,
-    object_counts, parse_osm_trees, save_placed_objects,
+    lidar_trees_to_tagged, object_counts, parse_osm_trees, save_placed_objects,
 )
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -827,6 +831,7 @@ def step_write_objects(
     tree_asset_paths: list[str] | None = None,
     tree_type_asset_paths: dict[str, str] | None = None,
     stake_asset_path: str | None = None,
+    detect_lidar_trees: bool | None = None,
 ) -> None:
     """
     Generate placedObjects2.json -- trees (from map.osm's natural=tree
@@ -860,6 +865,22 @@ def step_write_objects(
     from the way-based vector features everything else here reads
     from -- see osm.py's own docstring).
 
+    detect_lidar_trees (feature-flagged via project.json, same
+    None-means-use-saved pattern as the others; default off) adds
+    individually-detected trees straight from the LIDAR canopy --
+    see ingest/tree_detection.py -- on top of whatever OSM natural=tree
+    nodes were found, combined into one list (real per-tree radius/
+    height are carried through as TREE_RADIUS_TAG/TREE_HEIGHT_TAG, see
+    objects.py's lidar_trees_to_tagged, so both sources build
+    identically regardless of origin). LIDAR-detected trees are
+    dropped outside height_mask.geojson's polygon if that file exists
+    (the "core play area" mask adaptive-refine already uses) -- the
+    game's own procedural vegetation fill is expected to populate
+    everywhere else, so detecting real trees there too would double
+    up rather than add detail. Requires heightmap.npz and
+    pointcloud.npz (both from --step ingest-laz); raises StepError if
+    either is missing.
+
     This overwrites placedObjects2.json wholesale, same as
     step_write_splines/step_write_holes do for their own files.
     """
@@ -886,6 +907,8 @@ def step_write_objects(
         tree_type_asset_paths = project.get("objects_tree_type_asset_paths", {})
     if stake_asset_path is None:
         stake_asset_path = project.get("objects_stake_asset_path")
+    if detect_lidar_trees is None:
+        detect_lidar_trees = project.get("objects_detect_lidar_trees", False)
 
     required = ["crs_wkt", "origin_x", "origin_y", "horizontal_unit_factor", "merged_bounds_local"]
     missing = [k for k in required if k not in project]
@@ -919,6 +942,36 @@ def step_write_objects(
             trees.append((cx, cz, tags))
     print(f"  {len(trees)} of {len(full_frame_trees)} tree(s) fall inside the current "
           f"{COURSE_SIZE_M:.0f}x{COURSE_SIZE_M:.0f} m course crop")
+
+    if detect_lidar_trees:
+        heightmap_path = working_dir / HEIGHTMAP_FILE
+        pointcloud_path = working_dir / POINTCLOUD_FILE
+        if not heightmap_path.exists() or not pointcloud_path.exists():
+            raise StepError(
+                f"--detect-lidar-trees needs both {HEIGHTMAP_FILE} and {POINTCLOUD_FILE} under "
+                f"{working_dir} -- run --step ingest-laz first."
+            )
+        print("Detecting individual trees from LIDAR canopy points "
+              "(ingest/tree_detection.py)...")
+        ground_heights, _ = load_heightmap(heightmap_path)
+        resolution = ground_heights.shape[0]
+
+        full_cloud = PointCloud.load(pointcloud_path)
+        course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
+        canopy_heights = rasterize_canopy_heightmap(course_cloud, course_bounds, resolution)
+
+        mask_path = working_dir / HEIGHT_MASK_FILE
+        mask_geometry = load_height_mask(mask_path) if mask_path.exists() else None
+        if mask_geometry is None:
+            print(f"  NOTE: no {HEIGHT_MASK_FILE} found -- LIDAR-detected trees will NOT be "
+                  "confined to a core play area (run --step ingest-osm to generate one).")
+
+        lidar_trees = detect_trees_from_lidar(
+            ground_heights, canopy_heights, course_bounds, mask_geometry=mask_geometry,
+        )
+        trees += lidar_trees_to_tagged(lidar_trees)
+        print(f"  {len(lidar_trees)} LIDAR-detected tree(s) added "
+              f"({len(trees)} total tree(s) now)")
 
     placed_objects: list[dict] = []
 
@@ -975,6 +1028,7 @@ def step_write_objects(
         "objects_tree_asset_paths": tree_asset_paths,
         "objects_tree_type_asset_paths": tree_type_asset_paths,
         "objects_stake_asset_path": stake_asset_path,
+        "objects_detect_lidar_trees": detect_lidar_trees,
         "objects_tree_count": len(trees),
     })
 
@@ -1545,6 +1599,14 @@ def main(argv: list[str] | None = None) -> int:
                          help="write-objects: Unity asset path for a stake placed at every corner of "
                               "every 'building' feature. Omit to skip stakes entirely. Default: use "
                               "whatever's saved in project.json, or none if never set.")
+    parser.add_argument("--detect-lidar-trees", action=argparse.BooleanOptionalAction, default=None,
+                         help="write-objects: also detect individual trees directly from LIDAR canopy "
+                              "points (ingest/tree_detection.py), added on top of any OSM natural=tree "
+                              "nodes. Confined to height_mask.geojson's core-play-area polygon if one "
+                              "exists (the game's own procedural vegetation fill is expected to handle "
+                              "everywhere else). Needs heightmap.npz and pointcloud.npz (--step "
+                              "ingest-laz). Default: use whatever's saved in project.json, or off if "
+                              "never set.")
     parser.add_argument("--repack-filename", type=str, default=None,
                          help="repack: output filename (without .course extension)")
     args = parser.parse_args(argv)
@@ -1600,6 +1662,7 @@ def main(argv: list[str] | None = None) -> int:
             step_write_objects(
                 working_dir, args.game_version, _resolve_theme(args.theme), args.tree_variety,
                 args.tree_asset_paths, tree_type_asset_paths, args.stake_asset_path,
+                args.detect_lidar_trees,
             )
         elif args.step == "repack":
             if not args.repack_filename:
