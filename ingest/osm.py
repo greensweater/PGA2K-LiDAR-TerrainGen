@@ -53,7 +53,7 @@ import shapely.vectorized
 from terrain.bounding_box import BoundingBox
 
 DEFAULT_HEIGHT_MASK_KINDS = ("fairway", "green", "tee")
-DEFAULT_HOLE_CORRIDOR_BUFFER_PX = 30.0
+DEFAULT_HOLE_CORRIDOR_BUFFER_PX = 10.0
 GOLF_OBJECT_KINDS = ("fairway", "green", "tee", "hole")  # mask (=excluded) defaults False for these, True otherwise
 DEFAULT_HEIGHT_MASK_BUFFER_PX = 50.0  # see build_height_mask's docstring for what "pixel" means here
 
