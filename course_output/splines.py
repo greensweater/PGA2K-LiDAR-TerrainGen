@@ -9,7 +9,8 @@ Rockey's TGC-Designer-Tools (OSMTGC.py's newSpline family), reverse-
 engineered/tuned against real in-game testing:
 https://github.com/chadrockey/TGC-Designer-Tools
 
-Scope: green/tee/fairway/rough/bunker/cartpath/path/building/wood.
+Scope: green/tee/fairway/rough/heavyrough/bunker/cartpath/service_road/
+roadway/path/building/wood/pavement.
 
 Water is deliberately excluded here -- Chad's own approach fills water
 hazards with a placeholder "mulch" surface spline (confirmed directly
@@ -62,6 +63,12 @@ FEATURES_TO_SURFACES = {
     "water": 9,
     "surface3": 10,
     "cartpath": 10,
+    # Same raw surface id as "rough" (3), confirmed directly -- a
+    # separate, distinctly-named alias is kept anyway rather than
+    # reusing "rough" as the kind name: this is filled hardscape
+    # (parking lots, plaza-style footways), not grass rough, even
+    # though the two currently happen to resolve to the same texture.
+    "pavement": 3,
 }
 
 # Per-kind spline parameters, matching Chad's own newBunker/newGreen/
@@ -81,10 +88,26 @@ _STATIC_SPLINE_PARAMS: dict[str, dict] = {
                      tight_splines=False, secondary_surface="rough", secondary_width=5.0),
     "rough": dict(surface="rough", path_width=1.7, handle_length=3.0,
                    tight_splines=False, secondary_surface="", secondary_width=0.0),
+    "heavyrough": dict(surface="heavyrough", path_width=1.7, handle_length=3.0,
+                        tight_splines=False, secondary_surface="", secondary_width=0.0),
     "building": dict(surface="surface2", path_width=0.01, handle_length=0.2,
                       tight_splines=True, secondary_surface="", secondary_width=0.0),
     "wood": dict(surface="surface1", path_width=0.01, handle_length=0.2,
                   tight_splines=True, secondary_surface="", secondary_width=0.0),
+    "pavement": dict(surface="pavement", path_width=0.01, handle_length=0.2,
+                      tight_splines=True, secondary_surface="", secondary_width=0.0),
+}
+
+# Width (m) for each of the three OSM-derived road kinds -- all render
+# as the same "cartpath" surface texture, differing only in width.
+# Confirmed values (not this project's own guess): actual golf cart
+# paths are narrowest, service roads next, full vehicular roadways
+# widest. handle_length keeps the same 2x-width ratio the original
+# single fixed cartpath width (2.0 -> handle_length 4.0) used.
+_ROAD_KIND_WIDTHS = {
+    "cartpath": 1.7,
+    "service_road": 2.3,
+    "roadway": 3.5,
 }
 
 
@@ -221,11 +244,12 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
     if feature.kind in _STATIC_SPLINE_PARAMS:
         return _build_spline(points, **_STATIC_SPLINE_PARAMS[feature.kind])
 
-    if feature.kind == "cartpath":
+    if feature.kind in _ROAD_KIND_WIDTHS:
+        width = _ROAD_KIND_WIDTHS[feature.kind]
         return _build_spline(
-            points, surface="cartpath", path_width=2.0,
+            points, surface="cartpath", path_width=width,
             shrink_distance=None if is_area else 0.0,
-            handle_length=4.0, tight_splines=False,
+            handle_length=width * 2.0, tight_splines=False,
             secondary_surface="", secondary_width=0.0,
             state=3 if is_area else 0, is_closed=is_area, is_filled=is_area,
         )
