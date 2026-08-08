@@ -190,7 +190,7 @@ class PGAGenGUI:
         # log on the right; the sash between them resizes width, not height.
         right = ttk.PanedWindow(outer, orient="horizontal")
 
-        outer.add(left, weight=0, minsize=250)
+        outer.add(left, weight=0)
         outer.add(right, weight=1)
 
         self._build_file_tab(self._make_scrollable_tab(file_tab))
@@ -232,10 +232,23 @@ class PGAGenGUI:
         Combobox's wheel-to-cycle-values behavior) instead of letting
         them reach it. Scrolling is drag-the-scrollbar (or resize the
         pane -- see the outer PanedWindow in _build_layout) only.
+
+        The canvas gets an explicit, deliberately small starting
+        width (well under any tab's actual content) rather than
+        letting it size itself from that content -- ttk.PanedWindow
+        has no "minsize" option on add()/pane() (unlike the old
+        tk.PanedWindow), so the sidebar pane's minimum drag width is
+        just whatever its content's own natural requested width comes
+        out to. Without this, that came out to ~389px (driven by
+        whichever tab's fields are widest), so the sash couldn't be
+        dragged narrower than that at all. The canvas already crops/
+        scrolls its content at any width, so this doesn't lose
+        anything -- narrower than the content just means more of it
+        needs the (vertical) scrollbar to reach, same as always.
         """
         container = ttk.Frame(parent)
         container.pack(fill="both", expand=True)
-        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0, width=200)
         vscroll = ttk.Scrollbar(
             container, orient="vertical", command=canvas.yview, style="Thin.Vertical.TScrollbar",
         )
