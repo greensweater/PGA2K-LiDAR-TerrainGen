@@ -12,6 +12,7 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step ingest-course --course-file <path>
     PGA2k_gen.py <working_dir> --step generate-terrain
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
+                                 [--method adaptive|scatter] [--rad-m M]
     PGA2k_gen.py <working_dir> --step output-terrain
     PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023|2025>]
                                  [--theme <id-or-name>] [--tree-variety]              (2019)
@@ -100,9 +101,10 @@ from terrain.adaptive_refine import (
     DEFAULT_MIN_HOTSPOT_RADIUS_M,
     DEFAULT_MODEL_REBUILD_INTERVAL,
     DEFAULT_PLANAR_SHRINK_FACTOR,
-    DEFAULT_RADIUS_DECAY_PER_PASS,
+    DEFAULT_RAD_M,
     DEFAULT_RESOLUTION,
     refine_stamps,
+    scatter_refine_stamps,
 )
 from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
@@ -351,6 +353,7 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
     if latest_refine is not None:
         p = latest_refine["parameters"]
         extra_label = (
+            f"method={p.get('method', 'adaptive')} rad={p.get('rad_m', 'n/a')} "
             f"tol={p['tolerance']} res={p['resolution']} hot={p['min_hotspot_radius_cells']} "
             f"claim={p['claim_radius_fraction']} spread={p['brush_radius_spread_ratio']}"
         )
@@ -1098,52 +1101,60 @@ def step_refine_terrain(
     max_new_stamps: int | None,
     claim_radius_fraction: float | None,
     brush_radius_spread_ratio: float | None,
-    radius_decay_per_pass: float | None,
+    method: str | None,
     use_height_mask: bool | None,
     mask_buffer_px: float | None = None,
     model_rebuild_interval: int | None = None,
     candidate_brushes: tuple[int, ...] | None = None,
     max_planar_rms: float | None = None,
     planar_shrink_factor: float | None = None,
+    rad_m: float | None = None,
 ) -> None:
     """
-    One adaptive refinement pass (see terrain/adaptive_refine.py): find
-    contiguous regions of the binned error grid exceeding `tolerance`
-    (same grid preview_error.png visualizes), add one stamp per region
-    centered and sized on it, write the newly-added stamps (only --
-    not the whole cumulative list) to the next refine_stamps_N.json.
+    One refinement pass (see terrain/adaptive_refine.py), in one of two
+    methods:
 
-    Safe to run repeatedly -- each call reconstructs the full current
-    terrain via load_all_stamps() (initial_stamps.json plus every
-    prior refine_stamps_N.json) and scores against that, so "run this
-    a few times, watch the hotspot count drop" is the expected way to
-    iterate (see module docstring's "largest error -> split -> repeat").
+      "adaptive" (default) -- find contiguous regions of the binned
+      error grid exceeding `tolerance` (same grid preview_error.png
+      visualizes), add one stamp per region centered and sized on it.
+
+      "scatter" -- ignore error entirely; place stamps at randomly-
+      chosen, well-spaced sites, each flattened to the real local
+      LIDAR average -- see adaptive_refine.py's scatter_stamps for the
+      full rationale (closer in spirit to Chad Rockey's fixed-grid
+      raster approach, just organically spaced).
+
+    Either way, only the newly-added stamps (not the whole cumulative
+    list) are written to the next refine_stamps_N.json. Safe to run
+    repeatedly -- each call reconstructs the full current terrain via
+    load_all_stamps() (initial_stamps.json plus every prior
+    refine_stamps_N.json) and builds against that, so "run this a few
+    times, watch coverage improve" is the expected way to iterate.
     Deleting the highest-numbered refine_stamps_N.json undoes just
     that pass.
 
-    Without radius_decay_per_pass, every pass uses the exact same
-    min/max hotspot radius clamps (see adaptive_refine.py's
-    DEFAULT_MIN/MAX_HOTSPOT_RADIUS_M) regardless of how many prior
-    passes have already run -- confirmed in practice to cause a real
-    problem: a second pass over the same course reproduced hotspots at
-    nearly the same shape/radius as the first, just at lower error,
-    because min_radius=12.5 still floors every stamp up to at least
-    that size even where the residual error region is now much smaller
-    than that. radius_decay_per_pass > 1.0 shrinks both clamps by
-    decay**(pass_number - 1) each successive pass (pass 1 unchanged,
-    pass 2 divided by decay, pass 3 by decay^2, ...), so later passes
-    are only allowed to add progressively finer detail rather than
-    re-covering the same ground at a smaller value. 1.0 disables this
-    (every pass uses the same clamps -- the old default behavior).
+    rad_m ("RAD") is the literal target stamp radius (m) for THIS
+    pass, replacing the old radius_decay_per_pass percentage as the
+    direct, primary size control (see adaptive_refine.py's
+    DEFAULT_RAD_M docstring) -- no more indirect "decay compounds
+    across N passes" math to reason about; you just say how big you
+    want stamps this run. In "adaptive" mode this becomes max_radius
+    (min_radius = rad_m * the fixed 0.5 ratio DEFAULT_MIN/
+    MAX_HOTSPOT_RADIUS_M already used); in "scatter" mode it's the
+    literal per-stamp placement radius before jitter. The old implied
+    "decay" (how much smaller this pass's stamps are than the last
+    pass's) is now a DERIVED, informational value only -- computed
+    from last_refine_rad_m / rad_m and saved to project.json for
+    display, never fed back into the computation.
 
-    claim_radius_fraction / brush_radius_spread_ratio / radius_decay_per_pass /
+    claim_radius_fraction / brush_radius_spread_ratio / rad_m /
     max_planar_rms / planar_shrink_factor are feature-flagged via
     project.json rather than always needing a CLI value: pass None
     here to use whatever was last saved (defaulting to the old/off
     behavior if never set), or an explicit value to override for this
     run and persist it as the new default for next time.
 
-    max_planar_rms shrinks a hotspot's radius (before
+    max_planar_rms (adaptive only) shrinks a hotspot's radius (before
     claim_radius_fraction / brush_radius_spread_ratio are applied to
     it -- see adaptive_refine.py) until the region's actual LIDAR
     heights fit a single tilted plane within this RMS (m), catching
@@ -1152,6 +1163,14 @@ def step_refine_terrain(
     to rim, so it grows a stamp radius all the way to the rim with no
     planarity check, pulling the floor up and the rim down under one
     averaged stamp. None (default) disables this -- old behavior.
+
+    planar_shrink_factor ("SHR%") does double duty depending on
+    method: in "adaptive" it's max_planar_rms's shrink-loop step size
+    (see above); in "scatter" it's repurposed as radius jitter
+    magnitude instead (see adaptive_refine.py's scatter_stamps) --
+    there's no planar-fit concept in scatter mode at all, so reusing
+    the same GUI/CLI knob for a different, mode-appropriate purpose
+    avoids adding a redundant parameter.
     """
     heightmap_path = working_dir / HEIGHTMAP_FILE
     if not heightmap_path.exists():
@@ -1168,10 +1187,12 @@ def step_refine_terrain(
         brush_radius_spread_ratio = project.get(
             "refine_brush_radius_spread_ratio", DEFAULT_BRUSH_RADIUS_SPREAD_RATIO
         )
-    if radius_decay_per_pass is None:
-        radius_decay_per_pass = project.get(
-            "refine_radius_decay_per_pass", DEFAULT_RADIUS_DECAY_PER_PASS
-        )
+    if method is None:
+        method = project.get("refine_method", "adaptive")
+    if method not in ("adaptive", "scatter"):
+        raise StepError(f"method must be 'adaptive' or 'scatter', got {method!r}")
+    if rad_m is None:
+        rad_m = project.get("refine_rad_m", DEFAULT_RAD_M)
     if use_height_mask is None:
         use_height_mask = project.get("refine_use_height_mask", False)
     if model_rebuild_interval is None:
@@ -1191,19 +1212,17 @@ def step_refine_terrain(
     stamps = load_all_stamps(working_dir)
     pass_number = len(_refine_stamps_files(working_dir)) + 1
     print(f"  {len(stamps)} stamps (cumulative: initial + {pass_number - 1} prior refine pass(es))")
-    print(f"  claim_radius_fraction={claim_radius_fraction}  "
-          f"brush_radius_spread_ratio={brush_radius_spread_ratio}  "
-          f"radius_decay_per_pass={radius_decay_per_pass} (this is pass {pass_number})  "
-          f"use_height_mask={use_height_mask}")
-    if max_planar_rms is not None:
-        print(f"  max_planar_rms={max_planar_rms}  planar_shrink_factor={planar_shrink_factor}")
+    print(f"  method={method}  rad_m={rad_m}  claim_radius_fraction={claim_radius_fraction}  "
+          f"brush_radius_spread_ratio={brush_radius_spread_ratio}  use_height_mask={use_height_mask}")
 
-    decay = radius_decay_per_pass ** (pass_number - 1)
-    min_radius = DEFAULT_MIN_HOTSPOT_RADIUS_M / decay
-    max_radius = DEFAULT_MAX_HOTSPOT_RADIUS_M / decay
-    if decay != 1.0:
-        print(f"  min/max hotspot radius this pass: {min_radius:.2f} / {max_radius:.2f} m "
-              f"(decayed {decay:.2f}x from {DEFAULT_MIN_HOTSPOT_RADIUS_M}/{DEFAULT_MAX_HOTSPOT_RADIUS_M})")
+    last_rad_m = project.get("last_refine_rad_m")
+    implied_decay = (last_rad_m / rad_m) if last_rad_m and rad_m else None
+    if implied_decay is not None:
+        print(f"  implied decay vs. last run: {implied_decay:.3f}x "
+              f"(last_refine_rad_m={last_rad_m} -> rad_m={rad_m})")
+
+    if max_planar_rms is not None and method == "adaptive":
+        print(f"  max_planar_rms={max_planar_rms}  planar_shrink_factor={planar_shrink_factor}")
 
     heights, _ = load_heightmap(heightmap_path)
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
@@ -1227,44 +1246,69 @@ def step_refine_terrain(
               "matching the ground heightmap's own 1 px = 1 m grid. Not an error, just imprecise; "
               "an exact divisor (200, 250, 400, 500, 1000, 2000, ...) avoids this.")
 
-    print(f"Scanning the error grid ({resolution}x{resolution}, tolerance={tolerance} m)...")
     progress_start_time = time.time()
 
     def _print_refine_progress(hotspot_count: int, claimed_fraction: float) -> None:
         elapsed = time.time() - progress_start_time
-        print(f"  ... {elapsed:.0f}s elapsed: {hotspot_count} hotspots so far, "
-              f"{claimed_fraction:.1%} of the searchable area resolved")
+        print(f"  ... {elapsed:.0f}s elapsed: {hotspot_count} stamps so far, "
+              f"{claimed_fraction:.1%} of the searchable area claimed")
 
-    refined, hotspots = refine_stamps(
-        stamps, heights, bounds, tolerance=tolerance,
-        resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
-        min_radius=min_radius, max_radius=max_radius,
-        claim_radius_fraction=claim_radius_fraction,
-        brush_radius_spread_ratio=brush_radius_spread_ratio,
-        max_new_stamps=max_new_stamps,
-        mask=mask_grid,
-        model_rebuild_interval=model_rebuild_interval,
-        candidate_brushes=candidate_brushes,
-        max_planar_rms=max_planar_rms,
-        planar_shrink_factor=planar_shrink_factor,
-        progress_callback=_print_refine_progress,
-    )
+    if method == "scatter":
+        print(f"Scattering stamps ({resolution}x{resolution} grid, rad_m={rad_m})...")
+        refined, hotspots = scatter_refine_stamps(
+            stamps, heights, bounds, rad_m=rad_m,
+            resolution=resolution,
+            claim_radius_fraction=claim_radius_fraction,
+            brush_radius_spread_ratio=brush_radius_spread_ratio,
+            jitter_factor=planar_shrink_factor,
+            max_new_stamps=max_new_stamps,
+            mask=mask_grid,
+            model_rebuild_interval=model_rebuild_interval,
+            candidate_brushes=candidate_brushes,
+            progress_callback=_print_refine_progress,
+        )
+    else:
+        max_radius = rad_m
+        min_radius = rad_m * (DEFAULT_MIN_HOTSPOT_RADIUS_M / DEFAULT_MAX_HOTSPOT_RADIUS_M)
+        print(f"  min/max hotspot radius this pass: {min_radius:.2f} / {max_radius:.2f} m")
+        print(f"Scanning the error grid ({resolution}x{resolution}, tolerance={tolerance} m)...")
+        refined, hotspots = refine_stamps(
+            stamps, heights, bounds, tolerance=tolerance,
+            resolution=resolution, min_hotspot_radius_cells=min_hotspot_radius_cells,
+            min_radius=min_radius, max_radius=max_radius,
+            claim_radius_fraction=claim_radius_fraction,
+            brush_radius_spread_ratio=brush_radius_spread_ratio,
+            max_new_stamps=max_new_stamps,
+            mask=mask_grid,
+            model_rebuild_interval=model_rebuild_interval,
+            candidate_brushes=candidate_brushes,
+            max_planar_rms=max_planar_rms,
+            planar_shrink_factor=planar_shrink_factor,
+            progress_callback=_print_refine_progress,
+        )
 
     new_stamps = refined[len(stamps):]
+    fit_rms_values = [h.fit_rms for h in hotspots]
+    mean_fit_rms = float(np.mean(fit_rms_values)) if fit_rms_values else None
+    max_fit_rms = float(np.max(fit_rms_values)) if fit_rms_values else None
     if hotspots:
         worst = hotspots[0]
-        print(f"  {len(hotspots)} hotspots over tolerance (worst: {worst.peak_error:.3f} m "
-              f"at ({worst.x:.1f}, {worst.z:.1f}), {worst.n_cells} cells)")
+        label = "hotspots over tolerance" if method == "adaptive" else "stamps placed"
+        print(f"  {len(hotspots)} {label} (worst peak_error: {worst.peak_error:.3f} m "
+              f"at ({worst.x:.1f}, {worst.z:.1f}), {worst.n_cells} cells); "
+              f"fit_rms mean={mean_fit_rms:.3f} max={max_fit_rms:.3f}")
     else:
-        print("  0 hotspots over tolerance -- nothing to refine, terrain already meets it")
+        print("  nothing placed this pass")
 
     parameters = {
+        "method": method,
         "tolerance": tolerance,
         "resolution": resolution,
         "min_hotspot_radius_cells": min_hotspot_radius_cells,
         "max_new_stamps": max_new_stamps,
         "claim_radius_fraction": claim_radius_fraction,
         "brush_radius_spread_ratio": brush_radius_spread_ratio,
+        "rad_m": rad_m,
         "use_height_mask": use_height_mask,
         "mask_buffer_px": mask_buffer_px,
         "model_rebuild_interval": model_rebuild_interval,
@@ -1278,7 +1322,7 @@ def step_refine_terrain(
         out_path = _stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=next_n)
         save_stamp_file(
             new_stamps, out_path, step="refine-terrain", parameters=parameters,
-            extra={"hotspot_count": len(hotspots)},
+            extra={"hotspot_count": len(hotspots), "mean_fit_rms": mean_fit_rms, "max_fit_rms": max_fit_rms},
         )
         print(f"  wrote {out_path} ({len(new_stamps)} new stamps; "
               f"{len(stamps)} -> {len(refined)} total)")
@@ -1286,13 +1330,19 @@ def step_refine_terrain(
         print(f"  nothing written ({len(stamps)} total, unchanged)")
 
     save_project(working_dir, {
+        "last_refine_method": method,
+        "last_refine_rad_m": rad_m,
+        "last_refine_implied_decay": implied_decay,
         "last_refine_tolerance_m": tolerance,
         "last_refine_hotspot_count": len(hotspots),
         "last_refine_added_count": len(new_stamps),
+        "last_refine_mean_fit_rms": mean_fit_rms,
+        "last_refine_max_fit_rms": max_fit_rms,
         "total_stamp_count": len(refined),
         "refine_claim_radius_fraction": claim_radius_fraction,
         "refine_brush_radius_spread_ratio": brush_radius_spread_ratio,
-        "refine_radius_decay_per_pass": radius_decay_per_pass,
+        "refine_method": method,
+        "refine_rad_m": rad_m,
         "refine_use_height_mask": use_height_mask,
         "refine_model_rebuild_interval": model_rebuild_interval,
         "refine_candidate_brushes": list(candidate_brushes) if candidate_brushes is not None else None,
@@ -1502,13 +1552,20 @@ def main(argv: list[str] | None = None) -> int:
                               "(spread_ratio ** rank, ranks 0..3 for types 8/9/10/54); "
                               "1.0 disables it (default: use whatever's saved in project.json, "
                               f"or {DEFAULT_BRUSH_RADIUS_SPREAD_RATIO} if never set)")
-    parser.add_argument("--radius-decay-per-pass", type=float, default=None,
-                         help="refine-terrain: shrink min/max hotspot radius by this factor per "
-                              "prior refine pass already run (pass 2 divided by this once, pass 3 "
-                              "twice, ...), so later passes add progressively finer detail instead "
-                              "of re-covering the same ground at lower error; 1.0 disables it "
-                              "(default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_RADIUS_DECAY_PER_PASS} if never set)")
+    parser.add_argument("--method", type=str, default=None, choices=["adaptive", "scatter"],
+                         help="refine-terrain: 'adaptive' (default) targets error hotspots; "
+                              "'scatter' ignores error and places well-spaced random stamps flattened "
+                              "to real local LIDAR average -- see adaptive_refine.py's scatter_stamps. "
+                              "Default: use whatever's saved in project.json, or 'adaptive' if never set.")
+    parser.add_argument("--rad-m", type=float, default=None,
+                         help="refine-terrain: literal target stamp radius (m) for this pass -- "
+                              "'adaptive' uses this as max_radius (min_radius derives from the fixed "
+                              "0.5 ratio DEFAULT_MIN/MAX_HOTSPOT_RADIUS_M already used); 'scatter' "
+                              "uses it as the literal per-stamp placement radius before jitter. "
+                              "Replaces the old radius_decay_per_pass percentage -- the implied decay "
+                              "vs. the last run (last_refine_rad_m / rad_m) is now a derived, "
+                              "informational value only, saved to project.json for display. Default: "
+                              f"use whatever's saved in project.json, or {DEFAULT_RAD_M} if never set.")
     parser.add_argument("--use-height-mask", action=argparse.BooleanOptionalAction, default=None,
                          help="refine-terrain: restrict hotspot placement to inside height_mask.geojson "
                               "(fairway/green, see ingest-osm) -- everything outside is treated like "
@@ -1641,9 +1698,9 @@ def main(argv: list[str] | None = None) -> int:
             step_refine_terrain(working_dir, args.error_tolerance, args.resolution,
                                  args.min_hotspot_radius_cells, args.max_new_stamps,
                                  args.claim_radius_fraction, args.brush_radius_spread_ratio,
-                                 args.radius_decay_per_pass, args.use_height_mask, args.mask_buffer_px,
+                                 args.method, args.use_height_mask, args.mask_buffer_px,
                                  args.model_rebuild_interval, parsed_candidate_brushes,
-                                 args.max_planar_rms, args.planar_shrink_factor)
+                                 args.max_planar_rms, args.planar_shrink_factor, args.rad_m)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-splines":
