@@ -14,6 +14,7 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
                                  [--method adaptive|scatter] [--rad-m M]
     PGA2k_gen.py <working_dir> --step output-terrain
+    PGA2k_gen.py <working_dir> --step generate-trees [--detect-lidar-trees]
     PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023|2025>]
                                  [--theme <id-or-name>] [--tree-variety]              (2019)
                                  [--tree-asset-path <path>]...
@@ -90,7 +91,8 @@ from course_output.holes import build_holes, save_holes
 from course_output.objects import (
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019,
     build_building_stake_objects_v2021, build_tree_objects_v2019, build_tree_objects_v2021,
-    lidar_trees_to_tagged, object_counts, parse_osm_trees, save_placed_objects,
+    lidar_trees_to_tagged, load_object_list, object_counts, parse_osm_trees, save_object_list,
+    save_placed_objects,
 )
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -122,6 +124,7 @@ HEIGHT_MASK_FILE = "height_mask.geojson"
 HEIGHTMAP_FILE = "heightmap.npz"
 REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
 PLACED_OBJECTS_FILE = "placedObjects2.json"
+OBJECT_LIST_FILE = "object_list.json"
 
 
 def _stamps_dir(working_dir: Path) -> Path:
@@ -826,92 +829,53 @@ def _resolve_theme(theme_arg: str | None) -> int | None:
     return None
 
 
-def step_write_objects(
-    working_dir: Path,
-    game_version: str | None = None,
-    theme: int | None = None,
-    tree_variety: bool | None = None,
-    tree_asset_paths: list[str] | None = None,
-    tree_type_asset_paths: dict[str, str] | None = None,
-    stake_asset_path: str | None = None,
-    detect_lidar_trees: bool | None = None,
-) -> None:
+def step_generate_trees(working_dir: Path, detect_lidar_trees: bool | None = None) -> None:
     """
-    Generate placedObjects2.json -- trees (from map.osm's natural=tree
-    nodes) plus, optionally (v2021+ only), a stake at every building
-    corner (from features.geojson's "building" ways).
+    Generate the intermediate, VERSION-AGNOSTIC object_list.json (see
+    objects.py's save_object_list) -- trees parsed from map.osm's
+    natural=tree nodes, plus, optionally, trees individually detected
+    from LIDAR canopy points (ingest/tree_detection.py), combined into
+    one list.
 
-    game_version selects which of objects.py's two confirmed schemas
-    to write (see that module's docstring: v2019 is Chad Rockey's
-    numeric category/type/theme catalog; v2021+ is a real Unity asset
-    path). It's a project-level setting, same as course_name -- the
-    GUI sets it once near the top (not per-step) and it's read from
-    project.json here, same as every other value below. Raises
-    StepError up front if game_version isn't in
-    objects.IMPLEMENTED_GAME_VERSIONS (v2023/v2025 aren't confirmed
-    yet -- see objects.py's module docstring) rather than silently
-    guessing at an unconfirmed schema.
-
-    theme / tree_variety (v2019) and tree_asset_paths /
-    tree_type_asset_paths / stake_asset_path (v2021+) are all feature-
-    flagged via project.json, same pattern as refine-terrain's
-    parameters: pass None here to use whatever was last saved, or an
-    explicit value (an empty list/dict counts as explicit) to override
-    for this run and persist it as the new default for next time. Only
-    the parameters relevant to the resolved game_version are actually
-    used; the others are still accepted (and persisted, if given) so a
-    project can carry both versions' settings across a future
-    game_version switch without losing them.
-
-    Trees are parsed directly from map.osm, NOT features.geojson --
-    osm.py deliberately doesn't parse node data (a separate concern
-    from the way-based vector features everything else here reads
-    from -- see osm.py's own docstring).
+    Deliberately does NOT know about game_version or write
+    placedObjects2.json at all -- that's step_write_objects' job, kept
+    separate so switching game_version later only needs to re-run the
+    (cheap) version-specific formatting step, not repeat this one
+    (which does the actually-expensive work: OSM parsing, and LIDAR
+    watershed detection if enabled). Same "compile once, format at
+    write time" split this project already uses for terrain (Stamp
+    objects vs. userLayers.json) and features (features.geojson vs.
+    splines/holes).
 
     detect_lidar_trees (feature-flagged via project.json, same
-    None-means-use-saved pattern as the others; default off) adds
-    individually-detected trees straight from the LIDAR canopy --
-    see ingest/tree_detection.py -- on top of whatever OSM natural=tree
+    None-means-use-saved pattern used throughout this file) adds
+    individually-detected trees straight from the LIDAR canopy -- see
+    ingest/tree_detection.py -- on top of whatever OSM natural=tree
     nodes were found, combined into one list (real per-tree radius/
     height are carried through as TREE_RADIUS_TAG/TREE_HEIGHT_TAG, see
     objects.py's lidar_trees_to_tagged, so both sources build
-    identically regardless of origin). LIDAR-detected trees are
-    dropped outside height_mask.geojson's polygon if that file exists
-    (the "core play area" mask adaptive-refine already uses) -- the
-    game's own procedural vegetation fill is expected to populate
-    everywhere else, so detecting real trees there too would double
-    up rather than add detail. Requires heightmap.npz and
-    pointcloud.npz (both from --step ingest-laz); raises StepError if
-    either is missing.
+    identically regardless of origin). Defaults to True: OSM alone
+    typically finds few or no individually-tagged trees on a real
+    course (confirmed directly on a real course extract: 0 of ~5000
+    OSM nodes were natural=tree), so leaving this off by default would
+    silently produce an almost-empty tree list for most courses.
+    LIDAR-detected trees are dropped outside height_mask.geojson's
+    polygon if that file exists (the "core play area" mask adaptive-
+    refine already uses) -- the game's own procedural vegetation fill
+    is expected to populate everywhere else, so detecting real trees
+    there too would double up rather than add detail. Requires
+    heightmap.npz and pointcloud.npz (both from --step ingest-laz);
+    raises StepError if either is missing while this is on.
 
-    This overwrites placedObjects2.json wholesale, same as
-    step_write_splines/step_write_holes do for their own files.
+    This overwrites object_list.json wholesale.
     """
     osm_path = working_dir / "map.osm"
     if not osm_path.exists():
         raise StepError(f"No map.osm found at {osm_path}. Run --step ingest-laz first.")
 
     project = load_project(working_dir)
-    if game_version is None:
-        game_version = project.get("game_version", DEFAULT_GAME_VERSION)
-    if game_version not in IMPLEMENTED_GAME_VERSIONS:
-        raise StepError(
-            f"game_version={game_version!r} isn't implemented yet (only {IMPLEMENTED_GAME_VERSIONS} "
-            "are) -- see objects.py's module docstring. Set --game-version explicitly, or fix "
-            "project.json's saved 'game_version' if this project predates it."
-        )
-    if theme is None:
-        theme = project.get("objects_theme")
-    if tree_variety is None:
-        tree_variety = project.get("objects_tree_variety", False)
-    if tree_asset_paths is None:
-        tree_asset_paths = project.get("objects_tree_asset_paths", [])
-    if tree_type_asset_paths is None:
-        tree_type_asset_paths = project.get("objects_tree_type_asset_paths", {})
-    if stake_asset_path is None:
-        stake_asset_path = project.get("objects_stake_asset_path")
     if detect_lidar_trees is None:
-        detect_lidar_trees = project.get("objects_detect_lidar_trees", False)
+        detect_lidar_trees = project.get("objects_detect_lidar_trees", True)
 
     required = ["crs_wkt", "origin_x", "origin_y", "horizontal_unit_factor", "merged_bounds_local"]
     missing = [k for k in required if k not in project]
@@ -930,7 +894,6 @@ def step_write_objects(
     crs = pyproj.CRS.from_wkt(project["crs_wkt"])
     full_bounds = BoundingBox(**project["merged_bounds_local"])
 
-    print(f"game_version={game_version}")
     print(f"Parsing tree nodes from {osm_path}...")
     full_frame_trees = parse_osm_trees(
         osm_path, crs, project["origin_x"], project["origin_y"], project["horizontal_unit_factor"],
@@ -976,6 +939,89 @@ def step_write_objects(
         print(f"  {len(lidar_trees)} LIDAR-detected tree(s) added "
               f"({len(trees)} total tree(s) now)")
 
+    out_path = working_dir / OBJECT_LIST_FILE
+    save_object_list(trees, out_path)
+    print(f"Wrote {out_path} ({len(trees)} tree(s))")
+
+    save_project(working_dir, {
+        "objects_detect_lidar_trees": detect_lidar_trees,
+        "objects_tree_count": len(trees),
+    })
+
+
+def step_write_objects(
+    working_dir: Path,
+    game_version: str | None = None,
+    theme: int | None = None,
+    tree_variety: bool | None = None,
+    tree_asset_paths: list[str] | None = None,
+    tree_type_asset_paths: dict[str, str] | None = None,
+    stake_asset_path: str | None = None,
+) -> None:
+    """
+    Generate placedObjects2.json -- formats object_list.json (see
+    step_generate_trees; run that first) into the target game_version's
+    schema, plus, optionally (v2021+ only), a stake at every building
+    corner (from features.geojson's "building" ways).
+
+    game_version selects which of objects.py's two confirmed schemas
+    to write (see that module's docstring: v2019 is Chad Rockey's
+    numeric category/type/theme catalog; v2021+ is a real Unity asset
+    path). It's a project-level setting, same as course_name -- the
+    GUI sets it once near the top (not per-step) and it's read from
+    project.json here, same as every other value below. Raises
+    StepError up front if game_version isn't in
+    objects.IMPLEMENTED_GAME_VERSIONS (v2023/v2025 aren't confirmed
+    yet -- see objects.py's module docstring) rather than silently
+    guessing at an unconfirmed schema.
+
+    theme / tree_variety (v2019) and tree_asset_paths /
+    tree_type_asset_paths / stake_asset_path (v2021+) are all feature-
+    flagged via project.json, same pattern as refine-terrain's
+    parameters: pass None here to use whatever was last saved, or an
+    explicit value (an empty list/dict counts as explicit) to override
+    for this run and persist it as the new default for next time. Only
+    the parameters relevant to the resolved game_version are actually
+    used; the others are still accepted (and persisted, if given) so a
+    project can carry both versions' settings across a future
+    game_version switch without losing them.
+
+    tree_variety defaults to True (not just "off unless set") -- there's
+    no real reason to want the flat, single-generic-type result it
+    disables to; it exists mainly as an override for testing.
+
+    This overwrites placedObjects2.json wholesale, same as
+    step_write_splines/step_write_holes do for their own files.
+    """
+    object_list_path = working_dir / OBJECT_LIST_FILE
+    if not object_list_path.exists():
+        raise StepError(
+            f"No {OBJECT_LIST_FILE} found under {working_dir}. Run --step generate-trees first."
+        )
+
+    project = load_project(working_dir)
+    if game_version is None:
+        game_version = project.get("game_version", DEFAULT_GAME_VERSION)
+    if game_version not in IMPLEMENTED_GAME_VERSIONS:
+        raise StepError(
+            f"game_version={game_version!r} isn't implemented yet (only {IMPLEMENTED_GAME_VERSIONS} "
+            "are) -- see objects.py's module docstring. Set --game-version explicitly, or fix "
+            "project.json's saved 'game_version' if this project predates it."
+        )
+    if theme is None:
+        theme = project.get("objects_theme")
+    if tree_variety is None:
+        tree_variety = project.get("objects_tree_variety", True)
+    if tree_asset_paths is None:
+        tree_asset_paths = project.get("objects_tree_asset_paths", [])
+    if tree_type_asset_paths is None:
+        tree_type_asset_paths = project.get("objects_tree_type_asset_paths", {})
+    if stake_asset_path is None:
+        stake_asset_path = project.get("objects_stake_asset_path")
+
+    trees = load_object_list(object_list_path)
+    print(f"game_version={game_version}  loaded {len(trees)} tree(s) from {OBJECT_LIST_FILE}")
+
     placed_objects: list[dict] = []
 
     if game_version == "2019":
@@ -990,7 +1036,7 @@ def step_write_objects(
         if trees:
             if not tree_asset_paths and not tree_type_asset_paths:
                 raise StepError(
-                    f"{len(trees)} tree(s) found in the current course crop, but no tree asset path "
+                    f"{len(trees)} tree(s) found in object_list.json, but no tree asset path "
                     "is set -- pass --tree-asset-path (repeatable) and/or --tree-type-asset-path "
                     "TAG=path (repeatable). See objects.py's module docstring: there's no built-in "
                     "catalog to fall back to, v2021+ placed objects need real Unity asset paths."
@@ -1031,8 +1077,6 @@ def step_write_objects(
         "objects_tree_asset_paths": tree_asset_paths,
         "objects_tree_type_asset_paths": tree_type_asset_paths,
         "objects_stake_asset_path": stake_asset_path,
-        "objects_detect_lidar_trees": detect_lidar_trees,
-        "objects_tree_count": len(trees),
     })
 
 
@@ -1513,6 +1557,7 @@ STEPS = {
     "output-terrain": step_output_terrain,
     "write-splines": step_write_splines,
     "write-holes": step_write_holes,
+    "generate-trees": step_generate_trees,
     "write-objects": step_write_objects,
     "repack": step_repack,
     "visualize": step_visualize,
@@ -1638,7 +1683,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tree-variety", action=argparse.BooleanOptionalAction, default=None,
                          help="write-objects (game_version=2019 only): use the full set of the "
                               "theme's tree types (normal + skinny) instead of one generic type. "
-                              "Default: use whatever's saved in project.json, or off if never set.")
+                              "Default: use whatever's saved in project.json, or ON if never set.")
     parser.add_argument("--tree-asset-path", dest="tree_asset_paths", action="append", default=None,
                          help="write-objects (game_version=2021+ only): a Unity asset path (e.g. "
                               "'Assets/Trees/OakA') to draw "
@@ -1657,13 +1702,13 @@ def main(argv: list[str] | None = None) -> int:
                               "every 'building' feature. Omit to skip stakes entirely. Default: use "
                               "whatever's saved in project.json, or none if never set.")
     parser.add_argument("--detect-lidar-trees", action=argparse.BooleanOptionalAction, default=None,
-                         help="write-objects: also detect individual trees directly from LIDAR canopy "
+                         help="generate-trees: also detect individual trees directly from LIDAR canopy "
                               "points (ingest/tree_detection.py), added on top of any OSM natural=tree "
                               "nodes. Confined to height_mask.geojson's core-play-area polygon if one "
                               "exists (the game's own procedural vegetation fill is expected to handle "
                               "everywhere else). Needs heightmap.npz and pointcloud.npz (--step "
-                              "ingest-laz). Default: use whatever's saved in project.json, or off if "
-                              "never set.")
+                              "ingest-laz). Default: use whatever's saved in project.json, or ON if "
+                              "never set (OSM alone typically finds few or no trees on a real course).")
     parser.add_argument("--repack-filename", type=str, default=None,
                          help="repack: output filename (without .course extension)")
     args = parser.parse_args(argv)
@@ -1707,6 +1752,8 @@ def main(argv: list[str] | None = None) -> int:
             step_write_splines(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-holes":
             step_write_holes(working_dir)
+        elif args.step == "generate-trees":
+            step_generate_trees(working_dir, args.detect_lidar_trees)
         elif args.step == "write-objects":
             tree_type_asset_paths = None
             if args.tree_type_asset_paths is not None:
@@ -1719,7 +1766,6 @@ def main(argv: list[str] | None = None) -> int:
             step_write_objects(
                 working_dir, args.game_version, _resolve_theme(args.theme), args.tree_variety,
                 args.tree_asset_paths, tree_type_asset_paths, args.stake_asset_path,
-                args.detect_lidar_trees,
             )
         elif args.step == "repack":
             if not args.repack_filename:
