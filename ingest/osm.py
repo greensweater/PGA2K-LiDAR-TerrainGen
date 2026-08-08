@@ -53,8 +53,21 @@ import shapely.vectorized
 from terrain.bounding_box import BoundingBox
 
 DEFAULT_HEIGHT_MASK_KINDS = ("fairway", "green", "tee")
-DEFAULT_HOLE_CORRIDOR_BUFFER_PX = 10.0
+DEFAULT_HOLE_CORRIDOR_BUFFER_PX = 30.0
 GOLF_OBJECT_KINDS = ("fairway", "green", "tee", "hole")  # mask (=excluded) defaults False for these, True otherwise
+
+# Standard OSM vehicular-road highway= values -- classified as
+# "roadway" (the widest of the three road widths; see splines.py's
+# _ROAD_KIND_WIDTHS), distinct from "service_road" (highway=service)
+# and "cartpath"/"path" (golf-cart or foot access). Deliberately
+# excludes motorway/trunk (and their _link variants) even though
+# they're real roads -- those already return no-foot-access by default
+# above (implicit_foot_access) and aren't the kind of road a golf
+# course would ever actually cross/border in a way worth rendering.
+ROADWAY_HIGHWAY_TYPES = (
+    "primary", "primary_link", "secondary", "secondary_link",
+    "tertiary", "tertiary_link", "unclassified", "residential", "living_street",
+)
 DEFAULT_HEIGHT_MASK_BUFFER_PX = 50.0  # see build_height_mask's docstring for what "pixel" means here
 
 
@@ -97,6 +110,22 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     scatter_type = tags.get("pga_scatter")
     if scatter_type is not None:
         return ("vegetation", True)
+
+    # area:highway=footway -- the OSM convention for a closed way meant
+    # to render as a filled AREA (a plaza-style wide path) rather than
+    # a linear route, independent of (and not always accompanied by) a
+    # plain highway=footway tag. Filled pavement, same surface as
+    # amenity=parking below -- see splines.py's FEATURES_TO_SURFACES
+    # "pavement" alias.
+    if tags.get("area:highway") == "footway":
+        return ("pavement", True)
+
+    # leisure=golf_course -- the overall course property boundary
+    # (typically one large polygon/multipolygon underneath everything
+    # else). Rendered as heavy rough: a catch-all background that more
+    # specific surfaces (fairway, green, bunker, ...) paint over.
+    if tags.get("leisure") == "golf_course":
+        return ("heavyrough", True)
 
     golf_type = tags.get("golf")
     waterway_type = tags.get("waterway")
@@ -144,19 +173,42 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     if natural_type == "wood":
         return ("wood", True)
 
+    if natural_type == "water":
+        # By far the most common real-world OSM tagging for a pond/
+        # lake -- more common than golf=water_hazard or a bare
+        # waterway=* polygon (both already handled above). Always a
+        # filled area: a natural=water way with only a linestring
+        # geometry doesn't really occur in practice the way a
+        # waterway=stream centerline does.
+        return ("water", True)
+
     if highway_type is not None and highway_type not in ("proposed", "construction"):
         implicit_foot_access = {
             "motorway": "no", "motorway_link": "no", "trunk": "no", "trunk_link": "no",
         }
         way_foot_access = foot_type if foot_type is not None else implicit_foot_access.get(highway_type, "yes")
         if golf_cart_type not in (None, "no"):
+            # Cart-specific tagging wins regardless of the underlying
+            # highway value -- an actual golf cart path, narrowest of
+            # the three road widths (see splines.py's _ROAD_KIND_WIDTHS).
             return ("cartpath", explicit_area)
+        if highway_type == "service":
+            return ("service_road", explicit_area)
+        if highway_type in ROADWAY_HIGHWAY_TYPES:
+            return ("roadway", explicit_area)
         if way_foot_access != "no":
             return ("path", explicit_area)
         return None
 
     if amenity_type == "parking" and golf_cart_type not in (None, "no"):
         return ("cartpath", True)
+
+    # Any other parking lot -- filled pavement, not a path (see
+    # splines.py's FEATURES_TO_SURFACES "pavement" alias). Checked
+    # after the golf-cart-specific case above so that one still wins
+    # when both apply.
+    if amenity_type == "parking":
+        return ("pavement", True)
 
     return None
 
