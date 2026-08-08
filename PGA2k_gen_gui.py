@@ -753,33 +753,19 @@ class PGAGenGUI:
             self._run_step(["--step", "write-holes"], wd)
 
     def _build_objects_tab(self, parent: ttk.Frame) -> None:
-        theme_row = ttk.Frame(parent)
-        theme_row.pack(fill="x", pady=(0, 8))
-        theme_col = ttk.Frame(theme_row)
-        theme_col.pack(side="left")
-        ttk.Label(theme_col, text="Theme:").pack(anchor="w")
+        ttk.Label(parent, text="Theme:").pack(anchor="w")
         self._theme_name_to_id = {"(not set)": None}
         self._theme_name_to_id.update({name: theme_id for theme_id, name in THEMES_V2019.items()})
         self.objects_theme_var = tk.StringVar(value="(not set)")
         theme_box = ttk.Combobox(
-            theme_col, textvariable=self.objects_theme_var, state="readonly", width=14,
+            parent, textvariable=self.objects_theme_var, state="readonly", width=14,
             values=list(self._theme_name_to_id.keys()),
         )
-        theme_box.pack(anchor="w")
+        theme_box.pack(anchor="w", pady=(0, 8))
         _Tooltip(theme_box, "From the ingested .course (CourseDescription.json's theme / "
                  "CourseMetadata.json's courseTheme) -- controls which of the game's tree types are "
                  "available, same set for every game version. Leave as '(not set)' to use a single "
                  "generic tree type.")
-
-        variety_col = ttk.Frame(theme_row)
-        variety_col.pack(side="left", padx=(16, 0))
-        self.objects_tree_variety_var = tk.BooleanVar(value=False)
-        variety_checkbox = ttk.Checkbutton(
-            variety_col, text="Tree variety", variable=self.objects_tree_variety_var,
-        )
-        variety_checkbox.pack(anchor="w", pady=(14, 0))
-        _Tooltip(variety_checkbox, "Use the theme's full set of tree types (normal + skinny), "
-                 "randomly assigned per tree, instead of one generic type for every tree.")
 
         ttk.Label(parent, text="Asset List (.json):").pack(anchor="w")
         self.objects_asset_list_var = tk.StringVar(value="")
@@ -789,25 +775,21 @@ class PGAGenGUI:
         asset_list_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(asset_list_row, text="...", width=3, command=self._browse_objects_asset_list).pack(side="left")
         _Tooltip(asset_list_entry, "Not wired up yet -- placeholder for a future 2021+ asset-path "
-                 "list (replaces hand-typing tree/tree-type asset paths one at a time).")
+                 "list (will also cover building stakes; replaces hand-typing individual asset "
+                 "paths one at a time).")
 
-        ttk.Label(parent, text="Building stake asset path (optional):").pack(anchor="w")
-        self.stake_asset_path_var = tk.StringVar(value="")
-        stake_entry = ttk.Entry(parent, textvariable=self.stake_asset_path_var, width=28)
-        stake_entry.pack(anchor="w", fill="x", pady=(2, 8))
-        _Tooltip(stake_entry, "If set, places this asset at every corner of every 'building' feature "
-                 "from features.geojson. Leave blank to skip stakes entirely. 2021+ only.")
-
-        self.detect_lidar_trees_var = tk.BooleanVar(value=False)
+        self.detect_lidar_trees_var = tk.BooleanVar(value=True)
         lidar_trees_checkbox = ttk.Checkbutton(
             parent, text="Detect trees from LIDAR canopy", variable=self.detect_lidar_trees_var,
         )
-        lidar_trees_checkbox.pack(anchor="w", pady=(0, 8))
+        lidar_trees_checkbox.pack(anchor="w", pady=(0, 4))
         _Tooltip(lidar_trees_checkbox, "Also detect individual trees directly from LIDAR canopy "
                  "points (ingest/tree_detection.py), on top of any OSM natural=tree nodes. Confined "
                  "to height_mask.geojson's core-play-area polygon if one exists -- the game's own "
                  "procedural vegetation fill is expected to handle everywhere else. Needs "
-                 "heightmap.npz and pointcloud.npz (Ingest LAZ).")
+                 "heightmap.npz and pointcloud.npz (Ingest LAZ). On by default: OSM alone typically "
+                 "finds few or no individually-tagged trees on a real course.")
+        self._add_step_button(parent, "Generate Trees", self._run_generate_trees)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         obj_filter_row = ttk.Frame(parent)
@@ -850,19 +832,24 @@ class PGAGenGUI:
         if f:
             self.objects_asset_list_var.set(f)
 
+    def _run_generate_trees(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = [
+            "--step", "generate-trees",
+            "--detect-lidar-trees" if self.detect_lidar_trees_var.get() else "--no-detect-lidar-trees",
+        ]
+        self._run_step(args, wd)
+
     def _run_write_objects(self) -> None:
         wd = self._require_working_dir()
         if not wd:
             return
-        args = ["--step", "write-objects"]
+        args = ["--step", "write-objects", "--tree-variety"]
         theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
         if theme_id is not None:
             args += ["--theme", str(theme_id)]
-        args.append("--tree-variety" if self.objects_tree_variety_var.get() else "--no-tree-variety")
-        stake_path = self.stake_asset_path_var.get().strip()
-        if stake_path:
-            args += ["--stake-asset-path", stake_path]
-        args.append("--detect-lidar-trees" if self.detect_lidar_trees_var.get() else "--no-detect-lidar-trees")
         self._run_step(args, wd)
         self._refresh_objects_list()
 
