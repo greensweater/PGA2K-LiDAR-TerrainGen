@@ -78,7 +78,7 @@ from ingest.heightmap import (
 )
 from ingest.tree_detection import (
     DEFAULT_MIN_HEIGHT_M as DEFAULT_LIDAR_TREE_MIN_HEIGHT_M,
-    detect_trees_from_lidar, rasterize_canopy_heightmap,
+    detect_trees_from_lidar, rasterize_canopy_heightmap_with_fallback,
 )
 from ingest.osm import (
     DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, crop_features, load_features, load_height_mask,
@@ -924,7 +924,7 @@ def step_generate_trees(working_dir: Path, detect_lidar_trees: bool | None = Non
 
         full_cloud = PointCloud.load(pointcloud_path)
         course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
-        canopy_heights = rasterize_canopy_heightmap(course_cloud, course_bounds, resolution)
+        canopy_heights = rasterize_canopy_heightmap_with_fallback(course_cloud, course_bounds, resolution)
 
         mask_path = working_dir / HEIGHT_MASK_FILE
         mask_geometry = load_height_mask(mask_path) if mask_path.exists() else None
