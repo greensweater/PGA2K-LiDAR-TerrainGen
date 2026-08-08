@@ -72,7 +72,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -332,10 +332,16 @@ def stamp_to_entry(stamp: Stamp) -> dict:
     }
 
 
-def write_user_layers(stamps: Sequence[Stamp], path: Path) -> None:
+def write_user_layers(
+    stamps: Sequence[Stamp], path: Path, water: Optional[Sequence[dict]] = None,
+) -> None:
     """
     Write `stamps` into the "height" key of the userLayers.json at
-    `path`, preserving every other key already there.
+    `path`, preserving every other key already there. If `water` is
+    given (see water.py's build_water_objects), also replaces the
+    "water" key the same way; if omitted (None), "water" is left
+    exactly as found -- same "only touch what you were actually asked
+    to write" principle as "height" itself.
 
     If `path` doesn't exist yet, falls back to an all-empty schema
     (_BLANK_USER_LAYERS_SCHEMA) rather than writing a bare array --
@@ -350,6 +356,8 @@ def write_user_layers(stamps: Sequence[Stamp], path: Path) -> None:
         data = dict(_BLANK_USER_LAYERS_SCHEMA)
 
     data["height"] = [stamp_to_entry(s) for s in stamps]
+    if water is not None:
+        data["water"] = list(water)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
