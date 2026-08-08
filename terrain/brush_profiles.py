@@ -60,7 +60,7 @@ SHAPE_SQUARE = "square"
 # the output of running extract_brush_profiles.py once against those
 # same PNGs) live in a "brushes/" folder at the project root -- see
 # composite_render.py's DEFAULT_BRUSH_DIR, the same convention.
-BRUSH_ASSETS_DIR = Path(__file__).resolve().parent.parent / "brushes"
+BRUSH_ASSETS_DIR = Path(__file__).resolve().parent.parent / "viz/brushes"
 BRUSH_PROFILES_JSON = BRUSH_ASSETS_DIR / "brush_profiles.json"
 
 
