@@ -849,6 +849,25 @@ class PGAGenGUI:
         wd = self._require_working_dir()
         if not wd:
             return
+
+        # Same snapshot-before-run fix as _run_refine_terrain, and for
+        # the same reason: step_generate_trees loads whatever's
+        # currently saved in height_mask.geojson (only consulted when
+        # LIDAR detection is on -- that's the only thing the mask
+        # confines), which otherwise reflects whichever buffer was set
+        # the last time Ingest OSM (or a refine-terrain run) touched
+        # that file, not necessarily what's actually on screen here.
+        if self.detect_lidar_trees_var.get():
+            merged_geom = self._get_cached_mask_merged_geometry(Path(wd))
+            if merged_geom is not None:
+                buffer_px = self.mask_buffer_preview_var.get()
+                buffered = merged_geom.buffer(buffer_px)
+                save_height_mask(buffered, Path(wd) / HEIGHT_MASK_FILE)
+                self._append_log(
+                    f"\n[snapshotting height_mask.geojson at buffer={buffer_px:.0f} px "
+                    "before generate-trees]\n"
+                )
+
         args = [
             "--step", "generate-trees",
             "--detect-lidar-trees" if self.detect_lidar_trees_var.get() else "--no-detect-lidar-trees",
