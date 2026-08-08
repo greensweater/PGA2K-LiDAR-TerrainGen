@@ -229,6 +229,17 @@ BRUSH_RANK = {8: 0, 9: 1, 10: 2, 54: 3}
 DEFAULT_MAX_HOTSPOT_RADIUS_M = HEX_STAMP_RADIUS_M / 2.0
 DEFAULT_MIN_HOTSPOT_RADIUS_M = DEFAULT_MAX_HOTSPOT_RADIUS_M / 2.0
 
+# RAD -- literal target stamp radius (m), replacing the old indirect
+# radius_decay_per_pass percentage as the primary per-pass size
+# control (see PGA2k_gen.py's step_refine_terrain): "adaptive" derives
+# its max_radius/min_radius clamps directly from this (max_radius=RAD,
+# min_radius=RAD * the same 0.5 ratio DEFAULT_MIN/MAX_HOTSPOT_RADIUS_M
+# already used), "scatter" (see scatter_stamps) uses it as the literal
+# per-stamp placement radius, no derivation at all. Same numeric
+# default as the old DEFAULT_MAX_HOTSPOT_RADIUS_M, so a first run with
+# RAD left at default behaves like the old undecayed (decay=1.0) case.
+DEFAULT_RAD_M = DEFAULT_MAX_HOTSPOT_RADIUS_M
+
 # Planarity gating (feature-flagged, see module docstring addendum
 # below): disabled by default (None) so existing behavior/tuning is
 # unaffected unless a caller opts in.
@@ -678,5 +689,228 @@ def refine_stamps(
         progress_callback=progress_callback,
     )
 
+    new_stamps = [h.to_stamp() for h in hotspots]
+    return list(stamps) + new_stamps, hotspots
+
+
+def scatter_stamps(
+    stamps: Sequence[Stamp],
+    heights: np.ndarray,
+    bounds: BoundingBox,
+    rad_m: float,
+    resolution: int = DEFAULT_RESOLUTION,
+    claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
+    brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
+    jitter_factor: float = DEFAULT_PLANAR_SHRINK_FACTOR,
+    min_valid_cells: int = DEFAULT_MIN_POINTS,
+    max_new_stamps: Optional[int] = None,
+    mask: Optional[np.ndarray] = None,
+    model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
+    candidate_brushes: Optional[tuple[int, ...]] = None,
+    rng: Optional[np.random.Generator] = None,
+    progress_callback: Optional[Callable[[int, float], None]] = None,
+) -> list[ErrorHotspot]:
+    """
+    "Scatter" -- Poisson-disc-like random stamp placement, an
+    alternative to find_error_hotspots' error-driven site selection.
+    Rather than targeting specific under/over-tolerance regions, this
+    blankets the (masked) course with well-spaced stamps that each
+    snap to real average LIDAR ground height -- closer in spirit to
+    Chad Rockey's TGC-Designer-Tools fixed 2m-grid raster approach
+    (uniform small stamps stamped everywhere), just organically/
+    randomly spaced instead of on a fixed lattice, and reusing this
+    project's own brush-scoring machinery (_score_candidate) instead
+    of a separate rasterizer.
+
+    Each site is a uniformly random unclaimed (valid, in-mask, not
+    already claimed by an earlier scatter placement THIS pass) cell --
+    no error grid is computed or consulted at all. Existing `stamps`
+    only matter here for TerrainModel's pull-toward-value blending
+    (see _score_candidate) -- NOT for where scatter avoids placing;
+    unlike find_error_hotspots, this does not check prior passes'
+    stamp footprints when picking sites, only this pass's own claims.
+
+    rad_m ("RAD") is the literal target stamp radius -- unlike
+    find_error_hotspots' min_radius/max_radius clamps (derived from
+    the error region's own shape), there's no error region to measure
+    here, so this has to be given directly.
+
+    claim_radius_fraction ("EAT") does double duty beyond its
+    find_error_hotspots role: it both (a) sets the claimed exclusion
+    radius around each placed stamp (rad_m * claim_radius_fraction),
+    which is therefore also the effective MINIMUM center-to-center
+    spacing between scatter stamps -- the actual Poisson-disc
+    constraint -- and (b) sets the radius within which real LIDAR
+    points are averaged for this site's flatten target (the same
+    rad_m * claim_radius_fraction distance): sample only the area
+    "belonging" to this stamp, not points that might just as well
+    belong to a neighboring stamp.
+
+    jitter_factor ("SHR%", reused from its find_error_hotspots role
+    gating planar-fit radius shrinking -- which has no scatter-mode
+    equivalent, there's no error region to be planar or not here)
+    instead randomizes each stamp's actual radius within
+    [rad_m * jitter_factor, rad_m], so centers "arrange themselves
+    organically" instead of landing in a visibly uniform lattice of
+    identical circles despite random placement. 1.0 disables jitter
+    (every stamp is exactly rad_m).
+
+    Only TOOL_FLATTEN is considered, never TOOL_RAISE -- scatter's
+    whole purpose is directly reproducing real ground height, which is
+    what flatten's pull-toward-value semantics are for; there's no
+    scatter-mode analog to raise's "push up by this much".
+
+    Returns ErrorHotspot instances (reusing the same dataclass/
+    to_stamp() as find_error_hotspots) with peak_error repurposed as
+    |target_mean - current_at_center| -- how far the terrain was from
+    real ground at this site before this stamp -- and n_cells meaning
+    the same "cells within final_radius" as find_error_hotspots.
+    """
+    brushes = candidate_brushes if candidate_brushes is not None else CANDIDATE_BRUSHES
+    if rng is None:
+        rng = np.random.default_rng()
+
+    actual = downsample_heightmap(heights, bounds, resolution)
+    model = TerrainModel(stamps)
+
+    valid = np.isfinite(actual)
+    if mask is not None:
+        valid = valid & mask
+    claimed = ~valid
+    valid_count = int(np.sum(valid))
+
+    edges_x = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
+    edges_z = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
+    x_centers = (edges_x[:-1] + edges_x[1:]) / 2.0
+    z_centers = (edges_z[:-1] + edges_z[1:]) / 2.0
+
+    max_brush_scale = max(_brush_radius_multiplier(b, brush_radius_spread_ratio) for b in brushes)
+    base_claim_radius = rad_m * claim_radius_fraction
+
+    hotspots: list[ErrorHotspot] = []
+    last_progress_time = time.time()
+    progress_interval_s = 10.0
+
+    for _ in range(resolution * resolution):
+        if max_new_stamps is not None and len(hotspots) >= max_new_stamps:
+            break
+
+        if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
+            claimed_fraction = float(np.sum(claimed & valid)) / valid_count if valid_count else 1.0
+            progress_callback(len(hotspots), claimed_fraction)
+            last_progress_time = time.time()
+
+        rows_avail, cols_avail = np.nonzero(valid & ~claimed)
+        if rows_avail.size == 0:
+            break  # every valid cell is either already claimed or was never in bounds/mask
+
+        pick = int(rng.integers(rows_avail.size))
+        peak_row, peak_col = int(rows_avail[pick]), int(cols_avail[pick])
+        centroid_x = float(x_centers[peak_col])
+        centroid_z = float(z_centers[peak_row])
+
+        site_radius = rad_m * float(rng.uniform(jitter_factor, 1.0)) if jitter_factor < 1.0 else rad_m
+
+        query_radius = max(base_claim_radius, site_radius * max_brush_scale)
+        px, pz, actual_pts = query_heightmap_cells(heights, bounds, centroid_x, centroid_z, query_radius)
+        if px.size < min_valid_cells:
+            claimed[peak_row, peak_col] = True
+            continue
+
+        dist_from_center = np.hypot(px - centroid_x, pz - centroid_z)
+        in_sample_radius = dist_from_center <= base_claim_radius
+        if np.count_nonzero(in_sample_radius) < min_valid_cells:
+            claimed[peak_row, peak_col] = True
+            continue
+        target_mean = float(np.mean(actual_pts[in_sample_radius]))
+
+        current_at_points = model.evaluate_many(np.column_stack((px, pz)))
+        current_at_center = model.evaluate(centroid_x, centroid_z)
+
+        best: Optional[tuple[int, int, float, float, float]] = None  # + candidate_radius
+        for brush in brushes:
+            # Same fairness principle as find_error_hotspots: every
+            # brush is scored at the SAME site_radius, only inflated to
+            # its own candidate_radius (via brush_radius_spread_ratio)
+            # once a winner is picked for actual placement.
+            candidate_radius = site_radius * _brush_radius_multiplier(brush, brush_radius_spread_ratio)
+            result = _score_candidate(
+                centroid_x, centroid_z, site_radius, brush, TOOL_FLATTEN,
+                px, pz, actual_pts, current_at_points, current_at_center, target_mean,
+            )
+            if result is None:
+                continue
+            value, rms = result
+            if best is None or rms < best[3]:
+                best = (brush, TOOL_FLATTEN, value, rms, candidate_radius)
+
+        if best is None:
+            claimed[peak_row, peak_col] = True
+            continue
+
+        brush, tool, value, rms, final_radius = best
+        peak_error = abs(target_mean - current_at_center)
+
+        # Claim at base_claim_radius (rad_m * EAT), not final_radius --
+        # same "keep spread_ratio and claim/spacing independent"
+        # principle find_error_hotspots documents for its own claim
+        # step. No sign restriction here (scatter has no error sign at
+        # all -- every valid unclaimed cell is a candidate regardless).
+        rows_idx, cols_idx = np.nonzero(valid & ~claimed)
+        if rows_idx.size:
+            cell_dist = np.hypot(
+                (z_centers[rows_idx] - centroid_z), (x_centers[cols_idx] - centroid_x)
+            )
+            claimed[rows_idx[cell_dist <= base_claim_radius], cols_idx[cell_dist <= base_claim_radius]] = True
+        claimed[peak_row, peak_col] = True  # guaranteed claimed even if base_claim_radius rounds to ~0
+
+        n_cells = int(np.sum(valid & (np.hypot(
+            (z_centers[:, None] - centroid_z), (x_centers[None, :] - centroid_x)
+        ) <= final_radius)))
+        hotspots.append(ErrorHotspot(
+            x=centroid_x, z=centroid_z, radius=final_radius, peak_error=peak_error,
+            n_cells=n_cells, brush=brush, tool=tool, value=value, fit_rms=rms,
+        ))
+
+        if len(hotspots) % model_rebuild_interval == 0:
+            # Same same-pass staleness fix as find_error_hotspots (see
+            # its docstring) -- scatter stamps can overlap each other
+            # too whenever claim_radius_fraction < 1.
+            model = TerrainModel(list(stamps) + [h.to_stamp() for h in hotspots])
+
+    return hotspots
+
+
+def scatter_refine_stamps(
+    stamps: Sequence[Stamp],
+    heights: np.ndarray,
+    bounds: BoundingBox,
+    rad_m: float,
+    resolution: int = DEFAULT_RESOLUTION,
+    claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
+    brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
+    jitter_factor: float = DEFAULT_PLANAR_SHRINK_FACTOR,
+    min_valid_cells: int = DEFAULT_MIN_POINTS,
+    max_new_stamps: Optional[int] = None,
+    mask: Optional[np.ndarray] = None,
+    model_rebuild_interval: int = DEFAULT_MODEL_REBUILD_INTERVAL,
+    candidate_brushes: Optional[tuple[int, ...]] = None,
+    rng: Optional[np.random.Generator] = None,
+    progress_callback: Optional[Callable[[int, float], None]] = None,
+) -> tuple[list[Stamp], list[ErrorHotspot]]:
+    """
+    One scatter pass (see scatter_stamps): find and fit randomly-
+    placed stamps, append their stamps to the existing (unchanged)
+    list, and return the combined result -- the scatter-mode
+    counterpart to refine_stamps/find_error_hotspots.
+    """
+    hotspots = scatter_stamps(
+        stamps, heights, bounds, rad_m,
+        resolution=resolution, claim_radius_fraction=claim_radius_fraction,
+        brush_radius_spread_ratio=brush_radius_spread_ratio, jitter_factor=jitter_factor,
+        min_valid_cells=min_valid_cells, max_new_stamps=max_new_stamps, mask=mask,
+        model_rebuild_interval=model_rebuild_interval, candidate_brushes=candidate_brushes,
+        rng=rng, progress_callback=progress_callback,
+    )
     new_stamps = [h.to_stamp() for h in hotspots]
     return list(stamps) + new_stamps, hotspots
