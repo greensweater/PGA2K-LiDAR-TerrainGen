@@ -1215,6 +1215,12 @@ def step_refine_terrain(
     there's no planar-fit concept in scatter mode at all, so reusing
     the same GUI/CLI knob for a different, mode-appropriate purpose
     avoids adding a redundant parameter.
+
+    model_rebuild_interval only applies to "adaptive" -- "scatter"
+    doesn't build or evaluate a TerrainModel at all (see
+    adaptive_refine.py's scatter_stamps for why that's provably
+    unnecessary there), so this is silently ignored when method is
+    "scatter".
     """
     heightmap_path = working_dir / HEIGHTMAP_FILE
     if not heightmap_path.exists():
@@ -1292,10 +1298,21 @@ def step_refine_terrain(
 
     progress_start_time = time.time()
 
-    def _print_refine_progress(hotspot_count: int, claimed_fraction: float) -> None:
+    def _print_adaptive_progress(hotspot_count: int, claimed_fraction: float) -> None:
         elapsed = time.time() - progress_start_time
         print(f"  ... {elapsed:.0f}s elapsed: {hotspot_count} stamps so far, "
               f"{claimed_fraction:.1%} of the searchable area claimed")
+
+    def _print_scatter_progress(hotspot_count: int, failure_fraction: float) -> None:
+        # Not "searchable area" -- scatter mode never scans/claims a
+        # grid at all (see adaptive_refine.py's scatter_stamps); this
+        # is dart-throwing, so the only meaningful "how close to done"
+        # signal is how much of the consecutive-failure budget before
+        # giving up has been spent on the CURRENT run of rejections.
+        elapsed = time.time() - progress_start_time
+        print(f"  ... {elapsed:.0f}s elapsed: {hotspot_count} stamps placed, "
+              f"{failure_fraction:.1%} of the way through the current run of rejected placements "
+              "(stops once that reaches 100% -- the space is full)")
 
     if method == "scatter":
         print(f"Scattering stamps ({resolution}x{resolution} grid, rad_m={rad_m})...")
@@ -1307,9 +1324,8 @@ def step_refine_terrain(
             jitter_factor=planar_shrink_factor,
             max_new_stamps=max_new_stamps,
             mask=mask_grid,
-            model_rebuild_interval=model_rebuild_interval,
             candidate_brushes=candidate_brushes,
-            progress_callback=_print_refine_progress,
+            progress_callback=_print_scatter_progress,
         )
     else:
         max_radius = rad_m
@@ -1328,7 +1344,7 @@ def step_refine_terrain(
             candidate_brushes=candidate_brushes,
             max_planar_rms=max_planar_rms,
             planar_shrink_factor=planar_shrink_factor,
-            progress_callback=_print_refine_progress,
+            progress_callback=_print_adaptive_progress,
         )
 
     new_stamps = refined[len(stamps):]
