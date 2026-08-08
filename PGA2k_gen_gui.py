@@ -157,34 +157,9 @@ class PGAGenGUI:
     # ------------------------------------------------------------------
 
     def _build_layout(self) -> None:
-        top = ttk.Frame(self.root, padding=8)
-        top.pack(fill="x")
-
-        row1 = ttk.Frame(top)
-        row1.pack(fill="x")
-        ttk.Label(row1, text="Working directory:").pack(side="left")
-        ttk.Entry(row1, textvariable=self.working_dir, width=60).pack(
-            side="left", padx=4, fill="x", expand=True
-        )
-        ttk.Button(row1, text="Browse...", command=self._browse_working_dir).pack(side="left")
-
-        row2 = ttk.Frame(top)
-        row2.pack(fill="x", pady=(4, 0))
-        ttk.Label(row2, text="Course name:").pack(side="left")
-        ttk.Entry(row2, textvariable=self.course_name, width=40).pack(
-            side="left", padx=4, fill="x"
-        )
-        ttk.Label(row2, text="Game version:").pack(side="left", padx=(12, 0))
-        game_version_box = ttk.Combobox(
-            row2, textvariable=self.game_version, state="readonly", width=6, values=list(GAME_VERSIONS),
-        )
-        game_version_box.pack(side="left", padx=4)
-        _Tooltip(game_version_box, "PGA 2K's .course schema diverges across versions -- currently "
-                 f"only {IMPLEMENTED_GAME_VERSIONS} are actually implemented (see objects.py's "
-                 "module docstring); the others can be selected and saved, but write/repack steps "
-                 "will raise a clear error until their schema is confirmed. Project-level, same tier "
-                 "as course name -- saved immediately, used by write-objects and (eventually) "
-                 "write-splines/output-terrain/repack.")
+        footer = ttk.Frame(self.root, padding=(8, 4))
+        footer.pack(side="bottom", fill="x")
+        self._build_footer(footer)
 
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill="both", expand=True)
@@ -192,9 +167,11 @@ class PGAGenGUI:
         left = ttk.Notebook(main)
         left.pack(side="left", fill="both", padx=(0, 8))
 
+        file_tab = ttk.Frame(left, padding=4)
         terrain_tab = ttk.Frame(left, padding=4)
         splines_tab = ttk.Frame(left, padding=4)
         objects_tab = ttk.Frame(left, padding=4)
+        left.add(file_tab, text="File")
         left.add(terrain_tab, text="Terrain")
         left.add(splines_tab, text="Splines")
         left.add(objects_tab, text="Objects")
@@ -204,14 +181,105 @@ class PGAGenGUI:
         right = ttk.PanedWindow(main, orient="horizontal")
         right.pack(side="left", fill="both", expand=True)
 
-        self._build_step_buttons(terrain_tab)
-        self._build_splines_tab(splines_tab)
-        self._build_objects_tab(objects_tab)
+        self._build_file_tab(self._make_scrollable_tab(file_tab))
+        self._build_terrain_tab(self._make_scrollable_tab(terrain_tab))
+        self._build_splines_tab(self._make_scrollable_tab(splines_tab))
+        self._build_objects_tab(self._make_scrollable_tab(objects_tab))
         self._build_preview_panel(right)
         self._build_log_panel(right)
 
-    def _build_step_buttons(self, parent: ttk.Frame) -> None:
-        self._add_step_button(parent, "Init", self._run_init)
+    def _make_scrollable_tab(self, parent: ttk.Frame) -> ttk.Frame:
+        """
+        Wrap one Notebook tab in a vertically scrollable canvas, so a
+        tab's fields can exceed the visible window height without
+        forcing the whole window to grow -- previously every step's
+        fields lived in one flat stack per tab with no scrolling at
+        all, so seeing everything at once needed a tall window.
+        Returns the inner frame callers should actually build into.
+
+        Mousewheel binding is scoped to only while the pointer is over
+        THIS canvas (bind/unbind on Enter/Leave), not bound globally --
+        binding globally would make scrolling over the log panel, or
+        a different tab entirely, also scroll this canvas underneath
+        whatever's actually visible.
+        """
+        container = ttk.Frame(parent)
+        container.pack(fill="both", expand=True)
+        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+        vscroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(event):
+            # Stretch the inner frame to the canvas's own width, so
+            # widgets packed with fill="x" actually fill the visible
+            # width instead of just their own natural content width.
+            canvas.itemconfig(inner_id, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _bind_mousewheel(_event=None):
+            canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+            canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+            canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        def _unbind_mousewheel(_event=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
+
+        return inner
+
+    def _build_footer(self, parent: ttk.Frame) -> None:
+        """
+        Full-width, one-line status bar at the bottom of the window,
+        outside every tab -- always visible regardless of which tab is
+        selected or how far it's scrolled, unlike its previous home
+        inside the Terrain tab's own scrolling stack.
+        """
+        self.status_label = ttk.Label(parent, text="Idle", foreground="gray")
+        self.status_label.pack(side="left")
+        self.play_sound_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            parent, text="\U0001F514 Sound when done", variable=self.play_sound_var,
+        ).pack(side="left", padx=(12, 0))
+        self.stop_button = ttk.Button(parent, text="Stop", command=self._stop_current_step, state="disabled")
+        self.stop_button.pack(side="right")
+
+    def _build_file_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Working directory:").pack(anchor="w")
+        wd_row = ttk.Frame(parent)
+        wd_row.pack(fill="x", pady=(2, 8))
+        ttk.Entry(wd_row, textvariable=self.working_dir, width=26).pack(side="left", fill="x", expand=True)
+        ttk.Button(wd_row, text="Browse...", command=self._browse_working_dir).pack(side="left")
+
+        ttk.Label(parent, text="Game version:").pack(anchor="w")
+        game_version_box = ttk.Combobox(
+            parent, textvariable=self.game_version, state="readonly", width=8, values=list(GAME_VERSIONS),
+        )
+        game_version_box.pack(anchor="w", pady=(2, 8))
+        _Tooltip(game_version_box, "PGA 2K's .course schema diverges across versions -- currently "
+                 f"only {IMPLEMENTED_GAME_VERSIONS} are actually implemented (see objects.py's "
+                 "module docstring); the others can be selected and saved, but write/repack steps "
+                 "will raise a clear error until their schema is confirmed. Project-level, saved "
+                 "immediately, used by write-objects and (eventually) write-splines/output-terrain/"
+                 "repack.")
+
+        ttk.Label(parent, text="Course name:").pack(anchor="w")
+        ttk.Entry(parent, textvariable=self.course_name, width=26).pack(anchor="w", fill="x", pady=(2, 8))
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._add_step_button(parent, "Initialize", self._run_init)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.projection_var = tk.StringVar()
@@ -241,6 +309,19 @@ class PGAGenGUI:
         self._add_step_button(parent, "Ingest Course", self._run_ingest_course)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self.repack_filename_var = tk.StringVar()
+        self.repack_filename_var.trace_add("write", lambda *a: self._on_repack_filename_changed())
+        ttk.Label(parent, text="Repack filename:").pack(anchor="w")
+        ttk.Entry(parent, textvariable=self.repack_filename_var, width=20).pack(anchor="w")
+        self._add_step_button(parent, "Repack", self._run_repack)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._add_step_button(parent, "Copy to Game Folder", self._run_copy_to_game)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._add_step_button(parent, "Visualize", self._run_visualize)
+
+    def _build_terrain_tab(self, parent: ttk.Frame) -> None:
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -347,33 +428,6 @@ class PGAGenGUI:
                  "confirming in-game that terrain and splines land exactly where expected. Shared "
                  "with the same checkbox in the Splines tab (one setting, both places).")
         self._add_step_button(parent, "Write Terrain", self._run_output_terrain)
-
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self.repack_filename_var = tk.StringVar()
-        self.repack_filename_var.trace_add("write", lambda *a: self._on_repack_filename_changed())
-        ttk.Label(parent, text="Repack filename:").pack(anchor="w")
-        ttk.Entry(parent, textvariable=self.repack_filename_var, width=20).pack(anchor="w")
-        self._add_step_button(parent, "Repack", self._run_repack)
-
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self._add_step_button(parent, "Copy to Game Folder", self._run_copy_to_game)
-
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self._add_step_button(parent, "Visualize", self._run_visualize)
-
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=10)
-        status_row = ttk.Frame(parent)
-        status_row.pack(fill="x")
-        self.status_label = ttk.Label(status_row, text="Idle", foreground="gray")
-        self.status_label.pack(side="left")
-        self.stop_button = ttk.Button(status_row, text="Stop", command=self._stop_current_step, state="disabled")
-        self.stop_button.pack(side="right")
-        self.play_sound_var = tk.BooleanVar(value=True)
-        sound_row = ttk.Frame(parent)
-        sound_row.pack(anchor="w", fill="x")
-        ttk.Checkbutton(sound_row, text="\U0001F514 Sound when done", variable=self.play_sound_var).pack(side="left")
-        ttk.Button(sound_row, text="Test", width=5, command=self._test_sound).pack(side="left", padx=4)
-
     def _build_log_panel(self, paned: ttk.PanedWindow) -> None:
         frame = ttk.Frame(paned)
         paned.add(frame, weight=1)
@@ -582,51 +636,48 @@ class PGAGenGUI:
             self._run_step(["--step", "write-holes"], wd)
 
     def _build_objects_tab(self, parent: ttk.Frame) -> None:
-        ttk.Label(
-            parent, text="Trees (from map.osm's natural=tree nodes) plus, for 2021+, optional "
-            "building-corner stakes. Which fields below apply depends on the Game version selector "
-            "at the top -- see objects.py's module docstring for why the schema differs per version.",
-            wraplength=220, foreground="gray", justify="left",
-        ).pack(anchor="w", pady=(0, 8))
-
-        ttk.Label(parent, text="2019 -- theme:", font=("", 9, "bold")).pack(anchor="w", pady=(0, 2))
+        theme_row = ttk.Frame(parent)
+        theme_row.pack(fill="x", pady=(0, 8))
+        theme_col = ttk.Frame(theme_row)
+        theme_col.pack(side="left")
+        ttk.Label(theme_col, text="Theme:").pack(anchor="w")
         self._theme_name_to_id = {"(not set)": None}
         self._theme_name_to_id.update({name: theme_id for theme_id, name in THEMES_V2019.items()})
         self.objects_theme_var = tk.StringVar(value="(not set)")
         theme_box = ttk.Combobox(
-            parent, textvariable=self.objects_theme_var, state="readonly", width=16,
+            theme_col, textvariable=self.objects_theme_var, state="readonly", width=14,
             values=list(self._theme_name_to_id.keys()),
         )
         theme_box.pack(anchor="w")
-        _Tooltip(theme_box, "Controls which of the game's tree types are available (see objects.py's "
-                 "THEMES_V2019). Leave as '(not set)' to use a single generic tree type.")
+        _Tooltip(theme_box, "From the ingested .course (CourseDescription.json's theme / "
+                 "CourseMetadata.json's courseTheme) -- controls which of the game's tree types are "
+                 "available, same set for every game version. Leave as '(not set)' to use a single "
+                 "generic tree type.")
 
+        variety_col = ttk.Frame(theme_row)
+        variety_col.pack(side="left", padx=(16, 0))
         self.objects_tree_variety_var = tk.BooleanVar(value=False)
         variety_checkbox = ttk.Checkbutton(
-            parent, text="Tree variety", variable=self.objects_tree_variety_var,
+            variety_col, text="Tree variety", variable=self.objects_tree_variety_var,
         )
-        variety_checkbox.pack(anchor="w", pady=(2, 8))
+        variety_checkbox.pack(anchor="w", pady=(14, 0))
         _Tooltip(variety_checkbox, "Use the theme's full set of tree types (normal + skinny), "
                  "randomly assigned per tree, instead of one generic type for every tree.")
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=2)
-        ttk.Label(parent, text="2021+ -- asset paths:", font=("", 9, "bold")).pack(anchor="w", pady=(6, 2))
-        ttk.Label(parent, text="Tree asset paths (one per line, general pool):").pack(anchor="w")
-        self.tree_asset_paths_text = tk.Text(parent, height=3, width=28, wrap="none")
-        self.tree_asset_paths_text.pack(anchor="w", fill="x", pady=(2, 6))
-        _Tooltip(self.tree_asset_paths_text, "Real Unity asset paths, e.g. 'Assets/Trees/OakA' -- a "
-                 "tree with no pga_tree_type match below is randomly assigned one of these.")
-
-        ttk.Label(parent, text="Tree type overrides (one per line, TAG=path):").pack(anchor="w")
-        self.tree_type_asset_paths_text = tk.Text(parent, height=3, width=28, wrap="none")
-        self.tree_type_asset_paths_text.pack(anchor="w", fill="x", pady=(2, 6))
-        _Tooltip(self.tree_type_asset_paths_text, "e.g. 'oak=Assets/Trees/BigOak' -- overrides the "
-                 "general pool for any tree node hand-tagged pga_tree_type=oak in OSM.")
+        ttk.Label(parent, text="Asset List (.json):").pack(anchor="w")
+        self.objects_asset_list_var = tk.StringVar(value="")
+        asset_list_row = ttk.Frame(parent)
+        asset_list_row.pack(anchor="w", fill="x", pady=(2, 8))
+        asset_list_entry = ttk.Entry(asset_list_row, textvariable=self.objects_asset_list_var, width=24)
+        asset_list_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(asset_list_row, text="...", width=3, command=self._browse_objects_asset_list).pack(side="left")
+        _Tooltip(asset_list_entry, "Not wired up yet -- placeholder for a future 2021+ asset-path "
+                 "list (replaces hand-typing tree/tree-type asset paths one at a time).")
 
         ttk.Label(parent, text="Building stake asset path (optional):").pack(anchor="w")
         self.stake_asset_path_var = tk.StringVar(value="")
         stake_entry = ttk.Entry(parent, textvariable=self.stake_asset_path_var, width=28)
-        stake_entry.pack(anchor="w", pady=(2, 6))
+        stake_entry.pack(anchor="w", fill="x", pady=(2, 8))
         _Tooltip(stake_entry, "If set, places this asset at every corner of every 'building' feature "
                  "from features.geojson. Leave blank to skip stakes entirely. 2021+ only.")
 
@@ -634,20 +685,25 @@ class PGAGenGUI:
         lidar_trees_checkbox = ttk.Checkbutton(
             parent, text="Detect trees from LIDAR canopy", variable=self.detect_lidar_trees_var,
         )
-        lidar_trees_checkbox.pack(anchor="w", pady=(2, 6))
+        lidar_trees_checkbox.pack(anchor="w", pady=(0, 8))
         _Tooltip(lidar_trees_checkbox, "Also detect individual trees directly from LIDAR canopy "
                  "points (ingest/tree_detection.py), on top of any OSM natural=tree nodes. Confined "
                  "to height_mask.geojson's core-play-area polygon if one exists -- the game's own "
                  "procedural vegetation fill is expected to handle everywhere else. Needs "
                  "heightmap.npz and pointcloud.npz (Ingest LAZ).")
 
-        self._add_step_button(parent, "Write Objects", self._run_write_objects)
-
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         obj_filter_row = ttk.Frame(parent)
         obj_filter_row.pack(fill="x")
-        ttk.Label(obj_filter_row, text="Placed objects:").pack(side="left")
-        ttk.Button(obj_filter_row, text="Refresh", command=self._refresh_objects_list).pack(side="left", padx=4)
+        ttk.Label(obj_filter_row, text="Filter:").pack(side="left")
+        self.objects_filter_var = tk.StringVar(value="All")
+        self.objects_filter_box = ttk.Combobox(
+            obj_filter_row, textvariable=self.objects_filter_var, state="readonly", width=14,
+            values=["All"],
+        )
+        self.objects_filter_box.pack(side="left", padx=4)
+        self.objects_filter_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_objects_list())
+        ttk.Button(obj_filter_row, text="Refresh", command=self._refresh_objects_list).pack(side="left")
 
         obj_tree_frame = ttk.Frame(parent)
         obj_tree_frame.pack(fill="both", expand=True, pady=(6, 0))
@@ -667,6 +723,16 @@ class PGAGenGUI:
         obj_tree_scroll.pack(side="left", fill="y")
         self.objects_tree["yscrollcommand"] = obj_tree_scroll.set
 
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._add_step_button(parent, "Write Objects", self._run_write_objects)
+
+    def _browse_objects_asset_list(self) -> None:
+        f = filedialog.askopenfilename(
+            title="Select an asset list (.json)", filetypes=[(".json files", "*.json"), ("All files", "*.*")]
+        )
+        if f:
+            self.objects_asset_list_var.set(f)
+
     def _run_write_objects(self) -> None:
         wd = self._require_working_dir()
         if not wd:
@@ -676,14 +742,6 @@ class PGAGenGUI:
         if theme_id is not None:
             args += ["--theme", str(theme_id)]
         args.append("--tree-variety" if self.objects_tree_variety_var.get() else "--no-tree-variety")
-        for line in self.tree_asset_paths_text.get("1.0", "end").splitlines():
-            line = line.strip()
-            if line:
-                args += ["--tree-asset-path", line]
-        for line in self.tree_type_asset_paths_text.get("1.0", "end").splitlines():
-            line = line.strip()
-            if line:
-                args += ["--tree-type-asset-path", line]
         stake_path = self.stake_asset_path_var.get().strip()
         if stake_path:
             args += ["--stake-asset-path", stake_path]
@@ -703,10 +761,16 @@ class PGAGenGUI:
             objects = load_placed_objects(objects_path)
         except (json.JSONDecodeError, OSError):
             return
-        for path, item_count, cluster_count, spline_count in object_counts(objects):
+        counts = object_counts(objects)
+        self.objects_filter_box["values"] = ["All"] + sorted({path for path, *_ in counts})
+        filter_val = self.objects_filter_var.get()
+        for path, item_count, cluster_count, spline_count in counts:
+            if filter_val != "All" and path != filter_val:
+                continue
             self.objects_tree.insert(
                 "", "end", text=path, values=(item_count, cluster_count, spline_count),
             )
+
 
     def _refresh_splines_list(self) -> None:
         wd = self.working_dir.get().strip()
@@ -1200,9 +1264,7 @@ class PGAGenGUI:
         """
         Try platform-specific, actually-audible methods in order,
         falling back to root.bell() only if none work. Returns a short
-        description of what was actually tried/used, for _test_sound's
-        diagnostic feedback -- since none of this can be verified from
-        here, only reported.
+        description of what was actually tried/used.
         """
         system = platform.system()
         try:
@@ -1247,14 +1309,6 @@ class PGAGenGUI:
         """
         if self.play_sound_var.get():
             self._play_completion_sound()
-
-    def _test_sound(self) -> None:
-        """Always fires (ignores the checkbox) and reports what it tried, for diagnosing why the real thing isn't audible."""
-        used = self._play_completion_sound()
-        messagebox.showinfo("Sound test", f"Tried: {used}\n\nIf you didn't hear anything, this is "
-                             "very likely an OS-level sound setting (muted system sound, wrong output "
-                             "device, or the sound file above missing on your system) rather than "
-                             "something the code can fix.")
 
     def _append_log(self, text: str) -> None:
         self.log_text.config(state="normal")
