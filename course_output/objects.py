@@ -121,6 +121,7 @@ TREE_HEIGHT_M = 10.0
 # (v2021+) is resolved separately per version, see below.
 TREE_TYPE_TAG = "pga_tree_type"
 TREE_HEIGHT_TAG = "pga_tree_height"
+TREE_RADIUS_TAG = "pga_tree_radius"
 
 MIN_HEIGHT_SCALE = 0.5
 MAX_HEIGHT_SCALE = 1.2
@@ -214,6 +215,25 @@ def parse_osm_trees(
     return trees
 
 
+def lidar_trees_to_tagged(
+    trees: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, dict]]:
+    """
+    Convert (x, z, radius, height) tuples (see
+    ingest/tree_detection.py's detect_trees_from_lidar) into the
+    (x, z, tags) shape both build_tree_objects_v2019/_v2021 expect --
+    encoding radius/height as TREE_RADIUS_TAG/TREE_HEIGHT_TAG, the
+    same tags a hand-tagged OSM node would carry. This is what lets
+    LIDAR-detected and OSM-node trees be concatenated into one list
+    and built identically regardless of source -- neither builder
+    needs to know or care where a given tree came from.
+    """
+    return [
+        (x, z, {TREE_RADIUS_TAG: str(radius), TREE_HEIGHT_TAG: str(height)})
+        for x, z, radius, height in trees
+    ]
+
+
 def _placed_item(x: float, z: float, scale: float, rotation_degrees: float = 0.0) -> dict:
     """One placed-object instance, position shifted into the game's
     origin-centered grid (see module docstring), scale.x = scale.y =
@@ -275,15 +295,18 @@ def build_tree_objects_v2019(
     applies to v2021+ (see build_tree_objects_v2021).
 
     Classification as "normal" vs. "skinny" uses height/radius (h/r
-    >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019), same as Chad's original --
-    radius comes from TREE_RADIUS_M (no per-tree override tag exists
-    for this, matching upstream OSM's own lack of a tree-radius
-    concept). Scale is the same shared height-driven uniform x=y=z
-    rule every version uses (see _height_scale_lookup / module
-    docstring) -- Chad's original v2019 tool scaled x/z from radius
-    independently of y from height; this project deliberately does not
-    reproduce that (see prior conversation: scale should track height
-    alone, uniformly, not stretch/squash per axis).
+    >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019), same as Chad's original.
+    radius comes from a tree's TREE_RADIUS_TAG if present (e.g. a real
+    per-tree radius from LIDAR canopy detection -- see
+    ingest/tree_detection.py), falling back to the flat TREE_RADIUS_M
+    otherwise (matching upstream OSM node tags' own lack of a tree-
+    radius concept -- there's nothing to read for a plain OSM-sourced
+    tree). Scale is the same shared height-driven uniform x=y=z rule
+    every version uses (see _height_scale_lookup / module docstring)
+    -- Chad's original v2019 tool scaled x/z from radius independently
+    of y from height; this project deliberately does not reproduce
+    that (see prior conversation: scale should track height alone,
+    uniformly, not stretch/squash per axis).
     """
     if rng is None:
         rng = random.Random()
@@ -305,10 +328,14 @@ def build_tree_objects_v2019(
 
     heights, min_h, min_scale, scale_multiplier = _height_scale_lookup(trees)
 
-    for (x, z, _tags), h in zip(trees, heights):
+    for (x, z, tags), h in zip(trees, heights):
         scale = (h - min_h) * scale_multiplier + min_scale
         item = _placed_item(x, z, scale, rng.uniform(0, 359))
-        if TREE_RADIUS_M > 0 and h / TREE_RADIUS_M >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019 and skinny_groups:
+        try:
+            radius = float(tags.get(TREE_RADIUS_TAG, TREE_RADIUS_M))
+        except (TypeError, ValueError):
+            radius = TREE_RADIUS_M
+        if radius > 0 and h / radius >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019 and skinny_groups:
             group = rng.choice(list(skinny_groups.values()))
         else:
             group = rng.choice(list(normal_groups.values()))
