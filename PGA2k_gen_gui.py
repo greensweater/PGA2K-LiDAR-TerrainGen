@@ -51,7 +51,10 @@ from constants import (  # noqa: E402
     PREVIEW_LIDAR, PREVIEW_LIDAR_GROUND, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
     PREVIEW_STAMPS, STAMPS_DIR,
 )
-from PGA2k_gen import FEATURES_FILE, HEIGHT_MASK_FILE, OBJECT_LIST_FILE, load_project, save_project  # noqa: E402
+from PGA2k_gen import (  # noqa: E402
+    DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M, FEATURES_FILE, HEIGHT_MASK_FILE,
+    OBJECT_LIST_FILE, load_project, save_project,
+)
 from course_output.objects import (  # noqa: E402
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_HEIGHT_TAG,
     TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, save_object_list,
@@ -350,6 +353,38 @@ class PGAGenGUI:
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._add_step_button(parent, "Ingest OSM", self._run_ingest_osm)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        dig_row = ttk.Frame(parent)
+        dig_row.pack(fill="x", pady=(0, 4))
+        depth_col = ttk.Frame(dig_row)
+        depth_col.pack(side="left")
+        ttk.Label(depth_col, text="Depth (m):").pack(anchor="w")
+        self.dig_water_depth_var = tk.StringVar(value=str(DEFAULT_DIG_WATER_DEPTH_M))
+        depth_entry = ttk.Entry(depth_col, textvariable=self.dig_water_depth_var, width=6)
+        depth_entry.pack(anchor="w")
+        _Tooltip(depth_entry, "How much (m) to lower heightmap.npz under each water polygon.")
+
+        buffer_col = ttk.Frame(dig_row)
+        buffer_col.pack(side="left", padx=(12, 0))
+        ttk.Label(buffer_col, text="Buffer (m):").pack(anchor="w")
+        self.dig_water_buffer_var = tk.StringVar(value=str(DEFAULT_DIG_WATER_BUFFER_M))
+        buffer_entry = ttk.Entry(buffer_col, textvariable=self.dig_water_buffer_var, width=6)
+        buffer_entry.pack(anchor="w")
+        _Tooltip(buffer_entry, "Inward (negative) buffer applied to each water polygon before "
+                 "determining which cells to lower -- lets the water plane object (sized from the "
+                 "ORIGINAL un-buffered polygon; see Write Terrain + Water) clip slightly into the "
+                 "surrounding terrain at the edges, instead of floating exactly at the rim of a "
+                 "perfectly-matching recess with a visible seam.")
+
+        dig_water_btn = self._add_step_button(parent, "Dig Water", self._run_dig_water)
+        _Tooltip(dig_water_btn, "Lowers heightmap.npz under every OSM water polygon (needs Ingest LAZ "
+                 "and Ingest OSM to have both run). Modifies heightmap.npz IN PLACE -- running this "
+                 "twice compounds the dig rather than re-digging to a fixed level; re-run Ingest LAZ "
+                 "first for a clean slate if you want to change the depth/buffer after already "
+                 "digging once. Meant to run before Generate/Refine Terrain, so the recessed shape is "
+                 "already baked into the heightmap those steps fit against -- no water-specific "
+                 "terrain logic needed downstream.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.course_file_var = tk.StringVar()
@@ -1242,6 +1277,19 @@ class PGAGenGUI:
                 "--height-mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}",
             ]
             self._run_step(args, wd)
+
+    def _run_dig_water(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        depth = self.dig_water_depth_var.get().strip()
+        buffer = self.dig_water_buffer_var.get().strip()
+        args = ["--step", "dig-water"]
+        if depth:
+            args += ["--dig-depth", depth]
+        if buffer:
+            args += ["--dig-buffer", buffer]
+        self._run_step(args, wd)
 
     def _run_ingest_course(self) -> None:
         wd = self._require_working_dir()
