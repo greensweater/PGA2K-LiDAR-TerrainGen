@@ -263,6 +263,7 @@ _OSM_FEATURE_STYLES: dict[str, tuple[Optional[str], str]] = {
     "cartpath": ("#FFFFFF", "#FFFFFF"),      # white
     "service_road": ("#808080", "#000000"),  # same as roadway
     "roadway": ("#808080", "#000000"),       # same fill as pavement, black border
+    "driveway": ("#808080", "#FFA500"),      # same gray (surface3 family), orange border to stand apart
     "path": ("#A9A9A9", "#A9A9A9"),
     "pavement": ("#808080", "#FFFFFF"),      # gray, darker than path's; white border
     "building": ("#B22222", "#B22222"),
