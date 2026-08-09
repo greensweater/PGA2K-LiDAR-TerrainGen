@@ -135,6 +135,7 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     golf_cart_type = tags.get("golf_cart")
     foot_type = tags.get("foot")
     amenity_type = tags.get("amenity")
+    service_type = tags.get("service")
     explicit_area = tags.get("area") == "yes"
 
     if golf_type is not None:
@@ -201,8 +202,13 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
         if golf_cart_type not in (None, "no"):
             # Cart-specific tagging wins regardless of the underlying
             # highway value -- an actual golf cart path, narrowest of
-            # the three road widths (see splines.py's _ROAD_KIND_WIDTHS).
+            # the road widths (see splines.py's _ROAD_KIND_STYLES).
             return ("cartpath", explicit_area)
+        if highway_type == "service" and service_type == "driveway":
+            # Paved (surface 3, same texture as "pavement") but full
+            # vehicle width (same 3.5m as "roadway") -- a distinct
+            # texture/width combination from plain service roads.
+            return ("driveway", explicit_area)
         if highway_type == "service":
             return ("service_road", explicit_area)
         if highway_type in ROADWAY_HIGHWAY_TYPES:
