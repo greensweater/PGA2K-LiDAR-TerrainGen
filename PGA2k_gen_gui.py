@@ -61,6 +61,7 @@ from ingest.osm import (  # noqa: E402
     rasterize_mask_rgba, save_features, save_height_mask, shift_features,
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
+from terrain.hexgrid import HEX_LATTICE_PITCH_M  # noqa: E402
 from shapely.ops import unary_union  # noqa: E402
 import viz.visualize as viz  # noqa: E402
 
@@ -372,6 +373,16 @@ class PGAGenGUI:
         self._add_step_button(parent, "Visualize", self._run_visualize)
 
     def _build_terrain_tab(self, parent: ttk.Frame) -> None:
+        pitch_row = ttk.Frame(parent)
+        pitch_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(pitch_row, text="Pitch (m):").pack(side="left")
+        self.pitch_var = tk.StringVar(value=str(HEX_LATTICE_PITCH_M))
+        pitch_entry = ttk.Entry(pitch_row, textvariable=self.pitch_var, width=8)
+        pitch_entry.pack(side="left", padx=4)
+        _Tooltip(pitch_entry, "Spacing (m) of the initial coarse hex-grid stamp lattice "
+                 "(terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch means more, smaller, "
+                 "more tightly-packed initial stamps. Stamp radius and edge bleed both derive from "
+                 "this automatically (radius=2*pitch, bleed=pitch), no separate fields needed.")
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -1196,7 +1207,11 @@ class PGAGenGUI:
     def _run_generate_terrain(self) -> None:
         wd = self._require_working_dir()
         if wd:
-            self._run_step(["--step", "generate-terrain"], wd)
+            args = ["--step", "generate-terrain"]
+            pitch = self.pitch_var.get().strip()
+            if pitch:
+                args += ["--pitch", pitch]
+            self._run_step(args, wd)
 
     def _validate_refine_fields(self) -> bool:
         """Highlight (in red) any required Refine Terrain field left empty; returns True if all are filled."""
