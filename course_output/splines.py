@@ -10,7 +10,7 @@ engineered/tuned against real in-game testing:
 https://github.com/chadrockey/TGC-Designer-Tools
 
 Scope: green/tee/fairway/rough/heavyrough/bunker/cartpath/service_road/
-roadway/path/building/wood/pavement.
+roadway/path/building/wood/pavement/mulch.
 
 Water is deliberately excluded here -- Chad's own approach fills water
 hazards with a placeholder "mulch" surface spline (confirmed directly
@@ -96,6 +96,8 @@ _STATIC_SPLINE_PARAMS: dict[str, dict] = {
                   tight_splines=True, secondary_surface="", secondary_width=0.0),
     "pavement": dict(surface="pavement", path_width=0.01, handle_length=0.2,
                       tight_splines=True, secondary_surface="", secondary_width=0.0),
+    "mulch": dict(surface="surface2", path_width=0.01, handle_length=0.2,
+                   tight_splines=True, secondary_surface="", secondary_width=0.0),
 }
 
 # Width (m) for each of the three OSM-derived road kinds -- all render
