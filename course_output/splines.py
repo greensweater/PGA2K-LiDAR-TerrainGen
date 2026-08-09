@@ -125,6 +125,10 @@ _ROAD_KIND_STYLES = {
 }
 
 
+DEFAULT_MERGE_EPSILON_M = 0.5  # ported from an internal cleanup script's MERGE_EPSILON
+DEFAULT_HANDLE_SCALE = 0.3     # ported from the same script's DEFAULT_HANDLE_SCALE
+
+
 def _tangent_angle(p: tuple[float, float], n: tuple[float, float]) -> float:
     return math.atan2(n[1] - p[1], n[0] - p[0])
 
@@ -138,6 +142,48 @@ def _is_clockwise(points: list[tuple[float, float]]) -> bool:
         x0, y0 = points[i - 1]
         edge_sum += (x1 - x0) * (y1 + y0)
     return edge_sum >= 0.0
+
+
+def _merge_overlapping_points(
+    points: list[tuple[float, float]], is_closed: bool, epsilon: float = DEFAULT_MERGE_EPSILON_M,
+) -> list[tuple[float, float]]:
+    """
+    Drop any point within `epsilon` of the point immediately before it
+    in sequence -- including, for closed paths, the wraparound pair
+    (last vs. first). Ported and generalized from an internal cleanup
+    utility's merge_overlapping_waypoints (which only ever checked the
+    first-vs-last closure pair) to catch near-duplicate consecutive
+    vertices ANYWHERE in the sequence: real OSM way data legitimately
+    has these (edit history, node snapping, precision drift), and a
+    near-zero-length segment feeds a near-arbitrary, floating-point-
+    noise-driven direction into _tangent_angle -- that's the literal
+    cause of "poorly placed handles [that] render badly in-game":
+    the tangent computed from a degenerate segment has no real
+    relationship to the shape's actual local direction.
+
+    Falls back to the ORIGINAL points unchanged if merging would leave
+    fewer than 2 -- an extremely small/degenerate input shouldn't be
+    reduced to nothing just because every point happens to be close
+    together.
+
+    Operates on and returns a plain list of (x, z) tuples -- called
+    from _build_spline on a list already converted from a Feature's
+    shapely geometry (see feature_to_spline), well before anything
+    gets written back anywhere. Never touches the Feature or its
+    geometry, so features.geojson is completely unaffected regardless
+    of how this pass changes what actually gets written to
+    surfaceSplines.json.
+    """
+    if len(points) < 2:
+        return list(points)
+    kept = [points[0]]
+    for p in points[1:]:
+        if math.hypot(p[0] - kept[-1][0], p[1] - kept[-1][1]) > epsilon:
+            kept.append(p)
+    if is_closed and len(kept) > 2:
+        if math.hypot(kept[0][0] - kept[-1][0], kept[0][1] - kept[-1][1]) <= epsilon:
+            kept.pop()
+    return kept if len(kept) >= 2 else list(points)
 
 
 def _shrink_normals(
@@ -170,6 +216,7 @@ def _shrink_normals(
 def _build_waypoints(
     shrunk_points: list[tuple[float, float]], handle_length: float,
     is_clockwise: bool, tight_splines: bool,
+    adaptive_handle_cap: bool = True, handle_scale: float = DEFAULT_HANDLE_SCALE,
 ) -> list[dict]:
     n = len(shrunk_points)
     waypoints = []
@@ -178,6 +225,30 @@ def _build_waypoints(
         t = shrunk_points[i]
         nxt = shrunk_points[(i + 1) % n]
         angle = _tangent_angle(p, nxt)
+
+        # Cap (never extend) the configured handle_length by the local
+        # segment scale -- adapted from an internal cleanup script's
+        # auto_smooth_handles, which fully replaced handle length and
+        # direction both; here it only ever SHRINKS the already-tuned
+        # handle_length when local point spacing is irregular enough
+        # for it to overshoot a short segment (the other half of
+        # "poorly placed handles" -- see _merge_overlapping_points),
+        # never lengthens an already-well-behaved handle. This project's
+        # existing per-kind handle_length values are tuned against real
+        # in-game testing for evenly-spaced shapes (e.g. the
+        # registration-mark circles, verified to ~0.03% of a true
+        # circle) -- adaptive_handle_cap=False (see _circle_spline) skips
+        # this entirely for those, since hand-built regular geometry has
+        # no irregular-spacing problem to guard against in the first
+        # place.
+        effective_handle_length = handle_length
+        if adaptive_handle_cap:
+            prev_len = math.hypot(t[0] - p[0], t[1] - p[1])
+            next_len = math.hypot(nxt[0] - t[0], nxt[1] - t[1])
+            local_cap = min(prev_len, next_len) * handle_scale
+            if local_cap > 0:
+                effective_handle_length = min(handle_length, local_cap)
+
         if tight_splines:
             # Pull handles perpendicular and inward -- tight, low-
             # smoothing curves that hug the source shape closely.
@@ -191,12 +262,12 @@ def _build_waypoints(
             angle_two = angle
         waypoints.append({
             "pointOne": {
-                "x": round(t[0] + handle_length * math.cos(angle_one), 3),
-                "y": round(t[1] + handle_length * math.sin(angle_one), 3),
+                "x": round(t[0] + effective_handle_length * math.cos(angle_one), 3),
+                "y": round(t[1] + effective_handle_length * math.sin(angle_one), 3),
             },
             "pointTwo": {
-                "x": round(t[0] + handle_length * math.cos(angle_two), 3),
-                "y": round(t[1] + handle_length * math.sin(angle_two), 3),
+                "x": round(t[0] + effective_handle_length * math.cos(angle_two), 3),
+                "y": round(t[1] + effective_handle_length * math.sin(angle_two), 3),
             },
             "waypoint": {"x": round(t[0], 3), "y": round(t[1], 3)},
         })
@@ -215,12 +286,17 @@ def _build_spline(
     state: int = 3,
     is_closed: bool = True,
     is_filled: bool = True,
+    clean_up: bool = True,
 ) -> dict:
+    if clean_up:
+        points = _merge_overlapping_points(points, is_closed)
     is_clockwise = _is_clockwise(points)
     if shrink_distance is None:
         shrink_distance = path_width / 2.0
     shrunk = _shrink_normals(points, shrink_distance, is_clockwise)
-    waypoints = _build_waypoints(shrunk, handle_length, is_clockwise, tight_splines)
+    waypoints = _build_waypoints(
+        shrunk, handle_length, is_clockwise, tight_splines, adaptive_handle_cap=clean_up,
+    )
     return {
         "surface": FEATURES_TO_SURFACES[surface],
         "secondarySurface": FEATURES_TO_SURFACES.get(secondary_surface, 11),
@@ -320,7 +396,14 @@ def _circle_spline(cx: float, cz: float, radius: float) -> dict:
 
     shrink_distance=0.0 (not the usual path-width-based default) keeps
     the radius exact -- the whole point of a registration mark is
-    precise, known geometry.
+    precise, known geometry. clean_up=False for the same reason: with
+    exactly 4 points evenly spaced around a real circle, there's no
+    irregular-spacing/near-duplicate problem for _merge_overlapping_points
+    or the adaptive handle-length cap to guard against, and letting the
+    cap apply anyway would have actively shrunk these already-verified-
+    accurate handles (checked directly: the cap would have cut them from
+    ~0.552*radius down to ~0.424*radius, breaking the ~0.03% circle
+    accuracy this shape was specifically tuned for).
 
     cx, cz are in the local [0, COURSE_SIZE_M] frame, same as every
     other input to this module -- shifted by GRID_ORIGIN_OFFSET here,
@@ -340,7 +423,7 @@ def _circle_spline(cx: float, cz: float, radius: float) -> dict:
         points, surface="surface1", path_width=1.7,
         shrink_distance=0.0, handle_length=radius * _BEZIER_CIRCLE_KAPPA,
         tight_splines=False, secondary_surface="", secondary_width=0.0,
-        state=1, is_closed=True, is_filled=False,
+        state=1, is_closed=True, is_filled=False, clean_up=False,
     )
 
 
