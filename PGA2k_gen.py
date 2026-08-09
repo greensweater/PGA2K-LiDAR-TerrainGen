@@ -109,6 +109,8 @@ from terrain.adaptive_refine import (
     DEFAULT_PLANAR_SHRINK_FACTOR,
     DEFAULT_RAD_M,
     DEFAULT_RESOLUTION,
+    DEFAULT_VARIATION_CONTRAST_GAMMA,
+    DEFAULT_SUBPIXEL_JITTER_FRACTION,
     refine_stamps,
     scatter_refine_stamps,
 )
@@ -1321,6 +1323,10 @@ def step_refine_terrain(
     planar_shrink_factor: float | None = None,
     rad_m: float | None = None,
     use_slope_radius: bool | None = None,
+    use_variation_radius: bool | None = None,
+    variation_contrast_gamma: float | None = None,
+    density_weighted: bool | None = None,
+    subpixel_jitter_fraction: float | None = None,
 ) -> None:
     """
     One refinement pass (see terrain/adaptive_refine.py), in one of two
@@ -1389,6 +1395,32 @@ def step_refine_terrain(
     adaptive_refine.py's scatter_stamps for why that's provably
     unnecessary there), so this is silently ignored when method is
     "scatter".
+
+    use_variation_radius (scatter only) is the corrected replacement
+    for use_slope_radius: site radius is driven by RMS-from-local-mean
+    at lag=rad_m (real curvature AND macro-scale slope carried across
+    the window) rather than raw gradient magnitude, which a tilted
+    fairway reads as "steep" everywhere even though a wide flat stamp
+    would represent it fine at a small enough window. If both this and
+    use_slope_radius are set, use_variation_radius wins (see
+    adaptive_refine.py's scatter_stamps). variation_contrast_gamma (>1
+    sharpens toward the extremes, default 2.0) reshapes the percentile
+    map planar_shrink_factor/SHR% bounds.
+
+    density_weighted (scatter only) fixes what shrinking radius alone
+    can't: a smaller target radius previously only changed how big an
+    accepted dart was, never how often darts landed there, so small
+    high-detail regions ended up with isolated small stamps rather than
+    a tightly-packed cluster. With this on, candidate sites are drawn
+    from a precomputed density field (~1/radius^2) instead of uniform-
+    random over the whole course. Requires use_slope_radius or
+    use_variation_radius to be meaningful -- with neither set, every
+    site wants the same radius and density-weighting degenerates to
+    uniform anyway. subpixel_jitter_fraction (default 0.5, i.e. up to
+    half a cell width) jitters density-weighted draws off the exact
+    cell center -- dither only, to avoid visibly grid-aligned stamp
+    centers, not for precision (the course never needs sub-cell
+    accuracy).
     """
     heightmap_path = working_dir / HEIGHTMAP_FILE
     if not heightmap_path.exists():
@@ -1428,6 +1460,18 @@ def step_refine_terrain(
         )
     if use_slope_radius is None:
         use_slope_radius = project.get("refine_use_slope_radius", False)
+    if use_variation_radius is None:
+        use_variation_radius = project.get("refine_use_variation_radius", False)
+    if variation_contrast_gamma is None:
+        variation_contrast_gamma = project.get(
+            "refine_variation_contrast_gamma", DEFAULT_VARIATION_CONTRAST_GAMMA
+        )
+    if density_weighted is None:
+        density_weighted = project.get("refine_density_weighted", False)
+    if subpixel_jitter_fraction is None:
+        subpixel_jitter_fraction = project.get(
+            "refine_subpixel_jitter_fraction", DEFAULT_SUBPIXEL_JITTER_FRACTION
+        )
 
     stamps = load_all_stamps(working_dir)
     pass_number = len(_refine_stamps_files(working_dir)) + 1
@@ -1443,10 +1487,26 @@ def step_refine_terrain(
 
     if max_planar_rms is not None and method == "adaptive":
         print(f"  max_planar_rms={max_planar_rms}  planar_shrink_factor={planar_shrink_factor}")
-    if use_slope_radius and method == "scatter":
+    if use_slope_radius and method == "scatter" and not use_variation_radius:
         print(f"  use_slope_radius=on -- stamp radius driven by real local terrain slope "
               f"(np.gradient), not random jitter; planar_shrink_factor={planar_shrink_factor} is "
               "reused as the 'how small can it shrink on steep ground' floor.")
+    if use_variation_radius and method == "scatter":
+        print(f"  use_variation_radius=on -- stamp radius driven by RMS-from-local-mean at "
+              f"lag={rad_m}m (real curvature + macro-scale slope carried across the window), not "
+              f"random jitter; planar_shrink_factor={planar_shrink_factor} is the shrink floor, "
+              f"variation_contrast_gamma={variation_contrast_gamma} sharpens the map toward the "
+              "extremes.")
+        if use_slope_radius:
+            print("  (use_slope_radius is also on -- use_variation_radius takes priority)")
+    if density_weighted and method == "scatter":
+        print(f"  density_weighted=on -- candidate sites drawn from a ~1/radius^2 density field "
+              f"instead of uniform-random; subpixel_jitter_fraction={subpixel_jitter_fraction} "
+              "dithers draws off exact cell centers.")
+        if not (use_slope_radius or use_variation_radius):
+            print("  NOTE: density_weighted has no effect without use_slope_radius or "
+                  "use_variation_radius -- every site wants the same radius, so density-weighting "
+                  "degenerates to uniform draws anyway.")
 
     heights, _ = load_heightmap(heightmap_path)
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
@@ -1497,6 +1557,10 @@ def step_refine_terrain(
             brush_radius_spread_ratio=brush_radius_spread_ratio,
             jitter_factor=planar_shrink_factor,
             use_slope_radius=use_slope_radius,
+            use_variation_radius=use_variation_radius,
+            variation_contrast_gamma=variation_contrast_gamma,
+            density_weighted=density_weighted,
+            subpixel_jitter_fraction=subpixel_jitter_fraction,
             max_new_stamps=max_new_stamps,
             mask=mask_grid,
             candidate_brushes=candidate_brushes,
@@ -1584,6 +1648,10 @@ def step_refine_terrain(
         "refine_max_planar_rms": max_planar_rms,
         "refine_planar_shrink_factor": planar_shrink_factor,
         "refine_use_slope_radius": use_slope_radius,
+        "refine_use_variation_radius": use_variation_radius,
+        "refine_variation_contrast_gamma": variation_contrast_gamma,
+        "refine_density_weighted": density_weighted,
+        "refine_subpixel_jitter_fraction": subpixel_jitter_fraction,
     })
 
     print("Refreshing previews (parameters used above are now the header on the terrain previews)...")
@@ -1902,6 +1970,42 @@ def main(argv: list[str] | None = None) -> int:
                               "as the 'how small can it shrink on the steepest ground' floor, same "
                               "role it already plays for plain random jitter when this is off. Default: "
                               "use whatever's saved in project.json, or off if never set.")
+    parser.add_argument("--use-variation-radius", action=argparse.BooleanOptionalAction, default=None,
+                         help="refine-terrain, scatter method only: drive each stamp's radius from "
+                              "RMS-from-local-mean at lag=RAD (real curvature AND macro-scale slope "
+                              "carried across the window) instead of raw gradient magnitude -- the "
+                              "corrected replacement for --use-slope-radius (a tilted-plane-forgiving "
+                              "slope reading treats a gentle multi-km fairway grade as 'steep' "
+                              "everywhere, even though a wide flat stamp represents it fine at a small "
+                              "enough radius; RMS-from-local-mean instead only shrinks once the "
+                              "accumulated rise across that radius actually matters). Wins over "
+                              "--use-slope-radius if both are set. --planar-shrink-factor is the shrink "
+                              "floor, same role as for --use-slope-radius. Default: use whatever's "
+                              "saved in project.json, or off if never set.")
+    parser.add_argument("--variation-contrast-gamma", type=float, default=None,
+                         help="refine-terrain, scatter + --use-variation-radius only: exponent applied "
+                              "to the normalized variation field before mapping into [RAD * SHR%%, RAD] "
+                              "-- >1 sharpens toward the extremes (only genuinely high-variation cells "
+                              "shrink much; mid-variation terrain stays closer to full radius), 1.0 is "
+                              "a plain linear map. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_VARIATION_CONTRAST_GAMMA} if never set.")
+    parser.add_argument("--density-weighted", action=argparse.BooleanOptionalAction, default=None,
+                         help="refine-terrain, scatter method only: draw candidate sites from a "
+                              "~1/radius^2-weighted density field (over the same heightmap grid) "
+                              "instead of uniform-random over the whole course -- fixes what shrinking "
+                              "radius alone can't: a smaller target radius previously only changed how "
+                              "big an accepted dart was, never how often darts landed there, so small "
+                              "high-detail regions got isolated small stamps reading as random bumps "
+                              "instead of a tightly-packed cluster. Has no effect without "
+                              "--use-slope-radius or --use-variation-radius also set. Default: use "
+                              "whatever's saved in project.json, or off if never set.")
+    parser.add_argument("--subpixel-jitter-fraction", type=float, default=None,
+                         help="refine-terrain, scatter + --density-weighted only: fraction of a "
+                              "heightmap cell's width to jitter density-weighted draws by, off the "
+                              "exact cell center -- dither only, to avoid visibly grid-aligned stamp "
+                              "centers (the course never needs sub-cell precision on its own). Default: "
+                              f"use whatever's saved in project.json, or {DEFAULT_SUBPIXEL_JITTER_FRACTION} "
+                              "if never set.")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
@@ -1987,7 +2091,9 @@ def main(argv: list[str] | None = None) -> int:
                                  args.method, args.use_height_mask, args.mask_buffer_px,
                                  args.model_rebuild_interval, parsed_candidate_brushes,
                                  args.max_planar_rms, args.planar_shrink_factor, args.rad_m,
-                                 args.use_slope_radius)
+                                 args.use_slope_radius, args.use_variation_radius,
+                                 args.variation_contrast_gamma, args.density_weighted,
+                                 args.subpixel_jitter_fraction)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-splines":
