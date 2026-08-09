@@ -10,7 +10,7 @@ engineered/tuned against real in-game testing:
 https://github.com/chadrockey/TGC-Designer-Tools
 
 Scope: green/tee/fairway/rough/heavyrough/bunker/cartpath/service_road/
-roadway/path/building/wood/pavement/mulch.
+roadway/driveway/path/building/wood/pavement/mulch.
 
 Water is deliberately excluded here -- Chad's own approach fills water
 hazards with a placeholder "mulch" surface spline (confirmed directly
@@ -50,6 +50,16 @@ from course_output.userLayers import GRID_ORIGIN_OFFSET
 
 # From tgc_definitions.py (confirmed via direct re-fetch, no drift from
 # an earlier fetch): surface name -> numeric ID the game expects.
+# surface1/surface2/surface3 are the game's own placeholder names, not
+# ours -- their REAL rendered appearance was confirmed directly (not
+# guessed) as: surface1 = cartpath texture, surface2 = mulch texture,
+# surface3 = pavement texture. Every kind below references these three
+# canonical names directly rather than inventing separately-named
+# aliases for them (an earlier version of this dict had "cartpath": 10
+# and "pavement": 3 as such aliases -- both wrong: "cartpath" the KIND
+# needs surface1 (7), not surface3's 10, and "pavement" needs surface3
+# (10), not raw 3/"rough"'s value. Removed rather than left as
+# misleading dead aliases once the real mapping was confirmed.
 FEATURES_TO_SURFACES = {
     "bunker": 0,
     "green": 1,
@@ -58,17 +68,10 @@ FEATURES_TO_SURFACES = {
     "heavyrough": 4,
     "clearobjects": 5,
     "cleartrees": 6,
-    "surface1": 7,
-    "surface2": 8,
+    "surface1": 7,   # cartpath texture
+    "surface2": 8,   # mulch texture
     "water": 9,
-    "surface3": 10,
-    "cartpath": 10,
-    # Same raw surface id as "rough" (3), confirmed directly -- a
-    # separate, distinctly-named alias is kept anyway rather than
-    # reusing "rough" as the kind name: this is filled hardscape
-    # (parking lots, plaza-style footways), not grass rough, even
-    # though the two currently happen to resolve to the same texture.
-    "pavement": 3,
+    "surface3": 10,  # pavement texture
 }
 
 # Per-kind spline parameters, matching Chad's own newBunker/newGreen/
@@ -94,22 +97,31 @@ _STATIC_SPLINE_PARAMS: dict[str, dict] = {
                       tight_splines=True, secondary_surface="", secondary_width=0.0),
     "wood": dict(surface="surface1", path_width=0.01, handle_length=0.2,
                   tight_splines=True, secondary_surface="", secondary_width=0.0),
-    "pavement": dict(surface="pavement", path_width=0.01, handle_length=0.2,
+    # Surface 3 (pavement texture) -- see FEATURES_TO_SURFACES.
+    "pavement": dict(surface="surface3", path_width=0.01, handle_length=0.2,
                       tight_splines=True, secondary_surface="", secondary_width=0.0),
+    # Surface 2 (mulch texture) -- see FEATURES_TO_SURFACES. Covers
+    # natural=fell and landuse=flowerbed (both classified into this
+    # one "mulch" kind in ingest/osm.py's classify_way).
     "mulch": dict(surface="surface2", path_width=0.01, handle_length=0.2,
                    tight_splines=True, secondary_surface="", secondary_width=0.0),
 }
 
-# Width (m) for each of the three OSM-derived road kinds -- all render
-# as the same "cartpath" surface texture, differing only in width.
-# Confirmed values (not this project's own guess): actual golf cart
-# paths are narrowest, service roads next, full vehicular roadways
-# widest. handle_length keeps the same 2x-width ratio the original
-# single fixed cartpath width (2.0 -> handle_length 4.0) used.
-_ROAD_KIND_WIDTHS = {
-    "cartpath": 1.7,
-    "service_road": 2.3,
-    "roadway": 3.5,
+# (surface, width) for each of the four OSM-derived road/driveway
+# kinds -- surface1 (cartpath texture) for actual golf cart paths;
+# surface3 (pavement texture) for everything else (service roads,
+# full roadways, and driveways -- paved, not dirt/gravel like a cart
+# path). Confirmed widths (not this project's own guess): actual golf
+# cart paths are narrowest, service roads next, full vehicular
+# roadways and driveways widest (driveways matching roadway's width --
+# see ingest/osm.py's classify_way). handle_length keeps the same 2x-
+# width ratio the original single fixed cartpath width (2.0 ->
+# handle_length 4.0) used.
+_ROAD_KIND_STYLES = {
+    "cartpath": ("surface1", 1.7),
+    "service_road": ("surface3", 2.3),
+    "roadway": ("surface3", 3.5),
+    "driveway": ("surface3", 3.5),
 }
 
 
@@ -246,10 +258,10 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
     if feature.kind in _STATIC_SPLINE_PARAMS:
         return _build_spline(points, **_STATIC_SPLINE_PARAMS[feature.kind])
 
-    if feature.kind in _ROAD_KIND_WIDTHS:
-        width = _ROAD_KIND_WIDTHS[feature.kind]
+    if feature.kind in _ROAD_KIND_STYLES:
+        surface, width = _ROAD_KIND_STYLES[feature.kind]
         return _build_spline(
-            points, surface="cartpath", path_width=width,
+            points, surface=surface, path_width=width,
             shrink_distance=None if is_area else 0.0,
             handle_length=width * 2.0, tight_splines=False,
             secondary_surface="", secondary_width=0.0,
@@ -309,7 +321,7 @@ def _circle_spline(cx: float, cz: float, radius: float) -> dict:
         (cx - radius, cz),  # W
     ]
     return _build_spline(
-        points, surface="cartpath", path_width=1.7,
+        points, surface="surface1", path_width=1.7,
         shrink_distance=0.0, handle_length=radius * _BEZIER_CIRCLE_KAPPA,
         tight_splines=False, secondary_surface="", secondary_width=0.0,
         state=1, is_closed=True, is_filled=False,
