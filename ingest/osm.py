@@ -182,6 +182,17 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
         # waterway=stream centerline does.
         return ("water", True)
 
+    if natural_type == "fell":
+        # High, uncultivated/rough upland terrain -- rendered as a
+        # filled mulch texture (surface2, same as splines.py's
+        # "building"/"pavement" fill style), same treatment as
+        # landuse=flowerbed below since both are "not grass, not a
+        # golf surface, just a filled ground texture" cases.
+        return ("mulch", True)
+
+    if tags.get("landuse") == "flowerbed":
+        return ("mulch", True)
+
     if highway_type is not None and highway_type not in ("proposed", "construction"):
         implicit_foot_access = {
             "motorway": "no", "motorway_link": "no", "trunk": "no", "trunk_link": "no",
