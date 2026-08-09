@@ -513,7 +513,13 @@ class PGAGenGUI:
                  "circle spline (cart path surface) at each of the 4 course corners -- for visually "
                  "confirming in-game that terrain and splines land exactly where expected. Shared "
                  "with the same checkbox in the Splines tab (one setting, both places).")
-        self._add_step_button(parent, "Write Terrain", self._run_output_terrain)
+        write_terrain_btn = self._add_step_button(parent, "Write Terrain + Water", self._run_output_terrain)
+        _Tooltip(write_terrain_btn, "Writes userLayers.json's \"height\" key (the terrain stamps) AND "
+                 "its \"water\" key in one pass -- both live in the same file, so this is one step, not "
+                 "two (see course_output/water.py). Water objects are built from features.geojson's "
+                 "water polygons (natural=water, golf=water_hazard, waterway=* areas -- run Ingest OSM "
+                 "first if none show up) fitted to the CURRENT stamp list's low points, so water always "
+                 "reflects whatever terrain was most recently written here, not a stale prior run.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(parent, text="Refinement values:").pack(anchor="w")
