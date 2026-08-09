@@ -60,7 +60,7 @@ from course_output.objects import (  # noqa: E402
     TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, save_object_list,
 )
 from ingest.osm import (  # noqa: E402
-    DEFAULT_HOLE_CORRIDOR_BUFFER_PX, GOLF_OBJECT_KINDS, build_height_mask, crop_features,
+    DEFAULT_HOLE_CORRIDOR_BUFFER_PX, build_height_mask, crop_features,
     merge_height_mask_features, load_features,
     rasterize_mask_rgba, save_features, save_height_mask, shift_features,
 )
@@ -148,6 +148,7 @@ class PGAGenGUI:
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._selection_preview_job = None  # see _on_spline_selected's debounce
+        self._splines_selection_memory: set[str] = set()  # see _splines_memory_store/_recall
         self._suppress_course_name_save = False
         self._suppress_repack_filename_save = False
         self._suppress_game_version_save = False
@@ -758,8 +759,9 @@ class PGAGenGUI:
         self.mask_buffer_preview_label.pack(side="left")
 
     _SPLINE_KIND_FILTERS = (
-        "All", "green", "tee", "fairway", "rough", "bunker",
-        "water", "cartpath", "path", "building", "wood", "hole",
+        "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
+        "water", "cartpath", "service_road", "roadway", "driveway", "path",
+        "building", "wood", "pavement", "mulch", "hole",
     )
 
     BRUSH_TYPE_ORDER = (8, 9, 10, 54)
@@ -812,10 +814,19 @@ class PGAGenGUI:
         ttk.Button(button_row, text="Toggle Mask", command=self._toggle_selected_mask).pack(side="left")
         toggle_all_btn = ttk.Button(button_row, text="Toggle All", command=self._toggle_all_mask)
         toggle_all_btn.pack(side="left", padx=(4, 0))
-        _Tooltip(toggle_all_btn, "Toggle mask for every currently-visible golf object (fairway/green/"
-                 "tee/hole only -- bunker/water/cartpath/etc. are never affected, regardless of the "
-                 "filter). If any are currently unmasked, masks all of them in; otherwise masks all "
-                 "of them out.")
+        _Tooltip(toggle_all_btn, "Toggle mask for every feature currently visible (i.e. matching the "
+                 "active Filter) -- any kind, not just golf objects. If any are currently unmasked, "
+                 "masks all of them in; otherwise masks all of them out.")
+
+        ms_btn = ttk.Button(button_row, text="MS", width=4, command=self._splines_memory_store)
+        ms_btn.pack(side="left", padx=(12, 0))
+        _Tooltip(ms_btn, "Memory Store: remember the current row selection, regardless of the active "
+                 "Filter. Replaces whatever was remembered before.")
+        mr_btn = ttk.Button(button_row, text="MR", width=4, command=self._splines_memory_recall)
+        mr_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(mr_btn, "Memory Recall: re-select whatever MS last remembered. Only restores rows "
+                 "that are currently visible under the active Filter -- switch the Filter back to "
+                 "'All' first to recall a selection that spans multiple kinds.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         reg_marks_checkbox2 = ttk.Checkbutton(
@@ -1145,21 +1156,25 @@ class PGAGenGUI:
     def _toggle_all_mask(self) -> None:
         """
         Toggle mask for every feature currently visible in the tree
-        (i.e. matching the active kind filter) that's a golf-object
-        kind (fairway/green/tee/hole) -- bunker/water/cartpath/etc.
-        are never touched by this, regardless of what the filter
-        happens to show. If any visible golf object is currently
-        unmasked, this masks all of them in; otherwise it masks all
-        of them out (a standard select-all/deselect-all toggle).
+        (i.e. matching the active kind filter) -- same select-all/
+        deselect-all pattern as _toggle_selected_mask: if any visible
+        feature is currently unmasked, masks all of them in; otherwise
+        masks all of them out.
+
+        Previously restricted to golf-object kinds only (fairway/
+        green/tee/hole), deliberately asymmetric with
+        _toggle_selected_mask (which never had that restriction).
+        Removed: with the "All" filter active, that asymmetry meant
+        most of what's actually visible (bunker/rough/water/cartpath/
+        etc.) silently never got touched, which reads as "Toggle All
+        doesn't work" rather than as the intentional restriction it
+        was.
         """
         wd = self.working_dir.get().strip()
         if not wd:
             return
         visible_ids = {int(iid) for iid in self.splines_tree.get_children()}
-        targets = [
-            f for f in self._splines_features
-            if f.osm_id in visible_ids and f.kind in GOLF_OBJECT_KINDS
-        ]
+        targets = [f for f in self._splines_features if f.osm_id in visible_ids]
         if not targets:
             return
         new_state = any(not f.mask for f in targets)
@@ -1169,6 +1184,32 @@ class PGAGenGUI:
         self._regenerate_height_mask(Path(wd))
         self._refresh_splines_list()
         self._show_preview()
+
+    def _splines_memory_store(self) -> None:
+        """MS: remember the current row selection (by osm_id), independent of the active Filter."""
+        self._splines_selection_memory = set(self.splines_tree.selection())
+        self._append_log(f"\n[MS: remembered {len(self._splines_selection_memory)} row(s)]\n")
+
+    def _splines_memory_recall(self) -> None:
+        """
+        MR: re-select whatever MS last remembered. Only ever restores
+        rows that currently exist in the tree (i.e. match the active
+        Filter) -- a remembered row hidden by the current filter is
+        silently skipped, not an error, same as _toggle_selected_mask's
+        own restore-selection step. One batched selection_set() call,
+        not one .selection_add() per row (see that same method's
+        docstring for why: each individual call fires its own separate
+        <<TreeviewSelect>> event).
+        """
+        if not self._splines_selection_memory:
+            return
+        restorable = [iid for iid in self._splines_selection_memory if self.splines_tree.exists(iid)]
+        if restorable:
+            self.splines_tree.selection_set(restorable)
+        self._append_log(
+            f"\n[MR: recalled {len(restorable)} of {len(self._splines_selection_memory)} "
+            "remembered row(s) (rest hidden by the current filter)]\n"
+        )
 
     def _add_step_button(self, parent: ttk.Frame, label: str, command) -> ttk.Button:
         btn = ttk.Button(parent, text=label, command=command, width=22)
