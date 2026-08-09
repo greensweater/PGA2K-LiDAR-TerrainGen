@@ -49,20 +49,27 @@ entry from userLayers.json:
                                given rather than assumed to mirror
                                rotation.y
 
-Geometry: an earlier version of this module assumed the base plane
-asset was a flat 1x1 m unit quad, so scale.x/scale.z could just BE the
-real-world width/depth in meters directly. Confirmed wrong in practice
-(water planes rendering "way bigger" than their actual pond) -- the
-far more likely culprit is Unity's own built-in Plane primitive, which
-is NOT 1x1: it's a well-known 10x10 unit mesh by default. Dividing by
-WATER_MESH_BASE_SIZE_M (10.0) below corrects for that. This is still
-an assumption, not something independently re-confirmed against the
-actual mesh -- if a water plane is now consistently off by some OTHER
-constant factor, that factor is this one constant to adjust, not a
-rethink of the whole approach. A small WATER_RECT_MARGIN is also
-applied on top, so the plane errs toward "same size or slightly
-larger" than the fitted rectangle rather than an exact, zero-tolerance
-fit that could leave a sliver of real pond peeking out at the corners.
+Geometry: two rounds of guessing at the base plane mesh's real-world
+size so far, both from inference against an observed discrepancy, not
+a direct measurement. First guess: a flat 1x1 m unit quad, so
+scale.x/scale.z could just BE the real-world width/depth in meters
+directly. Confirmed wrong in practice (water planes rendering "way
+bigger" than their actual pond) -- Unity's own built-in Plane
+primitive is a well-known 10x10 unit mesh by default, so
+WATER_MESH_BASE_SIZE_M was set to 10.0 to correct for that. ALSO
+confirmed wrong in practice (water planes still rendering roughly 1/5
+the correct size -- too small -- after that fix): dividing by a number
+5x too large gives scale values 5x too small, which points at the real
+base size being closer to 2.0. WATER_MESH_BASE_SIZE_M is now 2.0. This
+is still an inference, not an independently confirmed number -- if
+it's off again, whether it's now too big or too small (and by roughly
+what factor) is more useful than another round-number guess; a direct
+in-game measurement against a known real-world span would settle this
+outright rather than continuing to iterate blind. A small
+WATER_RECT_MARGIN is also applied on top, so the plane errs toward
+"same size or slightly larger" than the fitted rectangle rather than
+an exact, zero-tolerance fit that could leave a sliver of real pond
+peeking out at the corners.
 
 Likewise the mapping from the fitted rectangle's two edge lengths to
 scale.x vs. scale.z (and how that pairs with rotation.y) is this
@@ -138,10 +145,19 @@ WATER_SURFACE_CATEGORY = 9  # same id as splines.py's FEATURES_TO_SURFACES["wate
 WATER_TYPE = 72
 _DECIMALS = 3
 
-# Unity's built-in Plane primitive is a 10x10 unit mesh by default, not
-# 1x1 -- see module docstring's "Geometry". scale.x/scale.z = desired
-# real-world meters / this constant.
-WATER_MESH_BASE_SIZE_M = 10.0
+# Unity's built-in Plane primitive is a 10x10 unit mesh by default --
+# that was the first guess here, based on Unity's own stock primitive
+# convention, not a direct measurement. Confirmed wrong in practice:
+# water planes still rendered roughly 1/5 the correct size (too SMALL)
+# after that fix, which points at the real base size being closer to
+# 2.0, not 10.0 (dividing by a 5x-smaller number gives 5x-larger scale
+# values, matching the observed 1/5 undersizing almost exactly). This
+# is now a second inference from an observed discrepancy, still not an
+# independently confirmed number -- if it's off again, the next data
+# point (over/under, and by roughly what factor) matters more than
+# guessing a third round number; a direct in-game measurement against
+# a known real-world span would settle it outright.
+WATER_MESH_BASE_SIZE_M = 2.0
 
 # Small safety margin on the fitted rectangle so the water plane errs
 # toward "same size or slightly larger" than the real pond outline,
