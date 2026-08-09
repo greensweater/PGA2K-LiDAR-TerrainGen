@@ -428,6 +428,7 @@ class PGAGenGUI:
         self.resolution_var = tk.StringVar(value="200")
         self.min_hotspot_radius_cells_var = tk.StringVar(value="1.0")
         self.max_new_var = tk.StringVar()
+        self.model_rebuild_interval_var = tk.StringVar()
         self.spread_ratio_var = tk.StringVar(value="1")
         self.claim_fraction_var = tk.StringVar(value="1")
         self.rad_var = tk.StringVar(value="25")
@@ -478,6 +479,14 @@ class PGAGenGUI:
                   required=True)
         add_field(1, 1, "max_new", "MAX n", "Cap on new stamps this pass. Leave blank for no cap.",
                   self.max_new_var, required=False)
+        add_field(1, 2, "model_rebuild_interval", "INT n", "Model rebuild interval: how many new "
+                  "stamps accumulate before the error grid gets fully re-rendered against everything "
+                  "placed so far this pass (see terrain/adaptive_refine.py). Higher = fewer, more "
+                  "expensive-per-stamp-count rebuilds -- the single biggest lever on how long a pass "
+                  "takes at high resolution/stamp counts, at the cost of later candidates in the same "
+                  "pass being fit against a slightly staler model (bounded by this many stamps' worth "
+                  "of staleness). Leave blank to use the default (25).",
+                  self.model_rebuild_interval_var, required=False)
 
         add_field(2, 0, "spread_ratio", "SPR %", "Brush radius spread ratio: every brush is scored "
                   "at the same base radius (a fair comparison of which brush shape fits best), but the "
@@ -1282,6 +1291,9 @@ class PGAGenGUI:
         max_new = self.max_new_var.get().strip()
         if max_new:
             args += ["--max-new-stamps", max_new]
+        model_rebuild_interval = self.model_rebuild_interval_var.get().strip()
+        if model_rebuild_interval:
+            args += ["--model-rebuild-interval", model_rebuild_interval]
         max_planar_rms = self.max_planar_rms_var.get().strip()
         if max_planar_rms:
             args += ["--max-planar-rms", max_planar_rms,
