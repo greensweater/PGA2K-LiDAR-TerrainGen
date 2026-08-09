@@ -268,6 +268,17 @@ DEFAULT_SCATTER_INDEX_REBUILD_INTERVAL = 200
 # from anything specific to this project's own scale.
 DEFAULT_SCATTER_MAX_CONSECUTIVE_FAILURES = 300
 
+# See _variation_to_radius_grid: >1 sharpens contrast toward the
+# extremes (only genuinely high-variation cells shrink much), 1.0 is a
+# plain linear percentile map.
+DEFAULT_VARIATION_CONTRAST_GAMMA = 2.0
+
+# Fraction of a heightmap cell's width to jitter density-weighted draws
+# by (see scatter_stamps' density_weighted). Purely to break up
+# grid-aligned dart placement (dither, not precision) -- the target
+# resolution never needs sub-cell accuracy on its own.
+DEFAULT_SUBPIXEL_JITTER_FRACTION = 0.5
+
 
 def _brush_radius_multiplier(brush: int, spread_ratio: float) -> float:
     return spread_ratio ** BRUSH_RANK[brush]
@@ -715,50 +726,122 @@ def refine_stamps(
     return list(stamps) + new_stamps, hotspots
 
 
-def _slope_magnitude(heights: np.ndarray, cell_size: float) -> np.ndarray:
-    """
-    Local slope magnitude (rise/run, not degrees) via central-
-    difference gradient (np.gradient) over the whole grid in one pass
-    -- cheap, O(n), no per-cell loop. NaN gaps in `heights` are
-    substituted with the grid's own nanmean first: np.gradient
-    propagates NaN into every neighbor of a NaN cell too (not just the
-    cell itself), which would otherwise disable slope-based radius
-    selection for any cell merely ADJACENT to a real gap, not just the
-    gap itself. This is purely a radius-SIZING signal, not the actual
-    terrain data, so a coarse substitution here is fine -- it never
-    touches what actually gets written.
-    """
-    filled = np.where(np.isnan(heights), np.nanmean(heights), heights)
-    dz, dx = np.gradient(filled, cell_size, cell_size)
-    return np.hypot(dx, dz)
-
-
-def _slope_to_radius_grid(
-    slope: np.ndarray, rad_m: float, min_scale: float,
+def _local_variation_field(
+    heights: np.ndarray, cell_size: float, window_radius_m: float,
 ) -> np.ndarray:
     """
-    Map slope magnitude to a per-cell target stamp radius in
-    [rad_m * min_scale, rad_m] -- inverse: low slope (flat ground) ->
-    large radius, high slope (steep/valley) -> small radius, per the
-    original request ("lower [heatmap] values on flat areas, higher in
-    valleys" -> smaller stamps wherever that value is high).
+    Local structure-function-style variation: the RMS of height about
+    the LOCAL MEAN (a horizontal reference) within a window of radius
+    `window_radius_m` centered on each cell -- i.e. "how badly would a
+    single flat (uniform-value) stamp of this radius, centered here,
+    misrepresent the actual terrain."
 
-    Normalized by the 5th/95th PERCENTILE of the slope field, not raw
-    min/max -- a single noisy outlier cell in a numerically-
-    differentiated field can otherwise compress the whole usable range
-    onto one or two cells, the same class of fragility already worked
-    around elsewhere in this project (e.g. the planar-fit-RMS
-    candidate floor gate in scatter_stamps' sibling, find_error_
-    hotspots).
+    This deliberately does NOT fit a tilted plane first (unlike
+    _planar_fit_rms elsewhere in this file). A tilted-plane fit
+    forgives slope -- exactly wrong here, since these stamps can only
+    ever emit one flat value with radial falloff, never a gradient.
+    RMS-from-local-mean instead scales with both real curvature
+    (bumps/greens -- high even in a small window) AND macro-scale
+    slope carried across the window (a gentle 2km fairway grade --
+    grows with window size even though the ground is locally "smooth"
+    in the tilted-plane sense), which is exactly the pair of failure
+    modes a single-value stamp needs to avoid. Same quantity as a
+    variogram evaluated at lag = window_radius_m.
+
+    Computed via box-filtered E[x^2] - E[x]^2 (scipy.ndimage.
+    uniform_filter, O(n), no per-cell loop) rather than a true circular
+    window -- a square window of the same radius is a cheap, adequate
+    approximation for a radius-sizing signal (it never touches what
+    actually gets written). NaN gaps are substituted with the grid's
+    own nanmean first, same rationale as the old slope field: box
+    filters spread NaN into every cell within the window of a gap, not
+    just the gap itself.
     """
-    finite = slope[np.isfinite(slope)]
+    filled = np.where(np.isnan(heights), np.nanmean(heights), heights)
+    window_cells = max(1, int(round(window_radius_m / cell_size)))
+    size = 2 * window_cells + 1
+    mean = ndimage.uniform_filter(filled, size=size, mode="nearest")
+    mean_sq = ndimage.uniform_filter(filled * filled, size=size, mode="nearest")
+    variance = np.clip(mean_sq - mean * mean, 0.0, None)  # clip: float roundoff can go slightly negative
+    return np.sqrt(variance)
+
+
+def _variation_to_radius_grid(
+    variation: np.ndarray, rad_m: float, min_scale: float, contrast_gamma: float = 2.0,
+) -> np.ndarray:
+    """
+    Map a local-variation field (_local_variation_field) to a per-cell
+    target stamp radius in [rad_m * min_scale, rad_m] -- inverse: low
+    variation (flat/uniformly-sloped ground) -> large radius, high
+    variation (real bumps, creases, or a slope steep enough to matter
+    at this radius) -> small radius.
+
+    Normalized by the 5th/95th percentile of the field, not raw
+    min/max, for the same reason as before (a single outlier cell
+    shouldn't compress the whole usable range).
+
+    contrast_gamma (>1 sharpens, <1 softens) is applied AFTER
+    normalizing to [0, 1] but BEFORE mapping into [min_scale, 1]:
+    normalized ** gamma. At gamma=1 this is the old linear map; gamma>1
+    means only genuinely high-variation cells shrink toward min_scale,
+    while mid-variation terrain stays closer to full radius -- pushes
+    contrast toward the extremes instead of spreading it evenly across
+    the whole percentile range, which is what actually produces visible
+    clustering rather than a smooth gradient of medium-sized stamps.
+    """
+    finite = variation[np.isfinite(variation)]
     if finite.size == 0:
-        return np.full_like(slope, rad_m)
+        return np.full_like(variation, rad_m)
     lo, hi = np.percentile(finite, [5.0, 95.0])
     if hi - lo < 1e-9:
-        return np.full_like(slope, rad_m)
-    normalized = np.clip((slope - lo) / (hi - lo), 0.0, 1.0)  # 0=flat, 1=steep
-    return rad_m * (1.0 - normalized * (1.0 - min_scale))
+        return np.full_like(variation, rad_m)
+    normalized = np.clip((variation - lo) / (hi - lo), 0.0, 1.0)  # 0=flat, 1=high-variation
+    contrasted = normalized ** contrast_gamma
+    return rad_m * (1.0 - contrasted * (1.0 - min_scale))
+
+
+def _build_density_sampler(
+    radius_grid: np.ndarray, valid: np.ndarray,
+) -> Optional[tuple[np.ndarray, int]]:
+    """
+    Precompute a cumulative distribution over grid cells for inverse-
+    CDF sampling, weighted by target stamp DENSITY rather than target
+    radius directly: coverage at radius r needs ~1/r^2 stamps per unit
+    area, so a cell whose target radius is half another's should be
+    roughly 4x as likely to be drawn, not just "somewhat more likely."
+
+    This is the actual fix for "shrinking radius alone doesn't cluster
+    stamps": a smaller target radius previously only changed how big an
+    accepted dart was, never how often darts landed there in the first
+    place, since candidates were drawn uniformly over the whole course
+    regardless of local need. Weighting the DRAW itself means the
+    sampler spends its attempts where detail is actually needed instead
+    of mostly re-confirming that already-full flat areas are full.
+
+    Returns (cumulative_weights, valid_cell_count) for use with
+    np.searchsorted, or None if no cell is valid. Built once per
+    scatter_stamps call (O(n)), not per-draw.
+    """
+    weights = np.where(valid, 1.0 / np.clip(radius_grid, 1e-6, None) ** 2, 0.0)
+    total = weights.sum()
+    if total <= 0.0:
+        return None
+    cumulative = np.cumsum(weights.ravel())
+    return cumulative, int(np.count_nonzero(valid))
+
+
+def _draw_density_weighted_cell(
+    cumulative: np.ndarray, n_cols: int, rng: np.random.Generator,
+) -> tuple[int, int]:
+    """
+    Inverse-CDF draw of one (row, col) from a precomputed cumulative
+    density (see _build_density_sampler). O(log n) via searchsorted --
+    cheap even at full heightmap resolution, called once per dart.
+    """
+    target = rng.uniform(0.0, cumulative[-1])
+    flat_idx = int(np.searchsorted(cumulative, target, side="right"))
+    flat_idx = min(flat_idx, cumulative.size - 1)
+    return flat_idx // n_cols, flat_idx % n_cols
 
 
 def scatter_stamps(
@@ -770,6 +853,10 @@ def scatter_stamps(
     brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
     jitter_factor: float = DEFAULT_PLANAR_SHRINK_FACTOR,
     use_slope_radius: bool = False,
+    use_variation_radius: bool = False,
+    variation_contrast_gamma: float = DEFAULT_VARIATION_CONTRAST_GAMMA,
+    density_weighted: bool = False,
+    subpixel_jitter_fraction: float = DEFAULT_SUBPIXEL_JITTER_FRACTION,
     min_valid_cells: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
@@ -788,32 +875,54 @@ def scatter_stamps(
     Rockey's TGC-Designer-Tools fixed 2m-grid raster approach, just
     organically/randomly spaced instead of on a fixed lattice).
 
-    use_slope_radius (default off, preserving the original fixed-
-    radius-with-random-jitter behavior exactly) switches the site
-    radius from pure random jitter to a value driven by real local
-    terrain slope instead: computed once up front (_slope_magnitude /
-    _slope_to_radius_grid over the whole grid, O(n), not per-candidate)
-    from the SAME `heights` this function already downsamples for
-    validity checking, so flat ground gets large stamps and steep
-    ground (valleys, ridges) gets small ones -- a proactive, precomputed
-    version of the same goal find_error_hotspots' max_planar_rms
-    already serves reactively, per-site, after error-driven site
-    selection has already happened.
+    use_slope_radius (default off, original behavior) sizes sites off
+    raw gradient magnitude -- kept only for back-compat/comparison.
+    use_variation_radius (default off) is the corrected replacement:
+    site radius is driven by _local_variation_field / _variation_to_
+    radius_grid (RMS-from-local-mean at lag=rad_m), computed once up
+    front, O(n), from the SAME `heights` this function already
+    downsamples for validity checking. Unlike slope, this scales with
+    BOTH real curvature (bumps, at any window size) and macro-scale
+    grade carried across the window (a gentle multi-km fairway slope
+    that a raw gradient reading treats as "steep" everywhere but that
+    only actually needs a smaller stamp once the window is wide enough
+    for the accumulated rise to matter) -- see _local_variation_field's
+    docstring for why a tilted-plane fit is the wrong metric here. The
+    two flags are mutually exclusive; use_variation_radius wins if both
+    are set.
 
-    jitter_factor ("SHR%") is reused for BOTH modes as the same "how
-    small can a stamp's radius shrink to" floor -- [rad_m * jitter_
-    factor, rad_m] -- just driven by pure chance when use_slope_radius
-    is off, or by that cell's actual measured slope when it's on. 1.0
-    disables shrinking either way (every stamp is exactly rad_m).
+    jitter_factor ("SHR%") is reused across all radius modes as the
+    same "how small can a stamp's radius shrink to" floor -- [rad_m *
+    jitter_factor, rad_m] -- driven by pure chance when neither radius
+    flag is on, or by the selected field when one is. 1.0 disables
+    shrinking (every stamp is exactly rad_m). variation_contrast_gamma
+    (use_variation_radius only) reshapes the map toward the extremes;
+    see _variation_to_radius_grid.
 
-    Poisson-disc spacing (claim_radius_fraction, "EAT") is now variable-
-    radius-aware when use_slope_radius is on: two candidate stamps of
-    DIFFERENT sizes need to be farther apart than two small ones or two
-    large ones alike, so the actual rejection test is "distance <
-    (candidate's own claim radius + already-accepted neighbor's own
-    claim radius)" -- the standard generalization of fixed-radius
-    Poisson-disc sampling to circles of varying size, not a fixed
-    distance for every pair regardless of size. Checked via a
+    density_weighted (default off) fixes what shrinking radius alone
+    can't: a smaller target radius only changes how big an accepted
+    dart is, never how often darts land there. With this on, candidate
+    (x, z) draws are pulled from a precomputed density field (~1/r^2,
+    see _build_density_sampler) instead of uniform-random over the
+    whole course, so attempts actually concentrate where small radius
+    is needed instead of mostly re-confirming flat areas are full --
+    this is what produces real clustering rather than isolated small
+    stamps reading as random bumps against unresolved neighbors. Draws
+    land on heightmap cell centers plus subpixel_jitter_fraction * cell
+    width of jitter (dither only, to avoid visibly grid-aligned
+    centers -- the target resolution never needs sub-cell precision on
+    its own). Requires a radius mode to be meaningful (with neither
+    radius flag on, every cell wants the same radius and density-
+    weighting degenerates to uniform anyway).
+
+    Poisson-disc spacing (claim_radius_fraction, "EAT") is variable-
+    radius-aware whenever either radius mode is on: two candidate
+    stamps of DIFFERENT sizes need to be farther apart than two small
+    ones or two large ones alike, so the actual rejection test is
+    "distance < (candidate's own claim radius + already-accepted
+    neighbor's own claim radius)" -- the standard generalization of
+    fixed-radius Poisson-disc sampling to circles of varying size, not
+    a fixed distance for every pair regardless of size. Checked via a
     cKDTree broad-phase query (candidate radius + the largest claim
     radius accepted so far -- a cheap, conservative upper bound, since
     the exact per-pair threshold isn't known until the actual neighbor
@@ -863,9 +972,18 @@ def scatter_stamps(
     max_brush_scale = max(_brush_radius_multiplier(b, brush_radius_spread_ratio) for b in brushes)
 
     radius_grid: Optional[np.ndarray] = None
-    if use_slope_radius:
+    use_radius_field = use_slope_radius or use_variation_radius
+    if use_variation_radius:
+        variation = _local_variation_field(actual, (cell_size_x + cell_size_z) / 2.0, rad_m)
+        radius_grid = _variation_to_radius_grid(variation, rad_m, jitter_factor, variation_contrast_gamma)
+    elif use_slope_radius:
         slope = _slope_magnitude(actual, (cell_size_x + cell_size_z) / 2.0)
         radius_grid = _slope_to_radius_grid(slope, rad_m, jitter_factor)
+
+    density_sampler: Optional[tuple[np.ndarray, int]] = None
+    if density_weighted:
+        density_field = radius_grid if radius_grid is not None else np.full_like(actual, rad_m)
+        density_sampler = _build_density_sampler(density_field, valid)
 
     def _cell_is_valid(cx: float, cz: float) -> Optional[tuple[int, int]]:
         col = int((cx - bounds.min_x) / cell_size_x)
@@ -907,15 +1025,28 @@ def scatter_stamps(
             progress_callback(len(hotspots), consecutive_failures / max_consecutive_failures)
             last_progress_time = time.time()
 
-        cx = float(rng.uniform(bounds.min_x, bounds.max_x))
-        cz = float(rng.uniform(bounds.min_z, bounds.max_z))
-        cell = _cell_is_valid(cx, cz)
-        if cell is None:
-            consecutive_failures += 1
-            continue
-        row, col = cell
+        if density_sampler is not None:
+            cumulative, _ = density_sampler
+            row, col = _draw_density_weighted_cell(cumulative, resolution, rng)
+            if not valid[row, col]:
+                consecutive_failures += 1
+                continue
+            jitter_x = (rng.uniform(-0.5, 0.5) * 2.0 * subpixel_jitter_fraction) * cell_size_x
+            jitter_z = (rng.uniform(-0.5, 0.5) * 2.0 * subpixel_jitter_fraction) * cell_size_z
+            cx = bounds.min_x + (col + 0.5) * cell_size_x + jitter_x
+            cz = bounds.min_z + (row + 0.5) * cell_size_z + jitter_z
+            cx = float(np.clip(cx, bounds.min_x, bounds.max_x))
+            cz = float(np.clip(cz, bounds.min_z, bounds.max_z))
+        else:
+            cx = float(rng.uniform(bounds.min_x, bounds.max_x))
+            cz = float(rng.uniform(bounds.min_z, bounds.max_z))
+            cell = _cell_is_valid(cx, cz)
+            if cell is None:
+                consecutive_failures += 1
+                continue
+            row, col = cell
 
-        if use_slope_radius:
+        if use_radius_field:
             site_radius = float(radius_grid[row, col])
         else:
             site_radius = rad_m * float(rng.uniform(jitter_factor, 1.0)) if jitter_factor < 1.0 else rad_m
@@ -978,6 +1109,10 @@ def scatter_refine_stamps(
     brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
     jitter_factor: float = DEFAULT_PLANAR_SHRINK_FACTOR,
     use_slope_radius: bool = False,
+    use_variation_radius: bool = False,
+    variation_contrast_gamma: float = DEFAULT_VARIATION_CONTRAST_GAMMA,
+    density_weighted: bool = False,
+    subpixel_jitter_fraction: float = DEFAULT_SUBPIXEL_JITTER_FRACTION,
     min_valid_cells: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
@@ -999,7 +1134,9 @@ def scatter_refine_stamps(
         heights, bounds, rad_m,
         resolution=resolution, claim_radius_fraction=claim_radius_fraction,
         brush_radius_spread_ratio=brush_radius_spread_ratio, jitter_factor=jitter_factor,
-        use_slope_radius=use_slope_radius,
+        use_slope_radius=use_slope_radius, use_variation_radius=use_variation_radius,
+        variation_contrast_gamma=variation_contrast_gamma,
+        density_weighted=density_weighted, subpixel_jitter_fraction=subpixel_jitter_fraction,
         min_valid_cells=min_valid_cells, max_new_stamps=max_new_stamps, mask=mask,
         candidate_brushes=candidate_brushes, index_rebuild_interval=index_rebuild_interval,
         max_consecutive_failures=max_consecutive_failures,
