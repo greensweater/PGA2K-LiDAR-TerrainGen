@@ -472,6 +472,8 @@ class PGAGenGUI:
         self.rad_var = tk.StringVar(value="25")
         self.max_planar_rms_var = tk.StringVar(value="")  # blank = off (old behavior)
         self.planar_shrink_var = tk.StringVar(value="0.75")
+        self.variation_contrast_gamma_var = tk.StringVar(value="2")
+        self.subpixel_jitter_var = tk.StringVar(value="0.5")
         self.refine_labels: dict[str, ttk.Label] = {}
 
         grid_frame = ttk.Frame(parent)
@@ -565,11 +567,49 @@ class PGAGenGUI:
         slope_checkbox = ttk.Checkbutton(grid_frame, text="Slope", variable=self.use_slope_radius_var)
         slope_checkbox.grid(row=3, column=2, sticky="w", padx=3, pady=2)
         _Tooltip(slope_checkbox, "scatter only: drive each stamp's radius from real local terrain "
-                 "slope (computed once, over the whole grid) instead of random jitter -- flat ground "
-                 "gets large stamps, steep ground (valleys, ridges) gets small ones. Poisson-disc "
-                 "spacing becomes radius-aware to match, so differently-sized nearby stamps still "
-                 "can't overlap. SHR % is reused as the 'how small can it shrink on the steepest "
-                 "ground' floor -- same role it plays for plain jitter when this is off.")
+                 "slope (raw gradient magnitude, computed once over the whole grid) instead of random "
+                 "jitter. Superseded by Variation below, which fixes a real blind spot this has (a "
+                 "gentle, multi-km fairway grade reads as 'steep' everywhere, even where a wide flat "
+                 "stamp would represent it fine) -- kept for back-compat/comparison. Variation wins if "
+                 "both are checked. SHR % is reused as the 'how small can it shrink' floor either way.")
+
+        self.use_variation_radius_var = tk.BooleanVar(value=False)
+        variation_checkbox = ttk.Checkbutton(
+            grid_frame, text="Variation", variable=self.use_variation_radius_var,
+        )
+        variation_checkbox.grid(row=4, column=0, sticky="w", padx=3, pady=2)
+        _Tooltip(variation_checkbox, "scatter only: drive each stamp's radius from RMS-from-local-mean "
+                 "at lag=RAD (computed once, over the whole grid) instead of random jitter -- unlike "
+                 "Slope, this scales with BOTH real curvature (bumps/greens) and macro-scale grade "
+                 "carried across the window, since a single flat stamp can't represent a tilted plane "
+                 "any better than a bumpy one. Flat/uniformly-graded ground still gets large stamps; "
+                 "genuinely detailed ground gets small ones. Wins over Slope if both are checked. SHR%% "
+                 "is the shrink floor, GAM sharpens the map toward the extremes.")
+
+        add_field(4, 1, "variation_contrast_gamma", "GAM", "Variation contrast gamma: exponent applied "
+                  "to the normalized variation field before mapping into [RAD * SHR%, RAD] -- >1 "
+                  "sharpens toward the extremes (only genuinely high-variation cells shrink much), 1.0 "
+                  "is a plain linear map. Only used when Variation is checked.",
+                  self.variation_contrast_gamma_var, required=False)
+
+        self.density_weighted_var = tk.BooleanVar(value=False)
+        density_checkbox = ttk.Checkbutton(
+            grid_frame, text="Density", variable=self.density_weighted_var,
+        )
+        density_checkbox.grid(row=4, column=2, sticky="w", padx=3, pady=2)
+        _Tooltip(density_checkbox, "scatter only: draw candidate sites from a ~1/radius^2-weighted "
+                 "density field instead of uniform-random over the whole course. Fixes what shrinking "
+                 "radius alone can't -- a smaller target radius only changes how big an accepted dart "
+                 "is, never how often darts land there, so small high-detail regions were getting "
+                 "isolated small stamps that read as random bumps instead of a tightly-packed cluster "
+                 "resolving the actual detail. Has no effect unless Slope or Variation is also checked "
+                 "-- with neither, every site wants the same radius already.")
+
+        add_field(5, 0, "subpixel_jitter_fraction", "JIT %", "Subpixel jitter fraction: fraction of a "
+                  "heightmap cell's width to jitter density-weighted draws by, off the exact cell "
+                  "center -- dither only, to avoid visibly grid-aligned stamp centers (the course "
+                  "never needs sub-cell precision on its own). Only used when Density is checked.",
+                  self.subpixel_jitter_var, required=False)
 
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
@@ -1451,6 +1491,13 @@ class PGAGenGUI:
         if max_planar_rms:
             args += ["--max-planar-rms", max_planar_rms]
         args.append("--use-slope-radius" if self.use_slope_radius_var.get() else "--no-use-slope-radius")
+        args.append(
+            "--use-variation-radius" if self.use_variation_radius_var.get()
+            else "--no-use-variation-radius"
+        )
+        args += ["--variation-contrast-gamma", self.variation_contrast_gamma_var.get().strip()]
+        args.append("--density-weighted" if self.density_weighted_var.get() else "--no-density-weighted")
+        args += ["--subpixel-jitter-fraction", self.subpixel_jitter_var.get().strip()]
         self._run_step(args, wd)
         self._refresh_refine_stats()
 
