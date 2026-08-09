@@ -89,10 +89,10 @@ from course_output.splines import (
 )
 from course_output.holes import build_holes, save_holes
 from course_output.objects import (
-    DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019,
-    build_building_stake_objects_v2021, build_tree_objects_v2019, build_tree_objects_v2021,
-    lidar_trees_to_tagged, load_object_list, object_counts, parse_osm_trees, save_object_list,
-    save_placed_objects,
+    DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_TYPE_TAG,
+    apply_area_tree_type_hints, build_building_stake_objects_v2021, build_tree_objects_v2019,
+    build_tree_objects_v2021, lidar_trees_to_tagged, load_object_list, object_counts,
+    parse_osm_trees, save_object_list, save_placed_objects,
 )
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -939,6 +939,23 @@ def step_generate_trees(working_dir: Path, detect_lidar_trees: bool | None = Non
         trees += lidar_trees_to_tagged(lidar_trees)
         print(f"  {len(lidar_trees)} LIDAR-detected tree(s) added "
               f"({len(trees)} total tree(s) now)")
+
+    features_path = working_dir / FEATURES_FILE
+    if features_path.exists() and trees:
+        features = load_features(features_path)
+        features = _crop_features_to_course(working_dir, features)
+        wood_features = [f for f in features if f.kind == "wood"]
+        if wood_features:
+            untyped_before = sum(1 for _, _, tags in trees if TREE_TYPE_TAG not in tags)
+            trees = apply_area_tree_type_hints(trees, wood_features)
+            untyped_after = sum(1 for _, _, tags in trees if TREE_TYPE_TAG not in tags)
+            if untyped_before != untyped_after:
+                print(f"  applied area-based tree-type hints from {len(wood_features)} wood "
+                      f"polygon(s): {untyped_before - untyped_after} tree(s) tagged "
+                      "(course_output/objects.py's LEAF_TYPE_TREE_HINTS)")
+    elif trees:
+        print(f"  No {FEATURES_FILE} found -- skipping area-based tree-type hints "
+              "(run --step ingest-osm first if you want wood-polygon leaf_type hints applied).")
 
     out_path = working_dir / OBJECT_LIST_FILE
     save_object_list(trees, out_path)
