@@ -84,8 +84,9 @@ from ingest.tree_detection import (
     detect_trees_from_lidar, rasterize_canopy_heightmap_with_fallback,
 )
 from ingest.osm import (
-    DEFAULT_HEIGHT_MASK_BUFFER_PX, build_height_mask, crop_features, load_features, load_height_mask,
-    parse_osm_features, rasterize_mask, save_features, save_height_mask, shift_features,
+    DEFAULT_HEIGHT_MASK_BUFFER_PX, DEFAULT_HOLE_CORRIDOR_BUFFER_PX, build_height_mask, crop_features,
+    load_features, load_height_mask, parse_osm_features, rasterize_mask, save_features,
+    save_height_mask, shift_features,
 )
 from course_output.splines import (
     build_registration_mark_splines, build_surface_splines, feature_to_spline, save_surface_splines,
@@ -604,7 +605,10 @@ def step_ingest_laz(
     })
 
 
-def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
+def step_ingest_osm(
+    working_dir: Path, height_mask_buffer_px: float,
+    hole_corridor_buffer_px: float = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
+) -> None:
     osm_path = working_dir / "map.osm"
     if not osm_path.exists():
         raise StepError(
@@ -680,7 +684,10 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
     print(f"  wrote {full_preview_path} (same features, uncropped, in the LIDAR previews' "
           "full-point-cloud frame instead -- plus the current course crop's own position)")
 
-    mask_geometry = build_height_mask(course_features, buffer_px=height_mask_buffer_px)
+    mask_geometry = build_height_mask(
+        course_features, buffer_px=height_mask_buffer_px,
+        hole_corridor_buffer_px=hole_corridor_buffer_px,
+    )
     mask_path = working_dir / HEIGHT_MASK_FILE
     save_height_mask(mask_geometry, mask_path)
     if mask_geometry is None:
@@ -689,7 +696,8 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
     else:
         print(f"  wrote {mask_path} (every feature with mask=False, i.e. NOT excluded -- defaults to "
               f"fairway/green/tee/hole, individually overridable per-feature in the GUI's Splines tab -- "
-              f"then buffered {height_mask_buffer_px} m/px)")
+              f"then buffered {height_mask_buffer_px} m/px, with hole routing centerlines corridor-"
+              f"buffered by {hole_corridor_buffer_px} m/px first)")
 
     mask_preview_path = working_dir / PREVIEW_DIR / PREVIEW_MASK
     viz.render_mask_preview(mask_geometry, course_bounds, mask_preview_path)
@@ -699,6 +707,7 @@ def step_ingest_osm(working_dir: Path, height_mask_buffer_px: float) -> None:
     save_project(working_dir, {
         "osm_feature_count": len(features), "osm_feature_kinds": counts,
         "height_mask_buffer_px": height_mask_buffer_px,
+        "hole_corridor_buffer_px": hole_corridor_buffer_px,
         # The course crop's own origin, expressed in the full point
         # cloud's frame -- features.geojson is stored in that full
         # frame (see parse_osm_features), so any step that needs the
@@ -1863,6 +1872,12 @@ def main(argv: list[str] | None = None) -> int:
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
                               f"2000x2000 m (default: {DEFAULT_HEIGHT_MASK_BUFFER_PX})")
+    parser.add_argument("--hole-corridor-buffer-px", type=float, default=DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
+                         help="ingest-osm: buffer each hole routing centerline (tee-to-green line) by "
+                              "this many pixels/meters before it contributes to the height mask -- an "
+                              "unbuffered centerline alone would leave most of the actual playing "
+                              "corridor outside the mask. This is a BUFFER (roughly half the resulting "
+                              f"corridor width), not the total width (default: {DEFAULT_HOLE_CORRIDOR_BUFFER_PX})")
     parser.add_argument("--max-planar-rms", type=float, default=None,
                          help="refine-terrain: shrink a hotspot's radius (before claim_radius_fraction/ "
                               "brush_radius_spread_ratio apply) until the region's actual LIDAR heights "
@@ -1951,7 +1966,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.step == "ingest-laz":
             step_ingest_laz(working_dir, args.projection, args.fill_heightmap_gaps)
         elif args.step == "ingest-osm":
-            step_ingest_osm(working_dir, args.height_mask_buffer_px)
+            step_ingest_osm(working_dir, args.height_mask_buffer_px, args.hole_corridor_buffer_px)
         elif args.step == "ingest-course":
             if args.course_file is None:
                 print("error: --step ingest-course requires --course-file <path>", file=sys.stderr)
