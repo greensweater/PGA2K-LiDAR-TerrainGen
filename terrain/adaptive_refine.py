@@ -715,6 +715,52 @@ def refine_stamps(
     return list(stamps) + new_stamps, hotspots
 
 
+def _slope_magnitude(heights: np.ndarray, cell_size: float) -> np.ndarray:
+    """
+    Local slope magnitude (rise/run, not degrees) via central-
+    difference gradient (np.gradient) over the whole grid in one pass
+    -- cheap, O(n), no per-cell loop. NaN gaps in `heights` are
+    substituted with the grid's own nanmean first: np.gradient
+    propagates NaN into every neighbor of a NaN cell too (not just the
+    cell itself), which would otherwise disable slope-based radius
+    selection for any cell merely ADJACENT to a real gap, not just the
+    gap itself. This is purely a radius-SIZING signal, not the actual
+    terrain data, so a coarse substitution here is fine -- it never
+    touches what actually gets written.
+    """
+    filled = np.where(np.isnan(heights), np.nanmean(heights), heights)
+    dz, dx = np.gradient(filled, cell_size, cell_size)
+    return np.hypot(dx, dz)
+
+
+def _slope_to_radius_grid(
+    slope: np.ndarray, rad_m: float, min_scale: float,
+) -> np.ndarray:
+    """
+    Map slope magnitude to a per-cell target stamp radius in
+    [rad_m * min_scale, rad_m] -- inverse: low slope (flat ground) ->
+    large radius, high slope (steep/valley) -> small radius, per the
+    original request ("lower [heatmap] values on flat areas, higher in
+    valleys" -> smaller stamps wherever that value is high).
+
+    Normalized by the 5th/95th PERCENTILE of the slope field, not raw
+    min/max -- a single noisy outlier cell in a numerically-
+    differentiated field can otherwise compress the whole usable range
+    onto one or two cells, the same class of fragility already worked
+    around elsewhere in this project (e.g. the planar-fit-RMS
+    candidate floor gate in scatter_stamps' sibling, find_error_
+    hotspots).
+    """
+    finite = slope[np.isfinite(slope)]
+    if finite.size == 0:
+        return np.full_like(slope, rad_m)
+    lo, hi = np.percentile(finite, [5.0, 95.0])
+    if hi - lo < 1e-9:
+        return np.full_like(slope, rad_m)
+    normalized = np.clip((slope - lo) / (hi - lo), 0.0, 1.0)  # 0=flat, 1=steep
+    return rad_m * (1.0 - normalized * (1.0 - min_scale))
+
+
 def scatter_stamps(
     heights: np.ndarray,
     bounds: BoundingBox,
@@ -723,6 +769,7 @@ def scatter_stamps(
     claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
     brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
     jitter_factor: float = DEFAULT_PLANAR_SHRINK_FACTOR,
+    use_slope_radius: bool = False,
     min_valid_cells: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
@@ -736,81 +783,68 @@ def scatter_stamps(
     "Scatter" -- Poisson-disc random stamp placement via dart-throwing:
     draw a random continuous (x, z), accept it as a new stamp center
     unless it's too close to an already-accepted one, repeat; average
-    real LIDAR points for each accepted center, set. An alternative to
-    find_error_hotspots' error-driven site selection, for reproducing
-    real LIDAR ground detail directly via many stamps rather than
-    targeting specific error regions -- closer in spirit to Chad
+    real LIDAR points for each accepted center, set. See prior
+    conversation for the full rationale (closer in spirit to Chad
     Rockey's TGC-Designer-Tools fixed 2m-grid raster approach, just
-    organically/randomly spaced instead of on a fixed lattice.
+    organically/randomly spaced instead of on a fixed lattice).
+
+    use_slope_radius (default off, preserving the original fixed-
+    radius-with-random-jitter behavior exactly) switches the site
+    radius from pure random jitter to a value driven by real local
+    terrain slope instead: computed once up front (_slope_magnitude /
+    _slope_to_radius_grid over the whole grid, O(n), not per-candidate)
+    from the SAME `heights` this function already downsamples for
+    validity checking, so flat ground gets large stamps and steep
+    ground (valleys, ridges) gets small ones -- a proactive, precomputed
+    version of the same goal find_error_hotspots' max_planar_rms
+    already serves reactively, per-site, after error-driven site
+    selection has already happened.
+
+    jitter_factor ("SHR%") is reused for BOTH modes as the same "how
+    small can a stamp's radius shrink to" floor -- [rad_m * jitter_
+    factor, rad_m] -- just driven by pure chance when use_slope_radius
+    is off, or by that cell's actual measured slope when it's on. 1.0
+    disables shrinking either way (every stamp is exactly rad_m).
+
+    Poisson-disc spacing (claim_radius_fraction, "EAT") is now variable-
+    radius-aware when use_slope_radius is on: two candidate stamps of
+    DIFFERENT sizes need to be farther apart than two small ones or two
+    large ones alike, so the actual rejection test is "distance <
+    (candidate's own claim radius + already-accepted neighbor's own
+    claim radius)" -- the standard generalization of fixed-radius
+    Poisson-disc sampling to circles of varying size, not a fixed
+    distance for every pair regardless of size. Checked via a
+    cKDTree broad-phase query (candidate radius + the largest claim
+    radius accepted so far -- a cheap, conservative upper bound, since
+    the exact per-pair threshold isn't known until the actual neighbor
+    is identified) followed by an exact per-candidate distance check
+    against only the (few) broad-phase hits -- same two-tier structure
+    (periodically-rebuilt tree + short linear scan for anything
+    accepted since) as the fixed-radius case, just with a radius-aware
+    query bound and exact check instead of a single fixed radius.
 
     Deliberately does NOT build or evaluate a TerrainModel at all (an
     earlier version did, and was correspondingly slow for no benefit):
     every real brush profile guarantees weight_center =
     kernel.sample(0.0) == 1.0 exactly (see terrain/brush_profiles.py's
-    own module docstring -- placing a stamp fully commits the terrain
-    under the cursor to the typed value, never just partially pulls
-    toward it). The usual pull-toward-value flatten formula, value =
-    current_at_center + (target_mean - current_at_center) /
-    weight_center, therefore collapses to exactly value = target_mean
-    regardless of what's already there -- current_at_center cancels
-    out completely, so there was never anything to gain by computing
-    it. Consequently there's also no RMS-based "which brush fits best"
-    comparison here either (that needed the same current-state
-    evaluation) -- brush type is chosen uniformly at random from
-    `candidate_brushes` per site instead, which is the right call
-    anyway for scatter: there's no error shape to fit against, so
-    shape choice is closer to a texture/variety choice than a
-    precision-fitting one.
-
-    One real tradeoff from dropping TerrainModel: an overlapping
-    scatter stamp (claim_radius_fraction < 1) no longer accounts for
-    an already-placed *scatter* neighbor's effect when computing its
-    own target -- each site's value is purely that site's own local
-    LIDAR average, independent of every other stamp. Any blending
-    between overlapping stamps happens at the game's own render time
-    (via brush falloff), not pre-computed here. This is a deliberate
-    simplification, not an oversight -- exactly "identify centers,
-    average, set" -- traded for the (large) resulting speedup.
+    own module docstring), so the usual pull-toward-value flatten
+    formula collapses to exactly value = target_mean regardless of
+    what's already there. Brush type is chosen uniformly at random
+    from `candidate_brushes` per site, not RMS-scored, for the same
+    reason.
 
     Site selection is dart-throwing, NOT a scan over every heightmap
-    cell (an earlier version enumerated all resolution^2 cells as
-    candidates up front -- correct, but still far too slow: with
-    stamps spaced tens of meters apart, well over 99% of a 2000x2000
-    grid's individual 1x1m cells are rejected almost immediately once
-    the area starts filling in, yet a plain Python loop still pays
-    full per-iteration overhead for each of several million of them).
-    Instead: draw a uniform-random continuous (x, z) directly within
-    bounds, check its heightmap cell is valid (in-mask, has real data)
-    and that it's at least rad_m * claim_radius_fraction from every
-    already-accepted center (via a scipy.spatial.cKDTree over
-    accepted centers, periodically rebuilt -- see
-    index_rebuild_interval -- rather than per-insertion, since
-    cKDTree has no incremental insert; anything accepted since the
-    last rebuild is checked with a short linear scan instead, bounded
-    by index_rebuild_interval regardless of total stamp count).
-    Accept or reject and move on. Stops once `max_consecutive_failures`
-    draws in a row are all rejected -- the standard termination
-    heuristic for dart-throwing (a long unbroken run of rejections is
-    itself the signal that the space is full, without needing to
-    enumerate every cell to prove it) -- or once max_new_stamps is hit,
-    whichever comes first.
+    cell: draw a uniform-random continuous (x, z) directly within
+    bounds, check its heightmap cell is valid (in-mask, has real data),
+    accept or reject on spacing, move on. Stops once
+    `max_consecutive_failures` draws in a row are all rejected (the
+    space is full) or max_new_stamps is hit, whichever first.
 
-    jitter_factor ("SHR%", reused from find_error_hotspots' unrelated
-    planar-fit-shrink role -- scatter has no planarity concept at all)
-    randomizes each stamp's actual radius within
-    [rad_m * jitter_factor, rad_m], so centers "arrange themselves
-    organically" instead of a visibly uniform lattice of identical
-    circles despite random placement. 1.0 disables jitter.
-
-    Only TOOL_FLATTEN is ever used -- scatter's whole purpose is
-    directly reproducing real ground height, which is what flatten's
-    pull-toward-value semantics (now provably just "= target_mean"
-    here) are for.
-
-    Returns ErrorHotspot instances (reusing the same dataclass/
-    to_stamp() as find_error_hotspots) with peak_error and fit_rms
-    both fixed at 0.0 -- neither concept applies here (see above);
-    kept as fields only for a uniform return type with adaptive mode.
+    Only TOOL_FLATTEN is ever used. Returns ErrorHotspot instances
+    (reusing the same dataclass/to_stamp() as find_error_hotspots) with
+    peak_error and fit_rms both fixed at 0.0 -- neither concept applies
+    here; kept as fields only for a uniform return type with adaptive
+    mode.
     """
     brushes = candidate_brushes if candidate_brushes is not None else CANDIDATE_BRUSHES
     if rng is None:
@@ -827,28 +861,38 @@ def scatter_stamps(
     cell_size_z = (bounds.max_z - bounds.min_z) / resolution
 
     max_brush_scale = max(_brush_radius_multiplier(b, brush_radius_spread_ratio) for b in brushes)
-    base_claim_radius = rad_m * claim_radius_fraction
 
-    placed_coords: list[tuple[float, float]] = []
-    tree: Optional[cKDTree] = None
-    tree_size = 0  # how many of placed_coords were folded into `tree` at its last rebuild
+    radius_grid: Optional[np.ndarray] = None
+    if use_slope_radius:
+        slope = _slope_magnitude(actual, (cell_size_x + cell_size_z) / 2.0)
+        radius_grid = _slope_to_radius_grid(slope, rad_m, jitter_factor)
 
-    def _too_close(cx: float, cz: float) -> bool:
-        if tree is not None:
-            dist, _ = tree.query([cx, cz], k=1)
-            if dist < base_claim_radius:
-                return True
-        for px_, pz_ in placed_coords[tree_size:]:
-            if math.hypot(px_ - cx, pz_ - cz) < base_claim_radius:
-                return True
-        return False
-
-    def _cell_is_valid(cx: float, cz: float) -> bool:
+    def _cell_is_valid(cx: float, cz: float) -> Optional[tuple[int, int]]:
         col = int((cx - bounds.min_x) / cell_size_x)
         row = int((cz - bounds.min_z) / cell_size_z)
         if col < 0 or col >= resolution or row < 0 or row >= resolution:
-            return False
-        return bool(valid[row, col])
+            return None
+        if not valid[row, col]:
+            return None
+        return row, col
+
+    placed: list[tuple[float, float, float]] = []  # (x, z, claim_radius)
+    tree: Optional[cKDTree] = None
+    tree_size = 0  # how many of placed were folded into `tree` at its last rebuild
+    max_claim_radius_seen = 0.0
+
+    def _too_close(cx: float, cz: float, candidate_claim_radius: float) -> bool:
+        nonlocal max_claim_radius_seen
+        broad_bound = candidate_claim_radius + max_claim_radius_seen
+        if tree is not None and broad_bound > 0:
+            for i in tree.query_ball_point([cx, cz], broad_bound):
+                px_, pz_, pr_ = placed[i]
+                if math.hypot(px_ - cx, pz_ - cz) < candidate_claim_radius + pr_:
+                    return True
+        for px_, pz_, pr_ in placed[tree_size:]:
+            if math.hypot(px_ - cx, pz_ - cz) < candidate_claim_radius + pr_:
+                return True
+        return False
 
     hotspots: list[ErrorHotspot] = []
     consecutive_failures = 0
@@ -865,19 +909,30 @@ def scatter_stamps(
 
         cx = float(rng.uniform(bounds.min_x, bounds.max_x))
         cz = float(rng.uniform(bounds.min_z, bounds.max_z))
-        if not _cell_is_valid(cx, cz) or _too_close(cx, cz):
+        cell = _cell_is_valid(cx, cz)
+        if cell is None:
+            consecutive_failures += 1
+            continue
+        row, col = cell
+
+        if use_slope_radius:
+            site_radius = float(radius_grid[row, col])
+        else:
+            site_radius = rad_m * float(rng.uniform(jitter_factor, 1.0)) if jitter_factor < 1.0 else rad_m
+        candidate_claim_radius = site_radius * claim_radius_fraction
+
+        if _too_close(cx, cz, candidate_claim_radius):
             consecutive_failures += 1
             continue
 
-        site_radius = rad_m * float(rng.uniform(jitter_factor, 1.0)) if jitter_factor < 1.0 else rad_m
-        query_radius = max(base_claim_radius, site_radius * max_brush_scale)
+        query_radius = max(candidate_claim_radius, site_radius * max_brush_scale)
         px, pz, actual_pts = query_heightmap_cells(heights, bounds, cx, cz, query_radius)
         if px.size < min_valid_cells:
             consecutive_failures += 1
             continue
 
         dist_from_center = np.hypot(px - cx, pz - cz)
-        in_sample_radius = dist_from_center <= base_claim_radius
+        in_sample_radius = dist_from_center <= candidate_claim_radius
         if np.count_nonzero(in_sample_radius) < min_valid_cells:
             consecutive_failures += 1
             continue
@@ -887,10 +942,11 @@ def scatter_stamps(
         final_radius = site_radius * _brush_radius_multiplier(brush, brush_radius_spread_ratio)
 
         consecutive_failures = 0
-        placed_coords.append((cx, cz))
-        if len(placed_coords) - tree_size >= index_rebuild_interval:
-            tree = cKDTree(np.asarray(placed_coords))
-            tree_size = len(placed_coords)
+        placed.append((cx, cz, candidate_claim_radius))
+        max_claim_radius_seen = max(max_claim_radius_seen, candidate_claim_radius)
+        if len(placed) - tree_size >= index_rebuild_interval:
+            tree = cKDTree(np.asarray(placed)[:, :2])
+            tree_size = len(placed)
 
         x_edges = np.linspace(bounds.min_x, bounds.max_x, resolution + 1)
         z_edges = np.linspace(bounds.min_z, bounds.max_z, resolution + 1)
@@ -921,6 +977,7 @@ def scatter_refine_stamps(
     claim_radius_fraction: float = DEFAULT_CLAIM_RADIUS_FRACTION,
     brush_radius_spread_ratio: float = DEFAULT_BRUSH_RADIUS_SPREAD_RATIO,
     jitter_factor: float = DEFAULT_PLANAR_SHRINK_FACTOR,
+    use_slope_radius: bool = False,
     min_valid_cells: int = DEFAULT_MIN_POINTS,
     max_new_stamps: Optional[int] = None,
     mask: Optional[np.ndarray] = None,
@@ -942,6 +999,7 @@ def scatter_refine_stamps(
         heights, bounds, rad_m,
         resolution=resolution, claim_radius_fraction=claim_radius_fraction,
         brush_radius_spread_ratio=brush_radius_spread_ratio, jitter_factor=jitter_factor,
+        use_slope_radius=use_slope_radius,
         min_valid_cells=min_valid_cells, max_new_stamps=max_new_stamps, mask=mask,
         candidate_brushes=candidate_brushes, index_rebuild_interval=index_rebuild_interval,
         max_consecutive_failures=max_consecutive_failures,
