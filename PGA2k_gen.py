@@ -10,6 +10,7 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step ingest-laz [--projection <EPSG>] [--no-fill-heightmap-gaps]
     PGA2k_gen.py <working_dir> --step ingest-osm
     PGA2k_gen.py <working_dir> --step ingest-course --course-file <path>
+    PGA2k_gen.py <working_dir> --step dig-water [--dig-depth M] [--dig-buffer M]
     PGA2k_gen.py <working_dir> --step generate-terrain
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
                                  [--method adaptive|scatter] [--rad-m M]
@@ -60,6 +61,7 @@ from pathlib import Path
 
 import numpy as np
 import pyproj
+from shapely.ops import unary_union
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -74,7 +76,8 @@ from ingest.laz_reader import LazReadError, PointCloud, load_point_cloud, recent
 from ingest.heightmap import (
     DEFAULT_FILL_MAX_ITERATIONS_PER_LEVEL, DEFAULT_FILL_MIN_COARSE_RESOLUTION,
     DEFAULT_FILL_TOLERANCE, DEFAULT_HEIGHTMAP_RESOLUTION,
-    fill_heightmap_gaps, load_heightmap, rasterize_ground_heightmap, save_heightmap,
+    dig_water_into_heightmap, fill_heightmap_gaps, load_heightmap, rasterize_ground_heightmap,
+    save_heightmap,
 )
 from ingest.tree_detection import (
     DEFAULT_MIN_HEIGHT_M as DEFAULT_LIDAR_TREE_MIN_HEIGHT_M,
@@ -126,6 +129,9 @@ HEIGHTMAP_FILE = "heightmap.npz"
 REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
 PLACED_OBJECTS_FILE = "placedObjects2.json"
 OBJECT_LIST_FILE = "object_list.json"
+
+DEFAULT_DIG_WATER_DEPTH_M = 3.0
+DEFAULT_DIG_WATER_BUFFER_M = 1.0
 
 
 def _stamps_dir(working_dir: Path) -> Path:
@@ -1108,6 +1114,109 @@ def step_write_objects(
     })
 
 
+def step_dig_water(
+    working_dir: Path, dig_depth_m: float | None = None, buffer_m: float | None = None,
+) -> None:
+    """
+    Lowers heightmap.npz by dig_depth_m wherever an (inward-buffered)
+    OSM water polygon covers it -- see ingest/heightmap.py's
+    dig_water_into_heightmap and course_output/water.py's own module
+    docstring for the companion "water plane clips slightly into the
+    bank" half of this same idea. Meant to run once, after both Ingest
+    LAZ and Ingest OSM, before Generate/Refine Terrain -- everything
+    downstream (adaptive/scatter refinement, water-level lookup) just
+    sees the resulting recessed heightmap and needs no water-specific
+    awareness of its own; letting refine-terrain do the rest is the
+    whole point, not a separate water-aware terrain algorithm.
+
+    buffer_m shrinks each water polygon INWARD (negative buffer) before
+    determining which cells to lower, so the dug recess ends up
+    slightly SMALLER than the water body's actual mapped outline --
+    letting the water plane object (built from the ORIGINAL, un-
+    buffered polygon; see water.py) clip a little into the surrounding
+    terrain at the edges instead of floating exactly at the rim of a
+    perfectly-matching recess with a visible seam.
+
+    Modifies heightmap.npz IN PLACE (overwrites it) -- there's no
+    separate "pristine" checkpoint kept here. Running this a second
+    time therefore compounds the dig (lowers already-dug cells by
+    dig_depth_m again, not to a fixed target level) -- if you want to
+    change dig_depth_m/buffer_m after already digging once, re-run
+    Ingest LAZ first to regenerate a clean heightmap.npz, then dig
+    again. A project.json flag triggers a loud warning (not a hard
+    block) if this looks like a second run without that reset, so a
+    compounded dig is a deliberate choice, not an accident.
+    """
+    heightmap_path = working_dir / HEIGHTMAP_FILE
+    if not heightmap_path.exists():
+        raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
+
+    project = load_project(working_dir)
+    if dig_depth_m is None:
+        dig_depth_m = project.get("dig_water_depth_m", DEFAULT_DIG_WATER_DEPTH_M)
+    if buffer_m is None:
+        buffer_m = project.get("dig_water_buffer_m", DEFAULT_DIG_WATER_BUFFER_M)
+
+    if project.get("water_dig_applied"):
+        print(f"  WARNING: water digging was already applied to this {HEIGHTMAP_FILE} -- running "
+              "again will compound the dig (lower already-dug cells a second time), not re-dig to a "
+              "fixed level. Re-run Ingest LAZ first for a clean slate if that's not what you want.")
+
+    heights, bounds = load_heightmap(heightmap_path)
+
+    features = load_features(features_path)
+    features = _crop_features_to_course(working_dir, features)
+    water_features = [f for f in features if f.kind == "water"]
+    if not water_features:
+        print("  No water features found -- nothing to dig.")
+        save_project(working_dir, {
+            "water_dig_applied": True, "dig_water_depth_m": dig_depth_m, "dig_water_buffer_m": buffer_m,
+        })
+        return
+
+    buffered_geoms = []
+    skipped = 0
+    for f in water_features:
+        buffered = f.geometry.buffer(-buffer_m)
+        if buffered.is_empty:
+            skipped += 1
+            continue
+        buffered_geoms.append(buffered)
+    if skipped:
+        print(f"  {skipped} water polygon(s) collapsed to nothing under a {buffer_m} m inward "
+              "buffer (too small) -- skipped.")
+    if not buffered_geoms:
+        print("  No water polygons survived the inward buffer -- nothing to dig.")
+        save_project(working_dir, {
+            "water_dig_applied": True, "dig_water_depth_m": dig_depth_m, "dig_water_buffer_m": buffer_m,
+        })
+        return
+
+    union_geom = unary_union(buffered_geoms)
+    resolution = heights.shape[0]
+    mask = rasterize_mask(union_geom, bounds, resolution)
+    dug_cell_count = int(mask.sum())
+    print(f"Digging {dig_depth_m} m into {dug_cell_count:,} heightmap cell(s) "
+          f"({dug_cell_count / mask.size:.2%} of the course) under {len(buffered_geoms)} water "
+          f"polygon(s), each buffered inward by {buffer_m} m...")
+
+    new_heights = dig_water_into_heightmap(heights, mask, dig_depth_m)
+    save_heightmap(new_heights, bounds, heightmap_path)
+    print(f"  wrote {heightmap_path}")
+
+    save_project(working_dir, {
+        "water_dig_applied": True,
+        "dig_water_depth_m": dig_depth_m,
+        "dig_water_buffer_m": buffer_m,
+    })
+
+    print("Refreshing previews...")
+    step_visualize(working_dir)
+
+
 def step_generate_terrain(working_dir: Path, pitch: float | None = None) -> None:
     """
     pitch (feature-flagged via project.json, same None-means-use-saved
@@ -1638,6 +1747,7 @@ STEPS = {
     "ingest-laz": step_ingest_laz,
     "ingest-osm": step_ingest_osm,
     "ingest-course": step_ingest_course,
+    "dig-water": step_dig_water,
     "generate-terrain": step_generate_terrain,
     "refine-terrain": step_refine_terrain,
     "output-terrain": step_output_terrain,
@@ -1672,6 +1782,16 @@ def main(argv: list[str] | None = None) -> int:
                               "and edge bleed both derive from this automatically (radius=2*pitch, "
                               "bleed=pitch). Default: use whatever's saved in project.json, or "
                               f"{HEX_LATTICE_PITCH_M} if never set.")
+    parser.add_argument("--dig-depth", type=float, default=None,
+                         help="dig-water: how much (m) to lower heightmap.npz under each water "
+                              "polygon. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_DIG_WATER_DEPTH_M} if never set.")
+    parser.add_argument("--dig-buffer", type=float, default=None,
+                         help="dig-water: inward (negative) buffer (m) applied to each water polygon "
+                              "before determining which cells to lower -- lets the water plane object "
+                              "(built from the ORIGINAL un-buffered polygon) clip slightly into the "
+                              "surrounding terrain at the edges. Default: use whatever's saved in "
+                              f"project.json, or {DEFAULT_DIG_WATER_BUFFER_M} if never set.")
     parser.add_argument("--error-tolerance", type=float, default=2.0,
                          help="refine-terrain: |predicted - actual| (m) above which a grid "
                               "cell counts as a hotspot (default: 2.0)")
@@ -1837,6 +1957,8 @@ def main(argv: list[str] | None = None) -> int:
                 print("error: --step ingest-course requires --course-file <path>", file=sys.stderr)
                 return 1
             step_ingest_course(working_dir, args.course_file)
+        elif args.step == "dig-water":
+            step_dig_water(working_dir, args.dig_depth, args.dig_buffer)
         elif args.step == "generate-terrain":
             step_generate_terrain(working_dir, args.pitch)
         elif args.step == "refine-terrain":
