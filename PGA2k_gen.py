@@ -1202,6 +1202,7 @@ def step_refine_terrain(
     max_planar_rms: float | None = None,
     planar_shrink_factor: float | None = None,
     rad_m: float | None = None,
+    use_slope_radius: bool | None = None,
 ) -> None:
     """
     One refinement pass (see terrain/adaptive_refine.py), in one of two
@@ -1307,6 +1308,8 @@ def step_refine_terrain(
         planar_shrink_factor = project.get(
             "refine_planar_shrink_factor", DEFAULT_PLANAR_SHRINK_FACTOR
         )
+    if use_slope_radius is None:
+        use_slope_radius = project.get("refine_use_slope_radius", False)
 
     stamps = load_all_stamps(working_dir)
     pass_number = len(_refine_stamps_files(working_dir)) + 1
@@ -1322,6 +1325,10 @@ def step_refine_terrain(
 
     if max_planar_rms is not None and method == "adaptive":
         print(f"  max_planar_rms={max_planar_rms}  planar_shrink_factor={planar_shrink_factor}")
+    if use_slope_radius and method == "scatter":
+        print(f"  use_slope_radius=on -- stamp radius driven by real local terrain slope "
+              f"(np.gradient), not random jitter; planar_shrink_factor={planar_shrink_factor} is "
+              "reused as the 'how small can it shrink on steep ground' floor.")
 
     heights, _ = load_heightmap(heightmap_path)
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
@@ -1371,6 +1378,7 @@ def step_refine_terrain(
             claim_radius_fraction=claim_radius_fraction,
             brush_radius_spread_ratio=brush_radius_spread_ratio,
             jitter_factor=planar_shrink_factor,
+            use_slope_radius=use_slope_radius,
             max_new_stamps=max_new_stamps,
             mask=mask_grid,
             candidate_brushes=candidate_brushes,
@@ -1457,6 +1465,7 @@ def step_refine_terrain(
         "refine_candidate_brushes": list(candidate_brushes) if candidate_brushes is not None else None,
         "refine_max_planar_rms": max_planar_rms,
         "refine_planar_shrink_factor": planar_shrink_factor,
+        "refine_use_slope_radius": use_slope_radius,
     })
 
     print("Refreshing previews (parameters used above are now the header on the terrain previews)...")
@@ -1747,6 +1756,17 @@ def main(argv: list[str] | None = None) -> int:
                               "time it fails the max_planar_rms check, until it passes or hits "
                               "min_radius. Only matters when --max-planar-rms is set. Default: use "
                               f"whatever's saved in project.json, or {DEFAULT_PLANAR_SHRINK_FACTOR} if never set.")
+    parser.add_argument("--use-slope-radius", action=argparse.BooleanOptionalAction, default=None,
+                         help="refine-terrain, scatter method only: drive each stamp's radius from "
+                              "real local terrain slope (np.gradient over the whole grid, computed "
+                              "once) instead of random jitter -- flat ground gets large stamps, steep "
+                              "ground (valleys, ridges) gets small ones. Poisson-disc spacing becomes "
+                              "radius-aware to match (two stamps of different sizes need to be farther "
+                              "apart than two small or two large ones alike -- see terrain/"
+                              "adaptive_refine.py's scatter_stamps). --planar-shrink-factor is reused "
+                              "as the 'how small can it shrink on the steepest ground' floor, same "
+                              "role it already plays for plain random jitter when this is off. Default: "
+                              "use whatever's saved in project.json, or off if never set.")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
     parser.add_argument("--course-file", type=Path, default=None,
@@ -1829,7 +1849,8 @@ def main(argv: list[str] | None = None) -> int:
                                  args.claim_radius_fraction, args.brush_radius_spread_ratio,
                                  args.method, args.use_height_mask, args.mask_buffer_px,
                                  args.model_rebuild_interval, parsed_candidate_brushes,
-                                 args.max_planar_rms, args.planar_shrink_factor, args.rad_m)
+                                 args.max_planar_rms, args.planar_shrink_factor, args.rad_m,
+                                 args.use_slope_radius)
         elif args.step == "output-terrain":
             step_output_terrain(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-splines":
