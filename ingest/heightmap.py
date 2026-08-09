@@ -346,3 +346,23 @@ def sample_heightmap_mean(
     if np.count_nonzero(valid) < min_valid_cells:
         return None
     return float(np.mean(sub_heights[valid]))
+
+
+def dig_water_into_heightmap(
+    heights: np.ndarray, mask: np.ndarray, dig_depth_m: float,
+) -> np.ndarray:
+    """
+    Lower `heights` by dig_depth_m wherever `mask` is True. NaN gaps
+    stay NaN (subtracting from NaN is still NaN -- no special handling
+    needed). Returns a NEW array; `heights` itself is never mutated.
+
+    See PGA2k_gen.py's step_dig_water for the full workflow this is
+    one piece of -- buffering water polygons inward before rasterizing
+    into `mask` happens there, not here, so this function stays
+    agnostic to where `mask` actually came from (it's just "lower
+    these specific cells by this much", nothing water-specific about
+    the math itself).
+    """
+    new_heights = heights.copy()
+    new_heights[mask] -= dig_depth_m
+    return new_heights
