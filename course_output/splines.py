@@ -238,8 +238,23 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
     """
     Build one PGA spline dict from a single Feature, or None if this
     feature's kind isn't handled by this writer (water, hole -- see
-    module docstring).
+    module docstring) -- or is deliberately hint-only (see below).
+
+    "wood" Features carrying a leaf_type tag (natural=wood polygons
+    tagged e.g. leaf_type=needleleaved -- see course_output/objects.py's
+    apply_area_tree_type_hints) are hint-only: their sole purpose is
+    telling tree generation what species to assume for trees inside
+    them, not painting a visible ground spline. A plain natural=wood
+    polygon WITHOUT a leaf_type tag still gets its usual ground spline
+    -- this only suppresses the ones being used specifically as tree-
+    type hints. Distinct from the upcoming "object splines" (density-
+    fill vegetation scatter, v2021+ only) mentioned in prior
+    conversation: those will be real, visible splines too, just written
+    under placedObjects2.json's "objects" node, not here.
     """
+    if feature.kind == "wood" and feature.tags.get("leaf_type"):
+        return None
+
     geom = feature.geometry
     is_area = geom.geom_type == "Polygon"
     raw_points = list(geom.exterior.coords[:-1]) if is_area else list(geom.coords)
@@ -257,6 +272,7 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
 
     if feature.kind in _STATIC_SPLINE_PARAMS:
         return _build_spline(points, **_STATIC_SPLINE_PARAMS[feature.kind])
+
 
     if feature.kind in _ROAD_KIND_STYLES:
         surface, width = _ROAD_KIND_STYLES[feature.kind]
