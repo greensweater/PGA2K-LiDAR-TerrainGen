@@ -91,6 +91,7 @@ from typing import Optional
 
 import overpy
 import pyproj
+from shapely.geometry import Point
 
 from ingest.osm import Feature, latlon_to_local
 from terrain.bounding_box import BoundingBox
@@ -232,6 +233,65 @@ def lidar_trees_to_tagged(
         (x, z, {TREE_RADIUS_TAG: str(radius), TREE_HEIGHT_TAG: str(height)})
         for x, z, radius, height in trees
     ]
+
+
+# OSM natural=wood polygons' leaf_type value -> a TREE_TYPE_TAG hint
+# for any tree that falls inside without its own explicit type already
+# (see apply_area_tree_type_hints). Deliberately small and easy to
+# extend -- only what's been directly requested so far -- rather than
+# guessing at a mapping for every possible leaf_type value (e.g.
+# "broadleaved", "mixed") without a specific asset in mind for each.
+LEAF_TYPE_TREE_HINTS = {
+    "needleleaved": "pine",
+}
+
+
+def apply_area_tree_type_hints(
+    trees: list[tuple[float, float, dict]], wood_features: list[Feature],
+) -> list[tuple[float, float, dict]]:
+    """
+    For every tree in `trees` that does NOT already have its own
+    explicit TREE_TYPE_TAG (a hand-tagged OSM node, or a LIDAR-detected
+    tree some earlier call already hinted), set one from whichever
+    "wood" Feature (natural=wood polygon) it falls inside, via
+    LEAF_TYPE_TREE_HINTS -- e.g. a wood polygon tagged
+    leaf_type=needleleaved hints every untyped tree inside it as
+    "pine". A tree outside every hinted wood polygon, or inside one
+    whose leaf_type has no entry in LEAF_TYPE_TREE_HINTS, is left
+    unchanged. An explicit per-node tag (from a hand-placed OSM
+    pga_tree_type) always wins over an area hint -- this only ever
+    fills in a MISSING type, never overrides one that's already there.
+
+    wood_features must already be cropped to the course and in the
+    same local [0, COURSE_SIZE_M] frame as `trees` (same convention as
+    every other geometry this module handles). Only Polygon-geometry
+    "wood" features contribute a hint; anything else is ignored.
+
+    Returns a new list (trees itself is never mutated) -- only the
+    dicts for trees that actually get a new tag are copied, everything
+    else is passed through as the same tuple.
+    """
+    hinted_polygons = []
+    for f in wood_features:
+        if f.kind != "wood" or f.geometry.geom_type != "Polygon":
+            continue
+        hint = LEAF_TYPE_TREE_HINTS.get(f.tags.get("leaf_type"))
+        if hint is not None:
+            hinted_polygons.append((f.geometry, hint))
+    if not hinted_polygons:
+        return trees
+
+    result = []
+    for x, z, tags in trees:
+        if TREE_TYPE_TAG not in tags:
+            point = Point(x, z)
+            for polygon, hint in hinted_polygons:
+                if polygon.contains(point):
+                    tags = dict(tags)
+                    tags[TREE_TYPE_TAG] = hint
+                    break
+        result.append((x, z, tags))
+    return result
 
 
 def _placed_item(x: float, z: float, scale: float, rotation_degrees: float = 0.0) -> dict:
