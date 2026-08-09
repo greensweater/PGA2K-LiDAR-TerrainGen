@@ -141,8 +141,8 @@ class PGAGenGUI:
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
         self._cached_mask_merged_geom = None  # see _get_cached_mask_merged_geometry
         self._cached_mask_geom_key = None
-        self._cached_base_thumb = None  # see _show_preview's static-part cache
-        self._cached_base_thumb_key = None
+        self._cached_composited_base = None  # see _show_preview's static-part cache (zoom-independent)
+        self._cached_composited_base_key = None
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
@@ -1837,7 +1837,7 @@ class PGAGenGUI:
             f"\n[undo] moved {len(files)} file(s) aside with suffix .{timestamp}.undo "
             f"(click Redo to bring them back)\n"
         )
-        self._cached_base_thumb_key = None  # the on-disk "latest" just changed underneath it
+        self._cached_composited_base_key = None  # the on-disk "latest" just changed underneath it
         self._refresh_preview_and_slider()
 
     def _run_redo(self) -> None:
@@ -1860,7 +1860,7 @@ class PGAGenGUI:
             f.rename(target)
             restored += 1
         self._append_log(f"\n[redo] restored {restored} file(s) from {timestamp}\n")
-        self._cached_base_thumb_key = None
+        self._cached_composited_base_key = None
         self._refresh_preview_and_slider()
 
     def _refresh_preview_and_slider(self) -> None:
@@ -2081,23 +2081,29 @@ class PGAGenGUI:
             return
 
         try:
-            # Cache the "static" part -- base image + OSM overlay,
-            # already thumbnailed to display size -- keyed on everything
-            # that would change it. A mask-buffer slider drag changes
-            # none of these, so re-deriving this every tick (disk I/O +
-            # full-resolution compositing + LANCZOS thumbnail, all
-            # measured at hundreds of ms combined) was the actual
-            # bottleneck, not the mask rasterization itself (~5 ms).
+            # Cache the "static" part -- base image + OSM overlay, at
+            # FULL resolution, BEFORE the zoom-dependent resize -- keyed
+            # on everything that would change IT specifically. zoom is
+            # deliberately NOT part of this key: only the resize below
+            # depends on zoom, and that's a cheap, already-in-memory PIL
+            # operation, not the disk I/O + full-resolution alpha-
+            # compositing this cache exists to avoid repeating. zoom
+            # WAS part of this key before -- meaning every single zoom
+            # tick (Ctrl+scroll) forced a full cache miss, silently
+            # re-opening the base PNG from disk and re-compositing the
+            # OSM overlay on EVERY zoom step, not just when the
+            # underlying image/overlay/opacity actually changed. That's
+            # what made zooming feel slow: it was redoing the expensive
+            # part on every tick, not doing genuinely new work.
             overlay_on = self.overlay_osm_var.get()
             zoom = self.preview_zoom_var.get()
             self.preview_zoom_label.config(text=f"{zoom*100:.0f}%")
-            cache_key = (
+            composite_key = (
                 str(path), path.stat().st_mtime, overlay_on,
                 self.overlay_opacity_var.get() if overlay_on else None,
-                zoom,
             )
-            if getattr(self, "_cached_base_thumb_key", None) == cache_key:
-                base_thumb = self._cached_base_thumb
+            if getattr(self, "_cached_composited_base_key", None) == composite_key:
+                composited = self._cached_composited_base
             else:
                 img = Image.open(path).convert("RGBA")
 
@@ -2142,19 +2148,21 @@ class PGAGenGUI:
                                   f"{img.size[0]}x{img.size[1]}. Re-run Ingest OSM to regenerate it "
                                   "at the current size.")
 
-                # zoom=1.0 shows the image at its actual native
-                # resolution (1959x1780) rather than the old fixed
-                # 900x900 cap -- previously nearly 80% of the real
-                # pixel area was being thrown away before the user ever
-                # saw it. Scrollbars (see _build_preview_panel) handle
-                # the case where the zoomed image no longer fits the
-                # visible area.
-                target_w = max(1, round(img.width * zoom))
-                target_h = max(1, round(img.height * zoom))
-                img = img.resize((target_w, target_h), Image.LANCZOS)
-                base_thumb = img
-                self._cached_base_thumb = img
-                self._cached_base_thumb_key = cache_key
+                composited = img
+                self._cached_composited_base = composited
+                self._cached_composited_base_key = composite_key
+
+            # zoom=1.0 shows the image at its actual native resolution
+            # (1959x1780) rather than the old fixed 900x900 cap --
+            # nearly 80% of the real pixel area was being thrown away
+            # before the user ever saw it. Scrollbars (see
+            # _build_preview_panel) handle the case where the zoomed
+            # image no longer fits the visible area. This resize runs
+            # fresh every call (cheap, in-memory) -- only the composite
+            # above is cached.
+            target_w = max(1, round(composited.width * zoom))
+            target_h = max(1, round(composited.height * zoom))
+            base_thumb = composited.resize((target_w, target_h), Image.LANCZOS)
 
             img = base_thumb
 
