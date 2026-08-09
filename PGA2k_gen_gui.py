@@ -60,7 +60,8 @@ from course_output.objects import (  # noqa: E402
     TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, save_object_list,
 )
 from ingest.osm import (  # noqa: E402
-    GOLF_OBJECT_KINDS, build_height_mask, crop_features, merge_height_mask_features, load_features,
+    DEFAULT_HOLE_CORRIDOR_BUFFER_PX, GOLF_OBJECT_KINDS, build_height_mask, crop_features,
+    merge_height_mask_features, load_features,
     rasterize_mask_rgba, save_features, save_height_mask, shift_features,
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
@@ -779,6 +780,18 @@ class PGAGenGUI:
         filter_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_splines_list())
         ttk.Button(filter_row, text="Refresh", command=self._refresh_splines_list).pack(side="left")
 
+        hole_width_row = ttk.Frame(parent)
+        hole_width_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(hole_width_row, text="Hole width (m):").pack(side="left")
+        self.hole_corridor_buffer_var = tk.StringVar(value=str(DEFAULT_HOLE_CORRIDOR_BUFFER_PX))
+        hole_width_entry = ttk.Entry(hole_width_row, textvariable=self.hole_corridor_buffer_var, width=6)
+        hole_width_entry.pack(side="left", padx=4)
+        _Tooltip(hole_width_entry, "Buffer applied to each hole routing centerline (tee-to-green line) "
+                 "before it contributes to the height mask -- an unbuffered centerline alone would leave "
+                 "most of the actual playing corridor outside the mask. This is a BUFFER distance, "
+                 "roughly HALF the resulting corridor width, not the total width. Takes effect the next "
+                 "time Ingest OSM runs (File tab).")
+
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.splines_tree = ttk.Treeview(
@@ -1276,6 +1289,9 @@ class PGAGenGUI:
                 "--step", "ingest-osm",
                 "--height-mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}",
             ]
+            hole_corridor_buffer = self.hole_corridor_buffer_var.get().strip()
+            if hole_corridor_buffer:
+                args += ["--hole-corridor-buffer-px", hole_corridor_buffer]
             self._run_step(args, wd)
 
     def _run_dig_water(self) -> None:
