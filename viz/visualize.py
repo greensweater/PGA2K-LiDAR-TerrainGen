@@ -592,53 +592,48 @@ def render_height_preview(
 
 
 def render_ground_lidar_preview(
-    cloud: PointCloud,
+    heights: np.ndarray,
     bounds: BoundingBox,
     path: Path,
-    resolution: int = 2000,
     extra_label: Optional[str] = None,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
 ) -> None:
     """
-    Actual (not predicted) ground-only LIDAR height, binned over
-    `bounds` at the same course-cropped frame/colormap as
-    render_height_preview -- the direct "ground truth vs. our fitted
-    model" comparison, meant to be flipped back and forth against
-    preview_height.png (unlike render_lidar_heightmap/
-    render_lidar_preview, which show the *full*, uncropped merged
-    cloud and every classification, for orientation/coverage checks,
-    not this kind of apples-to-apples shape comparison).
+    Actual (not predicted) ground-only LIDAR height -- the saved,
+    already gap-filled heightmap.npz array (see ingest/heightmap.py's
+    fill_heightmap_gaps), at whatever resolution it was rasterized at
+    during Ingest LAZ -- meant to be flipped back and forth against
+    preview_height.png as a direct "ground truth vs. our fitted model"
+    comparison.
 
-    resolution defaults to 2000 (native, 1 px = 1 m), NOT
-    render_height_preview's own 400 -- that 400 is a real, deliberate
-    tradeoff there (model.render() gets genuinely expensive at high
-    resolution with a large stamp count, and it runs automatically
-    after every refine pass), but plain point binning has no such
-    cost (confirmed directly: 2 million points bin in ~1.6s at either
-    400 or 2000, i.e. resolution isn't what's expensive here, point
-    count is). Worse, a coarser grid actively works against this
-    preview's whole purpose -- at 400, each cell averages a 5x5m
-    patch together, smoothing away exactly the high-frequency
-    noise-vs-signal detail this preview exists to let you inspect.
-    The comparison against preview_height.png stays valid despite the
-    resolution mismatch (color scale, not grid density, is what makes
-    two images comparable) -- if anything, it's informative: this one
-    can show real noise the smooth fitted surface never will.
+    Deliberately switched from binning the raw point cloud directly
+    (an earlier version did, via _bin_point_cloud) to using the SAME
+    already-filled array everything downstream (refine-terrain,
+    scatter, etc.) actually operates against -- confirmed as a real,
+    reported mismatch: with the raw-point-cloud version, this preview
+    kept showing "missing data" gaps under water/buildings even when
+    Ingest LAZ's "Fill heightmap gaps" ran and successfully filled
+    them, because this preview was silently re-deriving its own,
+    never-filled view from scratch instead of showing what the
+    pipeline is actually using. "Never behave as a black box" cuts
+    both ways -- a diagnostic preview that shows something OTHER than
+    what's really being used is its own kind of black box.
 
-    Ground-only (bare_earth_only=True, see _bin_point_cloud) for the
-    same reason render_error_preview filters this way: comparing our
-    predicted terrain against building-roof or treetop elevation isn't
-    a meaningful signal for how well the terrain itself was fit.
+    One real tradeoff from this switch: the raw-point-cloud version
+    could show genuine per-point noise a filled/gridded array can't
+    (harmonic inpainting is smooth by construction) -- this preview no
+    longer serves that specific purpose. If inspecting raw point noise
+    directly becomes useful again later, that's a different, new
+    preview to add, not a reason to revert this one.
 
     vmin/vmax: see render_height_preview's own docstring -- pass the
     same values to both for a directly color-comparable pair.
     """
-    grid = _bin_point_cloud(cloud, bounds, resolution, bare_earth_only=True)
-
+    resolution = heights.shape[0]
     fig, ax = _new_figure(bounds)
     im = ax.imshow(
-        grid, origin="lower", cmap="terrain", vmin=vmin, vmax=vmax,
+        heights, origin="lower", cmap="terrain", vmin=vmin, vmax=vmax,
         extent=(bounds.min_x, bounds.max_x, bounds.min_z, bounds.max_z),
     )
     _add_colorbar(fig, im, "ground elevation (m)")
