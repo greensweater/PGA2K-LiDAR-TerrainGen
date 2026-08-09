@@ -243,37 +243,55 @@ def _new_overlay_figure(bounds: BoundingBox):
     return fig, ax
 
 
-# Distinct colors per OSM feature kind (see ingest/osm.py's classify_way).
-# Deliberately saturated/high-contrast, since this overlay is meant to
-# be composited at partial opacity over another preview -- muted colors
-# would wash out and become hard to distinguish once blended.
-_OSM_FEATURE_COLORS = {
-    "green": "#3CB371",
-    "tee": "#2E8B57",
-    "fairway": "#7CFC00",
-    "rough": "#556B2F",
-    "bunker": "#EDC9AF",
-    "water": "#4682B4",
-    "cartpath": "#8B7355",
-    "path": "#A9A9A9",
-    "building": "#B22222",
-    "wood": "#228B22",
-    "hole": "#FFD700",
+# Distinct fill/edge colors per OSM feature kind (see ingest/osm.py's
+# classify_way) -- (fill_color, edge_color), fill_color=None meaning no
+# fill at all (edge-only outline). Split into a pair (rather than one
+# color used for both, as this used to be) specifically so a kind can
+# have a transparent interior with a distinctly-colored border --
+# heavyrough/wood are large, often course-spanning background areas
+# where a solid fill would obscure everything else in this overlay,
+# but their outline still needs to be visible and distinguishable from
+# each other.
+_OSM_FEATURE_STYLES: dict[str, tuple[Optional[str], str]] = {
+    "green": ("#3CB371", "#3CB371"),
+    "tee": ("#2E8B57", "#2E8B57"),
+    "fairway": ("#7CFC00", "#7CFC00"),
+    "rough": ("#556B2F", "#556B2F"),
+    "heavyrough": (None, "#006400"),         # transparent, dark green border
+    "bunker": ("#EDC9AF", "#EDC9AF"),
+    "water": ("#4682B4", "#4682B4"),
+    "cartpath": ("#FFFFFF", "#FFFFFF"),      # white
+    "service_road": ("#808080", "#000000"),  # same as roadway
+    "roadway": ("#808080", "#000000"),       # same fill as pavement, black border
+    "path": ("#A9A9A9", "#A9A9A9"),
+    "pavement": ("#808080", "#FFFFFF"),      # gray, darker than path's; white border
+    "building": ("#B22222", "#B22222"),
+    "wood": (None, "#90EE90"),               # transparent, light green border
+    "mulch": ("#C8A165", "#C8A165"),         # light brown, solid fill (like cartpath's old style)
+    "hole": ("#FFD700", "#FFD700"),
 }
 _OSM_DEFAULT_COLOR = "#FF00FF"  # unclassified kind -- deliberately jarring so it's obvious
 
 
+def _feature_style(kind: str) -> tuple[Optional[str], str]:
+    """(fill_color_or_None, edge_color) for an OSM feature kind -- see _OSM_FEATURE_STYLES."""
+    return _OSM_FEATURE_STYLES.get(kind, (_OSM_DEFAULT_COLOR, _OSM_DEFAULT_COLOR))
+
+
 def _draw_osm_feature(ax, feature: Feature) -> None:
-    color = _OSM_FEATURE_COLORS.get(feature.kind, _OSM_DEFAULT_COLOR)
+    fill_color, edge_color = _feature_style(feature.kind)
     geom = feature.geometry
     parts = geom.geoms if hasattr(geom, "geoms") else [geom]
     for part in parts:
         if part.geom_type == "Polygon":
             xs, zs = part.exterior.xy
-            ax.fill(xs, zs, facecolor=color, edgecolor=color, alpha=0.55, linewidth=1.2)
+            if fill_color is None:
+                ax.fill(xs, zs, facecolor="none", edgecolor=edge_color, alpha=0.9, linewidth=1.5)
+            else:
+                ax.fill(xs, zs, facecolor=fill_color, edgecolor=edge_color, alpha=0.55, linewidth=1.2)
         elif part.geom_type == "LineString":
             xs, zs = part.xy
-            ax.plot(xs, zs, color=color, linewidth=2.0, alpha=0.85, solid_capstyle="round")
+            ax.plot(xs, zs, color=edge_color, linewidth=2.0, alpha=0.85, solid_capstyle="round")
 
 
 def render_osm_features(
@@ -308,14 +326,14 @@ def render_osm_features(
         ))
 
     if kinds_present:
-        handles = [
-            Line2D(
+        handles = []
+        for kind in sorted(kinds_present):
+            fill_color, edge_color = _feature_style(kind)
+            handles.append(Line2D(
                 [0], [0], marker="s", linestyle="", markersize=8,
-                markerfacecolor=_OSM_FEATURE_COLORS.get(kind, _OSM_DEFAULT_COLOR),
-                markeredgecolor="black", label=kind,
-            )
-            for kind in sorted(kinds_present)
-        ]
+                markerfacecolor=fill_color if fill_color is not None else "none",
+                markeredgecolor=edge_color, markeredgewidth=1.5, label=kind,
+            ))
         if crop_box is not None:
             handles.append(Line2D([0], [0], color="red", linestyle="--", linewidth=2.0, label="course crop"))
         ax.legend(handles=handles, loc="upper right", fontsize=6, framealpha=0.7)
