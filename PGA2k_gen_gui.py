@@ -517,10 +517,22 @@ class PGAGenGUI:
                   self.max_planar_rms_var, required=False)
         add_field(3, 1, "planar_shrink", "SHR %", "adaptive: how much to shrink a hotspot's radius "
                   "each time it fails the max planar-fit RMS check (only used when PLN m is set). "
-                  "scatter: repurposed as radius jitter -- each stamp's radius is randomized within "
-                  "[RAD * SHR%, RAD], so centers arrange themselves organically instead of a visibly "
-                  "uniform lattice. 1.0 disables jitter (every stamp is exactly RAD).",
+                  "scatter: repurposed as radius jitter (when Slope is off) -- each stamp's radius is "
+                  "randomized within [RAD * SHR%, RAD], so centers arrange themselves organically "
+                  "instead of a visibly uniform lattice. When Slope is on, this instead becomes the "
+                  "floor for how small a stamp can shrink to on the steepest ground. 1.0 disables "
+                  "shrinking either way (every stamp is exactly RAD).",
                   self.planar_shrink_var, required=False)
+
+        self.use_slope_radius_var = tk.BooleanVar(value=False)
+        slope_checkbox = ttk.Checkbutton(grid_frame, text="Slope", variable=self.use_slope_radius_var)
+        slope_checkbox.grid(row=3, column=2, sticky="w", padx=3, pady=2)
+        _Tooltip(slope_checkbox, "scatter only: drive each stamp's radius from real local terrain "
+                 "slope (computed once, over the whole grid) instead of random jitter -- flat ground "
+                 "gets large stamps, steep ground (valleys, ridges) gets small ones. Poisson-disc "
+                 "spacing becomes radius-aware to match, so differently-sized nearby stamps still "
+                 "can't overlap. SHR % is reused as the 'how small can it shrink on the steepest "
+                 "ground' floor -- same role it plays for plain jitter when this is off.")
 
         self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
 
@@ -1322,10 +1334,18 @@ class PGAGenGUI:
         model_rebuild_interval = self.model_rebuild_interval_var.get().strip()
         if model_rebuild_interval:
             args += ["--model-rebuild-interval", model_rebuild_interval]
+        # Always sent, not just when max_planar_rms is set: SHR% also
+        # controls scatter mode's radius jitter/slope-shrink floor
+        # (see the "Slope" checkbox), which has nothing to do with
+        # max_planar_rms at all -- gating it behind that meant scatter
+        # mode never actually received whatever was typed into this
+        # field, silently using the backend default instead regardless
+        # of what the GUI showed.
+        args += ["--planar-shrink-factor", self.planar_shrink_var.get().strip()]
         max_planar_rms = self.max_planar_rms_var.get().strip()
         if max_planar_rms:
-            args += ["--max-planar-rms", max_planar_rms,
-                      "--planar-shrink-factor", self.planar_shrink_var.get().strip()]
+            args += ["--max-planar-rms", max_planar_rms]
+        args.append("--use-slope-radius" if self.use_slope_radius_var.get() else "--no-use-slope-radius")
         self._run_step(args, wd)
         self._refresh_refine_stats()
 
