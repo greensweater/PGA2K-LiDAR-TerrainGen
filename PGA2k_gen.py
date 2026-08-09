@@ -110,7 +110,7 @@ from terrain.adaptive_refine import (
 )
 from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
-from terrain.hexgrid import generate_hex_grid
+from terrain.hexgrid import HEX_LATTICE_PITCH_M, generate_hex_grid
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
 from course_output.userLayers import (
@@ -1108,12 +1108,30 @@ def step_write_objects(
     })
 
 
-def step_generate_terrain(working_dir: Path) -> None:
+def step_generate_terrain(working_dir: Path, pitch: float | None = None) -> None:
+    """
+    pitch (feature-flagged via project.json, same None-means-use-saved
+    pattern used throughout this file) is terrain/hexgrid.py's
+    HEX_LATTICE_PITCH_M, exposed here rather than hardcoded -- controls
+    the spacing of the initial coarse hex-grid stamp lattice (smaller
+    pitch = more, smaller, more tightly-packed initial stamps). Stamp
+    radius and edge bleed both derive from pitch using the exact same
+    ratios hexgrid.py's own module-level constants encode (radius =
+    2*pitch, bleed = radius/2 = pitch) -- generate_hex_grid() itself
+    only defaults those two to the ORIGINAL fixed pitch's values (Python
+    default arguments are evaluated once, not re-derived from whatever
+    `pitch` is actually passed), so both are computed explicitly here
+    for whatever pitch is in play, not left to fall back silently.
+    """
     pointcloud_path = working_dir / POINTCLOUD_FILE
     if not pointcloud_path.exists():
         raise StepError(
             f"No {POINTCLOUD_FILE} found under {working_dir}. Run --step ingest-laz first."
         )
+
+    project = load_project(working_dir)
+    if pitch is None:
+        pitch = project.get("generate_terrain_pitch_m", HEX_LATTICE_PITCH_M)
 
     print(f"Loading {pointcloud_path}...")
     full_cloud = PointCloud.load(pointcloud_path)
@@ -1131,8 +1149,10 @@ def step_generate_terrain(working_dir: Path) -> None:
         raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
     heightmap, _ = load_heightmap(heightmap_path)
 
-    print("Generating hex grid...")
-    stamps = generate_hex_grid(bounds)
+    stamp_radius = 2.0 * pitch
+    bleed = stamp_radius / 2.0
+    print(f"Generating hex grid (pitch={pitch} m, stamp_radius={stamp_radius} m, bleed={bleed} m)...")
+    stamps = generate_hex_grid(bounds, pitch=pitch, stamp_radius=stamp_radius, bleed=bleed)
     print(f"  {len(stamps)} stamps placed")
 
     print("Fitting stamp heights from the rasterized ground heightmap...")
@@ -1151,7 +1171,7 @@ def step_generate_terrain(working_dir: Path) -> None:
     out_path = _stamps_dir(working_dir) / INITIAL_STAMPS_FILE
     save_stamp_file(
         fitted, out_path, step="generate-terrain",
-        parameters={"course_size_m": COURSE_SIZE_M},
+        parameters={"course_size_m": COURSE_SIZE_M, "pitch_m": pitch},
     )
     print(f"  wrote {out_path}")
 
@@ -1159,6 +1179,7 @@ def step_generate_terrain(working_dir: Path) -> None:
         "course_origin_x": course_cloud.origin_x,
         "course_origin_y": course_cloud.origin_y,
         "stamp_count": len(fitted),
+        "generate_terrain_pitch_m": pitch,
     })
 
     print("Refreshing previews...")
@@ -1635,6 +1656,13 @@ def main(argv: list[str] | None = None) -> int:
                               "flood-fill (see ingest/heightmap.py's fill_heightmap_gaps). On by "
                               "default; pass --no-fill-heightmap-gaps to leave gaps as NaN, excluded "
                               "from error scoring/fitting downstream (old behavior).")
+    parser.add_argument("--pitch", type=float, default=None,
+                         help="generate-terrain: spacing (m) of the initial coarse hex-grid stamp "
+                              "lattice (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch "
+                              "means more, smaller, more tightly-packed initial stamps. Stamp radius "
+                              "and edge bleed both derive from this automatically (radius=2*pitch, "
+                              "bleed=pitch). Default: use whatever's saved in project.json, or "
+                              f"{HEX_LATTICE_PITCH_M} if never set.")
     parser.add_argument("--error-tolerance", type=float, default=2.0,
                          help="refine-terrain: |predicted - actual| (m) above which a grid "
                               "cell counts as a hotspot (default: 2.0)")
@@ -1790,7 +1818,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             step_ingest_course(working_dir, args.course_file)
         elif args.step == "generate-terrain":
-            step_generate_terrain(working_dir)
+            step_generate_terrain(working_dir, args.pitch)
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
                 tuple(int(b.strip()) for b in args.candidate_brushes.split(","))
