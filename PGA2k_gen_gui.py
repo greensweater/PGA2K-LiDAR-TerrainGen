@@ -143,6 +143,7 @@ class PGAGenGUI:
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
+        self._selection_preview_job = None  # see _on_spline_selected's debounce
         self._suppress_course_name_save = False
         self._suppress_repack_filename_save = False
         self._suppress_game_version_save = False
@@ -1006,8 +1007,25 @@ class PGAGenGUI:
             )
 
     def _on_spline_selected(self) -> None:
+        """
+        <<TreeviewSelect>> fires once PER CLICK during a multi-select
+        gesture (ctrl-click, shift-click extending a range) -- not
+        once for the whole final selection. Calling _show_preview()
+        (a real image redraw) synchronously here would redraw once per
+        click while building up a multi-select, before the mask toggle
+        the user's actually going for even runs. Debounced instead:
+        each call cancels any still-pending redraw and schedules a new
+        one a short delay out, so a rapid run of clicks collapses into
+        a single redraw once selection actually settles.
+        """
         selection = self.splines_tree.selection()
         self._highlighted_feature_osm_ids = {int(s) for s in selection}
+        if self._selection_preview_job is not None:
+            self.root.after_cancel(self._selection_preview_job)
+        self._selection_preview_job = self.root.after(150, self._show_preview_after_selection)
+
+    def _show_preview_after_selection(self) -> None:
+        self._selection_preview_job = None
         self._show_preview()
 
     def _regenerate_height_mask(self, working_dir: Path) -> None:
@@ -1049,9 +1067,19 @@ class PGAGenGUI:
         save_features(self._splines_features, Path(wd) / FEATURES_FILE)
         self._regenerate_height_mask(Path(wd))
         self._refresh_splines_list()
-        for osm_id in selected_ids:
-            if self.splines_tree.exists(str(osm_id)):
-                self.splines_tree.selection_add(str(osm_id))
+        # One batched call, not one .selection_add() per id: each
+        # individual call fires its own separate <<TreeviewSelect>>
+        # event (Tkinter doesn't coalesce these), so restoring a
+        # selection of hundreds of splines one at a time queued
+        # hundreds of events -- each triggering a selection readback
+        # that itself grows more expensive as the loop progressed
+        # (O(n) per read, O(n^2) total) -- which is what was actually
+        # locking up the UI on a large multi-select, not the toggle
+        # logic itself (already single-pass) or even _show_preview
+        # (already debounced, see _on_spline_selected).
+        restorable_ids = [str(i) for i in selected_ids if self.splines_tree.exists(str(i))]
+        if restorable_ids:
+            self.splines_tree.selection_set(restorable_ids)
         self._show_preview()
 
     def _toggle_all_mask(self) -> None:
