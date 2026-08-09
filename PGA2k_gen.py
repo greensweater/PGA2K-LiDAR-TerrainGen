@@ -512,7 +512,14 @@ def step_ingest_laz(
         BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M),
         resolution=DEFAULT_HEIGHTMAP_RESOLUTION,
     )
-    coverage = np.mean(np.isfinite(heightmap))
+    # float(), not the raw numpy scalar np.mean() returns -- otherwise
+    # `coverage < 1.0` below is numpy.bool_, not a real Python bool.
+    # json.dump can't serialize numpy.bool_ at all (a real, confirmed
+    # failure: it broke save_project's "heightmap_gaps_filled" entry,
+    # since `fill_heightmap and coverage < 1.0`'s `and` returns that
+    # second operand -- the numpy.bool_ -- completely unconverted
+    # whenever fill_heightmap is truthy).
+    coverage = float(np.mean(np.isfinite(heightmap)))
     print(f"  {coverage:.1%} of cells have at least one bare-earth point "
           f"({(1 - coverage):.1%} gap -- water, buildings, other no-data areas)")
 
