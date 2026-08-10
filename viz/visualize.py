@@ -513,7 +513,13 @@ def render_hex_preview(
     # s is marker AREA in points^2 (matplotlib convention), not pixels or
     # diameter -- 0.4 is the exact area giving a 1px-diameter marker at
     # this module's _DPI=100 (s=2, the old value, rendered at ~2.2px).
-    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=0.4, zorder=3)
+    # linewidths=0 matters as much as s here: scatter's default stroke
+    # (~1.5pt, ~2px at this DPI) is otherwise LARGER than the fill
+    # itself, so without this the outline -- not the fill -- dominates
+    # what actually renders, and a stroke that thin relative to its own
+    # circle can rasterize as a cross/star rather than a clean ring.
+    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=0.4,
+               linewidths=0, zorder=3)
 
     used_brushes = sorted(set(s.brush for s in stamps))
     handles = [
@@ -543,8 +549,10 @@ def render_stamps_preview(
     coll.set_array(values)
     coll.set_cmap("terrain")
     ax.add_collection(coll)
-    # See render_hex_preview's comment: s=0.4 -> 1px-diameter marker at _DPI=100.
-    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=0.4, zorder=3)
+    # See render_hex_preview's comment: s=0.4 -> 1px-diameter marker at
+    # _DPI=100, linewidths=0 -> no default stroke dominating that fill.
+    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=0.4,
+               linewidths=0, zorder=3)
 
     _add_colorbar(fig, coll, "fitted value (m)")
     _set_title(ax, f"Stamp values ({len(stamps)} stamps)", extra_label)
