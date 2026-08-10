@@ -72,6 +72,21 @@ from terrain.hexgrid import HEX_LATTICE_PITCH_M  # noqa: E402
 from shapely.ops import unary_union  # noqa: E402
 import viz.visualize as viz  # noqa: E402
 
+try:
+    # Same interface adaptive_refine.py already relies on for real
+    # scoring (TerrainKernel(BRUSH_PROFILES[brush]).sample_many(r_norm)) --
+    # reused here, not reimplemented, so the influence overlay reflects
+    # the SAME kernel the actual pipeline evaluates terrain with. Wrapped
+    # defensively since this GUI file hasn't independently verified
+    # terrain_kernel.py's exact API beyond that established call pattern;
+    # a mismatch here should degrade to the plain coverage overlay, not
+    # crash preview rendering entirely.
+    from terrain.brush_profiles import BRUSH_PROFILES  # noqa: E402
+    from terrain.terrain_kernel import TerrainKernel  # noqa: E402
+    _HAVE_TERRAIN_KERNEL = True
+except ImportError:
+    _HAVE_TERRAIN_KERNEL = False
+
 PREVIEW_FILES = [
     "preview_lidar_heightmap.png",
     "preview_lidar.png",
@@ -953,19 +968,22 @@ class PGAGenGUI:
         stamp_cov_row.pack(fill="x", pady=(4, 0))
         self.show_stamp_coverage_var = tk.BooleanVar(value=False)
         stamp_cov_checkbox = ttk.Checkbutton(
-            stamp_cov_row, text="Show stamp coverage (Elevation contour)",
+            stamp_cov_row, text="Show stamp influence (Elevation contour)",
             variable=self.show_stamp_coverage_var, command=self._show_preview,
         )
         stamp_cov_checkbox.pack(side="left")
         _Tooltip(stamp_cov_checkbox, "Only has an effect while Elevation contour is also checked. "
-                 "Reads the real current stamp list (initial_stamps.json + every refine_stamps_N.json, "
-                 "via load_all_stamps) and rasterizes which cells of the elevation band are actually "
-                 "reached by SOME stamp's own placement radius: GREEN = in-band and covered, RED = "
-                 "in-band and NOT covered by anything -- the real gaps, not inferred from the "
-                 "heightmap's shape alone. Coverage itself doesn't depend on the slider/width, so it's "
-                 "computed once per stamp-list version and cached -- the first toggle (or first check "
-                 "after a new refine-terrain pass) can take a few seconds at real stamp counts, "
-                 "dragging the slider after that is instant.")
+                 "Reads the real current stamp list (initial_stamps.json + every refine_stamps_N.json) "
+                 "and, for every cell in the elevation band, evaluates the REAL kernel weight (via "
+                 "terrain.terrain_kernel.TerrainKernel -- the same kernel adaptive_refine.py scores "
+                 "candidates with) from whichever stamp pulls hardest there -- not just whether some "
+                 "stamp's nominal radius geometrically reaches it. Pure RED = untouched by anything, "
+                 "pure GREEN = strongly pulled, anything in between (orange/yellow) is geometrically "
+                 "'covered' but only weakly influenced -- exactly the gap a soft-falloff brush (type "
+                 "10/9/54) leaves near its own nominal radius. If a region reads solid green under the "
+                 "old binary check but still looks unfilled visually, this is what actually explains "
+                 "it. Cached same as before -- first toggle (or first check after a new refine-terrain "
+                 "pass) can take a few seconds, instant after that.")
 
     _SPLINE_KIND_FILTERS = (
         "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
@@ -2317,32 +2335,59 @@ class PGAGenGUI:
         self._cached_stamps_key = cache_key
         return stamps
 
-    def _get_cached_stamp_coverage_mask(self, working_dir: Path, shape: tuple[int, int]):
+    def _get_cached_stamp_influence(self, working_dir: Path, shape: tuple[int, int]):
         """
-        Rasterize which cells of a `shape`-sized grid (matching the
-        heightmap's own array shape, not any preview PNG's pixel size)
-        are reached by ANY stamp's own placement radius -- a STATIC
-        property of the stamp list, independent of the elevation-
-        contour slider/width, so this is cached and keyed on the same
-        stamp-file mtimes as _get_cached_stamps rather than recomputed
-        on every tick. Expensive at real stamp counts (one pass per
-        stamp -- can take a few seconds the first time, or after a new
-        refine-terrain pass); cheap to reuse after that.
+        Real weighted influence, not binary coverage: for every cell,
+        the MAX kernel weight (0..1, via terrain.terrain_kernel.
+        TerrainKernel -- the same kernel adaptive_refine.py already
+        scores candidates with) among every stamp whose radius reaches
+        it. A point can sit well inside a soft-falloff brush's (type
+        10/9/54) nominal radius while its real weight there is close to
+        0 -- confirmed as the actual issue behind "100% covered, still
+        looks unfilled": binary radius-only coverage can't distinguish
+        "geometrically reached" from "meaningfully pulled," and this
+        can.
+
+        One TerrainKernel per brush type (4 total: 8/9/10/54), not per
+        stamp -- construction cost, whatever it is, shouldn't be paid
+        hundreds of thousands of times over.
+
+        Static property of the stamp list, independent of the
+        elevation slider/width, same caching rationale as the old
+        binary coverage mask this replaces -- expensive the first time
+        (or after a new refine-terrain pass), cheap on every slider
+        tick after that.
+
+        Returns None if terrain.terrain_kernel/terrain.brush_profiles
+        aren't importable as expected (see the try/except at module
+        level) or there are no stamps yet.
         """
+        if not _HAVE_TERRAIN_KERNEL:
+            return None
         stamps = self._get_cached_stamps(working_dir)
         if stamps is None:
             return None
         cache_key = (self._cached_stamps_key, shape)
-        if getattr(self, "_cached_stamp_coverage_key", None) == cache_key:
-            return self._cached_stamp_coverage_mask
+        if getattr(self, "_cached_stamp_influence_key", None) == cache_key:
+            return self._cached_stamp_influence
+
+        kernels: dict[int, "TerrainKernel"] = {}
+
+        def _kernel_for(brush: int):
+            if brush not in kernels:
+                kernels[brush] = TerrainKernel(BRUSH_PROFILES[brush])
+            return kernels[brush]
 
         n_rows, n_cols = shape
         cell_x = COURSE_SIZE_M / n_cols
         cell_z = COURSE_SIZE_M / n_rows
         x_centers = (np.arange(n_cols) + 0.5) * cell_x
         z_centers = (np.arange(n_rows) + 0.5) * cell_z
-        covered = np.zeros(shape, dtype=bool)
+        influence = np.zeros(shape, dtype=np.float32)
+
         for s in stamps:
+            if s.radius <= 0:
+                continue
             col_min = max(0, int((s.x - s.radius) / cell_x))
             col_max = min(n_cols, int((s.x + s.radius) / cell_x) + 1)
             row_min = max(0, int((s.z - s.radius) / cell_z))
@@ -2352,12 +2397,19 @@ class PGAGenGUI:
             sub_x = x_centers[col_min:col_max]
             sub_z = z_centers[row_min:row_max]
             xx, zz = np.meshgrid(sub_x, sub_z)
-            within = np.hypot(xx - s.x, zz - s.z) <= s.radius
-            covered[row_min:row_max, col_min:col_max] |= within
+            dist = np.hypot(xx - s.x, zz - s.z)
+            within = dist <= s.radius
+            if not within.any():
+                continue
+            r_norm = np.clip(dist[within] / s.radius, 0.0, 1.0)
+            weight = _kernel_for(s.brush).sample_many(r_norm)
 
-        self._cached_stamp_coverage_mask = covered
-        self._cached_stamp_coverage_key = cache_key
-        return covered
+            sub_view = influence[row_min:row_max, col_min:col_max]
+            sub_view[within] = np.maximum(sub_view[within], weight)
+
+        self._cached_stamp_influence = influence
+        self._cached_stamp_influence_key = cache_key
+        return influence
 
     def _on_elevation_contour_toggle(self) -> None:
         """
@@ -2606,22 +2658,27 @@ class PGAGenGUI:
 
                     band_rgba = np.zeros((*band.shape, 4), dtype=np.uint8)
                     if self.show_stamp_coverage_var.get():
-                        coverage = self._get_cached_stamp_coverage_mask(Path(wd), heights.shape)
-                        if coverage is not None:
-                            covered_in_band = band & coverage
-                            uncovered_in_band = band & ~coverage
-                            # GREEN: in-band and reached by some stamp's own
-                            # radius. RED: in-band and reached by nothing --
-                            # the real gaps, read directly off the actual
-                            # stamp list rather than inferred from shape.
-                            band_rgba[covered_in_band] = (0, 220, 0, 255)
-                            band_rgba[uncovered_in_band] = (255, 0, 0, 255)
+                        influence = self._get_cached_stamp_influence(Path(wd), heights.shape)
+                        if influence is not None:
+                            in_band_weight = influence[band]
+                            # Continuous RED (weight=0, untouched) -> GREEN
+                            # (weight=1, strongly pulled) -- a solidly green
+                            # region under the OLD binary check that still
+                            # reads orange/yellow here is exactly a soft-
+                            # brush "geometrically covered, weakly pulled"
+                            # zone, not a rendering artifact.
+                            rows_idx, cols_idx = np.nonzero(band)
+                            band_rgba[rows_idx, cols_idx, 0] = np.clip((1.0 - in_band_weight) * 255, 0, 255).astype(np.uint8)
+                            band_rgba[rows_idx, cols_idx, 1] = np.clip(in_band_weight * 255, 0, 255).astype(np.uint8)
+                            band_rgba[rows_idx, cols_idx, 3] = 255
+                        elif not _HAVE_TERRAIN_KERNEL:
+                            # terrain.terrain_kernel didn't import as
+                            # expected -- degrade to plain band rendering
+                            # rather than silently showing nothing, per
+                            # this checkbox's tooltip.
+                            band_rgba[band, :3] = 255
+                            band_rgba[band, 3] = 255
                         else:
-                            # No stamps yet (or none loadable) -- fall back
-                            # to the plain band rendering rather than
-                            # showing nothing, so toggling this on early
-                            # in the pipeline doesn't look like a silent
-                            # failure.
                             band_rgba[band, :3] = 255
                             band_rgba[band, 3] = 255
                     else:
