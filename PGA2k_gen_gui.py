@@ -411,16 +411,84 @@ class PGAGenGUI:
         self._add_step_button(parent, "Visualize", self._run_visualize)
 
     def _build_terrain_tab(self, parent: ttk.Frame) -> None:
+        gen_method_row = ttk.Frame(parent)
+        gen_method_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(gen_method_row, text="Method:").pack(side="left")
+        self.generate_terrain_method_var = tk.StringVar(value="hex")
+        gen_method_box = ttk.Combobox(
+            gen_method_row, textvariable=self.generate_terrain_method_var, state="readonly", width=10,
+            values=["hex", "contour"],
+        )
+        gen_method_box.pack(side="left", padx=4)
+        _Tooltip(gen_method_box, "hex: flat hex-grid lattice (the original behavior). contour: traces "
+                 "elevation-band contours of the real heightmap and places stamps along each ring, "
+                 "spaced by local curvature, with a gap-fill pass for flat interiors (greens, ponds) "
+                 "ring-tracing structurally can't reach on its own -- see terrain/contour_layers.py.")
+
         pitch_row = ttk.Frame(parent)
         pitch_row.pack(fill="x", pady=(0, 4))
         ttk.Label(pitch_row, text="Pitch (m):").pack(side="left")
         self.pitch_var = tk.StringVar(value=str(HEX_LATTICE_PITCH_M))
         pitch_entry = ttk.Entry(pitch_row, textvariable=self.pitch_var, width=8)
         pitch_entry.pack(side="left", padx=4)
-        _Tooltip(pitch_entry, "Spacing (m) of the initial coarse hex-grid stamp lattice "
-                 "(terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch means more, smaller, "
-                 "more tightly-packed initial stamps. Stamp radius and edge bleed both derive from "
-                 "this automatically (radius=2*pitch, bleed=pitch), no separate fields needed.")
+        _Tooltip(pitch_entry, "hex method only: spacing (m) of the initial coarse hex-grid stamp "
+                 "lattice (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch means more, "
+                 "smaller, more tightly-packed initial stamps. Stamp radius and edge bleed both "
+                 "derive from this automatically (radius=2*pitch, bleed=pitch), no separate fields "
+                 "needed.")
+
+        contour_frame = ttk.Frame(parent)
+        contour_frame.pack(anchor="w", fill="x", pady=(0, 4))
+
+        def add_contour_field(row, col, var, label, tooltip):
+            cell = ttk.Frame(contour_frame)
+            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+            lbl = ttk.Label(cell, text=label)
+            lbl.pack(anchor="w")
+            entry = ttk.Entry(cell, textvariable=var, width=8)
+            entry.pack(anchor="w")
+            _Tooltip(lbl, tooltip)
+            _Tooltip(entry, tooltip)
+
+        self.band_spacing_var = tk.StringVar(value="5")
+        self.contour_brush_var = tk.StringVar(value="10")
+        self.min_ring_radius_var = tk.StringVar(value="5")
+        self.max_ring_radius_var = tk.StringVar(value="50")
+        self.curvature_window_var = tk.StringVar(value="10")
+        self.curvature_contrast_gamma_var = tk.StringVar(value="2")
+        self.gap_fill_brush_var = tk.StringVar(value="10")
+        self.min_gap_radius_var = tk.StringVar(value="5")
+        self.gap_fill_resolution_var = tk.StringVar(value="400")
+
+        add_contour_field(0, 0, self.band_spacing_var, "BAND m",
+                           "contour method only: elevation spacing (m) between traced bands -- "
+                           "smaller means more bands, denser coverage on sloped terrain, more "
+                           "stamps overall. Tweak and re-run to see how it behaves in the preview.")
+        add_contour_field(0, 1, self.contour_brush_var, "BRUSH",
+                           "contour method only: brush type placed along each ring -- 10 or 54 "
+                           "(no flat plateau) recommended so adjacent bands blend instead of "
+                           "showing terrace edges.")
+        add_contour_field(0, 2, self.min_ring_radius_var, "MIN m",
+                           "contour method only: smallest allowed along-ring stamp radius (m), "
+                           "used at the sharpest bends.")
+        add_contour_field(1, 0, self.max_ring_radius_var, "MAX m",
+                           "contour method only: largest allowed along-ring stamp radius (m), used "
+                           "on the straightest runs -- also the cap used for gap-fill stamp radius.")
+        add_contour_field(1, 1, self.curvature_window_var, "CRV m",
+                           "contour method only: arc-length window (m) used to estimate each ring "
+                           "vertex's local curvature.")
+        add_contour_field(1, 2, self.curvature_contrast_gamma_var, "GAM",
+                           "contour method only: exponent sharpening the curvature-to-radius map "
+                           "toward the extremes (>1 sharpens, 1.0 is linear).")
+        add_contour_field(2, 0, self.gap_fill_brush_var, "GAP BR",
+                           "contour method only: brush type used for the gap-fill pass that closes "
+                           "flat interiors (greens, ponds) ring-tracing can't reach.")
+        add_contour_field(2, 1, self.min_gap_radius_var, "GAP MIN",
+                           "contour method only: smallest allowed gap-fill stamp radius (m).")
+        add_contour_field(2, 2, self.gap_fill_resolution_var, "GAP RES",
+                           "contour method only: coverage-mask grid resolution the gap-fill pass "
+                           "runs against -- finer catches smaller gaps at higher cost.")
+
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -1401,10 +1469,38 @@ class PGAGenGUI:
     def _run_generate_terrain(self) -> None:
         wd = self._require_working_dir()
         if wd:
-            args = ["--step", "generate-terrain"]
+            args = ["--step", "generate-terrain",
+                     "--generate-terrain-method", self.generate_terrain_method_var.get()]
             pitch = self.pitch_var.get().strip()
             if pitch:
                 args += ["--pitch", pitch]
+            band_spacing = self.band_spacing_var.get().strip()
+            if band_spacing:
+                args += ["--band-spacing-m", band_spacing]
+            contour_brush = self.contour_brush_var.get().strip()
+            if contour_brush:
+                args += ["--contour-brush", contour_brush]
+            min_ring_radius = self.min_ring_radius_var.get().strip()
+            if min_ring_radius:
+                args += ["--min-ring-radius", min_ring_radius]
+            max_ring_radius = self.max_ring_radius_var.get().strip()
+            if max_ring_radius:
+                args += ["--max-ring-radius", max_ring_radius]
+            curvature_window = self.curvature_window_var.get().strip()
+            if curvature_window:
+                args += ["--curvature-window-m", curvature_window]
+            curvature_contrast_gamma = self.curvature_contrast_gamma_var.get().strip()
+            if curvature_contrast_gamma:
+                args += ["--curvature-contrast-gamma", curvature_contrast_gamma]
+            gap_fill_brush = self.gap_fill_brush_var.get().strip()
+            if gap_fill_brush:
+                args += ["--gap-fill-brush", gap_fill_brush]
+            min_gap_radius = self.min_gap_radius_var.get().strip()
+            if min_gap_radius:
+                args += ["--min-gap-radius", min_gap_radius]
+            gap_fill_resolution = self.gap_fill_resolution_var.get().strip()
+            if gap_fill_resolution:
+                args += ["--gap-fill-resolution", gap_fill_resolution]
             self._run_step(args, wd)
 
     def _validate_refine_fields(self) -> bool:
