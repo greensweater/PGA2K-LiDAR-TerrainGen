@@ -50,12 +50,17 @@ capped hilltops; connected components of (heights < A) whose own min
 height never reaches the previous level are capped pits (a pond that
 doesn't bottom out below the previous ring, or literally the course's
 lowest terrain, below the lowest traced level, always counts). Both
-reuse a dist_field already computed above (or its below-level mirror)
-restricted to just that component, and get filled with LARGE, HARD
-stamps (type 54/73 by default) via simple greedy largest-first
-placement -- interiors don't need the boundary passes' fine, curvature-
-matched footprint, they need coverage with as few stamps as reasonably
-possible.
+get filled via greedy largest-first placement (type 8 by default --
+NOT 54, which measures at only ~62% vertical amplitude of type 8 per
+2k25_terrain_arch.txt's own brush data, too soft/short-reaching for a
+fill whose entire job is guaranteeing coverage) with the distance
+transform recomputed LIVE against the shrinking remaining area each
+iteration, cropped to the region's own bounding box -- see
+_fill_region_greedy's docstring for why a single precomputed field
+(an earlier version's approach) leaves real gaps near a region's true
+edge once its middle gets claimed. Interiors don't need the boundary
+passes' fine, curvature-matched footprint, they need coverage with as
+few stamps as reasonably possible.
 
 Caveat worth being upfront about: this component check operates on the
 WHOLE connected landmass, so it correctly catches genuinely isolated
@@ -106,7 +111,10 @@ DEFAULT_MAX_RING_RADIUS_M = 50.0
 DEFAULT_RING_SPACING_FRACTION = 0.5  # spacing = radius * this; matches Chad's radius=2x-spacing rule
 
 # Capped hilltop/pit interior fills -- large, hard stamps; few needed by design
-DEFAULT_INTERIOR_BRUSH = 54
+DEFAULT_INTERIOR_BRUSH = 8  # wide flat plateau, sharp edge -- full-strength pull across most of its
+                            # radius. NOT type 54: measured at only ~62% vertical amplitude of type 8
+                            # (see 2k25_terrain_arch.txt's brush measurements) -- too soft/short-reaching
+                            # for a fill whose whole job is guaranteeing coverage.
 DEFAULT_MIN_INTERIOR_RADIUS_M = 10.0
 DEFAULT_MAX_INTERIOR_RADIUS_M = 150.0
 DEFAULT_INTERIOR_CLAIM_RADIUS_FRACTION = 0.5
@@ -235,54 +243,68 @@ def _capped_pit_mask(heights: np.ndarray, level: float, prev_level: Optional[flo
 
 
 def _fill_region_greedy(
-    mask: np.ndarray, dist_field: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
+    mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
     brush: int, min_radius: float, max_radius: float, claim_radius_fraction: float,
 ) -> list[Stamp]:
     """
-    Greedy largest-first fill of `mask` using a PRECOMPUTED `dist_field`
-    (not recomputed via EDT each iteration, unlike an earlier version's
-    gap-fill loop) -- appropriate here because interiors need few,
-    large stamps, so the static field's "true distance to this region's
-    own real boundary" is a fine radius/priority signal without paying
-    for a fresh EDT every placement. Claims only claim_radius_fraction
-    of each placed radius (see module docstring's OVERLAP note), so
-    consecutive interior stamps' full footprints genuinely overlap.
+    Greedy largest-first fill of `mask`, recomputing the distance
+    transform LIVE against the shrinking remaining area each iteration
+    -- an earlier version used a single precomputed field for the
+    whole loop, which has a real flaw: EDT boundary pixels of the
+    ORIGINAL mask always sit at distance ~0 by definition, so once a
+    big stamp claims a region's middle, whatever's left near the true
+    edge can look like "no room" to a STALE field even when there's
+    genuinely still uncovered area there relative to what's actually
+    been placed. Recomputing each iteration (same approach the
+    residual pass already uses) fixes that directly, at the cost of
+    more EDT calls -- kept cheap by cropping to `mask`'s own bounding
+    box (+ a max_radius margin) rather than paying for the full
+    heightmap's extent on every single placement, since capped
+    hilltop/pit regions are local by construction.
 
-    Value is the real local heightmap mean within the placed radius --
-    these fills aren't tied to one exact contour level the way ring
-    stamps are.
+    Claims only claim_radius_fraction of each placed radius (see
+    module docstring's OVERLAP note), so consecutive interior stamps'
+    full footprints genuinely overlap. Value is the real local
+    heightmap mean within the placed radius -- these fills aren't tied
+    to one exact contour level the way ring stamps are.
     """
+    rows_nz, cols_nz = np.nonzero(mask)
+    if rows_nz.size == 0:
+        return []
+
     n_rows, n_cols = heights.shape
     cell_x = (bounds.max_x - bounds.min_x) / n_cols
     cell_z = (bounds.max_z - bounds.min_z) / n_rows
-    x_centers = bounds.min_x + (np.arange(n_cols) + 0.5) * cell_x
-    z_centers = bounds.min_z + (np.arange(n_rows) + 0.5) * cell_z
+    margin_x = int(np.ceil(max_radius / cell_x)) + 2
+    margin_z = int(np.ceil(max_radius / cell_z)) + 2
 
-    remaining = mask.copy()
+    row_min = max(0, int(rows_nz.min()) - margin_z)
+    row_max = min(n_rows, int(rows_nz.max()) + margin_z + 1)
+    col_min = max(0, int(cols_nz.min()) - margin_x)
+    col_max = min(n_cols, int(cols_nz.max()) + margin_x + 1)
+
+    remaining = mask[row_min:row_max, col_min:col_max].copy()
+    sub_heights = heights[row_min:row_max, col_min:col_max]
+    x_centers = bounds.min_x + (np.arange(col_min, col_max) + 0.5) * cell_x
+    z_centers = bounds.min_z + (np.arange(row_min, row_max) + 0.5) * cell_z
+    xx_full, zz_full = np.meshgrid(x_centers, z_centers)
+    sampling = (cell_z, cell_x)
+
     stamps: list[Stamp] = []
-
     while remaining.any():
-        candidate = np.where(remaining, dist_field, 0.0)
-        peak = float(candidate.max())
+        dist = ndimage.distance_transform_edt(remaining, sampling=sampling)
+        peak = float(dist.max())
         if peak <= 0.0:
             break
-        row, col = np.unravel_index(np.argmax(candidate), candidate.shape)
+        row, col = np.unravel_index(np.argmax(dist), dist.shape)
         radius = float(np.clip(peak, min_radius, max_radius))
         claim_radius = radius * claim_radius_fraction
         cx, cz = float(x_centers[col]), float(z_centers[row])
 
-        row_min = max(0, int((cz - radius - bounds.min_z) / cell_z))
-        row_max = min(n_rows, int((cz + radius - bounds.min_z) / cell_z) + 1)
-        col_min = max(0, int((cx - radius - bounds.min_x) / cell_x))
-        col_max = min(n_cols, int((cx + radius - bounds.min_x) / cell_x) + 1)
-        sub_x = x_centers[col_min:col_max]
-        sub_z = z_centers[row_min:row_max]
-        xx, zz = np.meshgrid(sub_x, sub_z)
-        dist_from_center = np.hypot(xx - cx, zz - cz)
+        dist_from_center = np.hypot(xx_full - cx, zz_full - cz)
         within_radius = dist_from_center <= radius
         within_claim = dist_from_center <= claim_radius
 
-        sub_heights = heights[row_min:row_max, col_min:col_max]
         sub_valid = np.isfinite(sub_heights) & within_radius
         if not sub_valid.any():
             remaining[row, col] = False
@@ -290,7 +312,7 @@ def _fill_region_greedy(
         value = float(np.mean(sub_heights[sub_valid]))
 
         stamps.append(Stamp(x=cx, z=cz, radius=radius, value=value, brush=brush, tool=TOOL_FLATTEN))
-        remaining[row_min:row_max, col_min:col_max][within_claim] = False
+        remaining[within_claim] = False
 
     return stamps
 
@@ -483,20 +505,15 @@ def generate_contour_layers(
             capped_up = _capped_hilltop_mask(heights, level, next_level)
             if capped_up.any():
                 stamps.extend(_fill_region_greedy(
-                    capped_up, above_dist_by_level[i], heights, bounds,
+                    capped_up, heights, bounds,
                     interior_brush, min_interior_radius, max_interior_radius,
                     interior_claim_radius_fraction,
                 ))
 
             capped_down = _capped_pit_mask(heights, level, prev_level)
             if capped_down.any():
-                below_dist = ndimage.distance_transform_edt(
-                    heights < level,
-                    sampling=((bounds.max_z - bounds.min_z) / heights.shape[0],
-                              (bounds.max_x - bounds.min_x) / heights.shape[1]),
-                )
                 stamps.extend(_fill_region_greedy(
-                    capped_down, below_dist, heights, bounds,
+                    capped_down, heights, bounds,
                     interior_brush, min_interior_radius, max_interior_radius,
                     interior_claim_radius_fraction,
                 ))
