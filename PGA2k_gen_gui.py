@@ -456,8 +456,10 @@ class PGAGenGUI:
         self.max_ring_radius_var = tk.StringVar(value="50")
         self.curvature_window_var = tk.StringVar(value="10")
         self.curvature_contrast_gamma_var = tk.StringVar(value="2")
+        self.ring_spacing_fraction_var = tk.StringVar(value="0.5")
         self.gap_fill_brush_var = tk.StringVar(value="10")
         self.min_gap_radius_var = tk.StringVar(value="5")
+        self.gap_claim_radius_fraction_var = tk.StringVar(value="0.5")
         self.gap_fill_resolution_var = tk.StringVar(value="400")
 
         add_contour_field(0, 0, self.band_spacing_var, "BAND m",
@@ -488,6 +490,18 @@ class PGAGenGUI:
         add_contour_field(2, 2, self.gap_fill_resolution_var, "GAP RES",
                            "contour method only: coverage-mask grid resolution the gap-fill pass "
                            "runs against -- finer catches smaller gaps at higher cost.")
+        add_contour_field(3, 0, self.ring_spacing_fraction_var, "OVL %",
+                           "contour method only: along-ring stamp spacing as a fraction of the local "
+                           "target radius -- < 1.0 means deliberate overlap (0.5 default, matching "
+                           "Chad's radius=2x-spacing rule) rather than merely-touching stamps, since "
+                           "a cosine-falloff kernel's weight is ~0 right at the tangent point between "
+                           "two touching stamps. Lower this if results still look spotty.")
+        add_contour_field(3, 1, self.gap_claim_radius_fraction_var, "GAP OVL %",
+                           "contour method only: fraction of each gap-fill stamp's placed radius "
+                           "marked as claimed -- < 1.0 (0.5 default, same idea as OVL %) means the "
+                           "next gap-fill stamp lands closer and genuinely overlaps this one instead "
+                           "of just touching it. Lower this if flat areas (greens, ponds) still look "
+                           "spotty/seamed.")
 
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
@@ -1492,12 +1506,18 @@ class PGAGenGUI:
             curvature_contrast_gamma = self.curvature_contrast_gamma_var.get().strip()
             if curvature_contrast_gamma:
                 args += ["--curvature-contrast-gamma", curvature_contrast_gamma]
+            ring_spacing_fraction = self.ring_spacing_fraction_var.get().strip()
+            if ring_spacing_fraction:
+                args += ["--ring-spacing-fraction", ring_spacing_fraction]
             gap_fill_brush = self.gap_fill_brush_var.get().strip()
             if gap_fill_brush:
                 args += ["--gap-fill-brush", gap_fill_brush]
             min_gap_radius = self.min_gap_radius_var.get().strip()
             if min_gap_radius:
                 args += ["--min-gap-radius", min_gap_radius]
+            gap_claim_radius_fraction = self.gap_claim_radius_fraction_var.get().strip()
+            if gap_claim_radius_fraction:
+                args += ["--gap-claim-radius-fraction", gap_claim_radius_fraction]
             gap_fill_resolution = self.gap_fill_resolution_var.get().strip()
             if gap_fill_resolution:
                 args += ["--gap-fill-resolution", gap_fill_resolution]
