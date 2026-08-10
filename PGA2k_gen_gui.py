@@ -34,6 +34,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import numpy as np
+
 try:
     from PIL import Image, ImageTk
     _HAVE_PIL = True
@@ -53,8 +55,9 @@ from constants import (  # noqa: E402
 )
 from PGA2k_gen import (  # noqa: E402
     DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M, FEATURES_FILE, HEIGHT_MASK_FILE,
-    OBJECT_LIST_FILE, load_project, save_project,
+    HEIGHTMAP_FILE, OBJECT_LIST_FILE, load_project, save_project,
 )
+from ingest.heightmap import load_heightmap  # noqa: E402
 from course_output.objects import (  # noqa: E402
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_HEIGHT_TAG,
     TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, save_object_list,
@@ -910,6 +913,41 @@ class PGAGenGUI:
         ).pack(side="left", fill="x", expand=True, padx=4)
         self.mask_buffer_preview_label = ttk.Label(mask_row, text="50", width=4)
         self.mask_buffer_preview_label.pack(side="left")
+
+        # Live elevation-band overlay -- purely in-memory (see
+        # _show_preview's compositing block below and _get_cached_
+        # heightmap): reads heightmap.npz directly, thresholds it into
+        # a 1-bit [elevation, elevation+width) band, and composites
+        # that on top of whatever preview is currently showing. Never
+        # writes anything to disk. Useful for eyeballing real channel
+        # width against generate-terrain's BAND m / MAX RING m settings
+        # (Terrain tab) before committing to a run.
+        elev_row = ttk.Frame(frame)
+        elev_row.pack(fill="x", pady=(4, 0))
+        self.show_elevation_contour_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            elev_row, text="Elevation contour", variable=self.show_elevation_contour_var,
+            command=self._on_elevation_contour_toggle,
+        ).pack(side="left")
+        ttk.Label(elev_row, text="Elev (m):").pack(side="left", padx=(8, 0))
+        self.elevation_contour_var = tk.DoubleVar(value=0.0)
+        self.elevation_contour_scale = ttk.Scale(
+            elev_row, from_=0.0, to=1.0, orient="horizontal",
+            variable=self.elevation_contour_var, command=lambda _v: self._show_preview(),
+        )
+        self.elevation_contour_scale.pack(side="left", fill="x", expand=True, padx=4)
+        self.elevation_contour_label = ttk.Label(elev_row, text="0.0", width=8)
+        self.elevation_contour_label.pack(side="left")
+        ttk.Label(elev_row, text="Width (m):").pack(side="left", padx=(8, 0))
+        self.elevation_contour_width_var = tk.StringVar(value="1.0")
+        width_entry = ttk.Entry(elev_row, textvariable=self.elevation_contour_width_var, width=6)
+        width_entry.pack(side="left", padx=(2, 0))
+        width_entry.bind("<Return>", lambda e: self._show_preview())
+        width_entry.bind("<FocusOut>", lambda e: self._show_preview())
+        _Tooltip(width_entry, "Band thickness (m): shows heights in [Elev, Elev+Width) as solid "
+                 "white, everything else transparent -- 1-bit, no antialiasing, purely an in-"
+                 "memory visual (nothing written to disk). Narrow this toward your BAND m setting "
+                 "to see one traced level at a time; widen it to see a whole channel at once.")
 
     _SPLINE_KIND_FILTERS = (
         "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
@@ -2210,6 +2248,50 @@ class PGAGenGUI:
         self._cached_mask_geom_key = cache_key
         return merged
 
+    def _get_cached_heightmap(self, working_dir: Path):
+        """
+        Lazily load heightmap.npz and cache it (mtime-keyed, same
+        idiom as _get_cached_mask_merged_geometry) so the elevation-
+        contour slider/width box can redraw on every tick by just
+        re-thresholding this already-in-memory array (cheap numpy
+        comparison + resize), not re-reading the file from disk each
+        time. Returns None if there's no heightmap.npz yet.
+        """
+        path = working_dir / HEIGHTMAP_FILE
+        if not path.exists():
+            return None
+        mtime = path.stat().st_mtime
+        cache_key = (str(path), mtime)
+        if getattr(self, "_cached_heightmap_key", None) == cache_key:
+            return self._cached_heightmap
+
+        heights, _ = load_heightmap(path)
+        self._cached_heightmap = heights
+        self._cached_heightmap_key = cache_key
+        return heights
+
+    def _on_elevation_contour_toggle(self) -> None:
+        """
+        First time the checkbox goes on, size the slider to the real
+        heightmap's own [min, max] -- it starts at a 0..1 placeholder
+        range since that range isn't known until a heightmap actually
+        exists. Re-checking an already-sized slider is a no-op here
+        (harmless -- just re-applies the same range).
+        """
+        wd = self.working_dir.get().strip()
+        if self.show_elevation_contour_var.get() and wd:
+            heights = self._get_cached_heightmap(Path(wd))
+            if heights is not None:
+                finite = heights[np.isfinite(heights)]
+                if finite.size:
+                    lo, hi = float(finite.min()), float(finite.max())
+                    if hi > lo:
+                        self.elevation_contour_scale.configure(from_=lo, to=hi)
+                        current = self.elevation_contour_var.get()
+                        if not (lo <= current <= hi):
+                            self.elevation_contour_var.set((lo + hi) / 2.0)
+        self._show_preview()
+
     def _set_preview_text(self, text: str) -> None:
         self.preview_canvas.delete("all")
         self.preview_canvas.create_text(10, 10, anchor="nw", text=text, fill="black")
@@ -2410,6 +2492,51 @@ class PGAGenGUI:
                     mask_full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
                     mask_full.paste(mask_data_img, (data_left, data_top), mask_data_img)
                     img = Image.alpha_composite(img, mask_full)
+
+            # Live elevation-band overlay -- see _build_preview_panel's
+            # comment and _get_cached_heightmap. Reads heightmap.npz
+            # directly (not any preview PNG), so it's exact regardless
+            # of which preview is currently selected. Same _PLOT_RECT-
+            # aware positioning as the mask buffer above.
+            if self.show_elevation_contour_var.get() and viz.strip_preview_version(path.name) not in (
+                PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+            ):
+                heights = self._get_cached_heightmap(Path(wd))
+                if heights is not None:
+                    elevation = self.elevation_contour_var.get()
+                    self.elevation_contour_label.config(text=f"{elevation:.1f}")
+                    try:
+                        band_width = float(self.elevation_contour_width_var.get())
+                    except ValueError:
+                        band_width = 1.0
+
+                    # NaN comparisons are False either way in numpy, so
+                    # gaps in the heightmap fall out of the band with no
+                    # special-casing needed.
+                    band = (heights >= elevation) & (heights < elevation + band_width)
+                    # 1-bit: solid white where the band matches, fully
+                    # transparent elsewhere -- no antialiasing/blending.
+                    band_rgba = np.zeros((*band.shape, 4), dtype=np.uint8)
+                    band_rgba[band, :3] = 255
+                    band_rgba[band, 3] = 255
+                    # imshow(heights, origin="lower") in visualize.py puts
+                    # heights' row 0 at the BOTTOM of the rendered preview,
+                    # but PIL images put row 0 at the TOP -- flip vertically
+                    # or this overlay renders upside-down relative to the
+                    # base image underneath it.
+                    band_img = Image.fromarray(band_rgba[::-1, :, :], mode="RGBA")
+
+                    left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
+                    data_left = round(img.width * left_frac)
+                    data_top = round(img.height * (1 - bottom_frac - height_frac))
+                    data_width = max(1, round(img.width * width_frac))
+                    data_height = max(1, round(img.height * height_frac))
+                    # NEAREST, not LANCZOS -- keeps the band's edges hard
+                    # (genuinely 1-bit) rather than antialiased/blurred.
+                    band_resized = band_img.resize((data_width, data_height), Image.NEAREST)
+                    band_full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
+                    band_full.paste(band_resized, (data_left, data_top), band_resized)
+                    img = Image.alpha_composite(img, band_full)
 
             # Highlight the currently-selected spline (Splines tab),
             # same _PLOT_RECT-aware positioning as the mask buffer above
