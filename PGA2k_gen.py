@@ -124,8 +124,10 @@ from terrain.contour_layers import (
     DEFAULT_MAX_RING_RADIUS_M,
     DEFAULT_CURVATURE_WINDOW_M,
     DEFAULT_CURVATURE_CONTRAST_GAMMA,
+    DEFAULT_RING_SPACING_FRACTION,
     DEFAULT_GAP_FILL_BRUSH,
     DEFAULT_MIN_GAP_RADIUS_M,
+    DEFAULT_GAP_CLAIM_RADIUS_FRACTION,
     DEFAULT_GAP_FILL_RESOLUTION,
     generate_contour_layers,
 )
@@ -1250,8 +1252,10 @@ def step_generate_terrain(
     max_ring_radius: float | None = None,
     curvature_window_m: float | None = None,
     curvature_contrast_gamma: float | None = None,
+    ring_spacing_fraction: float | None = None,
     gap_fill_brush: int | None = None,
     min_gap_radius: float | None = None,
+    gap_claim_radius_fraction: float | None = None,
     gap_fill_resolution: int | None = None,
 ) -> None:
     """
@@ -1320,10 +1324,18 @@ def step_generate_terrain(
         curvature_contrast_gamma = project.get(
             "generate_terrain_curvature_contrast_gamma", DEFAULT_CURVATURE_CONTRAST_GAMMA
         )
+    if ring_spacing_fraction is None:
+        ring_spacing_fraction = project.get(
+            "generate_terrain_ring_spacing_fraction", DEFAULT_RING_SPACING_FRACTION
+        )
     if gap_fill_brush is None:
         gap_fill_brush = project.get("generate_terrain_gap_fill_brush", DEFAULT_GAP_FILL_BRUSH)
     if min_gap_radius is None:
         min_gap_radius = project.get("generate_terrain_min_gap_radius_m", DEFAULT_MIN_GAP_RADIUS_M)
+    if gap_claim_radius_fraction is None:
+        gap_claim_radius_fraction = project.get(
+            "generate_terrain_gap_claim_radius_fraction", DEFAULT_GAP_CLAIM_RADIUS_FRACTION
+        )
     if gap_fill_resolution is None:
         gap_fill_resolution = project.get(
             "generate_terrain_gap_fill_resolution", DEFAULT_GAP_FILL_RESOLUTION
@@ -1348,7 +1360,8 @@ def step_generate_terrain(
     if method == "contour":
         print(f"Tracing elevation-band contours (band_spacing_m={band_spacing_m}, "
               f"brush={contour_brush}, ring_radius=[{min_ring_radius}, {max_ring_radius}] m, "
-              f"curvature_window_m={curvature_window_m})...")
+              f"curvature_window_m={curvature_window_m}, ring_spacing_fraction={ring_spacing_fraction}, "
+              f"gap_claim_radius_fraction={gap_claim_radius_fraction})...")
         fitted = generate_contour_layers(
             heightmap, bounds,
             band_spacing_m=band_spacing_m,
@@ -1357,9 +1370,11 @@ def step_generate_terrain(
             max_ring_radius=max_ring_radius,
             curvature_window_m=curvature_window_m,
             curvature_contrast_gamma=curvature_contrast_gamma,
+            ring_spacing_fraction=ring_spacing_fraction,
             gap_fill_brush=gap_fill_brush,
             min_gap_radius=min_gap_radius,
             max_gap_radius=max_ring_radius,
+            gap_claim_radius_fraction=gap_claim_radius_fraction,
             gap_fill_resolution=gap_fill_resolution,
         )
         print(f"  {len(fitted)} stamps placed (ring tracing + gap-fill, all already fitted)")
@@ -1404,8 +1419,10 @@ def step_generate_terrain(
         "generate_terrain_max_ring_radius_m": max_ring_radius,
         "generate_terrain_curvature_window_m": curvature_window_m,
         "generate_terrain_curvature_contrast_gamma": curvature_contrast_gamma,
+        "generate_terrain_ring_spacing_fraction": ring_spacing_fraction,
         "generate_terrain_gap_fill_brush": gap_fill_brush,
         "generate_terrain_min_gap_radius_m": min_gap_radius,
+        "generate_terrain_gap_claim_radius_fraction": gap_claim_radius_fraction,
         "generate_terrain_gap_fill_resolution": gap_fill_resolution,
     })
 
@@ -2002,6 +2019,15 @@ def main(argv: list[str] | None = None) -> int:
                               "linear) -- same role as refine-terrain's --variation-contrast-gamma. "
                               "Default: use whatever's saved in project.json, or "
                               f"{DEFAULT_CURVATURE_CONTRAST_GAMMA} if never set.")
+    parser.add_argument("--ring-spacing-fraction", type=float, default=None,
+                         help="generate-terrain, contour method only: along-ring stamp spacing as a "
+                              "fraction of the local target radius -- < 1.0 means stamps deliberately "
+                              "overlap (default 0.5, matching Chad Rockey's TGC-Designer-Tools own "
+                              "radius=2x-spacing rule) rather than merely touching, since a cosine-"
+                              "falloff kernel's weight is ~0 right at the tangent point between two "
+                              "touching stamps -- tangent placement reads as visible seams, not a "
+                              "smooth result. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RING_SPACING_FRACTION} if never set.")
     parser.add_argument("--gap-fill-brush", type=int, default=None,
                          help="generate-terrain, contour method only: brush type used for the "
                               "distance-transform gap-fill pass that closes flat interiors ring-"
@@ -2011,6 +2037,14 @@ def main(argv: list[str] | None = None) -> int:
                          help="generate-terrain, contour method only: smallest allowed gap-fill stamp "
                               "radius (m). Default: use whatever's saved in project.json, or "
                               f"{DEFAULT_MIN_GAP_RADIUS_M} if never set.")
+    parser.add_argument("--gap-claim-radius-fraction", type=float, default=None,
+                         help="generate-terrain, contour method only: fraction of each gap-fill "
+                              "stamp's placed radius marked as 'covered' (claimed) -- < 1.0 (default "
+                              "0.5, same idea and default as --ring-spacing-fraction) means the next "
+                              "gap-fill stamp lands closer, so its full-radius footprint genuinely "
+                              "overlaps this one's instead of just touching it. Default: use "
+                              f"whatever's saved in project.json, or {DEFAULT_GAP_CLAIM_RADIUS_FRACTION} "
+                              "if never set.")
     parser.add_argument("--gap-fill-resolution", type=int, default=None,
                          help="generate-terrain, contour method only: coverage-mask grid resolution "
                               "the gap-fill pass runs against -- finer catches smaller gaps at higher "
@@ -2240,8 +2274,9 @@ def main(argv: list[str] | None = None) -> int:
             step_generate_terrain(
                 working_dir, args.pitch, args.generate_terrain_method, args.band_spacing_m,
                 args.contour_brush, args.min_ring_radius, args.max_ring_radius,
-                args.curvature_window_m, args.curvature_contrast_gamma,
-                args.gap_fill_brush, args.min_gap_radius, args.gap_fill_resolution,
+                args.curvature_window_m, args.curvature_contrast_gamma, args.ring_spacing_fraction,
+                args.gap_fill_brush, args.min_gap_radius, args.gap_claim_radius_fraction,
+                args.gap_fill_resolution,
             )
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
