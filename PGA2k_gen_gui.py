@@ -426,6 +426,19 @@ class PGAGenGUI:
         self._add_step_button(parent, "Copy to Game Folder", self._run_copy_to_game)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        error_res_row = ttk.Frame(parent)
+        error_res_row.pack(fill="x")
+        ttk.Label(error_res_row, text="Error resolution:").pack(side="left")
+        self.error_resolution_var = tk.StringVar(value="")
+        error_res_entry = ttk.Entry(error_res_row, textvariable=self.error_resolution_var, width=6)
+        error_res_entry.pack(side="left", padx=4)
+        _Tooltip(error_res_entry, "preview_error.png's own grid resolution. Left blank, it inherits "
+                 "whatever --resolution refine-terrain last used, or a hardcoded 200 if refine-terrain "
+                 "hasn't run at all yet -- far too coarse to localize a specific small feature (at "
+                 "RES~1000, a 200x200 error grid averages ~5x5 real cells into one). Set this directly "
+                 "to decouple it from refine-terrain entirely. Not saved to project.json -- costs more "
+                 "at higher values (evaluated at every cell), so start moderate (e.g. 500) before "
+                 "jumping to 1000+.")
         self._add_step_button(parent, "Visualize", self._run_visualize)
 
     def _build_terrain_tab(self, parent: ttk.Frame) -> None:
@@ -1801,7 +1814,11 @@ class PGAGenGUI:
     def _run_visualize(self) -> None:
         wd = self._require_working_dir()
         if wd:
-            self._run_step(["--step", "visualize"], wd)
+            args = ["--step", "visualize"]
+            error_resolution = self.error_resolution_var.get().strip()
+            if error_resolution:
+                args += ["--error-resolution", error_resolution]
+            self._run_step(args, wd)
 
     # ------------------------------------------------------------------
     # Copy to Game Folder -- a plain file copy, not a pipeline step, so
