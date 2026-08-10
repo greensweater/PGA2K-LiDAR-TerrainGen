@@ -85,7 +85,8 @@ a smooth result.
 
 from __future__ import annotations
 
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 import numpy as np
 from scipy import ndimage
@@ -395,6 +396,7 @@ def generate_contour_layers(
     max_residual_radius: float = DEFAULT_MAX_RESIDUAL_RADIUS_M,
     residual_claim_radius_fraction: float = DEFAULT_RESIDUAL_CLAIM_RADIUS_FRACTION,
     coverage_resolution: int = DEFAULT_COVERAGE_RESOLUTION,
+    progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> list[Stamp]:
     """
     Generate an organic base layer via the channel model (see module
@@ -412,10 +414,31 @@ def generate_contour_layers(
     later stamps take precedence in any overlap -- see module docstring
     for why this specific order produces a real gradient across each
     channel rather than a flat patch with a hard edge.
+
+    progress_callback, if given, is called periodically (time-
+    throttled to ~10s, not every level) with (stamps_placed_so_far,
+    fraction_complete). Progress is tracked as levels processed out of
+    a fixed budget of 2*n_levels + 1 steps -- the ring-pass loop (n
+    levels, ascending from lowest to highest elevation), the hilltop/
+    pit-fill loop (another n levels), and the final residual pass (one
+    step) -- a genuinely meaningful estimate since it's the same
+    lowest-to-highest level order the function actually walks, not a
+    raw iteration count against an unrelated bound.
     """
     levels = _contour_levels(heights, band_spacing_m)
     n = len(levels)
     stamps: list[Stamp] = []
+
+    total_steps = max(1, 2 * n + 1)
+    completed_steps = 0
+    last_progress_time = time.time()
+    progress_interval_s = 10.0
+
+    def _maybe_report() -> None:
+        nonlocal last_progress_time
+        if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
+            progress_callback(len(stamps), completed_steps / total_steps)
+            last_progress_time = time.time()
 
     if n > 0:
         rings_by_level = [measure.find_contours(heights, level=lvl) for lvl in levels]
@@ -450,6 +473,8 @@ def generate_contour_layers(
                         x, z, radii, level, rough_brush,
                         min_ring_radius, max_ring_radius, ring_spacing_fraction,
                     ))
+            completed_steps += 1
+            _maybe_report()
 
         for i, level in enumerate(levels):
             next_level = levels[i + 1] if i < n - 1 else None
@@ -475,6 +500,8 @@ def generate_contour_layers(
                     interior_brush, min_interior_radius, max_interior_radius,
                     interior_claim_radius_fraction,
                 ))
+            completed_steps += 1
+            _maybe_report()
 
     covered = np.zeros((coverage_resolution, coverage_resolution), dtype=bool)
     _rasterize_coverage(stamps, bounds, coverage_resolution, covered)
@@ -482,5 +509,8 @@ def generate_contour_layers(
         heights, bounds, coverage_resolution, covered,
         residual_brush, min_residual_radius, max_residual_radius, residual_claim_radius_fraction,
     ))
+    completed_steps += 1
+    if progress_callback is not None:
+        progress_callback(len(stamps), 1.0)
 
     return stamps
