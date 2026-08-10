@@ -86,6 +86,30 @@ this module already established, for the same reason -- a cosine-
 falloff kernel's weight is ~0 right at a tangent point between two
 touching stamps, so tangent-only placement reads as visible seams, not
 a smooth result.
+
+BRUSH SOFTNESS: geometric radius alone isn't a fair coverage proxy
+across brush types. terrain/adaptive_refine.py already documents this
+via BRUSH_RANK={8:0, 9:1, 10:2, 54:3} -- higher-rank brushes have
+smoother falloff and genuinely weaker real influence relative to their
+OWN nominal radius than type 8 does (measured directly for one case:
+type 54 sits at only ~62% of type 8's amplitude at the same radius/
+height, see 2k25_terrain_arch.txt). Ring/rough default to type 10 and
+9 (ranks 2 and 1) -- both softer than type 8 -- so treating "geometric
+distance reached" as "meaningfully covered" with no brush-dependent
+correction systematically overstates real coverage for the defaults
+this module actually ships with, leaving thin real gaps between
+neighbors that geometrically touch or even slightly overlap. The fix
+here is spacing, not radius: widening the PLACEMENT radius itself
+risks a ring-A stamp overshooting into the A- band's own territory,
+reintroducing the bleed this whole design exists to avoid. Instead,
+edge_softness_ratio (default 1.0, a no-op, same "expose the knob and
+tune against real results" philosophy as adaptive_refine.py's own
+brush_radius_spread_ratio rather than a derived table) packs a brush's
+stamps proportionally CLOSER together the higher its rank -- spacing
+and claim fractions get multiplied by edge_softness_ratio **
+BRUSH_RANK[brush], so a ratio below 1.0 tightens softer brushes while
+leaving type 8 (rank 0, softness_ratio**0 == 1) unaffected regardless
+of the value chosen.
 """
 
 from __future__ import annotations
@@ -109,6 +133,16 @@ DEFAULT_ROUGH_BRUSH = 9          # Rule 4: slightly narrower plateau, corrected 
 DEFAULT_MIN_RING_RADIUS_M = 5.0
 DEFAULT_MAX_RING_RADIUS_M = 50.0
 DEFAULT_RING_SPACING_FRACTION = 0.5  # spacing = radius * this; matches Chad's radius=2x-spacing rule
+
+# Mirrors terrain/adaptive_refine.py's BRUSH_RANK -- duplicated here rather
+# than imported, since this module deliberately doesn't depend on
+# adaptive_refine.py's much larger surface for one small shared constant.
+# Genuinely belongs in terrain/brush_profiles.py as the real shared source
+# of truth if the two ever drift; keep in sync manually until then.
+BRUSH_RANK = {8: 0, 9: 1, 10: 2, 54: 3}
+
+DEFAULT_EDGE_SOFTNESS_RATIO = 1.0  # 1.0 = no-op (old behavior). <1.0 packs higher-BRUSH_RANK (softer-
+                                    # falloff) brushes proportionally tighter -- see module docstring.
 
 # Capped hilltop/pit interior fills -- large, hard stamps; few needed by design
 DEFAULT_INTERIOR_BRUSH = 8  # wide flat plateau, sharp edge -- full-strength pull across most of its
@@ -157,17 +191,20 @@ def _pixel_to_world(
 
 def _place_stamps_along_ring(
     x: np.ndarray, z: np.ndarray, radii: np.ndarray, value: float, brush: int,
-    min_radius: float, max_radius: float, spacing_fraction: float,
+    min_radius: float, max_radius: float, spacing_fraction: float, edge_softness_ratio: float,
 ) -> list[Stamp]:
     """
     Walk one ring (world coords) placing a flatten stamp every time
     accumulated arc length since the last placement reaches
-    `spacing_fraction * radius` at the CURRENT point -- deliberately
-    less than the full radius (default 0.5) so consecutive stamps'
-    full-radius footprints overlap rather than merely touch (see
-    module docstring's OVERLAP note). `radii` is precomputed per-vertex
-    (sampled from a distance field by the caller, not derived from
-    curvature here).
+    `spacing_fraction * edge_softness_ratio**BRUSH_RANK[brush] * radius`
+    at the CURRENT point -- deliberately less than the full radius
+    (default spacing_fraction=0.5, edge_softness_ratio=1.0 a no-op) so
+    consecutive stamps' full-radius footprints overlap rather than
+    merely touch (see module docstring's OVERLAP note), tightened
+    further for higher-BRUSH_RANK (softer-falloff) brushes when
+    edge_softness_ratio < 1.0 (see module docstring's BRUSH SOFTNESS
+    note). `radii` is precomputed per-vertex (sampled from a distance
+    field by the caller, not derived from curvature here).
     """
     n = len(x)
     if n < 2:
@@ -175,13 +212,14 @@ def _place_stamps_along_ring(
 
     seg_len = np.hypot(np.diff(x), np.diff(z))
     clipped = np.clip(radii, min_radius, max_radius)
+    effective_fraction = spacing_fraction * edge_softness_ratio ** BRUSH_RANK.get(brush, 0)
 
     stamps: list[Stamp] = [
         Stamp(x=float(x[0]), z=float(z[0]), radius=float(clipped[0]),
               value=value, brush=brush, tool=TOOL_FLATTEN)
     ]
     accumulated = 0.0
-    next_target = clipped[0] * spacing_fraction
+    next_target = clipped[0] * effective_fraction
 
     for i in range(1, n):
         accumulated += seg_len[i - 1]
@@ -189,7 +227,7 @@ def _place_stamps_along_ring(
             stamps.append(Stamp(x=float(x[i]), z=float(z[i]), radius=float(clipped[i]),
                                  value=value, brush=brush, tool=TOOL_FLATTEN))
             accumulated = 0.0
-            next_target = clipped[i] * spacing_fraction
+            next_target = clipped[i] * effective_fraction
 
     return stamps
 
@@ -245,6 +283,7 @@ def _capped_pit_mask(heights: np.ndarray, level: float, prev_level: Optional[flo
 def _fill_region_greedy(
     mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
     brush: int, min_radius: float, max_radius: float, claim_radius_fraction: float,
+    edge_softness_ratio: float,
 ) -> list[Stamp]:
     """
     Greedy largest-first fill of `mask`, recomputing the distance
@@ -289,6 +328,7 @@ def _fill_region_greedy(
     z_centers = bounds.min_z + (np.arange(row_min, row_max) + 0.5) * cell_z
     xx_full, zz_full = np.meshgrid(x_centers, z_centers)
     sampling = (cell_z, cell_x)
+    effective_claim_fraction = claim_radius_fraction * edge_softness_ratio ** BRUSH_RANK.get(brush, 0)
 
     stamps: list[Stamp] = []
     while remaining.any():
@@ -298,7 +338,7 @@ def _fill_region_greedy(
             break
         row, col = np.unravel_index(np.argmax(dist), dist.shape)
         radius = float(np.clip(peak, min_radius, max_radius))
-        claim_radius = radius * claim_radius_fraction
+        claim_radius = radius * effective_claim_fraction
         cx, cz = float(x_centers[col]), float(z_centers[row])
 
         dist_from_center = np.hypot(xx_full - cx, zz_full - cz)
@@ -343,6 +383,7 @@ def _rasterize_coverage(
 def _residual_fill_pass(
     heights: np.ndarray, bounds: BoundingBox, resolution: int, covered: np.ndarray,
     brush: int, min_radius: float, max_radius: float, claim_radius_fraction: float,
+    edge_softness_ratio: float,
     max_iterations: int = DEFAULT_MAX_RESIDUAL_ITERATIONS,
 ) -> list[Stamp]:
     """
@@ -361,6 +402,7 @@ def _residual_fill_pass(
     x_centers = bounds.min_x + (np.arange(resolution) + 0.5) * cell_x
     z_centers = bounds.min_z + (np.arange(resolution) + 0.5) * cell_z
     sampling = (cell_z, cell_x)
+    effective_claim_fraction = claim_radius_fraction * edge_softness_ratio ** BRUSH_RANK.get(brush, 0)
 
     stamps: list[Stamp] = []
     for _ in range(max_iterations):
@@ -373,7 +415,7 @@ def _residual_fill_pass(
             break
         row, col = np.unravel_index(np.argmax(dist), dist.shape)
         radius = float(np.clip(peak, min_radius, max_radius))
-        claim_radius = radius * claim_radius_fraction
+        claim_radius = radius * effective_claim_fraction
         cx, cz = float(x_centers[col]), float(z_centers[row])
 
         row_min = max(0, int((cz - radius - bounds.min_z) / cell_z))
@@ -418,6 +460,7 @@ def generate_contour_layers(
     max_residual_radius: float = DEFAULT_MAX_RESIDUAL_RADIUS_M,
     residual_claim_radius_fraction: float = DEFAULT_RESIDUAL_CLAIM_RADIUS_FRACTION,
     coverage_resolution: int = DEFAULT_COVERAGE_RESOLUTION,
+    edge_softness_ratio: float = DEFAULT_EDGE_SOFTNESS_RATIO,
     progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> list[Stamp]:
     """
@@ -436,6 +479,16 @@ def generate_contour_layers(
     later stamps take precedence in any overlap -- see module docstring
     for why this specific order produces a real gradient across each
     channel rather than a flat patch with a hard edge.
+
+    edge_softness_ratio (default 1.0, a no-op) tightens spacing/claim
+    fractions for higher-BRUSH_RANK (softer-falloff) brushes -- see
+    module docstring's BRUSH SOFTNESS note. Matters most with the
+    default ring_brush=10/rough_brush=9 (ranks 2 and 1), since their
+    real influence relative to their own nominal radius is genuinely
+    weaker than type 8's; a value below 1.0 (start around 0.7-0.85 and
+    tune against real results, same philosophy as adaptive_refine.py's
+    brush_radius_spread_ratio) packs their stamps closer together to
+    compensate without changing any stamp's own geometric radius.
 
     progress_callback, if given, is called periodically (time-
     throttled to ~10s, not every level) with (stamps_placed_so_far,
@@ -483,7 +536,7 @@ def generate_contour_layers(
                     x, z = _pixel_to_world(rows, cols, heights.shape, bounds)
                     stamps.extend(_place_stamps_along_ring(
                         x, z, radii, level, ring_brush,
-                        min_ring_radius, max_ring_radius, ring_spacing_fraction,
+                        min_ring_radius, max_ring_radius, ring_spacing_fraction, edge_softness_ratio,
                     ))
             if i < n - 1:
                 df_cur = above_dist_by_level[i]
@@ -493,7 +546,7 @@ def generate_contour_layers(
                     x, z = _pixel_to_world(rows, cols, heights.shape, bounds)
                     stamps.extend(_place_stamps_along_ring(
                         x, z, radii, level, rough_brush,
-                        min_ring_radius, max_ring_radius, ring_spacing_fraction,
+                        min_ring_radius, max_ring_radius, ring_spacing_fraction, edge_softness_ratio,
                     ))
             completed_steps += 1
             _maybe_report()
@@ -507,7 +560,7 @@ def generate_contour_layers(
                 stamps.extend(_fill_region_greedy(
                     capped_up, heights, bounds,
                     interior_brush, min_interior_radius, max_interior_radius,
-                    interior_claim_radius_fraction,
+                    interior_claim_radius_fraction, edge_softness_ratio,
                 ))
 
             capped_down = _capped_pit_mask(heights, level, prev_level)
@@ -515,7 +568,7 @@ def generate_contour_layers(
                 stamps.extend(_fill_region_greedy(
                     capped_down, heights, bounds,
                     interior_brush, min_interior_radius, max_interior_radius,
-                    interior_claim_radius_fraction,
+                    interior_claim_radius_fraction, edge_softness_ratio,
                 ))
             completed_steps += 1
             _maybe_report()
@@ -525,6 +578,7 @@ def generate_contour_layers(
     stamps.extend(_residual_fill_pass(
         heights, bounds, coverage_resolution, covered,
         residual_brush, min_residual_radius, max_residual_radius, residual_claim_radius_fraction,
+        edge_softness_ratio,
     ))
     completed_steps += 1
     if progress_callback is not None:
