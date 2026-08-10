@@ -119,21 +119,12 @@ from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import HEX_LATTICE_PITCH_M, generate_hex_grid
 from terrain.contour_layers import (
     DEFAULT_BAND_SPACING_M,
-    DEFAULT_RING_BRUSH,
-    DEFAULT_ROUGH_BRUSH,
-    DEFAULT_MIN_RING_RADIUS_M,
-    DEFAULT_MAX_RING_RADIUS_M,
-    DEFAULT_RING_SPACING_FRACTION,
-    DEFAULT_INTERIOR_BRUSH,
-    DEFAULT_MIN_INTERIOR_RADIUS_M,
-    DEFAULT_MAX_INTERIOR_RADIUS_M,
-    DEFAULT_INTERIOR_CLAIM_RADIUS_FRACTION,
-    DEFAULT_RESIDUAL_BRUSH,
-    DEFAULT_MIN_RESIDUAL_RADIUS_M,
-    DEFAULT_MAX_RESIDUAL_RADIUS_M,
-    DEFAULT_RESIDUAL_CLAIM_RADIUS_FRACTION,
-    DEFAULT_COVERAGE_RESOLUTION,
-    DEFAULT_EDGE_SOFTNESS_RATIO,
+    DEFAULT_FILL_BRUSH,
+    DEFAULT_MIN_RADIUS_M,
+    DEFAULT_MAX_RADIUS_M,
+    DEFAULT_RADIUS_STEP_M,
+    DEFAULT_SMOOTHING_BRUSH,
+    DEFAULT_DENOISE_PX,
     generate_contour_layers,
 )
 from terrain.stamp import Stamp
@@ -1274,21 +1265,12 @@ def step_generate_terrain(
     pitch: float | None = None,
     method: str | None = None,
     band_spacing_m: float | None = None,
-    ring_brush: int | None = None,
-    rough_brush: int | None = None,
-    min_ring_radius: float | None = None,
-    max_ring_radius: float | None = None,
-    ring_spacing_fraction: float | None = None,
-    interior_brush: int | None = None,
-    min_interior_radius: float | None = None,
-    max_interior_radius: float | None = None,
-    interior_claim_radius_fraction: float | None = None,
-    residual_brush: int | None = None,
-    min_residual_radius: float | None = None,
-    max_residual_radius: float | None = None,
-    residual_claim_radius_fraction: float | None = None,
-    coverage_resolution: int | None = None,
-    edge_softness_ratio: float | None = None,
+    fill_brush: int | None = None,
+    min_radius: float | None = None,
+    max_radius: float | None = None,
+    radius_step_m: float | None = None,
+    smoothing_brush: int | None = None,
+    denoise_px: int | None = None,
 ) -> None:
     """
     pitch (feature-flagged via project.json, same None-means-use-saved
@@ -1306,35 +1288,25 @@ def step_generate_terrain(
 
     method ("hex", default, or "contour") picks the initial-layout
     generator: "hex" is the flat lattice above; "contour" is terrain/
-    contour_layers.py's organic elevation-band tracer, which fills the
-    CHANNEL between every pair of consecutive traced levels (not just
-    the lines themselves) using each level's real distance-to-boundary,
-    plus dedicated large-stamp fills for isolated hilltops/pits and a
-    final residual safety net -- see that module's docstring for the
-    full rationale. Only "hex"'s parameters (pitch) apply in "hex" mode
+    contour_layers.py's tiered multi-scale 1-bit band fill -- every
+    elevation band's real 2D footprint gets filled directly with
+    circles sized from real local geometry, valued at the real local
+    heightmap mean. Only "hex"'s parameters (pitch) apply in "hex" mode
     and vice versa for the contour_* parameters below.
 
     Unlike hex mode, contour mode's stamps already carry their exact
-    fitted value (ring stamps: the level they were traced from;
-    interior/residual stamps: the local heightmap mean over their own
+    fitted value (the local heightmap mean within each stamp's own
     footprint, computed inside generate_contour_layers itself) -- so
     the fit_stamp_heights() pass below only runs in "hex" mode.
-    Re-running it against contour stamps would actually be harmful, not
-    a no-op: fit_stamp_heights averages nearby LIDAR points within a
-    stamp's radius, and near a ring that sits right on a real elevation
-    boundary, that average pulls away from the exact level the ring was
-    deliberately traced at -- undoing the one thing edge-tracing gets
-    for free that hex mode doesn't.
+    Re-running it against contour stamps would be redundant at best.
 
-    max_ring_radius is the single most important contour-mode tuning
-    knob on gentle/open terrain: it needs to roughly match the real
-    channel half-width (band_spacing_m / local slope) for the ring
-    passes to do the bulk of the work. Too small relative to that, and
-    most of the course silently falls through to the residual pass
-    instead -- more stamps, slower, and losing the ring model's
-    gradient-blending benefit. Widening band_spacing_m to compensate
-    does NOT help (it makes channels even wider against the same reach
-    cap); raise max_ring_radius directly instead.
+    max_radius is the main contour-mode tuning knob for level of detail:
+    it caps how large the tiered fill's biggest stamps can be, so it
+    should scale with how much real terrain variation exists at your
+    chosen band_spacing_m -- too large on genuinely complex terrain
+    wastes accuracy; too small on open/gentle terrain leaves everything
+    to the (slower, smaller-stamp) crumb-smoothing pass instead of the
+    efficient tiered fill.
     """
     if method is None:
         project = load_project(working_dir)
@@ -1353,54 +1325,18 @@ def step_generate_terrain(
         pitch = project.get("generate_terrain_pitch_m", HEX_LATTICE_PITCH_M)
     if band_spacing_m is None:
         band_spacing_m = project.get("generate_terrain_band_spacing_m", DEFAULT_BAND_SPACING_M)
-    if ring_brush is None:
-        ring_brush = project.get("generate_terrain_ring_brush", DEFAULT_RING_BRUSH)
-    if rough_brush is None:
-        rough_brush = project.get("generate_terrain_rough_brush", DEFAULT_ROUGH_BRUSH)
-    if min_ring_radius is None:
-        min_ring_radius = project.get("generate_terrain_min_ring_radius_m", DEFAULT_MIN_RING_RADIUS_M)
-    if max_ring_radius is None:
-        max_ring_radius = project.get("generate_terrain_max_ring_radius_m", DEFAULT_MAX_RING_RADIUS_M)
-    if ring_spacing_fraction is None:
-        ring_spacing_fraction = project.get(
-            "generate_terrain_ring_spacing_fraction", DEFAULT_RING_SPACING_FRACTION
-        )
-    if interior_brush is None:
-        interior_brush = project.get("generate_terrain_interior_brush", DEFAULT_INTERIOR_BRUSH)
-    if min_interior_radius is None:
-        min_interior_radius = project.get(
-            "generate_terrain_min_interior_radius_m", DEFAULT_MIN_INTERIOR_RADIUS_M
-        )
-    if max_interior_radius is None:
-        max_interior_radius = project.get(
-            "generate_terrain_max_interior_radius_m", DEFAULT_MAX_INTERIOR_RADIUS_M
-        )
-    if interior_claim_radius_fraction is None:
-        interior_claim_radius_fraction = project.get(
-            "generate_terrain_interior_claim_radius_fraction", DEFAULT_INTERIOR_CLAIM_RADIUS_FRACTION
-        )
-    if residual_brush is None:
-        residual_brush = project.get("generate_terrain_residual_brush", DEFAULT_RESIDUAL_BRUSH)
-    if min_residual_radius is None:
-        min_residual_radius = project.get(
-            "generate_terrain_min_residual_radius_m", DEFAULT_MIN_RESIDUAL_RADIUS_M
-        )
-    if max_residual_radius is None:
-        max_residual_radius = project.get(
-            "generate_terrain_max_residual_radius_m", DEFAULT_MAX_RESIDUAL_RADIUS_M
-        )
-    if residual_claim_radius_fraction is None:
-        residual_claim_radius_fraction = project.get(
-            "generate_terrain_residual_claim_radius_fraction", DEFAULT_RESIDUAL_CLAIM_RADIUS_FRACTION
-        )
-    if coverage_resolution is None:
-        coverage_resolution = project.get(
-            "generate_terrain_coverage_resolution", DEFAULT_COVERAGE_RESOLUTION
-        )
-    if edge_softness_ratio is None:
-        edge_softness_ratio = project.get(
-            "generate_terrain_edge_softness_ratio", DEFAULT_EDGE_SOFTNESS_RATIO
-        )
+    if fill_brush is None:
+        fill_brush = project.get("generate_terrain_fill_brush", DEFAULT_FILL_BRUSH)
+    if min_radius is None:
+        min_radius = project.get("generate_terrain_min_radius_m", DEFAULT_MIN_RADIUS_M)
+    if max_radius is None:
+        max_radius = project.get("generate_terrain_max_radius_m", DEFAULT_MAX_RADIUS_M)
+    if radius_step_m is None:
+        radius_step_m = project.get("generate_terrain_radius_step_m", DEFAULT_RADIUS_STEP_M)
+    if smoothing_brush is None:
+        smoothing_brush = project.get("generate_terrain_smoothing_brush", DEFAULT_SMOOTHING_BRUSH)
+    if denoise_px is None:
+        denoise_px = project.get("generate_terrain_denoise_px", DEFAULT_DENOISE_PX)
 
     print(f"Loading {pointcloud_path}...")
     full_cloud = PointCloud.load(pointcloud_path)
@@ -1419,39 +1355,28 @@ def step_generate_terrain(
     heightmap, _ = load_heightmap(heightmap_path)
 
     if method == "contour":
-        print(f"Filling elevation-band channels (band_spacing_m={band_spacing_m}, "
-              f"ring_radius=[{min_ring_radius}, {max_ring_radius}] m, "
-              f"interior_radius=[{min_interior_radius}, {max_interior_radius}] m)...")
+        print(f"Tiered multi-scale band fill (band_spacing_m={band_spacing_m}, "
+              f"radius=[{min_radius}, {max_radius}] m, step={radius_step_m} m)...")
 
         progress_start_time = time.time()
 
         def _print_contour_progress(stamp_count: int, fraction: float) -> None:
             elapsed = time.time() - progress_start_time
             print(f"  ... {elapsed:.0f}s elapsed: {stamp_count} stamps so far, "
-                  f"{fraction:.1%} complete (working lowest to highest elevation)")
+                  f"{fraction:.1%} complete (bands ascending, lowest to highest elevation)")
 
         fitted = generate_contour_layers(
             heightmap, bounds,
             band_spacing_m=band_spacing_m,
-            ring_brush=ring_brush,
-            rough_brush=rough_brush,
-            min_ring_radius=min_ring_radius,
-            max_ring_radius=max_ring_radius,
-            ring_spacing_fraction=ring_spacing_fraction,
-            interior_brush=interior_brush,
-            min_interior_radius=min_interior_radius,
-            max_interior_radius=max_interior_radius,
-            interior_claim_radius_fraction=interior_claim_radius_fraction,
-            residual_brush=residual_brush,
-            min_residual_radius=min_residual_radius,
-            max_residual_radius=max_residual_radius,
-            residual_claim_radius_fraction=residual_claim_radius_fraction,
-            coverage_resolution=coverage_resolution,
-            edge_softness_ratio=edge_softness_ratio,
+            fill_brush=fill_brush,
+            min_radius=min_radius,
+            max_radius=max_radius,
+            radius_step_m=radius_step_m,
+            smoothing_brush=smoothing_brush,
+            denoise_px=denoise_px,
             progress_callback=_print_contour_progress,
         )
-        print(f"  {len(fitted)} stamps placed (channel fill + hilltop/pit interiors + residual, "
-              "all already fitted)")
+        print(f"  {len(fitted)} stamps placed (tiered band fill + crumb smoothing, all already fitted)")
     else:
         stamp_radius = 2.0 * pitch
         bleed = stamp_radius / 2.0
@@ -1488,21 +1413,12 @@ def step_generate_terrain(
         "generate_terrain_pitch_m": pitch,
         "generate_terrain_method": method,
         "generate_terrain_band_spacing_m": band_spacing_m,
-        "generate_terrain_ring_brush": ring_brush,
-        "generate_terrain_rough_brush": rough_brush,
-        "generate_terrain_min_ring_radius_m": min_ring_radius,
-        "generate_terrain_max_ring_radius_m": max_ring_radius,
-        "generate_terrain_ring_spacing_fraction": ring_spacing_fraction,
-        "generate_terrain_interior_brush": interior_brush,
-        "generate_terrain_min_interior_radius_m": min_interior_radius,
-        "generate_terrain_max_interior_radius_m": max_interior_radius,
-        "generate_terrain_interior_claim_radius_fraction": interior_claim_radius_fraction,
-        "generate_terrain_residual_brush": residual_brush,
-        "generate_terrain_min_residual_radius_m": min_residual_radius,
-        "generate_terrain_max_residual_radius_m": max_residual_radius,
-        "generate_terrain_residual_claim_radius_fraction": residual_claim_radius_fraction,
-        "generate_terrain_coverage_resolution": coverage_resolution,
-        "generate_terrain_edge_softness_ratio": edge_softness_ratio,
+        "generate_terrain_fill_brush": fill_brush,
+        "generate_terrain_min_radius_m": min_radius,
+        "generate_terrain_max_radius_m": max_radius,
+        "generate_terrain_radius_step_m": radius_step_m,
+        "generate_terrain_smoothing_brush": smoothing_brush,
+        "generate_terrain_denoise_px": denoise_px,
     })
 
     print("Refreshing previews...")
@@ -2070,92 +1986,42 @@ def main(argv: list[str] | None = None) -> int:
                               "see terrain/contour_layers.py. Default: use whatever's saved in "
                               "project.json, or 'hex' if never set.")
     parser.add_argument("--band-spacing-m", type=float, default=None,
-                         help="generate-terrain, contour method only: elevation spacing (m) between "
-                              "traced levels -- smaller means more, narrower channels. Widening this "
-                              "does NOT help on gentle terrain where the residual pass dominates; "
-                              "raise --max-ring-radius instead. Default: use whatever's saved in "
-                              f"project.json, or {DEFAULT_BAND_SPACING_M} if never set.")
-    parser.add_argument("--ring-brush", type=int, default=None,
-                         help="generate-terrain, contour method only: brush for each level's own "
-                              "(Rule 3, precise) ring pass. Default: use whatever's saved in "
-                              f"project.json, or {DEFAULT_RING_BRUSH} if never set.")
-    parser.add_argument("--rough-brush", type=int, default=None,
-                         help="generate-terrain, contour method only: brush for the rough advance "
-                              "(Rule 4) pass into the next band up. Default: use whatever's saved in "
-                              f"project.json, or {DEFAULT_ROUGH_BRUSH} if never set.")
-    parser.add_argument("--min-ring-radius", type=float, default=None,
-                         help="generate-terrain, contour method only: smallest allowed ring-pass stamp "
-                              "radius (m). Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_MIN_RING_RADIUS_M} if never set.")
-    parser.add_argument("--max-ring-radius", type=float, default=None,
-                         help="generate-terrain, contour method only: largest allowed ring-pass stamp "
-                              "radius (m) -- the key tuning knob on gentle terrain: it needs to roughly "
-                              "match the real channel half-width (band_spacing_m / local slope) or most "
-                              "of the course falls through to the residual pass instead. Default: use "
-                              f"whatever's saved in project.json, or {DEFAULT_MAX_RING_RADIUS_M} if "
+                         help="generate-terrain, contour method only: elevation spacing (m) defining "
+                              "each band -- smaller means more, narrower bands. Default: use whatever's "
+                              f"saved in project.json, or {DEFAULT_BAND_SPACING_M} if never set.")
+    parser.add_argument("--fill-brush", type=int, default=None,
+                         help="generate-terrain, contour method only: brush for the main tiered multi-"
+                              "scale band fill -- type 8 (wide flat plateau) recommended, has the best "
+                              "plateau fraction (least overhang) of the four brush types. Default: use "
+                              f"whatever's saved in project.json, or {DEFAULT_FILL_BRUSH} if never set.")
+    parser.add_argument("--min-radius", type=float, default=None,
+                         help="generate-terrain, contour method only: smallest tier in the multi-scale "
+                              "fill scan (m). Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_MIN_RADIUS_M} if never set.")
+    parser.add_argument("--max-radius", type=float, default=None,
+                         help="generate-terrain, contour method only: largest tier in the multi-scale "
+                              "fill scan (m) -- the main level-of-detail knob: how big the biggest "
+                              "stamps in a band are allowed to be. Default: use whatever's saved in "
+                              f"project.json, or {DEFAULT_MAX_RADIUS_M} if never set.")
+    parser.add_argument("--radius-step-m", type=float, default=None,
+                         help="generate-terrain, contour method only: step size (m) between tiers, "
+                              "scanning from --max-radius down to --min-radius -- smaller steps are "
+                              "more thorough (fewer stamps left to the crumb-smoothing fallback) at "
+                              "the cost of more distance-transform passes. Default: use whatever's "
+                              f"saved in project.json, or {DEFAULT_RADIUS_STEP_M} if never set.")
+    parser.add_argument("--smoothing-brush", type=int, default=None,
+                         help="generate-terrain, contour method only: brush for leftover fragments "
+                              "smaller than --min-radius -- a softer brush (type 10 default) so small "
+                              "scattered crumbs blend rather than showing a hard-edged patch. Default: "
+                              f"use whatever's saved in project.json, or {DEFAULT_SMOOTHING_BRUSH} if "
                               "never set.")
-    parser.add_argument("--ring-spacing-fraction", type=float, default=None,
-                         help="generate-terrain, contour method only: along-ring stamp spacing as a "
-                              "fraction of the local target radius -- < 1.0 means stamps deliberately "
-                              "overlap (default 0.5, matching Chad Rockey's TGC-Designer-Tools own "
-                              "radius=2x-spacing rule) rather than merely touching, since a cosine-"
-                              "falloff kernel's weight is ~0 right at the tangent point between two "
-                              "touching stamps -- tangent placement reads as visible seams, not a "
-                              "smooth result. Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_RING_SPACING_FRACTION} if never set.")
-    parser.add_argument("--interior-brush", type=int, default=None,
-                         help="generate-terrain, contour method only: brush for isolated hilltop/pit "
-                              "interior fills (large, hard stamps by design). Default: use whatever's "
-                              f"saved in project.json, or {DEFAULT_INTERIOR_BRUSH} if never set.")
-    parser.add_argument("--min-interior-radius", type=float, default=None,
-                         help="generate-terrain, contour method only: smallest allowed hilltop/pit "
-                              "interior-fill stamp radius (m). Default: use whatever's saved in "
-                              f"project.json, or {DEFAULT_MIN_INTERIOR_RADIUS_M} if never set.")
-    parser.add_argument("--max-interior-radius", type=float, default=None,
-                         help="generate-terrain, contour method only: largest allowed hilltop/pit "
-                              "interior-fill stamp radius (m). Default: use whatever's saved in "
-                              f"project.json, or {DEFAULT_MAX_INTERIOR_RADIUS_M} if never set.")
-    parser.add_argument("--interior-claim-radius-fraction", type=float, default=None,
-                         help="generate-terrain, contour method only: fraction of each interior-fill "
-                              "stamp's placed radius marked as claimed -- < 1.0 (default 0.5) means "
-                              "the next interior stamp lands closer and genuinely overlaps this one. "
-                              "Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_INTERIOR_CLAIM_RADIUS_FRACTION} if never set.")
-    parser.add_argument("--residual-brush", type=int, default=None,
-                         help="generate-terrain, contour method only: brush for the final safety-net "
-                              "pass covering whatever ring/interior fills leave untouched -- rare/small "
-                              "by design. Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_RESIDUAL_BRUSH} if never set.")
-    parser.add_argument("--min-residual-radius", type=float, default=None,
-                         help="generate-terrain, contour method only: smallest allowed residual-pass "
-                              "stamp radius (m). Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_MIN_RESIDUAL_RADIUS_M} if never set.")
-    parser.add_argument("--max-residual-radius", type=float, default=None,
-                         help="generate-terrain, contour method only: largest allowed residual-pass "
-                              "stamp radius (m). Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_MAX_RESIDUAL_RADIUS_M} if never set.")
-    parser.add_argument("--residual-claim-radius-fraction", type=float, default=None,
-                         help="generate-terrain, contour method only: fraction of each residual-pass "
-                              "stamp's placed radius marked as claimed -- < 1.0 (default 0.5) means "
-                              "the next residual stamp lands closer and genuinely overlaps this one. "
-                              "Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_RESIDUAL_CLAIM_RADIUS_FRACTION} if never set.")
-    parser.add_argument("--coverage-resolution", type=int, default=None,
-                         help="generate-terrain, contour method only: coverage-mask grid resolution "
-                              "the residual pass runs against -- finer catches smaller gaps at higher "
-                              "cost, independent of any resolution used by later refinement passes. "
-                              "Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_COVERAGE_RESOLUTION} if never set.")
-    parser.add_argument("--edge-softness-ratio", type=float, default=None,
-                         help="generate-terrain, contour method only: tightens spacing/claim fractions "
-                              "for higher-BRUSH_RANK (softer-falloff) brushes -- default ring_brush=10/"
-                              "rough_brush=9 have genuinely weaker real influence relative to their own "
-                              "nominal radius than type 8 does, so geometric radius alone understates "
-                              "how close together they need to be for real (not just nominal) coverage. "
-                              "1.0 is a no-op; values below 1.0 (try 0.7-0.85) pack softer brushes "
-                              "closer -- type 8 (BRUSH_RANK 0) is unaffected at any value. Default: use "
-                              f"whatever's saved in project.json, or {DEFAULT_EDGE_SOFTNESS_RATIO} if "
-                              "never set.")
+    parser.add_argument("--denoise-px", type=int, default=None,
+                         help="generate-terrain, contour method only: morphological open+close radius "
+                              "(heightmap pixels) applied to each band's mask before filling -- trims "
+                              "isolated few-pixel bumps and fills isolated few-pixel gaps, simplifying "
+                              "the boundary before it fragments the fill into unnecessary tiny stamps. "
+                              "0 disables. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_DENOISE_PX} if never set.")
     parser.add_argument("--error-resolution", type=int, default=None,
                          help="visualize: grid resolution for preview_error.png, overriding the "
                               "default of inheriting whatever --resolution refine-terrain last used "
@@ -2387,12 +2253,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "generate-terrain":
             step_generate_terrain(
                 working_dir, args.pitch, args.generate_terrain_method, args.band_spacing_m,
-                args.ring_brush, args.rough_brush, args.min_ring_radius, args.max_ring_radius,
-                args.ring_spacing_fraction, args.interior_brush, args.min_interior_radius,
-                args.max_interior_radius, args.interior_claim_radius_fraction,
-                args.residual_brush, args.min_residual_radius, args.max_residual_radius,
-                args.residual_claim_radius_fraction, args.coverage_resolution,
-                args.edge_softness_ratio,
+                args.fill_brush, args.min_radius, args.max_radius, args.radius_step_m,
+                args.smoothing_brush, args.denoise_px,
             )
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
