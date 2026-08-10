@@ -36,20 +36,39 @@ find_deep_holes already do elsewhere in this project: rasterize what's
 actually been covered by a placed stamp, run a distance transform over
 the uncovered area, and the point of maximum distance from any covered
 cell is both the most-interior uncovered point AND the natural radius
-for a stamp that fills it -- repeat, claiming only the placed circle,
-until nothing uncovered remains. This runs regardless of how tightly
-the elevation bands are spaced, so it's a real guarantee, not a
-tuning-dependent hope.
+for a stamp that fills it -- repeat until nothing uncovered remains.
+This runs regardless of how tightly the elevation bands are spaced, so
+it's a real guarantee, not a tuning-dependent hope.
 
-COVERAGE GUARANTEE, more precisely: ring placement always uses
-spacing == radius (each new stamp sits exactly one radius past the
-last, reaching back to the previous stamp's own center -- the same
-"reach to neighbor center" principle hexgrid.py's HEX_STAMP_RADIUS_M
-uses, just walked along a curve instead of a lattice). Combined with
-gap_fill_pass running to full saturation (loop until the distance
-transform's max is <= 0, not a failure-count heuristic), every point
-in the valid area ends up within SOME placed stamp's own radius of its
-center -- if it weren't, gap_fill_pass would have placed a stamp there.
+OVERLAP, not just coverage: claiming the entire placed circle (as an
+early version of this did) leaves neighboring stamps merely tangent at
+best -- and right at that tangent point a cosine-falloff kernel's
+weight is ~0 for BOTH stamps, so almost no pull happens there. Since
+neighboring gap-fill stamps generally target different local means,
+that reads as a visible seam/hole at every boundary -- "spotty," not
+smooth, exactly the terracing this whole design is meant to avoid.
+Both the ring walk and the gap-fill pass instead use the same
+claim_radius_fraction idea adaptive_refine.py already established:
+place each stamp at its full computed radius, but only mark an INNER
+fraction of that radius as "claimed" (ring: the arc-length spacing
+threshold for the next stamp; gap-fill: the covered-mask update), so
+the next stamp naturally lands closer and its full-radius footprint
+overlaps this one's, not just touches it.
+
+COVERAGE GUARANTEE, more precisely: ring placement uses spacing =
+radius * ring_spacing_fraction (default 0.5 -- deliberately matching
+Chad Rockey's TGC-Designer-Tools own fixed rule, "stamp radius = 2x
+its placement grid spacing," see adaptive_refine.py's module
+docstring), each new stamp sitting well inside the last one's own
+radius rather than just reaching its center -- the same "reach to
+neighbor" principle hexgrid.py's HEX_STAMP_RADIUS_M uses, generalized
+to deliberate overlap and walked along a curve instead of a lattice.
+Combined with gap_fill_pass running to full saturation (loop until the
+distance transform's max is <= 0, not a failure-count heuristic) at a
+claim radius smaller than its placement radius, every point in the
+valid area ends up within SOME placed stamp's own (full, unclaimed)
+radius of its center -- if it weren't, gap_fill_pass would have placed
+a stamp there.
 """
 
 from __future__ import annotations
@@ -71,8 +90,10 @@ DEFAULT_MIN_RING_RADIUS_M = 5.0
 DEFAULT_MAX_RING_RADIUS_M = 50.0
 DEFAULT_CURVATURE_WINDOW_M = 10.0  # arc-length window used to estimate local curvature
 DEFAULT_CURVATURE_CONTRAST_GAMMA = 2.0  # same role as adaptive_refine.py's variation_contrast_gamma
+DEFAULT_RING_SPACING_FRACTION = 0.5  # spacing = radius * this; matches Chad's radius=2x-spacing rule
 DEFAULT_GAP_FILL_BRUSH = 10
 DEFAULT_MIN_GAP_RADIUS_M = 5.0
+DEFAULT_GAP_CLAIM_RADIUS_FRACTION = 0.5  # claimed (covered) radius = placed radius * this
 DEFAULT_GAP_FILL_RESOLUTION = 400  # coverage-mask grid for the gap-fill pass; see generate_contour_layers
 DEFAULT_MAX_GAP_FILL_ITERATIONS = 20000  # safety cap, not expected to bind in practice
 
@@ -170,15 +191,17 @@ def _curvature_to_radius(
 def _place_stamps_along_ring(
     x: np.ndarray, z: np.ndarray, level: float, brush: int,
     min_radius: float, max_radius: float, curvature_window_m: float, contrast_gamma: float,
+    spacing_fraction: float,
 ) -> list[Stamp]:
     """
     Walk one contour ring (already in world coordinates) and place a
     flatten stamp every time accumulated arc length since the last
-    placement reaches the CURRENT local target radius -- i.e. spacing
-    == radius, reaching back exactly to the previous stamp's own
-    center, mirroring hexgrid.py's own neighbor-spacing convention
-    (see module docstring's coverage-guarantee note) just walked along
-    a curve with a locally-varying radius instead of a fixed lattice.
+    placement reaches `spacing_fraction * radius` -- deliberately less
+    than the full radius (default 0.5, matching Chad's own radius=2x-
+    spacing convention -- see module docstring) so consecutive stamps'
+    full-radius footprints overlap rather than merely touch. Each
+    stamp is still PLACED at its full local target radius; only the
+    spacing threshold for the next one shrinks.
 
     Ring is treated as closed if find_contours returned matching first
     and last points (the normal case for a ring that doesn't touch the
@@ -202,7 +225,7 @@ def _place_stamps_along_ring(
     accumulated = 0.0
     stamps.append(Stamp(x=float(x[0]), z=float(z[0]), radius=float(radius_at_vertex[0]),
                          value=level, brush=brush, tool=TOOL_FLATTEN))
-    next_target = radius_at_vertex[0]
+    next_target = radius_at_vertex[0] * spacing_fraction
 
     for i in range(1, n):
         accumulated += seg_len[i - 1]
@@ -210,7 +233,7 @@ def _place_stamps_along_ring(
             stamps.append(Stamp(x=float(x[i]), z=float(z[i]), radius=float(radius_at_vertex[i]),
                                  value=level, brush=brush, tool=TOOL_FLATTEN))
             accumulated = 0.0
-            next_target = radius_at_vertex[i]
+            next_target = radius_at_vertex[i] * spacing_fraction
 
     return stamps
 
@@ -250,6 +273,7 @@ def _rasterize_coverage(
 def _gap_fill_pass(
     heights: np.ndarray, bounds: BoundingBox, resolution: int, covered: np.ndarray,
     brush: int, min_radius: float, max_radius: float,
+    claim_radius_fraction: float = DEFAULT_GAP_CLAIM_RADIUS_FRACTION,
     max_iterations: int = DEFAULT_MAX_GAP_FILL_ITERATIONS,
 ) -> list[Stamp]:
     """
@@ -259,10 +283,22 @@ def _gap_fill_pass(
     applied to a plain coverage mask instead of a signed-error mask
     (there's no over/under distinction here, just covered/uncovered).
 
+    claim_radius_fraction (default 0.5, same idea and default as the
+    ring walk's spacing_fraction) marks only an INNER fraction of each
+    placed stamp's radius as covered -- the stamp itself is still
+    placed at its full computed radius. Claiming the whole circle (an
+    earlier version did) leaves neighbors merely tangent, and a
+    cosine-falloff kernel's weight is ~0 right at that tangent point
+    for both stamps -- visible seams between differently-toned patches,
+    not the smooth result the whole design is meant to produce. Shrunk
+    claiming means the next iteration's stamp naturally lands closer,
+    so consecutive stamps' full-radius footprints genuinely overlap.
+
     Runs to genuine saturation -- the loop only exits when the
     distance transform's peak is <= 0, i.e. nothing valid remains
     uncovered -- not a failure-count heuristic, so this is a real
-    guarantee regardless of how the elevation bands above were spaced.
+    guarantee regardless of how the elevation bands above were spaced
+    or how much overlap claim_radius_fraction asks for.
     """
     actual = downsample_heightmap(heights, bounds, resolution)
     valid = np.isfinite(actual)
@@ -286,8 +322,12 @@ def _gap_fill_pass(
             break
         row, col = np.unravel_index(np.argmax(dist), dist.shape)
         radius = float(np.clip(peak, min_radius, max_radius))
+        claim_radius = radius * claim_radius_fraction
         cx, cz = float(x_centers[col]), float(z_centers[row])
 
+        # Window sized to the full placement radius, not the (smaller)
+        # claim radius -- both the target-value query and the covered-
+        # mask update need to reach the actual footprint being placed.
         row_min = max(0, int((cz - radius - bounds.min_z) / cell_z))
         row_max = min(resolution, int((cz + radius - bounds.min_z) / cell_z) + 1)
         col_min = max(0, int((cx - radius - bounds.min_x) / cell_x))
@@ -295,16 +335,18 @@ def _gap_fill_pass(
         sub_x = x_centers[col_min:col_max]
         sub_z = z_centers[row_min:row_max]
         xx, zz = np.meshgrid(sub_x, sub_z)
-        within = np.hypot(xx - cx, zz - cz) <= radius
+        dist_from_center = np.hypot(xx - cx, zz - cz)
+        within_radius = dist_from_center <= radius
+        within_claim = dist_from_center <= claim_radius
         sub_actual = actual[row_min:row_max, col_min:col_max]
-        sub_valid = valid[row_min:row_max, col_min:col_max] & within
+        sub_valid = valid[row_min:row_max, col_min:col_max] & within_radius
         if not sub_valid.any():
             covered[row, col] = True  # can't fit a value here; claim just this cell and move on
             continue
         target = float(np.mean(sub_actual[sub_valid]))
 
         stamps.append(Stamp(x=cx, z=cz, radius=radius, value=target, brush=brush, tool=TOOL_FLATTEN))
-        covered[row_min:row_max, col_min:col_max][within] = True
+        covered[row_min:row_max, col_min:col_max][within_claim] = True
 
     return stamps
 
@@ -318,9 +360,11 @@ def generate_contour_layers(
     max_ring_radius: float = DEFAULT_MAX_RING_RADIUS_M,
     curvature_window_m: float = DEFAULT_CURVATURE_WINDOW_M,
     curvature_contrast_gamma: float = DEFAULT_CURVATURE_CONTRAST_GAMMA,
+    ring_spacing_fraction: float = DEFAULT_RING_SPACING_FRACTION,
     gap_fill_brush: int = DEFAULT_GAP_FILL_BRUSH,
     min_gap_radius: float = DEFAULT_MIN_GAP_RADIUS_M,
     max_gap_radius: Optional[float] = None,
+    gap_claim_radius_fraction: float = DEFAULT_GAP_CLAIM_RADIUS_FRACTION,
     gap_fill_resolution: int = DEFAULT_GAP_FILL_RESOLUTION,
 ) -> list[Stamp]:
     """
@@ -342,6 +386,12 @@ def generate_contour_layers(
     adaptive_refine.py's scatter_stamps), since they don't come from a
     contour level at all.
 
+    ring_spacing_fraction / gap_claim_radius_fraction (both default
+    0.5) control deliberate overlap, not just coverage -- see module
+    docstring's OVERLAP section. Neither should be set to 1.0 in
+    practice; that reduces to tangent-only placement and reintroduces
+    the visible seams this design is meant to avoid.
+
     max_gap_radius defaults to max_ring_radius when not given.
     gap_fill_resolution controls the coverage-mask grid the gap-fill
     pass runs against -- finer catches smaller gaps (a green missed
@@ -361,7 +411,7 @@ def generate_contour_layers(
             x, z = _pixel_to_world(rows, cols, heights.shape, bounds)
             stamps.extend(_place_stamps_along_ring(
                 x, z, level, brush, min_ring_radius, max_ring_radius,
-                curvature_window_m, curvature_contrast_gamma,
+                curvature_window_m, curvature_contrast_gamma, ring_spacing_fraction,
             ))
 
     covered = np.zeros((gap_fill_resolution, gap_fill_resolution), dtype=bool)
@@ -370,6 +420,7 @@ def generate_contour_layers(
     gap_stamps = _gap_fill_pass(
         heights, bounds, gap_fill_resolution, covered,
         gap_fill_brush, min_gap_radius, max_gap_radius,
+        claim_radius_fraction=gap_claim_radius_fraction,
     )
     stamps.extend(gap_stamps)
 
