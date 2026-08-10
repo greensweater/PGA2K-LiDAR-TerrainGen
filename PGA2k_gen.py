@@ -503,10 +503,16 @@ def step_visualize(
     print(f"Writing {PREVIEW_ERROR} (course-cropped point cloud vs. TerrainModel)...")
     if error_resolution is None:
         error_resolution = latest_refine["parameters"]["resolution"] if latest_refine is not None else 200
-    viz.render_error_preview(
+    error_stats = viz.render_error_preview(
         model, course_cloud, bounds, preview_dir / PREVIEW_ERROR,
         resolution=error_resolution, extra_label=extra_label, mask=mask_grid,
     )
+    print(f"  RMS={error_stats['rms']:.2f} m, bias={error_stats['bias']:+.2f} m "
+          "(bias = mean(predicted - actual): positive means the map sits above the real LIDAR "
+          "on average, negative means below)")
+    if error_stats["masked_rms"] is not None:
+        print(f"  masked area: RMS={error_stats['masked_rms']:.2f} m, "
+              f"bias={error_stats['masked_bias']:+.2f} m")
 
     print(f"All previews written to {preview_dir}")
 
