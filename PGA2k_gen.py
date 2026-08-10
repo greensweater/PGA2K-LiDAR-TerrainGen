@@ -1394,6 +1394,14 @@ def step_generate_terrain(
         print(f"Filling elevation-band channels (band_spacing_m={band_spacing_m}, "
               f"ring_radius=[{min_ring_radius}, {max_ring_radius}] m, "
               f"interior_radius=[{min_interior_radius}, {max_interior_radius}] m)...")
+
+        progress_start_time = time.time()
+
+        def _print_contour_progress(stamp_count: int, fraction: float) -> None:
+            elapsed = time.time() - progress_start_time
+            print(f"  ... {elapsed:.0f}s elapsed: {stamp_count} stamps so far, "
+                  f"{fraction:.1%} complete (working lowest to highest elevation)")
+
         fitted = generate_contour_layers(
             heightmap, bounds,
             band_spacing_m=band_spacing_m,
@@ -1411,6 +1419,7 @@ def step_generate_terrain(
             max_residual_radius=max_residual_radius,
             residual_claim_radius_fraction=residual_claim_radius_fraction,
             coverage_resolution=coverage_resolution,
+            progress_callback=_print_contour_progress,
         )
         print(f"  {len(fitted)} stamps placed (channel fill + hilltop/pit interiors + residual, "
               "all already fitted)")
