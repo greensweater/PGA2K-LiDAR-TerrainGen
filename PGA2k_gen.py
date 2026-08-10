@@ -133,6 +133,7 @@ from terrain.contour_layers import (
     DEFAULT_MAX_RESIDUAL_RADIUS_M,
     DEFAULT_RESIDUAL_CLAIM_RADIUS_FRACTION,
     DEFAULT_COVERAGE_RESOLUTION,
+    DEFAULT_EDGE_SOFTNESS_RATIO,
     generate_contour_layers,
 )
 from terrain.stamp import Stamp
@@ -1265,6 +1266,7 @@ def step_generate_terrain(
     max_residual_radius: float | None = None,
     residual_claim_radius_fraction: float | None = None,
     coverage_resolution: int | None = None,
+    edge_softness_ratio: float | None = None,
 ) -> None:
     """
     pitch (feature-flagged via project.json, same None-means-use-saved
@@ -1373,6 +1375,10 @@ def step_generate_terrain(
         coverage_resolution = project.get(
             "generate_terrain_coverage_resolution", DEFAULT_COVERAGE_RESOLUTION
         )
+    if edge_softness_ratio is None:
+        edge_softness_ratio = project.get(
+            "generate_terrain_edge_softness_ratio", DEFAULT_EDGE_SOFTNESS_RATIO
+        )
 
     print(f"Loading {pointcloud_path}...")
     full_cloud = PointCloud.load(pointcloud_path)
@@ -1419,6 +1425,7 @@ def step_generate_terrain(
             max_residual_radius=max_residual_radius,
             residual_claim_radius_fraction=residual_claim_radius_fraction,
             coverage_resolution=coverage_resolution,
+            edge_softness_ratio=edge_softness_ratio,
             progress_callback=_print_contour_progress,
         )
         print(f"  {len(fitted)} stamps placed (channel fill + hilltop/pit interiors + residual, "
@@ -1473,6 +1480,7 @@ def step_generate_terrain(
         "generate_terrain_max_residual_radius_m": max_residual_radius,
         "generate_terrain_residual_claim_radius_fraction": residual_claim_radius_fraction,
         "generate_terrain_coverage_resolution": coverage_resolution,
+        "generate_terrain_edge_softness_ratio": edge_softness_ratio,
     })
 
     print("Refreshing previews...")
@@ -2116,6 +2124,16 @@ def main(argv: list[str] | None = None) -> int:
                               "cost, independent of any resolution used by later refinement passes. "
                               "Default: use whatever's saved in project.json, or "
                               f"{DEFAULT_COVERAGE_RESOLUTION} if never set.")
+    parser.add_argument("--edge-softness-ratio", type=float, default=None,
+                         help="generate-terrain, contour method only: tightens spacing/claim fractions "
+                              "for higher-BRUSH_RANK (softer-falloff) brushes -- default ring_brush=10/"
+                              "rough_brush=9 have genuinely weaker real influence relative to their own "
+                              "nominal radius than type 8 does, so geometric radius alone understates "
+                              "how close together they need to be for real (not just nominal) coverage. "
+                              "1.0 is a no-op; values below 1.0 (try 0.7-0.85) pack softer brushes "
+                              "closer -- type 8 (BRUSH_RANK 0) is unaffected at any value. Default: use "
+                              f"whatever's saved in project.json, or {DEFAULT_EDGE_SOFTNESS_RATIO} if "
+                              "never set.")
     parser.add_argument("--dig-depth", type=float, default=None,
                          help="dig-water: how much (m) to lower heightmap.npz under each water "
                               "polygon. Default: use whatever's saved in project.json, or "
@@ -2343,6 +2361,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.max_interior_radius, args.interior_claim_radius_fraction,
                 args.residual_brush, args.min_residual_radius, args.max_residual_radius,
                 args.residual_claim_radius_fraction, args.coverage_resolution,
+                args.edge_softness_ratio,
             )
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
