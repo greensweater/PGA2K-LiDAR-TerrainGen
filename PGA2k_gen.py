@@ -117,6 +117,18 @@ from terrain.adaptive_refine import (
 from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
 from terrain.hexgrid import HEX_LATTICE_PITCH_M, generate_hex_grid
+from terrain.contour_layers import (
+    DEFAULT_BAND_SPACING_M,
+    DEFAULT_BRUSH as CONTOUR_DEFAULT_BRUSH,
+    DEFAULT_MIN_RING_RADIUS_M,
+    DEFAULT_MAX_RING_RADIUS_M,
+    DEFAULT_CURVATURE_WINDOW_M,
+    DEFAULT_CURVATURE_CONTRAST_GAMMA,
+    DEFAULT_GAP_FILL_BRUSH,
+    DEFAULT_MIN_GAP_RADIUS_M,
+    DEFAULT_GAP_FILL_RESOLUTION,
+    generate_contour_layers,
+)
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
 from course_output.userLayers import (
@@ -1228,7 +1240,20 @@ def step_dig_water(
     step_visualize(working_dir)
 
 
-def step_generate_terrain(working_dir: Path, pitch: float | None = None) -> None:
+def step_generate_terrain(
+    working_dir: Path,
+    pitch: float | None = None,
+    method: str | None = None,
+    band_spacing_m: float | None = None,
+    contour_brush: int | None = None,
+    min_ring_radius: float | None = None,
+    max_ring_radius: float | None = None,
+    curvature_window_m: float | None = None,
+    curvature_contrast_gamma: float | None = None,
+    gap_fill_brush: int | None = None,
+    min_gap_radius: float | None = None,
+    gap_fill_resolution: int | None = None,
+) -> None:
     """
     pitch (feature-flagged via project.json, same None-means-use-saved
     pattern used throughout this file) is terrain/hexgrid.py's
@@ -1242,7 +1267,34 @@ def step_generate_terrain(working_dir: Path, pitch: float | None = None) -> None
     default arguments are evaluated once, not re-derived from whatever
     `pitch` is actually passed), so both are computed explicitly here
     for whatever pitch is in play, not left to fall back silently.
+
+    method ("hex", default, or "contour") picks the initial-layout
+    generator: "hex" is the flat lattice above; "contour" is terrain/
+    contour_layers.py's organic elevation-band tracer -- see that
+    module's docstring for the full rationale (curvature-driven along-
+    ring spacing, plus a distance-transform gap-fill pass for flat
+    interiors a boundary-only method structurally can't reach). Only
+    "hex"'s parameters (pitch) apply in "hex" mode and vice versa for
+    the contour_* parameters below; irrelevant ones are ignored.
+
+    Unlike hex mode, contour mode's stamps already carry their exact
+    fitted value (ring stamps: the contour level they were traced
+    from; gap-fill stamps: the local heightmap mean over their own
+    footprint, computed inside generate_contour_layers itself) -- so
+    the fit_stamp_heights() pass below only runs in "hex" mode.
+    Re-running it against contour stamps would actually be harmful, not
+    a no-op: fit_stamp_heights averages nearby LIDAR points within a
+    stamp's radius, and near a ring that sits right on a real elevation
+    boundary, that average pulls away from the exact level the ring was
+    deliberately traced at -- undoing the one thing edge-tracing gets
+    for free that hex mode doesn't.
     """
+    if method is None:
+        project = load_project(working_dir)
+        method = project.get("generate_terrain_method", "hex")
+    if method not in ("hex", "contour"):
+        raise StepError(f"method must be 'hex' or 'contour', got {method!r}")
+
     pointcloud_path = working_dir / POINTCLOUD_FILE
     if not pointcloud_path.exists():
         raise StepError(
@@ -1252,6 +1304,30 @@ def step_generate_terrain(working_dir: Path, pitch: float | None = None) -> None
     project = load_project(working_dir)
     if pitch is None:
         pitch = project.get("generate_terrain_pitch_m", HEX_LATTICE_PITCH_M)
+    if band_spacing_m is None:
+        band_spacing_m = project.get("generate_terrain_band_spacing_m", DEFAULT_BAND_SPACING_M)
+    if contour_brush is None:
+        contour_brush = project.get("generate_terrain_contour_brush", CONTOUR_DEFAULT_BRUSH)
+    if min_ring_radius is None:
+        min_ring_radius = project.get("generate_terrain_min_ring_radius_m", DEFAULT_MIN_RING_RADIUS_M)
+    if max_ring_radius is None:
+        max_ring_radius = project.get("generate_terrain_max_ring_radius_m", DEFAULT_MAX_RING_RADIUS_M)
+    if curvature_window_m is None:
+        curvature_window_m = project.get(
+            "generate_terrain_curvature_window_m", DEFAULT_CURVATURE_WINDOW_M
+        )
+    if curvature_contrast_gamma is None:
+        curvature_contrast_gamma = project.get(
+            "generate_terrain_curvature_contrast_gamma", DEFAULT_CURVATURE_CONTRAST_GAMMA
+        )
+    if gap_fill_brush is None:
+        gap_fill_brush = project.get("generate_terrain_gap_fill_brush", DEFAULT_GAP_FILL_BRUSH)
+    if min_gap_radius is None:
+        min_gap_radius = project.get("generate_terrain_min_gap_radius_m", DEFAULT_MIN_GAP_RADIUS_M)
+    if gap_fill_resolution is None:
+        gap_fill_resolution = project.get(
+            "generate_terrain_gap_fill_resolution", DEFAULT_GAP_FILL_RESOLUTION
+        )
 
     print(f"Loading {pointcloud_path}...")
     full_cloud = PointCloud.load(pointcloud_path)
@@ -1269,18 +1345,37 @@ def step_generate_terrain(working_dir: Path, pitch: float | None = None) -> None
         raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
     heightmap, _ = load_heightmap(heightmap_path)
 
-    stamp_radius = 2.0 * pitch
-    bleed = stamp_radius / 2.0
-    print(f"Generating hex grid (pitch={pitch} m, stamp_radius={stamp_radius} m, bleed={bleed} m)...")
-    stamps = generate_hex_grid(bounds, pitch=pitch, stamp_radius=stamp_radius, bleed=bleed)
-    print(f"  {len(stamps)} stamps placed")
+    if method == "contour":
+        print(f"Tracing elevation-band contours (band_spacing_m={band_spacing_m}, "
+              f"brush={contour_brush}, ring_radius=[{min_ring_radius}, {max_ring_radius}] m, "
+              f"curvature_window_m={curvature_window_m})...")
+        fitted = generate_contour_layers(
+            heightmap, bounds,
+            band_spacing_m=band_spacing_m,
+            brush=contour_brush,
+            min_ring_radius=min_ring_radius,
+            max_ring_radius=max_ring_radius,
+            curvature_window_m=curvature_window_m,
+            curvature_contrast_gamma=curvature_contrast_gamma,
+            gap_fill_brush=gap_fill_brush,
+            min_gap_radius=min_gap_radius,
+            max_gap_radius=max_ring_radius,
+            gap_fill_resolution=gap_fill_resolution,
+        )
+        print(f"  {len(fitted)} stamps placed (ring tracing + gap-fill, all already fitted)")
+    else:
+        stamp_radius = 2.0 * pitch
+        bleed = stamp_radius / 2.0
+        print(f"Generating hex grid (pitch={pitch} m, stamp_radius={stamp_radius} m, bleed={bleed} m)...")
+        stamps = generate_hex_grid(bounds, pitch=pitch, stamp_radius=stamp_radius, bleed=bleed)
+        print(f"  {len(stamps)} stamps placed")
 
-    print("Fitting stamp heights from the rasterized ground heightmap...")
-    fitted = fit_stamp_heights(stamps, heightmap, bounds)
-    n_unfitted = sum(1 for s in fitted if s.value == 0.0)
-    if n_unfitted:
-        print(f"  WARNING: {n_unfitted} stamps had too few nearby heightmap cells and kept "
-              "their placeholder value=0.0")
+        print("Fitting stamp heights from the rasterized ground heightmap...")
+        fitted = fit_stamp_heights(stamps, heightmap, bounds)
+        n_unfitted = sum(1 for s in fitted if s.value == 0.0)
+        if n_unfitted:
+            print(f"  WARNING: {n_unfitted} stamps had too few nearby heightmap cells and kept "
+                  "their placeholder value=0.0")
 
     mean_elevation = float(np.nanmean(heightmap))
     print(f"Prepending a course-wide baseline-flatten stamp at the mean ground "
@@ -1291,15 +1386,27 @@ def step_generate_terrain(working_dir: Path, pitch: float | None = None) -> None
     out_path = _stamps_dir(working_dir) / INITIAL_STAMPS_FILE
     save_stamp_file(
         fitted, out_path, step="generate-terrain",
-        parameters={"course_size_m": COURSE_SIZE_M, "pitch_m": pitch},
+        parameters={"course_size_m": COURSE_SIZE_M, "pitch_m": pitch, "method": method,
+                     "band_spacing_m": band_spacing_m},
     )
     print(f"  wrote {out_path}")
+
 
     save_project(working_dir, {
         "course_origin_x": course_cloud.origin_x,
         "course_origin_y": course_cloud.origin_y,
         "stamp_count": len(fitted),
         "generate_terrain_pitch_m": pitch,
+        "generate_terrain_method": method,
+        "generate_terrain_band_spacing_m": band_spacing_m,
+        "generate_terrain_contour_brush": contour_brush,
+        "generate_terrain_min_ring_radius_m": min_ring_radius,
+        "generate_terrain_max_ring_radius_m": max_ring_radius,
+        "generate_terrain_curvature_window_m": curvature_window_m,
+        "generate_terrain_curvature_contrast_gamma": curvature_contrast_gamma,
+        "generate_terrain_gap_fill_brush": gap_fill_brush,
+        "generate_terrain_min_gap_radius_m": min_gap_radius,
+        "generate_terrain_gap_fill_resolution": gap_fill_resolution,
     })
 
     print("Refreshing previews...")
@@ -1853,12 +1960,63 @@ def main(argv: list[str] | None = None) -> int:
                               "default; pass --no-fill-heightmap-gaps to leave gaps as NaN, excluded "
                               "from error scoring/fitting downstream (old behavior).")
     parser.add_argument("--pitch", type=float, default=None,
-                         help="generate-terrain: spacing (m) of the initial coarse hex-grid stamp "
-                              "lattice (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch "
-                              "means more, smaller, more tightly-packed initial stamps. Stamp radius "
-                              "and edge bleed both derive from this automatically (radius=2*pitch, "
-                              "bleed=pitch). Default: use whatever's saved in project.json, or "
-                              f"{HEX_LATTICE_PITCH_M} if never set.")
+                         help="generate-terrain, hex method only: spacing (m) of the initial coarse "
+                              "hex-grid stamp lattice (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- "
+                              "smaller pitch means more, smaller, more tightly-packed initial stamps. "
+                              "Stamp radius and edge bleed both derive from this automatically "
+                              "(radius=2*pitch, bleed=pitch). Default: use whatever's saved in "
+                              f"project.json, or {HEX_LATTICE_PITCH_M} if never set.")
+    parser.add_argument("--generate-terrain-method", type=str, default=None, choices=["hex", "contour"],
+                         help="generate-terrain: 'hex' (default) is the flat hex lattice. 'contour' "
+                              "traces elevation-band contours of the real heightmap and places stamps "
+                              "along each ring, spaced by local curvature, with a distance-transform "
+                              "gap-fill pass for flat interiors ring-tracing can't reach on its own -- "
+                              "see terrain/contour_layers.py. Default: use whatever's saved in "
+                              "project.json, or 'hex' if never set.")
+    parser.add_argument("--band-spacing-m", type=float, default=None,
+                         help="generate-terrain, contour method only: elevation spacing (m) between "
+                              "traced contour bands -- smaller means more bands, denser coverage on "
+                              "sloped terrain, more stamps overall. Default: use whatever's saved in "
+                              f"project.json, or {DEFAULT_BAND_SPACING_M} if never set.")
+    parser.add_argument("--contour-brush", type=int, default=None,
+                         help="generate-terrain, contour method only: brush type placed along each "
+                              "ring -- type 10/54 (no flat plateau) recommended so adjacent bands "
+                              "blend instead of showing terrace edges. Default: use whatever's saved "
+                              f"in project.json, or {CONTOUR_DEFAULT_BRUSH} if never set.")
+    parser.add_argument("--min-ring-radius", type=float, default=None,
+                         help="generate-terrain, contour method only: smallest allowed along-ring "
+                              "stamp radius (m), used at the sharpest bends. Default: use whatever's "
+                              f"saved in project.json, or {DEFAULT_MIN_RING_RADIUS_M} if never set.")
+    parser.add_argument("--max-ring-radius", type=float, default=None,
+                         help="generate-terrain, contour method only: largest allowed along-ring stamp "
+                              "radius (m), used on the straightest runs -- also the cap used for gap-"
+                              "fill stamp radius. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_MAX_RING_RADIUS_M} if never set.")
+    parser.add_argument("--curvature-window-m", type=float, default=None,
+                         help="generate-terrain, contour method only: arc-length window (m) used to "
+                              "estimate each ring vertex's local curvature. Default: use whatever's "
+                              f"saved in project.json, or {DEFAULT_CURVATURE_WINDOW_M} if never set.")
+    parser.add_argument("--curvature-contrast-gamma", type=float, default=None,
+                         help="generate-terrain, contour method only: exponent sharpening the "
+                              "curvature-to-radius map toward the extremes (>1 sharpens, 1.0 is "
+                              "linear) -- same role as refine-terrain's --variation-contrast-gamma. "
+                              "Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_CURVATURE_CONTRAST_GAMMA} if never set.")
+    parser.add_argument("--gap-fill-brush", type=int, default=None,
+                         help="generate-terrain, contour method only: brush type used for the "
+                              "distance-transform gap-fill pass that closes flat interiors ring-"
+                              "tracing can't reach. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_GAP_FILL_BRUSH} if never set.")
+    parser.add_argument("--min-gap-radius", type=float, default=None,
+                         help="generate-terrain, contour method only: smallest allowed gap-fill stamp "
+                              "radius (m). Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_MIN_GAP_RADIUS_M} if never set.")
+    parser.add_argument("--gap-fill-resolution", type=int, default=None,
+                         help="generate-terrain, contour method only: coverage-mask grid resolution "
+                              "the gap-fill pass runs against -- finer catches smaller gaps at higher "
+                              "cost, independent of any resolution used by later refinement passes. "
+                              "Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_GAP_FILL_RESOLUTION} if never set.")
     parser.add_argument("--dig-depth", type=float, default=None,
                          help="dig-water: how much (m) to lower heightmap.npz under each water "
                               "polygon. Default: use whatever's saved in project.json, or "
@@ -2079,7 +2237,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "dig-water":
             step_dig_water(working_dir, args.dig_depth, args.dig_buffer)
         elif args.step == "generate-terrain":
-            step_generate_terrain(working_dir, args.pitch)
+            step_generate_terrain(
+                working_dir, args.pitch, args.generate_terrain_method, args.band_spacing_m,
+                args.contour_brush, args.min_ring_radius, args.max_ring_radius,
+                args.curvature_window_m, args.curvature_contrast_gamma,
+                args.gap_fill_brush, args.min_gap_radius, args.gap_fill_resolution,
+            )
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
                 tuple(int(b.strip()) for b in args.candidate_brushes.split(","))
