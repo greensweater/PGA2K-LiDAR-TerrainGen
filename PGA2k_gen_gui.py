@@ -55,7 +55,7 @@ from constants import (  # noqa: E402
 )
 from PGA2k_gen import (  # noqa: E402
     DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M, FEATURES_FILE, HEIGHT_MASK_FILE,
-    HEIGHTMAP_FILE, OBJECT_LIST_FILE, load_project, save_project,
+    HEIGHTMAP_FILE, OBJECT_LIST_FILE, load_all_stamps, load_project, save_project,
 )
 from ingest.heightmap import load_heightmap  # noqa: E402
 from course_output.objects import (  # noqa: E402
@@ -948,6 +948,24 @@ class PGAGenGUI:
                  "white, everything else transparent -- 1-bit, no antialiasing, purely an in-"
                  "memory visual (nothing written to disk). Narrow this toward your BAND m setting "
                  "to see one traced level at a time; widen it to see a whole channel at once.")
+
+        stamp_cov_row = ttk.Frame(frame)
+        stamp_cov_row.pack(fill="x", pady=(4, 0))
+        self.show_stamp_coverage_var = tk.BooleanVar(value=False)
+        stamp_cov_checkbox = ttk.Checkbutton(
+            stamp_cov_row, text="Show stamp coverage (Elevation contour)",
+            variable=self.show_stamp_coverage_var, command=self._show_preview,
+        )
+        stamp_cov_checkbox.pack(side="left")
+        _Tooltip(stamp_cov_checkbox, "Only has an effect while Elevation contour is also checked. "
+                 "Reads the real current stamp list (initial_stamps.json + every refine_stamps_N.json, "
+                 "via load_all_stamps) and rasterizes which cells of the elevation band are actually "
+                 "reached by SOME stamp's own placement radius: GREEN = in-band and covered, RED = "
+                 "in-band and NOT covered by anything -- the real gaps, not inferred from the "
+                 "heightmap's shape alone. Coverage itself doesn't depend on the slider/width, so it's "
+                 "computed once per stamp-list version and cached -- the first toggle (or first check "
+                 "after a new refine-terrain pass) can take a few seconds at real stamp counts, "
+                 "dragging the slider after that is instant.")
 
     _SPLINE_KIND_FILTERS = (
         "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
@@ -2270,6 +2288,77 @@ class PGAGenGUI:
         self._cached_heightmap_key = cache_key
         return heights
 
+    def _get_cached_stamps(self, working_dir: Path):
+        """
+        Lazily load the full current stamp list (initial_stamps.json
+        plus every refine_stamps_N.json, via PGA2k_gen.load_all_stamps)
+        and cache it, keyed on the mtime of every *.json file present
+        under stamps/ -- so running another refine-terrain pass (or
+        undoing one) properly invalidates this the next time the
+        overlay redraws. Returns None if there's no initial_stamps.json
+        yet (load_all_stamps raises in that case; caught here so a
+        missing stamp file just means "no overlay" rather than an
+        error swallowing the whole preview).
+        """
+        stamps_dir = working_dir / STAMPS_DIR
+        if not stamps_dir.exists():
+            return None
+        stamp_files = sorted(stamps_dir.glob("*.json"))
+        if not stamp_files:
+            return None
+        cache_key = tuple((str(p), p.stat().st_mtime) for p in stamp_files)
+        if getattr(self, "_cached_stamps_key", None) == cache_key:
+            return self._cached_stamps
+        try:
+            stamps = load_all_stamps(working_dir)
+        except Exception:
+            return None
+        self._cached_stamps = stamps
+        self._cached_stamps_key = cache_key
+        return stamps
+
+    def _get_cached_stamp_coverage_mask(self, working_dir: Path, shape: tuple[int, int]):
+        """
+        Rasterize which cells of a `shape`-sized grid (matching the
+        heightmap's own array shape, not any preview PNG's pixel size)
+        are reached by ANY stamp's own placement radius -- a STATIC
+        property of the stamp list, independent of the elevation-
+        contour slider/width, so this is cached and keyed on the same
+        stamp-file mtimes as _get_cached_stamps rather than recomputed
+        on every tick. Expensive at real stamp counts (one pass per
+        stamp -- can take a few seconds the first time, or after a new
+        refine-terrain pass); cheap to reuse after that.
+        """
+        stamps = self._get_cached_stamps(working_dir)
+        if stamps is None:
+            return None
+        cache_key = (self._cached_stamps_key, shape)
+        if getattr(self, "_cached_stamp_coverage_key", None) == cache_key:
+            return self._cached_stamp_coverage_mask
+
+        n_rows, n_cols = shape
+        cell_x = COURSE_SIZE_M / n_cols
+        cell_z = COURSE_SIZE_M / n_rows
+        x_centers = (np.arange(n_cols) + 0.5) * cell_x
+        z_centers = (np.arange(n_rows) + 0.5) * cell_z
+        covered = np.zeros(shape, dtype=bool)
+        for s in stamps:
+            col_min = max(0, int((s.x - s.radius) / cell_x))
+            col_max = min(n_cols, int((s.x + s.radius) / cell_x) + 1)
+            row_min = max(0, int((s.z - s.radius) / cell_z))
+            row_max = min(n_rows, int((s.z + s.radius) / cell_z) + 1)
+            if col_min >= col_max or row_min >= row_max:
+                continue
+            sub_x = x_centers[col_min:col_max]
+            sub_z = z_centers[row_min:row_max]
+            xx, zz = np.meshgrid(sub_x, sub_z)
+            within = np.hypot(xx - s.x, zz - s.z) <= s.radius
+            covered[row_min:row_max, col_min:col_max] |= within
+
+        self._cached_stamp_coverage_mask = covered
+        self._cached_stamp_coverage_key = cache_key
+        return covered
+
     def _on_elevation_contour_toggle(self) -> None:
         """
         First time the checkbox goes on, size the slider to the real
@@ -2514,11 +2603,32 @@ class PGAGenGUI:
                     # gaps in the heightmap fall out of the band with no
                     # special-casing needed.
                     band = (heights >= elevation) & (heights < elevation + band_width)
-                    # 1-bit: solid white where the band matches, fully
-                    # transparent elsewhere -- no antialiasing/blending.
+
                     band_rgba = np.zeros((*band.shape, 4), dtype=np.uint8)
-                    band_rgba[band, :3] = 255
-                    band_rgba[band, 3] = 255
+                    if self.show_stamp_coverage_var.get():
+                        coverage = self._get_cached_stamp_coverage_mask(Path(wd), heights.shape)
+                        if coverage is not None:
+                            covered_in_band = band & coverage
+                            uncovered_in_band = band & ~coverage
+                            # GREEN: in-band and reached by some stamp's own
+                            # radius. RED: in-band and reached by nothing --
+                            # the real gaps, read directly off the actual
+                            # stamp list rather than inferred from shape.
+                            band_rgba[covered_in_band] = (0, 220, 0, 255)
+                            band_rgba[uncovered_in_band] = (255, 0, 0, 255)
+                        else:
+                            # No stamps yet (or none loadable) -- fall back
+                            # to the plain band rendering rather than
+                            # showing nothing, so toggling this on early
+                            # in the pipeline doesn't look like a silent
+                            # failure.
+                            band_rgba[band, :3] = 255
+                            band_rgba[band, 3] = 255
+                    else:
+                        # 1-bit: solid white where the band matches, fully
+                        # transparent elsewhere -- no antialiasing/blending.
+                        band_rgba[band, :3] = 255
+                        band_rgba[band, 3] = 255
                     # imshow(heights, origin="lower") in visualize.py puts
                     # heights' row 0 at the BOTTOM of the rendered preview,
                     # but PIL images put row 0 at the TOP -- flip vertically
