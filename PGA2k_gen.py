@@ -299,12 +299,27 @@ def step_init(working_dir: Path) -> None:
               f"{working_dir} --step ingest-laz --projection <EPSG code>")
 
 
-def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -> None:
+def step_visualize(
+    working_dir: Path, overwrite_current_version: bool = False, error_resolution: int | None = None,
+) -> None:
     """
     Generate every diagnostic preview PNG this pipeline can currently
     produce, against whatever artifacts already exist in working_dir.
     Never a prerequisite for other steps -- purely for inspection (see
     "never behave as a black box").
+
+    error_resolution overrides preview_error.png's own grid resolution
+    directly. Left at None (default), it falls back to whatever refine-
+    terrain last used (letting the error preview match the resolution
+    refine actually tuned against) -- but that inherits a completely
+    unrelated step's own setting, and silently drops to a hardcoded 200
+    if refine-terrain hasn't run yet at all, which is far too coarse to
+    localize a specific small feature (confirmed: at RES~1000, a 200x200
+    error grid averages ~5x5 real cells into one, hiding exactly the
+    kind of localized error a generate-terrain contour-method run needs
+    to debug before refine-terrain has even run once). Pass this
+    explicitly to decouple preview_error.png from refine-terrain
+    entirely and control it directly.
 
     overwrite_current_version distinguishes this function's two kinds
     of caller. generate-terrain/refine-terrain call this automatically
@@ -486,7 +501,8 @@ def step_visualize(working_dir: Path, overwrite_current_version: bool = False) -
     if overwrite_current_version:
         _overwrite_latest(PREVIEW_ERROR)
     print(f"Writing {PREVIEW_ERROR} (course-cropped point cloud vs. TerrainModel)...")
-    error_resolution = latest_refine["parameters"]["resolution"] if latest_refine is not None else 200
+    if error_resolution is None:
+        error_resolution = latest_refine["parameters"]["resolution"] if latest_refine is not None else 200
     viz.render_error_preview(
         model, course_cloud, bounds, preview_dir / PREVIEW_ERROR,
         resolution=error_resolution, extra_label=extra_label, mask=mask_grid,
@@ -2134,6 +2150,15 @@ def main(argv: list[str] | None = None) -> int:
                               "closer -- type 8 (BRUSH_RANK 0) is unaffected at any value. Default: use "
                               f"whatever's saved in project.json, or {DEFAULT_EDGE_SOFTNESS_RATIO} if "
                               "never set.")
+    parser.add_argument("--error-resolution", type=int, default=None,
+                         help="visualize: grid resolution for preview_error.png, overriding the "
+                              "default of inheriting whatever --resolution refine-terrain last used "
+                              "(or a hardcoded 200 if refine-terrain hasn't run at all yet -- far too "
+                              "coarse to localize a specific small feature; at RES~1000 a 200x200 "
+                              "error grid averages ~5x5 real cells into one). Not saved to project.json "
+                              "-- pass it explicitly each time you want a non-default resolution. "
+                              "Higher values cost more (predicted-vs-actual is evaluated at every "
+                              "cell), so start moderate (e.g. 500) before jumping to 1000+.")
     parser.add_argument("--dig-depth", type=float, default=None,
                          help="dig-water: how much (m) to lower heightmap.npz under each water "
                               "polygon. Default: use whatever's saved in project.json, or "
@@ -2404,7 +2429,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             step_repack(working_dir, args.repack_filename)
         elif args.step == "visualize":
-            step_visualize(working_dir, overwrite_current_version=True)
+            step_visualize(working_dir, overwrite_current_version=True, error_resolution=args.error_resolution)
     except StepError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
