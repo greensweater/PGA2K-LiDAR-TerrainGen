@@ -764,7 +764,7 @@ def render_error_preview(
     resolution: int = 200,
     extra_label: Optional[str] = None,
     mask: Optional[np.ndarray] = None,
-) -> None:
+) -> dict:
     """
     Predicted height vs. binned LIDAR elevation, as signed error
     (predicted - actual) on a diverging colormap centered at zero.
@@ -778,6 +778,12 @@ def render_error_preview(
     the *entire* course regardless of whether refinement was actually
     restricted to a fraction of it, diluting the number with however
     much of the un-refined remainder still carried old error.
+
+    Returns {"rms", "bias", "masked_rms", "masked_bias"} (the latter
+    two None if no mask given or the mask is empty at this resolution)
+    so callers (see PGA2k_gen.py's step_visualize) can print these
+    numbers straight to the console instead of requiring the PNG to be
+    reopened just to read its title.
     """
     actual = _bin_point_cloud(cloud, bounds, resolution, bare_earth_only=True)
     predicted = model.render(resolution=resolution, bounds=bounds)
@@ -796,17 +802,33 @@ def render_error_preview(
     _add_colorbar(fig, im, "predicted - actual (m)")
 
     rms = float(np.sqrt(np.mean(np.square(finite))))
+    # Mean signed error, not just RMS -- RMS is magnitude-only (squares
+    # away the sign), so it can't distinguish "large but balanced
+    # positive/negative error" from "a systematic directional bias."
+    # Confirmed real need: a genuine map-wide upward bias was only
+    # visible by eyeballing color balance on the diverging colormap
+    # before this existed, with no precise number to check it against.
+    mean_bias = float(np.mean(finite))
+    stats = {"rms": rms, "bias": mean_bias, "masked_rms": None, "masked_bias": None}
     if mask is not None:
         masked_finite = error[np.isfinite(error) & mask]
         if masked_finite.size > 0:
             masked_rms = float(np.sqrt(np.mean(np.square(masked_finite))))
+            masked_mean_bias = float(np.mean(masked_finite))
+            stats["masked_rms"] = masked_rms
+            stats["masked_bias"] = masked_mean_bias
             title = (
-                f"Height error, RMS={rms:.2f} m whole course / "
-                f"{masked_rms:.2f} m masked area ({resolution}x{resolution})"
+                f"Height error, RMS={rms:.2f} m / bias={mean_bias:+.2f} m whole course, "
+                f"RMS={masked_rms:.2f} m / bias={masked_mean_bias:+.2f} m masked area "
+                f"({resolution}x{resolution})"
             )
         else:
-            title = f"Height error, RMS={rms:.2f} m whole course (mask empty at this resolution)"
+            title = (
+                f"Height error, RMS={rms:.2f} m / bias={mean_bias:+.2f} m whole course "
+                "(mask empty at this resolution)"
+            )
     else:
-        title = f"Height error, RMS={rms:.2f} m ({resolution}x{resolution})"
+        title = f"Height error, RMS={rms:.2f} m / bias={mean_bias:+.2f} m ({resolution}x{resolution})"
     _set_title(ax, title, extra_label)
     _save(fig, path)
+    return stats
