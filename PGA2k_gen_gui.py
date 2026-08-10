@@ -420,10 +420,11 @@ class PGAGenGUI:
             values=["hex", "contour"],
         )
         gen_method_box.pack(side="left", padx=4)
-        _Tooltip(gen_method_box, "hex: flat hex-grid lattice (the original behavior). contour: traces "
-                 "elevation-band contours of the real heightmap and places stamps along each ring, "
-                 "spaced by local curvature, with a gap-fill pass for flat interiors (greens, ponds) "
-                 "ring-tracing structurally can't reach on its own -- see terrain/contour_layers.py.")
+        _Tooltip(gen_method_box, "hex: flat hex-grid lattice (the original behavior). contour: fills "
+                 "the CHANNEL between every pair of consecutive elevation levels using each level's "
+                 "real distance-to-boundary (not just tracing the lines), plus dedicated large-stamp "
+                 "fills for isolated hilltops/pits and a final safety-net pass -- see terrain/"
+                 "contour_layers.py.")
 
         pitch_row = ttk.Frame(parent)
         pitch_row.pack(fill="x", pady=(0, 4))
@@ -451,57 +452,75 @@ class PGAGenGUI:
             _Tooltip(entry, tooltip)
 
         self.band_spacing_var = tk.StringVar(value="5")
-        self.contour_brush_var = tk.StringVar(value="10")
+        self.ring_brush_var = tk.StringVar(value="10")
+        self.rough_brush_var = tk.StringVar(value="9")
         self.min_ring_radius_var = tk.StringVar(value="5")
         self.max_ring_radius_var = tk.StringVar(value="50")
-        self.curvature_window_var = tk.StringVar(value="10")
-        self.curvature_contrast_gamma_var = tk.StringVar(value="2")
         self.ring_spacing_fraction_var = tk.StringVar(value="0.5")
-        self.gap_fill_brush_var = tk.StringVar(value="10")
-        self.min_gap_radius_var = tk.StringVar(value="5")
-        self.gap_claim_radius_fraction_var = tk.StringVar(value="0.5")
-        self.gap_fill_resolution_var = tk.StringVar(value="400")
+        self.interior_brush_var = tk.StringVar(value="54")
+        self.min_interior_radius_var = tk.StringVar(value="10")
+        self.max_interior_radius_var = tk.StringVar(value="150")
+        self.interior_claim_radius_fraction_var = tk.StringVar(value="0.5")
+        self.residual_brush_var = tk.StringVar(value="8")
+        self.min_residual_radius_var = tk.StringVar(value="10")
+        self.max_residual_radius_var = tk.StringVar(value="150")
+        self.residual_claim_radius_fraction_var = tk.StringVar(value="0.5")
+        self.coverage_resolution_var = tk.StringVar(value="400")
 
         add_contour_field(0, 0, self.band_spacing_var, "BAND m",
-                           "contour method only: elevation spacing (m) between traced bands -- "
-                           "smaller means more bands, denser coverage on sloped terrain, more "
-                           "stamps overall. Tweak and re-run to see how it behaves in the preview.")
-        add_contour_field(0, 1, self.contour_brush_var, "BRUSH",
-                           "contour method only: brush type placed along each ring -- 10 or 54 "
-                           "(no flat plateau) recommended so adjacent bands blend instead of "
-                           "showing terrace edges.")
-        add_contour_field(0, 2, self.min_ring_radius_var, "MIN m",
-                           "contour method only: smallest allowed along-ring stamp radius (m), "
-                           "used at the sharpest bends.")
-        add_contour_field(1, 0, self.max_ring_radius_var, "MAX m",
-                           "contour method only: largest allowed along-ring stamp radius (m), used "
-                           "on the straightest runs -- also the cap used for gap-fill stamp radius.")
-        add_contour_field(1, 1, self.curvature_window_var, "CRV m",
-                           "contour method only: arc-length window (m) used to estimate each ring "
-                           "vertex's local curvature.")
-        add_contour_field(1, 2, self.curvature_contrast_gamma_var, "GAM",
-                           "contour method only: exponent sharpening the curvature-to-radius map "
-                           "toward the extremes (>1 sharpens, 1.0 is linear).")
-        add_contour_field(2, 0, self.gap_fill_brush_var, "GAP BR",
-                           "contour method only: brush type used for the gap-fill pass that closes "
-                           "flat interiors (greens, ponds) ring-tracing can't reach.")
-        add_contour_field(2, 1, self.min_gap_radius_var, "GAP MIN",
-                           "contour method only: smallest allowed gap-fill stamp radius (m).")
-        add_contour_field(2, 2, self.gap_fill_resolution_var, "GAP RES",
-                           "contour method only: coverage-mask grid resolution the gap-fill pass "
-                           "runs against -- finer catches smaller gaps at higher cost.")
-        add_contour_field(3, 0, self.ring_spacing_fraction_var, "OVL %",
+                           "contour method only: elevation spacing (m) between traced levels -- "
+                           "smaller means more, narrower channels. Widening this does NOT help if "
+                           "results look mostly like large flat residual patches on gentle terrain; "
+                           "raise MAX RING m instead. Tweak and re-run to see how it behaves.")
+        add_contour_field(0, 1, self.ring_brush_var, "RING BR",
+                           "contour method only: brush for each level's own precise ring pass "
+                           "(Rule 3).")
+        add_contour_field(0, 2, self.rough_brush_var, "ROUGH BR",
+                           "contour method only: brush for the rough advance pass into the next "
+                           "band up (Rule 4) -- gets overwritten near the next ring by that ring's "
+                           "own precise pass, producing a gradient rather than a hard edge.")
+        add_contour_field(1, 0, self.min_ring_radius_var, "MIN m",
+                           "contour method only: smallest allowed ring-pass stamp radius (m).")
+        add_contour_field(1, 1, self.max_ring_radius_var, "MAX RING m",
+                           "contour method only: largest allowed ring-pass stamp radius (m) -- the "
+                           "key tuning knob on gentle/open terrain. Needs to roughly match the real "
+                           "channel half-width (BAND m / local slope) or most of the course falls "
+                           "through to the residual pass instead. If results look mostly like large "
+                           "flat patches, raise this -- NOT band spacing.")
+        add_contour_field(1, 2, self.ring_spacing_fraction_var, "OVL %",
                            "contour method only: along-ring stamp spacing as a fraction of the local "
                            "target radius -- < 1.0 means deliberate overlap (0.5 default, matching "
-                           "Chad's radius=2x-spacing rule) rather than merely-touching stamps, since "
-                           "a cosine-falloff kernel's weight is ~0 right at the tangent point between "
-                           "two touching stamps. Lower this if results still look spotty.")
-        add_contour_field(3, 1, self.gap_claim_radius_fraction_var, "GAP OVL %",
-                           "contour method only: fraction of each gap-fill stamp's placed radius "
-                           "marked as claimed -- < 1.0 (0.5 default, same idea as OVL %) means the "
-                           "next gap-fill stamp lands closer and genuinely overlaps this one instead "
-                           "of just touching it. Lower this if flat areas (greens, ponds) still look "
-                           "spotty/seamed.")
+                           "Chad's radius=2x-spacing rule) rather than merely-touching stamps.")
+        add_contour_field(2, 0, self.interior_brush_var, "INT BR",
+                           "contour method only: brush for isolated hilltop/pit interior fills -- "
+                           "large, hard stamps by design (default type 54).")
+        add_contour_field(2, 1, self.min_interior_radius_var, "INT MIN",
+                           "contour method only: smallest allowed hilltop/pit interior-fill stamp "
+                           "radius (m).")
+        add_contour_field(2, 2, self.max_interior_radius_var, "INT MAX",
+                           "contour method only: largest allowed hilltop/pit interior-fill stamp "
+                           "radius (m) -- interiors want FEW LARGE stamps, so this is usually well "
+                           "above MAX RING m.")
+        add_contour_field(3, 0, self.interior_claim_radius_fraction_var, "INT OVL %",
+                           "contour method only: fraction of each interior-fill stamp's placed "
+                           "radius marked as claimed -- < 1.0 (0.5 default) means the next interior "
+                           "stamp lands closer and genuinely overlaps this one.")
+        add_contour_field(3, 1, self.residual_brush_var, "RES BR",
+                           "contour method only: brush for the final safety-net pass covering "
+                           "whatever ring/interior fills leave untouched -- rare/small by design if "
+                           "MAX RING m is set well; a large fraction of stamps landing here on "
+                           "gentle terrain is the signal to raise MAX RING m.")
+        add_contour_field(3, 2, self.min_residual_radius_var, "RES MIN",
+                           "contour method only: smallest allowed residual-pass stamp radius (m).")
+        add_contour_field(4, 0, self.max_residual_radius_var, "RES MAX",
+                           "contour method only: largest allowed residual-pass stamp radius (m).")
+        add_contour_field(4, 1, self.residual_claim_radius_fraction_var, "RES OVL %",
+                           "contour method only: fraction of each residual-pass stamp's placed "
+                           "radius marked as claimed -- < 1.0 (0.5 default) means the next residual "
+                           "stamp lands closer and genuinely overlaps this one.")
+        add_contour_field(4, 2, self.coverage_resolution_var, "COV RES",
+                           "contour method only: coverage-mask grid resolution the residual pass "
+                           "runs against -- finer catches smaller gaps at higher cost.")
 
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
@@ -1491,36 +1510,48 @@ class PGAGenGUI:
             band_spacing = self.band_spacing_var.get().strip()
             if band_spacing:
                 args += ["--band-spacing-m", band_spacing]
-            contour_brush = self.contour_brush_var.get().strip()
-            if contour_brush:
-                args += ["--contour-brush", contour_brush]
+            ring_brush = self.ring_brush_var.get().strip()
+            if ring_brush:
+                args += ["--ring-brush", ring_brush]
+            rough_brush = self.rough_brush_var.get().strip()
+            if rough_brush:
+                args += ["--rough-brush", rough_brush]
             min_ring_radius = self.min_ring_radius_var.get().strip()
             if min_ring_radius:
                 args += ["--min-ring-radius", min_ring_radius]
             max_ring_radius = self.max_ring_radius_var.get().strip()
             if max_ring_radius:
                 args += ["--max-ring-radius", max_ring_radius]
-            curvature_window = self.curvature_window_var.get().strip()
-            if curvature_window:
-                args += ["--curvature-window-m", curvature_window]
-            curvature_contrast_gamma = self.curvature_contrast_gamma_var.get().strip()
-            if curvature_contrast_gamma:
-                args += ["--curvature-contrast-gamma", curvature_contrast_gamma]
             ring_spacing_fraction = self.ring_spacing_fraction_var.get().strip()
             if ring_spacing_fraction:
                 args += ["--ring-spacing-fraction", ring_spacing_fraction]
-            gap_fill_brush = self.gap_fill_brush_var.get().strip()
-            if gap_fill_brush:
-                args += ["--gap-fill-brush", gap_fill_brush]
-            min_gap_radius = self.min_gap_radius_var.get().strip()
-            if min_gap_radius:
-                args += ["--min-gap-radius", min_gap_radius]
-            gap_claim_radius_fraction = self.gap_claim_radius_fraction_var.get().strip()
-            if gap_claim_radius_fraction:
-                args += ["--gap-claim-radius-fraction", gap_claim_radius_fraction]
-            gap_fill_resolution = self.gap_fill_resolution_var.get().strip()
-            if gap_fill_resolution:
-                args += ["--gap-fill-resolution", gap_fill_resolution]
+            interior_brush = self.interior_brush_var.get().strip()
+            if interior_brush:
+                args += ["--interior-brush", interior_brush]
+            min_interior_radius = self.min_interior_radius_var.get().strip()
+            if min_interior_radius:
+                args += ["--min-interior-radius", min_interior_radius]
+            max_interior_radius = self.max_interior_radius_var.get().strip()
+            if max_interior_radius:
+                args += ["--max-interior-radius", max_interior_radius]
+            interior_claim_radius_fraction = self.interior_claim_radius_fraction_var.get().strip()
+            if interior_claim_radius_fraction:
+                args += ["--interior-claim-radius-fraction", interior_claim_radius_fraction]
+            residual_brush = self.residual_brush_var.get().strip()
+            if residual_brush:
+                args += ["--residual-brush", residual_brush]
+            min_residual_radius = self.min_residual_radius_var.get().strip()
+            if min_residual_radius:
+                args += ["--min-residual-radius", min_residual_radius]
+            max_residual_radius = self.max_residual_radius_var.get().strip()
+            if max_residual_radius:
+                args += ["--max-residual-radius", max_residual_radius]
+            residual_claim_radius_fraction = self.residual_claim_radius_fraction_var.get().strip()
+            if residual_claim_radius_fraction:
+                args += ["--residual-claim-radius-fraction", residual_claim_radius_fraction]
+            coverage_resolution = self.coverage_resolution_var.get().strip()
+            if coverage_resolution:
+                args += ["--coverage-resolution", coverage_resolution]
             self._run_step(args, wd)
 
     def _validate_refine_fields(self) -> bool:
