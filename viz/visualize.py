@@ -510,7 +510,10 @@ def render_hex_preview(
 
     colors = [_BRUSH_COLORS.get(s.brush, _DEFAULT_BRUSH_COLOR) for s in stamps]
     ax.add_collection(_stamp_patches(stamps, colors))
-    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=2, zorder=3)
+    # s is marker AREA in points^2 (matplotlib convention), not pixels or
+    # diameter -- 0.4 is the exact area giving a 1px-diameter marker at
+    # this module's _DPI=100 (s=2, the old value, rendered at ~2.2px).
+    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=0.4, zorder=3)
 
     used_brushes = sorted(set(s.brush for s in stamps))
     handles = [
@@ -540,7 +543,8 @@ def render_stamps_preview(
     coll.set_array(values)
     coll.set_cmap("terrain")
     ax.add_collection(coll)
-    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=2, zorder=3)
+    # See render_hex_preview's comment: s=0.4 -> 1px-diameter marker at _DPI=100.
+    ax.scatter([s.x for s in stamps], [s.z for s in stamps], c="black", s=0.4, zorder=3)
 
     _add_colorbar(fig, coll, "fitted value (m)")
     _set_title(ax, f"Stamp values ({len(stamps)} stamps)", extra_label)
