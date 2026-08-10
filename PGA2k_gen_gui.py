@@ -466,6 +466,7 @@ class PGAGenGUI:
         self.max_residual_radius_var = tk.StringVar(value="150")
         self.residual_claim_radius_fraction_var = tk.StringVar(value="0.5")
         self.coverage_resolution_var = tk.StringVar(value="400")
+        self.edge_softness_ratio_var = tk.StringVar(value="1.0")
 
         add_contour_field(0, 0, self.band_spacing_var, "BAND m",
                            "contour method only: elevation spacing (m) between traced levels -- "
@@ -524,6 +525,14 @@ class PGAGenGUI:
         add_contour_field(4, 2, self.coverage_resolution_var, "COV RES",
                            "contour method only: coverage-mask grid resolution the residual pass "
                            "runs against -- finer catches smaller gaps at higher cost.")
+        add_contour_field(5, 0, self.edge_softness_ratio_var, "EDGE SOFT",
+                           "contour method only: tightens spacing/claim fractions for higher-"
+                           "BRUSH_RANK (softer-falloff) brushes -- default RING BR=10/ROUGH BR=9 "
+                           "have genuinely weaker real influence relative to their own nominal "
+                           "radius than type 8, so nominal radius alone understates how close "
+                           "together they need to be for real coverage (visible as small gaps in "
+                           "low-relief areas even though stamps geometrically touch). 1.0 is a "
+                           "no-op; try 0.7-0.85 if you see this. Type 8 is unaffected at any value.")
 
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
@@ -1555,6 +1564,9 @@ class PGAGenGUI:
             coverage_resolution = self.coverage_resolution_var.get().strip()
             if coverage_resolution:
                 args += ["--coverage-resolution", coverage_resolution]
+            edge_softness_ratio = self.edge_softness_ratio_var.get().strip()
+            if edge_softness_ratio:
+                args += ["--edge-softness-ratio", edge_softness_ratio]
             self._run_step(args, wd)
 
     def _validate_refine_fields(self) -> bool:
