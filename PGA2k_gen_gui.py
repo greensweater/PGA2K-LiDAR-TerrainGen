@@ -457,7 +457,7 @@ class PGAGenGUI:
         self.min_ring_radius_var = tk.StringVar(value="5")
         self.max_ring_radius_var = tk.StringVar(value="50")
         self.ring_spacing_fraction_var = tk.StringVar(value="0.5")
-        self.interior_brush_var = tk.StringVar(value="54")
+        self.interior_brush_var = tk.StringVar(value="8")
         self.min_interior_radius_var = tk.StringVar(value="10")
         self.max_interior_radius_var = tk.StringVar(value="150")
         self.interior_claim_radius_fraction_var = tk.StringVar(value="0.5")
@@ -493,7 +493,10 @@ class PGAGenGUI:
                            "Chad's radius=2x-spacing rule) rather than merely-touching stamps.")
         add_contour_field(2, 0, self.interior_brush_var, "INT BR",
                            "contour method only: brush for isolated hilltop/pit interior fills -- "
-                           "large, hard stamps by design (default type 54).")
+                           "large, hard stamps by design (default type 8, wide flat plateau, full-"
+                           "strength pull across most of its radius). Avoid type 54 here specifically "
+                           "-- it measures at only ~62% vertical amplitude of type 8, too soft/short-"
+                           "reaching for a fill whose whole job is guaranteeing coverage.")
         add_contour_field(2, 1, self.min_interior_radius_var, "INT MIN",
                            "contour method only: smallest allowed hilltop/pit interior-fill stamp "
                            "radius (m).")
