@@ -942,7 +942,7 @@ class PGAGenGUI:
         self.elevation_contour_var = tk.DoubleVar(value=0.0)
         self.elevation_contour_scale = ttk.Scale(
             elev_row, from_=0.0, to=1.0, orient="horizontal",
-            variable=self.elevation_contour_var, command=lambda _v: self._show_preview(),
+            variable=self.elevation_contour_var, command=self._on_elevation_slider_drag,
         )
         self.elevation_contour_scale.pack(side="left", fill="x", expand=True, padx=4)
         self.elevation_contour_label = ttk.Label(elev_row, text="0.0", width=8)
@@ -951,12 +951,14 @@ class PGAGenGUI:
         self.elevation_contour_width_var = tk.StringVar(value="1.0")
         width_entry = ttk.Entry(elev_row, textvariable=self.elevation_contour_width_var, width=6)
         width_entry.pack(side="left", padx=(2, 0))
-        width_entry.bind("<Return>", lambda e: self._show_preview())
-        width_entry.bind("<FocusOut>", lambda e: self._show_preview())
+        width_entry.bind("<Return>", lambda e: self._on_elevation_width_changed())
+        width_entry.bind("<FocusOut>", lambda e: self._on_elevation_width_changed())
         _Tooltip(width_entry, "Band thickness (m): shows heights in [Elev, Elev+Width) as solid "
                  "white, everything else transparent -- 1-bit, no antialiasing, purely an in-"
                  "memory visual (nothing written to disk). Narrow this toward your BAND m setting "
-                 "to see one traced level at a time; widen it to see a whole channel at once.")
+                 "to see one traced level at a time; widen it to see a whole channel at once. The "
+                 "slider snaps to multiples of this value, matching the same band boundaries a real "
+                 "generate-terrain run at that BAND m would actually produce.")
 
         stamp_cov_row = ttk.Frame(frame)
         stamp_cov_row.pack(fill="x", pady=(4, 0))
@@ -2402,6 +2404,55 @@ class PGAGenGUI:
         self._cached_stamp_influence_key = cache_key
         return influence
 
+    def _snap_elevation(self, value: float) -> float:
+        """
+        Round `value` to the nearest multiple of the current Width,
+        counted from the slider's own lower bound (the heightmap's real
+        min elevation) -- so snapped positions land exactly on the same
+        band boundaries a real generate-terrain run at that BAND m would
+        actually produce, not an arbitrary sub-meter drag position.
+        Clamped to the slider's [from, to] range.
+        """
+        try:
+            width = float(self.elevation_contour_width_var.get())
+        except ValueError:
+            width = 1.0
+        if width <= 0:
+            width = 1.0
+        lo = float(self.elevation_contour_scale.cget("from"))
+        hi = float(self.elevation_contour_scale.cget("to"))
+        steps = round((value - lo) / width)
+        snapped = lo + steps * width
+        return max(lo, min(hi, snapped))
+
+    def _on_elevation_slider_drag(self, raw_value) -> None:
+        """
+        Scale's own command callback -- fires continuously while
+        dragging, with the raw (unsnapped) value as a string. Snapping
+        here (rather than leaving the slider continuous and only
+        snapping what gets displayed) means the thumb itself visibly
+        jumps to each real band boundary as you drag across it, instead
+        of scrubbing smoothly through positions that don't correspond
+        to any band a real run would produce.
+        """
+        try:
+            raw = float(raw_value)
+        except (TypeError, ValueError):
+            raw = self.elevation_contour_var.get()
+        self.elevation_contour_var.set(self._snap_elevation(raw))
+        self._show_preview()
+
+    def _on_elevation_width_changed(self) -> None:
+        """
+        Re-snaps the current elevation to the new Width's own grid --
+        without this, changing Width after already dragging the slider
+        would leave the displayed elevation sitting off-grid until the
+        next drag, silently showing a band boundary that wouldn't
+        actually exist at the new Width.
+        """
+        self.elevation_contour_var.set(self._snap_elevation(self.elevation_contour_var.get()))
+        self._show_preview()
+
     def _on_elevation_contour_toggle(self) -> None:
         """
         First time the checkbox goes on, size the slider to the real
@@ -2421,7 +2472,9 @@ class PGAGenGUI:
                         self.elevation_contour_scale.configure(from_=lo, to=hi)
                         current = self.elevation_contour_var.get()
                         if not (lo <= current <= hi):
-                            self.elevation_contour_var.set((lo + hi) / 2.0)
+                            self.elevation_contour_var.set(self._snap_elevation((lo + hi) / 2.0))
+                        else:
+                            self.elevation_contour_var.set(self._snap_elevation(current))
         self._show_preview()
 
     def _set_preview_text(self, text: str) -> None:
