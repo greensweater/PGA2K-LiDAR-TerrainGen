@@ -525,6 +525,24 @@ class PGAGenGUI:
                            "bumps and fills isolated few-pixel gaps, simplifying the boundary before "
                            "it fragments the fill into unnecessary tiny stamps. 0 disables.")
 
+        # Deliberately separate from the settings grid above, not another
+        # field in it -- this is a quick-preview control, not a real
+        # generation setting (not saved to project.json, meant to be set
+        # explicitly each time), and mixing it into the persistent-feeling
+        # grid would undercut the point of having just decluttered it.
+        max_stamps_row = ttk.Frame(parent)
+        max_stamps_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(max_stamps_row, text="Max stamps (preview only):").pack(side="left")
+        self.max_stamps_var = tk.StringVar(value="")
+        max_stamps_entry = ttk.Entry(max_stamps_row, textvariable=self.max_stamps_var, width=8)
+        max_stamps_entry.pack(side="left", padx=4)
+        _Tooltip(max_stamps_entry, "contour method only: stop once this many stamps have been placed "
+                 "in total -- a quick way to sanity-check a parameter combination before committing "
+                 "to the full run. Bands fill ascending by elevation, so the cutoff always lands on "
+                 "the low-elevation end and most of the course will be genuinely unfilled, not just "
+                 "coarser -- this is a partial-preview tool, not a real generation mode. Leave blank "
+                 "for a real run. Not saved to project.json -- set explicitly each time.")
+
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -1587,6 +1605,9 @@ class PGAGenGUI:
             denoise_px = self.denoise_px_var.get().strip()
             if denoise_px:
                 args += ["--denoise-px", denoise_px]
+            max_stamps = self.max_stamps_var.get().strip()
+            if max_stamps:
+                args += ["--max-stamps", max_stamps]
             self._run_step(args, wd)
 
     def _validate_refine_fields(self) -> bool:
