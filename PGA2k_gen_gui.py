@@ -967,17 +967,18 @@ class PGAGenGUI:
         )
         stamp_cov_checkbox.pack(side="left")
         _Tooltip(stamp_cov_checkbox, "Only has an effect while Elevation contour is also checked. "
-                 "Reads the real current stamp list (initial_stamps.json + every refine_stamps_N.json) "
-                 "and, for every cell in the elevation band, evaluates the REAL kernel weight (via "
-                 "terrain.terrain_kernel.TerrainKernel -- the same kernel adaptive_refine.py scores "
-                 "candidates with) from whichever stamp pulls hardest there -- not just whether some "
-                 "stamp's nominal radius geometrically reaches it. Pure RED = untouched by anything, "
-                 "pure GREEN = strongly pulled, anything in between (orange/yellow) is geometrically "
-                 "'covered' but only weakly influenced -- exactly the gap a soft-falloff brush (type "
-                 "10/9/54) leaves near its own nominal radius. If a region reads solid green under the "
-                 "old binary check but still looks unfilled visually, this is what actually explains "
-                 "it. Cached same as before -- first toggle (or first check after a new refine-terrain "
-                 "pass) can take a few seconds, instant after that.")
+                 "Filters the real current stamp list (initial_stamps.json + every refine_stamps_N.json) "
+                 "to only stamps whose own VALUE falls within the current [Elev, Elev+Width) band -- "
+                 "not the whole course -- then evaluates the REAL kernel weight (via terrain."
+                 "terrain_kernel.TerrainKernel -- the same kernel adaptive_refine.py scores candidates "
+                 "with) from whichever of THOSE stamps pulls hardest at each cell, not just whether "
+                 "some stamp's nominal radius geometrically reaches it. Pure RED = untouched by this "
+                 "band's own stamps (not just 'touched by a neighboring band's stamp instead' -- those "
+                 "are excluded), pure GREEN = strongly pulled, anything in between (orange/yellow) is "
+                 "geometrically 'covered' but only weakly influenced. If a region reads solid green "
+                 "under the old binary check but still looks unfilled visually, this is what actually "
+                 "explains it. Recomputed per elevation (filtering changes which stamps are relevant), "
+                 "but only over that band's own stamp subset, so it stays fast in practice.")
 
     _SPLINE_KIND_FILTERS = (
         "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
@@ -2309,13 +2310,24 @@ class PGAGenGUI:
         self._cached_stamps_key = cache_key
         return stamps
 
-    def _get_cached_stamp_influence(self, working_dir: Path, shape: tuple[int, int]):
+    def _get_cached_stamp_influence(
+        self, working_dir: Path, shape: tuple[int, int], elevation: float, width: float,
+    ):
         """
         Real weighted influence, not binary coverage: for every cell,
         the MAX kernel weight (0..1, via terrain.terrain_kernel.
         TerrainKernel -- the same kernel adaptive_refine.py already
-        scores candidates with) among every stamp whose radius reaches
-        it. A point can sit well inside a soft-falloff brush's (type
+        scores candidates with) among every stamp *whose own value
+        falls within [elevation, elevation+width)* whose radius reaches
+        it -- i.e. only stamps belonging to the CURRENT band, matching
+        the same half-open convention terrain/contour_layers.py's own
+        _band_mask uses. Earlier versions of this used every stamp on
+        the course regardless of value, which meant a red (near-zero)
+        cell wasn't distinguishable from "reached by a different band's
+        stamp, not this one" -- confirmed ambiguous by direct request:
+        filtering first fixes that at the source.
+
+        A point can sit well inside a soft-falloff brush's (type
         10/9/54) nominal radius while its real weight there is close to
         0 -- confirmed as the actual issue behind "100% covered, still
         looks unfilled": binary radius-only coverage can't distinguish
@@ -2326,11 +2338,14 @@ class PGAGenGUI:
         stamp -- construction cost, whatever it is, shouldn't be paid
         hundreds of thousands of times over.
 
-        Static property of the stamp list, independent of the
-        elevation slider/width, same caching rationale as the old
-        binary coverage mask this replaces -- expensive the first time
-        (or after a new refine-terrain pass), cheap on every slider
-        tick after that.
+        Cached and keyed on (stamps version, shape, elevation, width) --
+        filtering by value means the relevant stamp subset changes with
+        the slider, unlike the old whole-course version, so the cache
+        can't be elevation-independent anymore. Kept fast in practice
+        because the FILTERED subset (one band's worth of stamps, not
+        the whole course) is typically a small fraction of the total,
+        so each slider tick's recompute is proportionally cheap even
+        though it's no longer a pure cache hit.
 
         Returns None if terrain.terrain_kernel/terrain.brush_profiles
         aren't importable as expected (see the try/except at module
@@ -2341,9 +2356,11 @@ class PGAGenGUI:
         stamps = self._get_cached_stamps(working_dir)
         if stamps is None:
             return None
-        cache_key = (self._cached_stamps_key, shape)
+        cache_key = (self._cached_stamps_key, shape, elevation, width)
         if getattr(self, "_cached_stamp_influence_key", None) == cache_key:
             return self._cached_stamp_influence
+
+        band_stamps = [s for s in stamps if elevation <= s.value < elevation + width]
 
         kernels: dict[int, "TerrainKernel"] = {}
 
@@ -2359,7 +2376,7 @@ class PGAGenGUI:
         z_centers = (np.arange(n_rows) + 0.5) * cell_z
         influence = np.zeros(shape, dtype=np.float32)
 
-        for s in stamps:
+        for s in band_stamps:
             if s.radius <= 0:
                 continue
             col_min = max(0, int((s.x - s.radius) / cell_x))
@@ -2632,7 +2649,9 @@ class PGAGenGUI:
 
                     band_rgba = np.zeros((*band.shape, 4), dtype=np.uint8)
                     if self.show_stamp_coverage_var.get():
-                        influence = self._get_cached_stamp_influence(Path(wd), heights.shape)
+                        influence = self._get_cached_stamp_influence(
+                            Path(wd), heights.shape, elevation, band_width,
+                        )
                         if influence is not None:
                             in_band_weight = influence[band]
                             # Continuous RED (weight=0, untouched) -> GREEN
