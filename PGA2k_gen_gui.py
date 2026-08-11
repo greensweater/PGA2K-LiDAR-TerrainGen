@@ -493,7 +493,7 @@ class PGAGenGUI:
         self.fill_brush_var = tk.StringVar(value="8")
         self.min_radius_var = tk.StringVar(value="10")
         self.max_radius_var = tk.StringVar(value="50")
-        self.radius_step_var = tk.StringVar(value="1")
+        self.radius_step_var = tk.StringVar(value="0.85")
         self.smoothing_brush_var = tk.StringVar(value="10")
         self.denoise_px_var = tk.StringVar(value="1")
 
@@ -511,10 +511,13 @@ class PGAGenGUI:
                            "contour method only: largest tier in the multi-scale fill scan (m) -- "
                            "the main level-of-detail knob: how big the biggest stamps in a band are "
                            "allowed to be.")
-        add_contour_field(1, 1, self.radius_step_var, "STEP m",
-                           "contour method only: step size (m) between tiers, scanning from MAX m "
-                           "down to MIN m -- smaller steps are more thorough (fewer stamps left to "
-                           "crumb-smoothing) at the cost of more distance-transform passes.")
+        add_contour_field(1, 1, self.radius_step_var, "STEP ratio",
+                           "contour method only: geometric (multiplicative) step between tiers, "
+                           "scanning from MAX m down to MIN m -- each tier's radius is the previous "
+                           "tier's radius times this ratio (0-1, NOT a fixed meters step). Closer to "
+                           "1.0 means more, finer-grained tiers (more thorough, fewer stamps left to "
+                           "crumb-smoothing) at the cost of more distance-transform passes. Scales "
+                           "automatically with whatever MIN m/MAX m range you pick.")
         add_contour_field(1, 2, self.smoothing_brush_var, "SMOOTH BR",
                            "contour method only: brush for leftover fragments smaller than MIN m -- "
                            "a softer brush (type 10 default) so small scattered crumbs blend rather "
@@ -1598,7 +1601,7 @@ class PGAGenGUI:
                 args += ["--max-radius", max_radius]
             radius_step = self.radius_step_var.get().strip()
             if radius_step:
-                args += ["--radius-step-m", radius_step]
+                args += ["--radius-step-ratio", radius_step]
             smoothing_brush = self.smoothing_brush_var.get().strip()
             if smoothing_brush:
                 args += ["--smoothing-brush", smoothing_brush]
