@@ -120,7 +120,15 @@ DEFAULT_RADIUS_STEP_RATIO = 0.85  # each tier = previous tier * this; NOT a fixe
 DEFAULT_SMOOTHING_BRUSH = 10  # soft falloff for leftover sub-min_radius crumbs -- blends, no hard edge
 DEFAULT_DENOISE_PX = 1  # morphological opening+closing radius, in heightmap pixels; 0 disables
 DEFAULT_FALLBACK_PLATEAU_FRACTION = 0.5  # used only if terrain_kernel isn't importable at all
-DEFAULT_MAX_TIER_ITERATIONS = 5000  # per-tier safety cap on the inner placement loop
+DEFAULT_MAX_TIER_ITERATIONS = 2_000_000  # true last-resort backstop against a genuine infinite-loop
+                                          # bug, NOT a real limit -- confirmed the previous default of
+                                          # 5000 was silently binding in normal operation: a single flat
+                                          # band covering the whole course can legitimately need ~15,700
+                                          # same-size placements at radius=10, ~63,000 at radius=5. That
+                                          # forced every tier to look "exhausted" and shrink to the next
+                                          # size far before it actually was, cascading into stamps
+                                          # getting smaller far too quickly and leaving real gaps a
+                                          # larger stamp could still have filled.
 
 
 _plateau_fraction_cache: dict[int, float] = {}
