@@ -74,14 +74,19 @@ for the main tiered pack at all -- see _scatter_fill_remaining, which
 doesn't depend on a plateau and is the right tool for those brushes.
 
 DENOISE ("schmear"): before tiering, each band's mask gets a small
-morphological opening+closing pass (scipy.ndimage) -- opening trims
-isolated few-pixel protrusions, closing fills isolated few-pixel gaps.
-Purely a simplification of WHICH pixels count as "in this band," at
-whatever resolution the heightmap itself is (no separate coverage grid
-needed anymore, unlike an earlier version's coverage_resolution).
-Doesn't touch any real heightmap value, just removes single-pixel
-noise from the boundary before it fragments the fill into unnecessary
-tiny stamps.
+closing pass (fills isolated few-pixel gaps) followed by connected-
+component AREA filtering (scipy.ndimage.label + a pixel-count
+threshold, not morphological opening -- see _denoise_mask's docstring
+for why: opening erases by WIDTH, which was confirmed to delete real,
+thin, connected terrain features before any fill stage ever saw them,
+reading as true zero influence rather than weak coverage). Purely a
+simplification of WHICH pixels count as "in this band," at whatever
+resolution the heightmap itself is (no separate coverage grid needed
+anymore, unlike an earlier version's coverage_resolution). Doesn't
+touch any real heightmap value, just removes small ISOLATED noise
+specks (by area) from the boundary before they fragment the fill into
+unnecessary tiny stamps -- long thin real features, however narrow,
+are left alone.
 
 LEFTOVER CRUMBS: even 1-bit full-radius claiming leaves genuine gaps
 along irregular boundaries -- any spot whose true local space is
@@ -268,18 +273,36 @@ def _band_mask(heights: np.ndarray, lo: Optional[float], hi: Optional[float]) ->
 
 def _denoise_mask(mask: np.ndarray, radius_px: int) -> np.ndarray:
     """
-    Morphological opening (trims isolated few-pixel protrusions) then
-    closing (fills isolated few-pixel gaps) -- see module docstring's
-    DENOISE section. radius_px <= 0 disables this (returns mask
-    unchanged), e.g. for exact/no-simplification runs.
+    Closing (fills isolated few-pixel gaps) then AREA-based removal of
+    small isolated components (pixel count, not width) -- see module
+    docstring's DENOISE section. radius_px <= 0 disables this (returns
+    mask unchanged), e.g. for exact/no-simplification runs.
+
+    Deliberately NOT morphological opening (an earlier version used
+    it): opening erodes-then-dilates, which erases anything NARROWER
+    than its structuring element regardless of how long or real that
+    feature is -- confirmed as a real bug against actual terrain: a
+    genuinely thin but real, connected tendril of a band got erased
+    entirely before any fill stage ever saw it, reading as true zero
+    influence (not weak/under-filled -- the area was never a candidate
+    at all). Filtering by connected-component AREA instead only
+    removes small, ISOLATED specks (true single-pixel noise), leaving
+    long thin real features alone no matter how narrow they are.
     """
     if radius_px <= 0 or not mask.any():
         return mask
+
     structure = ndimage.generate_binary_structure(2, 2)
     structure = ndimage.iterate_structure(structure, radius_px)
-    opened = ndimage.binary_opening(mask, structure=structure)
-    closed = ndimage.binary_closing(opened, structure=structure)
-    return closed
+    closed = ndimage.binary_closing(mask, structure=structure)
+
+    min_area = max(1, (2 * radius_px + 1) ** 2 // 2)  # same rough scale as the old structuring element
+    labeled, n = ndimage.label(closed)
+    if n == 0:
+        return closed
+    sizes = ndimage.sum(closed, labeled, index=np.arange(1, n + 1))
+    keep_labels = np.nonzero(sizes >= min_area)[0] + 1
+    return np.isin(labeled, keep_labels)
 
 
 def _tier_radii(
