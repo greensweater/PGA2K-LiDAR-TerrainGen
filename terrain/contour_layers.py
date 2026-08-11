@@ -212,11 +212,20 @@ def _local_mean_value(
 def _tiered_fill_band(
     mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
     brush: int, min_radius: float, max_radius: float, radius_step_m: float,
+    max_stamps: Optional[int] = None,
     max_tier_iterations: int = DEFAULT_MAX_TIER_ITERATIONS,
 ) -> tuple[list[Stamp], np.ndarray]:
     """
     Multi-scale greedy fill of `mask` -- see module docstring's TIERED
     MULTI-SCALE FILL and PLATEAU-RADIUS FIT TOLERANCE sections.
+
+    max_stamps, if given, is a LOCAL budget for this call only (the
+    caller is expected to compute "how many more can this band place"
+    from its own running total -- see generate_contour_layers). Once
+    reached, returns immediately with whatever's been placed so far;
+    `remaining` in that case includes both genuine crumbs AND whatever
+    real area the cap cut off early, so it should not be treated as
+    "this band is fully accounted for" when max_stamps actually bound.
 
     Returns (stamps, remaining) -- `remaining` is whatever's still
     unfilled once the scan reaches min_radius (the "crumbs" a caller
@@ -234,7 +243,7 @@ def _tiered_fill_band(
 
     remaining = mask.copy()
     stamps: list[Stamp] = []
-    if not remaining.any() or max_radius <= 0:
+    if not remaining.any() or max_radius <= 0 or (max_stamps is not None and max_stamps <= 0):
         return stamps, remaining
 
     n_tiers = max(1, int(round((max_radius - min_radius) / max(radius_step_m, 1e-6))) + 1)
@@ -251,6 +260,8 @@ def _tiered_fill_band(
         work = np.where(dist >= plateau_r, dist, 0.0)
 
         for _ in range(max_tier_iterations):
+            if max_stamps is not None and len(stamps) >= max_stamps:
+                return stamps, remaining
             peak = float(work.max())
             if peak < plateau_r:
                 break
@@ -291,6 +302,7 @@ def _tiered_fill_band(
 def _fill_region_greedy(
     mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
     brush: int, min_radius: float, max_radius: float, claim_radius_fraction: float = 0.5,
+    max_stamps: Optional[int] = None,
 ) -> list[Stamp]:
     """
     Live-recompute greedy fill for small leftover fragments (the
@@ -300,10 +312,11 @@ def _fill_region_greedy(
     here: crumbs are small and few by construction, so this is cheap in
     aggregate), cropped to `mask`'s own bounding box + a max_radius
     margin so cost scales with the crumb region's own extent, not the
-    full heightmap.
+    full heightmap. max_stamps (local budget, see _tiered_fill_band's
+    docstring for the same convention) stops early once reached.
     """
     rows_nz, cols_nz = np.nonzero(mask)
-    if rows_nz.size == 0:
+    if rows_nz.size == 0 or (max_stamps is not None and max_stamps <= 0):
         return []
 
     n_rows, n_cols = heights.shape
@@ -328,6 +341,8 @@ def _fill_region_greedy(
 
     stamps: list[Stamp] = []
     while remaining.any():
+        if max_stamps is not None and len(stamps) >= max_stamps:
+            break
         dist = ndimage.distance_transform_edt(remaining, sampling=sampling)
         peak = float(dist.max())
         if peak <= 0.0:
@@ -363,6 +378,7 @@ def generate_contour_layers(
     radius_step_m: float = DEFAULT_RADIUS_STEP_M,
     smoothing_brush: int = DEFAULT_SMOOTHING_BRUSH,
     denoise_px: int = DEFAULT_DENOISE_PX,
+    max_stamps: Optional[int] = None,
     progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> list[Stamp]:
     """
@@ -382,6 +398,19 @@ def generate_contour_layers(
     pit/residual special-casing -- every band gets identical treatment
     regardless of its own shape or connectivity.
 
+    max_stamps, if given, stops generation as soon as that many stamps
+    have been placed in total -- intended as a quick way to sanity-
+    check a parameter combination (band_spacing_m, radii, brushes) on a
+    partial run before committing to the full one, not as a real
+    terrain-generation mode: the result stops mid-band (typically
+    partway through the lowest few elevation bands, since bands process
+    ascending), so most of the course will genuinely be unfilled, not
+    just coarser. Bands ascending means the cutoff always lands on the
+    LOW-elevation end -- if you specifically want to preview a band
+    somewhere in the middle of the elevation range, this cap can't
+    target that; it only ever gives you "however far up from the
+    bottom N stamps gets you."
+
     Stamp order: bands ascending by elevation, and within each band,
     the tiered-fill stamps (large to small) followed by that band's own
     crumb-smoothing stamps. Under this project's sequential pull-
@@ -393,7 +422,10 @@ def generate_contour_layers(
 
     progress_callback, if given, is called periodically (time-throttled
     to ~10s) with (stamps_placed_so_far, fraction_complete), tracked as
-    bands processed out of the total band count.
+    bands processed out of the total band count -- if max_stamps cuts
+    generation off early, the final call still reports whatever
+    fraction of bands had actually been reached, not 1.0, so a partial
+    run's progress output doesn't misleadingly claim completion.
     """
     levels = _contour_levels(heights, band_spacing_m)
     n_levels = len(levels)
@@ -413,27 +445,40 @@ def generate_contour_layers(
     stamps: list[Stamp] = []
     last_progress_time = time.time()
     progress_interval_s = 10.0
+    bands_reached = 0
 
     for i, (lo, hi) in enumerate(boundaries):
+        if max_stamps is not None and len(stamps) >= max_stamps:
+            break
+        bands_reached = i + 1
+
         mask = _band_mask(heights, lo, hi)
         if mask.any():
             mask = _denoise_mask(mask, denoise_px)
         if mask.any():
+            tier_budget = None if max_stamps is None else max_stamps - len(stamps)
             band_stamps, crumbs = _tiered_fill_band(
                 mask, heights, bounds, fill_brush, min_radius, max_radius, radius_step_m,
+                max_stamps=tier_budget,
             )
             stamps.extend(band_stamps)
             if crumbs.any():
-                stamps.extend(_fill_region_greedy(
-                    crumbs, heights, bounds, smoothing_brush,
-                    min_radius=max(1.0, min_radius / 3.0), max_radius=min_radius,
-                ))
+                crumb_budget = None if max_stamps is None else max_stamps - len(stamps)
+                if crumb_budget is None or crumb_budget > 0:
+                    stamps.extend(_fill_region_greedy(
+                        crumbs, heights, bounds, smoothing_brush,
+                        min_radius=max(1.0, min_radius / 3.0), max_radius=min_radius,
+                        max_stamps=crumb_budget,
+                    ))
 
         if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
             progress_callback(len(stamps), (i + 1) / total_bands)
             last_progress_time = time.time()
 
     if progress_callback is not None:
-        progress_callback(len(stamps), 1.0)
+        # Real fraction reached, not a fake 1.0/0.0 -- a max_stamps cutoff
+        # partway through band 3 of 10 should report 0.3, not claim either
+        # full completion or that nothing happened.
+        progress_callback(len(stamps), bands_reached / total_bands)
 
     return stamps
