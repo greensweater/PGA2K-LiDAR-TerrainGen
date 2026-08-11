@@ -122,7 +122,7 @@ from terrain.contour_layers import (
     DEFAULT_FILL_BRUSH,
     DEFAULT_MIN_RADIUS_M,
     DEFAULT_MAX_RADIUS_M,
-    DEFAULT_RADIUS_STEP_M,
+    DEFAULT_RADIUS_STEP_RATIO,
     DEFAULT_SMOOTHING_BRUSH,
     DEFAULT_DENOISE_PX,
     generate_contour_layers,
@@ -1268,7 +1268,7 @@ def step_generate_terrain(
     fill_brush: int | None = None,
     min_radius: float | None = None,
     max_radius: float | None = None,
-    radius_step_m: float | None = None,
+    radius_step_ratio: float | None = None,
     smoothing_brush: int | None = None,
     denoise_px: int | None = None,
     max_stamps: int | None = None,
@@ -1342,8 +1342,8 @@ def step_generate_terrain(
         min_radius = project.get("generate_terrain_min_radius_m", DEFAULT_MIN_RADIUS_M)
     if max_radius is None:
         max_radius = project.get("generate_terrain_max_radius_m", DEFAULT_MAX_RADIUS_M)
-    if radius_step_m is None:
-        radius_step_m = project.get("generate_terrain_radius_step_m", DEFAULT_RADIUS_STEP_M)
+    if radius_step_ratio is None:
+        radius_step_ratio = project.get("generate_terrain_radius_step_ratio", DEFAULT_RADIUS_STEP_RATIO)
     if smoothing_brush is None:
         smoothing_brush = project.get("generate_terrain_smoothing_brush", DEFAULT_SMOOTHING_BRUSH)
     if denoise_px is None:
@@ -1367,7 +1367,7 @@ def step_generate_terrain(
 
     if method == "contour":
         print(f"Tiered multi-scale band fill (band_spacing_m={band_spacing_m}, "
-              f"radius=[{min_radius}, {max_radius}] m, step={radius_step_m} m)...")
+              f"radius=[{min_radius}, {max_radius}] m, step_ratio={radius_step_ratio})...")
         if max_stamps is not None:
             print(f"  max_stamps={max_stamps} -- PARTIAL PREVIEW RUN, not a real generation: "
                   "bands fill ascending by elevation, so this will stop somewhere on the low-"
@@ -1387,7 +1387,7 @@ def step_generate_terrain(
             fill_brush=fill_brush,
             min_radius=min_radius,
             max_radius=max_radius,
-            radius_step_m=radius_step_m,
+            radius_step_ratio=radius_step_ratio,
             smoothing_brush=smoothing_brush,
             denoise_px=denoise_px,
             max_stamps=max_stamps,
@@ -1437,7 +1437,7 @@ def step_generate_terrain(
         "generate_terrain_fill_brush": fill_brush,
         "generate_terrain_min_radius_m": min_radius,
         "generate_terrain_max_radius_m": max_radius,
-        "generate_terrain_radius_step_m": radius_step_m,
+        "generate_terrain_radius_step_ratio": radius_step_ratio,
         "generate_terrain_smoothing_brush": smoothing_brush,
         "generate_terrain_denoise_px": denoise_px,
     })
@@ -2024,12 +2024,16 @@ def main(argv: list[str] | None = None) -> int:
                               "fill scan (m) -- the main level-of-detail knob: how big the biggest "
                               "stamps in a band are allowed to be. Default: use whatever's saved in "
                               f"project.json, or {DEFAULT_MAX_RADIUS_M} if never set.")
-    parser.add_argument("--radius-step-m", type=float, default=None,
-                         help="generate-terrain, contour method only: step size (m) between tiers, "
-                              "scanning from --max-radius down to --min-radius -- smaller steps are "
-                              "more thorough (fewer stamps left to the crumb-smoothing fallback) at "
-                              "the cost of more distance-transform passes. Default: use whatever's "
-                              f"saved in project.json, or {DEFAULT_RADIUS_STEP_M} if never set.")
+    parser.add_argument("--radius-step-ratio", type=float, default=None,
+                         help="generate-terrain, contour method only: geometric (multiplicative) step "
+                              "between tiers, scanning from --max-radius down to --min-radius -- each "
+                              "tier's radius is the previous tier's radius times this ratio (0-1, not "
+                              "a fixed meters step). Closer to 1.0 means more, finer-grained tiers "
+                              "(more thorough, fewer stamps left to the crumb-smoothing fallback) at "
+                              "the cost of more distance-transform passes; automatically scales with "
+                              "whatever --min-radius/--max-radius range you choose, unlike a fixed "
+                              "meters step. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RADIUS_STEP_RATIO} if never set.")
     parser.add_argument("--smoothing-brush", type=int, default=None,
                          help="generate-terrain, contour method only: brush for leftover fragments "
                               "smaller than --min-radius -- a softer brush (type 10 default) so small "
@@ -2282,7 +2286,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "generate-terrain":
             step_generate_terrain(
                 working_dir, args.pitch, args.generate_terrain_method, args.band_spacing_m,
-                args.fill_brush, args.min_radius, args.max_radius, args.radius_step_m,
+                args.fill_brush, args.min_radius, args.max_radius, args.radius_step_ratio,
                 args.smoothing_brush, args.denoise_px, args.max_stamps,
             )
         elif args.step == "refine-terrain":
