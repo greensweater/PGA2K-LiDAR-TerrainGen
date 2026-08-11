@@ -1271,6 +1271,7 @@ def step_generate_terrain(
     radius_step_m: float | None = None,
     smoothing_brush: int | None = None,
     denoise_px: int | None = None,
+    max_stamps: int | None = None,
 ) -> None:
     """
     pitch (feature-flagged via project.json, same None-means-use-saved
@@ -1307,6 +1308,16 @@ def step_generate_terrain(
     wastes accuracy; too small on open/gentle terrain leaves everything
     to the (slower, smaller-stamp) crumb-smoothing pass instead of the
     efficient tiered fill.
+
+    max_stamps (contour method only) stops generation once that many
+    stamps have been placed in total -- a quick way to sanity-check a
+    parameter combination before committing to the full run, not a real
+    generation mode: bands process ascending by elevation, so the cutoff
+    always lands on the low-elevation end and most of the course will
+    genuinely be unfilled, not just coarser. Deliberately NOT persisted
+    to project.json (unlike every other contour-mode parameter here) --
+    it's meant to be set explicitly each time you want a quick partial
+    preview, not silently inherited by your next real run.
     """
     if method is None:
         project = load_project(working_dir)
@@ -1357,6 +1368,11 @@ def step_generate_terrain(
     if method == "contour":
         print(f"Tiered multi-scale band fill (band_spacing_m={band_spacing_m}, "
               f"radius=[{min_radius}, {max_radius}] m, step={radius_step_m} m)...")
+        if max_stamps is not None:
+            print(f"  max_stamps={max_stamps} -- PARTIAL PREVIEW RUN, not a real generation: "
+                  "bands fill ascending by elevation, so this will stop somewhere on the low-"
+                  "elevation end and most of the course will be genuinely unfilled, not just "
+                  "coarser. Re-run without --max-stamps for the real thing.")
 
         progress_start_time = time.time()
 
@@ -1374,9 +1390,14 @@ def step_generate_terrain(
             radius_step_m=radius_step_m,
             smoothing_brush=smoothing_brush,
             denoise_px=denoise_px,
+            max_stamps=max_stamps,
             progress_callback=_print_contour_progress,
         )
-        print(f"  {len(fitted)} stamps placed (tiered band fill + crumb smoothing, all already fitted)")
+        if max_stamps is not None and len(fitted) >= max_stamps:
+            print(f"  {len(fitted)} stamps placed -- STOPPED at max_stamps={max_stamps}, "
+                  "course is only partially filled (see note above)")
+        else:
+            print(f"  {len(fitted)} stamps placed (tiered band fill + crumb smoothing, all already fitted)")
     else:
         stamp_radius = 2.0 * pitch
         bleed = stamp_radius / 2.0
@@ -2022,6 +2043,14 @@ def main(argv: list[str] | None = None) -> int:
                               "the boundary before it fragments the fill into unnecessary tiny stamps. "
                               "0 disables. Default: use whatever's saved in project.json, or "
                               f"{DEFAULT_DENOISE_PX} if never set.")
+    parser.add_argument("--max-stamps", type=int, default=None,
+                         help="generate-terrain, contour method only: stop once this many stamps have "
+                              "been placed in total -- a quick way to sanity-check a parameter "
+                              "combination before committing to the full run. Bands fill ascending by "
+                              "elevation, so the cutoff always lands on the low-elevation end and most "
+                              "of the course will be genuinely unfilled, not just coarser -- this is a "
+                              "partial-preview tool, not a real generation mode. Not saved to "
+                              "project.json -- pass it explicitly each time.")
     parser.add_argument("--error-resolution", type=int, default=None,
                          help="visualize: grid resolution for preview_error.png, overriding the "
                               "default of inheriting whatever --resolution refine-terrain last used "
@@ -2254,7 +2283,7 @@ def main(argv: list[str] | None = None) -> int:
             step_generate_terrain(
                 working_dir, args.pitch, args.generate_terrain_method, args.band_spacing_m,
                 args.fill_brush, args.min_radius, args.max_radius, args.radius_step_m,
-                args.smoothing_brush, args.denoise_px,
+                args.smoothing_brush, args.denoise_px, args.max_stamps,
             )
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
