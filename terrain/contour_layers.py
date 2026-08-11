@@ -88,16 +88,18 @@ specks (by area) from the boundary before they fragment the fill into
 unnecessary tiny stamps -- long thin real features, however narrow,
 are left alone.
 
-LEFTOVER CRUMBS: even 1-bit full-radius claiming leaves genuine gaps
-along irregular boundaries -- any spot whose true local space is
-smaller than min_radius never gets picked up by the main tiered scan
-at all. What's left is thin, scattered, irregular slivers, and trying
-to TILE those (many small stamps individually shaped to a sliver's own
-sub-meter width) doesn't converge well regardless of how many size
-tiers are added underneath min_radius -- an earlier version tried
-exactly that (a second tiered pass continuing the size curve down) and
-it was still fundamentally the wrong shape of algorithm for this kind
-of leftover.
+LEFTOVER CRUMBS: even with the real, substantial plateau claimed at
+every tier (see PLATEAU-RADIUS FIT TOLERANCE AND CLAIMING above),
+genuine gaps remain along irregular boundaries -- any spot whose true
+local space is smaller than min_radius never gets picked up by the
+main tiered scan at all, and the plateau-to-radius falloff ring around
+every stamp adds further leftover on top of that. What's left is thin,
+scattered, irregular slivers, and trying to TILE those (many small
+stamps individually shaped to a sliver's own sub-meter width) doesn't
+converge well regardless of how many size tiers are added underneath
+min_radius -- an earlier version tried exactly that (a second tiered
+pass continuing the size curve down) and it was still fundamentally
+the wrong shape of algorithm for this kind of leftover.
 
 Fixed with a genuinely different algorithm, not more tiers: see
 _scatter_fill_remaining. A single FIXED, deliberately oversized radius
@@ -165,13 +167,39 @@ DEFAULT_MIN_RADIUS_M = 10.0
 DEFAULT_MAX_RADIUS_M = 50.0
 DEFAULT_RADIUS_STEP_RATIO = 0.85  # each tier = previous tier * this; NOT a fixed meters step -- see
                                    # _tier_radii's docstring for why geometric spacing is the right shape
-DEFAULT_SMOOTHING_BRUSH = 10  # soft falloff for leftover sub-min_radius crumbs -- blends, no hard edge
+DEFAULT_EDGE_DISTANCE_M = 0.0  # pass-1-only buffer past the true band boundary (see _poisson_pack_band);
+                                 # 0 disables. The crumb pass (pass 2) always ignores this.
+DEFAULT_SMOOTHING_BRUSH = 10  # soft falloff for whatever pass 1 leaves as genuine crumbs
+DEFAULT_SMOOTHING_MIN_RADIUS_M = 4.0  # pass 2's OWN radius floor -- independent of the main pack's
+                                        # min_radius; the crumb stage's scale should be tuned on its own
 DEFAULT_SMOOTHING_FLOOR_M = 1.0  # floor for the SECOND tiered pass (smoothing_brush); below this,
                                   # whatever's left goes to the true one-at-a-time last resort
-DEFAULT_CRUMB_SCATTER_MULTIPLIER = 4.0  # crumb scatter radius = min_radius * this -- deliberately
-                                          # oversized so one placement reaches across a thin sliver's
-                                          # own local width instead of needing many tiny stamps
-DEFAULT_CRUMB_SCATTER_CLAIM_FRACTION = 0.5  # heavy overlap for the crumb scatter -- same convention
+DEFAULT_CRUMB_SCATTER_MULTIPLIER = 4.0  # crumb scatter radius = smoothing_min_radius * this --
+                                          # deliberately oversized so one placement reaches across a
+                                          # thin sliver's own local width instead of needing many tiny
+                                          # stamps; "spread," per the 2-4x range this was tuned against
+DEFAULT_SMOOTH_CLAIM_FRACTION = 0.25  # "eat" -- how much of each crumb-scatter stamp's placed radius
+                                        # gets claimed; deliberately much heavier overlap (claim less)
+                                        # than the main pack's own claim (its real plateau fraction),
+                                        # since the crumb pass's whole job is blanket-covering whatever
+                                        # the main pack's large hard stamps couldn't reach
+DEFAULT_CANDIDATES_PER_RADIUS = 2000  # starting point for auto-tuning (see _auto_tune_candidates), or
+                                        # used directly if candidates_per_radius is set explicitly
+DEFAULT_SWEET_SPOT_STAMP_RATIO = 0.10  # auto-tune target: keep doubling candidates_per_radius until
+                                         # pass 2's own stamp count drops to this fraction of pass 1's --
+                                         # past that point more candidates buys diminishing pass-1
+                                         # coverage while pass 2 does proportionally less mop-up work
+DEFAULT_SWEET_SPOT_SAMPLE_BANDS = 3  # how many regularly-spaced bands to calibrate against, not every
+                                       # band -- bands are similar enough in character that per-band
+                                       # tuning would mostly repeat the same search for no benefit
+DEFAULT_SWEET_SPOT_SEEDS = 2  # random seeds per sampled band, so one lucky/unlucky seed doesn't skew
+                                # the calibration -- the MAX candidate count found across every
+                                # band/seed combination is what actually gets used for the real run
+DEFAULT_SWEET_SPOT_MAX_CANDIDATES = 50_000  # safety cap on the auto-tune search itself
+DEFAULT_SWEET_SPOT_TIME_BUDGET_S = 60.0  # hard wall-clock ceiling on the whole auto-tune search --
+                                           # once exceeded, returns whatever's best so far rather than
+                                           # letting calibration dominate total run time unpredictably
+DEFAULT_RANDOM_SEED = 1
 DEFAULT_DENOISE_PX = 1  # morphological opening+closing radius, in heightmap pixels; 0 disables
 DEFAULT_FALLBACK_PLATEAU_FRACTION = 0.5  # used only if terrain.brush_profiles isn't importable at all
 DEFAULT_MAX_TIER_ITERATIONS = 2_000_000  # true last-resort backstop against a genuine infinite-loop
@@ -353,6 +381,175 @@ def _local_mean_value(
     if sub_valid.any():
         return float(np.mean(sub_heights[sub_valid]))
     return float(heights[fallback_row, fallback_col])
+
+
+def _poisson_pack_band(
+    mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
+    brush: int, max_radius: float, min_radius: float, radius_step_ratio: float,
+    edge_distance_m: float, candidates_per_radius: int, rng: np.random.Generator,
+    max_stamps: Optional[int] = None,
+) -> tuple[list[Stamp], np.ndarray]:
+    """
+    Fast first pass ("chunky poisson fill"): a STATIC distance field
+    (computed once for the whole band, not per tier), random-candidate
+    sampling capped at candidates_per_radius per tier, and a spatial
+    hash grid for O(1)-amortized overlap rejection -- architecturally
+    different from _tiered_fill_band's exhaustive argmax-per-tier
+    approach, trading a per-call completeness guarantee for real speed.
+    Not the whole story on its own: generate_contour_layers always
+    follows this with _scatter_fill_remaining over whatever this
+    leaves uncovered, so the lack of a guarantee here doesn't cost
+    overall coverage -- see that function and this module's LEFTOVER
+    CRUMBS docstring section.
+
+    ACCEPTANCE AND OVERLAP are both based on each stamp's real PLATEAU
+    radius (radius * _brush_plateau_fraction(brush)), not its full
+    nominal radius -- "let the stamp itself do the work of overlapping"
+    via the real falloff geometry beyond the plateau, rather than a
+    separate tuned overlap parameter on top of it. Two accepted
+    stamps' PLATEAUS are never allowed to intersect; their full
+    nominal radii (which extend further) naturally do, which is what
+    produces real blending in the rendered terrain. Intended for hard,
+    high-plateau brushes (type 8/73) -- a brush with no real plateau
+    (_brush_plateau_fraction <= 0, e.g. type 10/54) can't do this
+    pass's job at all and is refused outright (returns everything as
+    crumbs for pass 2 instead of silently placing zero-claim stamps).
+
+    edge_distance_m (this pass only -- _scatter_fill_remaining ignores
+    it entirely) requires each candidate's plateau to additionally
+    clear the true band boundary by this much, not just fit within it
+    -- deliberately leaves a buffer strip along every band edge for
+    the crumb pass to handle instead, so this pass's large, hard
+    stamps never come close enough to a real boundary for fit-test
+    tolerance to matter.
+
+    Returns (stamps, crumbs) -- `crumbs` is computed from the REAL
+    accepted stamps' own plateau footprints (not the static distance
+    field, which never updates), so it reflects genuine leftover area,
+    the same contract _tiered_fill_band's return value has.
+    """
+    n_rows, n_cols = heights.shape
+    cell_x = (bounds.max_x - bounds.min_x) / n_cols
+    cell_z = (bounds.max_z - bounds.min_z) / n_rows
+    sampling = (cell_z, cell_x)
+
+    stamps: list[Stamp] = []
+    if not mask.any() or max_radius <= 0 or (max_stamps is not None and max_stamps <= 0):
+        return stamps, mask.copy()
+
+    plateau_fraction = _brush_plateau_fraction(brush)
+    if plateau_fraction <= 0:
+        return stamps, mask.copy()
+
+    # Crop to mask's own bounding box + a max_radius margin (same
+    # convention as _tiered_fill_band/_scatter_fill_remaining) so the
+    # one-time static EDT and every candidate lookup scale with the
+    # band's own extent, not the whole heightmap.
+    rows_nz, cols_nz = np.nonzero(mask)
+    margin_x = int(np.ceil(max_radius / cell_x)) + 2
+    margin_z = int(np.ceil(max_radius / cell_z)) + 2
+    row0 = max(0, int(rows_nz.min()) - margin_z)
+    row1 = min(n_rows, int(rows_nz.max()) + margin_z + 1)
+    col0 = max(0, int(cols_nz.min()) - margin_x)
+    col1 = min(n_cols, int(cols_nz.max()) + margin_x + 1)
+    mask_crop = mask[row0:row1, col0:col1]
+    crop_rows, crop_cols = mask_crop.shape
+
+    crop_x_centers = bounds.min_x + (col0 + np.arange(crop_cols) + 0.5) * cell_x
+    crop_z_centers = bounds.min_z + (row0 + np.arange(crop_rows) + 0.5) * cell_z
+
+    # ONE static distance field for the whole pass -- not recomputed
+    # per tier, unlike _tiered_fill_band. Every tier just filters this
+    # by its own (plateau_r + edge_distance_m) threshold.
+    dist_static = ndimage.distance_transform_edt(mask_crop, sampling=sampling)
+
+    radii = _tier_radii(max_radius, min_radius, radius_step_ratio)
+
+    # Spatial hash for overlap rejection -- cell size covers the
+    # largest possible interaction distance (two max-radius plateaus),
+    # same convention as the reference tool this pass is based on.
+    cell_size = max(cell_x, cell_z) + 2 * max_radius * plateau_fraction
+    grid: dict[tuple[int, int], list[tuple[float, float, float]]] = {}
+    max_plateau_seen = max_radius * plateau_fraction  # tight upper bound: radii process largest-first
+
+    def cell_key(x: float, z: float) -> tuple[int, int]:
+        return (int(x // cell_size), int(z // cell_size))
+
+    def conflicts(x: float, z: float, plateau_r: float) -> bool:
+        search_r = plateau_r + max_plateau_seen
+        min_gx = int((x - search_r) // cell_size)
+        max_gx = int((x + search_r) // cell_size)
+        min_gz = int((z - search_r) // cell_size)
+        max_gz = int((z + search_r) // cell_size)
+        for gz in range(min_gz, max_gz + 1):
+            for gx in range(min_gx, max_gx + 1):
+                for ox, oz, o_plateau_r in grid.get((gx, gz), ()):
+                    min_dist = plateau_r + o_plateau_r
+                    if (x - ox) ** 2 + (z - oz) ** 2 < min_dist * min_dist:
+                        return True
+        return False
+
+    for radius in radii:
+        if max_stamps is not None and len(stamps) >= max_stamps:
+            break
+        plateau_r = radius * plateau_fraction
+        if plateau_r <= 0:
+            continue
+        threshold = plateau_r + max(0.0, edge_distance_m)
+
+        eligible_rows, eligible_cols = np.nonzero(dist_static >= threshold)
+        if eligible_rows.size == 0:
+            continue
+
+        n_pick = min(candidates_per_radius, eligible_rows.size)
+        pick_idx = rng.choice(eligible_rows.size, size=n_pick, replace=False)
+
+        for i in pick_idx:
+            if max_stamps is not None and len(stamps) >= max_stamps:
+                break
+            r_local, c_local = int(eligible_rows[i]), int(eligible_cols[i])
+            cx = float(crop_x_centers[c_local])
+            cz = float(crop_z_centers[r_local])
+
+            if conflicts(cx, cz, plateau_r):
+                continue
+
+            row_full, col_full = r_local + row0, c_local + col0
+            row_min = max(0, int((cz - radius - bounds.min_z) / cell_z))
+            row_max = min(n_rows, int((cz + radius - bounds.min_z) / cell_z) + 1)
+            col_min = max(0, int((cx - radius - bounds.min_x) / cell_x))
+            col_max = min(n_cols, int((cx + radius - bounds.min_x) / cell_x) + 1)
+            sub_x = bounds.min_x + (np.arange(col_min, col_max) + 0.5) * cell_x
+            sub_z = bounds.min_z + (np.arange(row_min, row_max) + 0.5) * cell_z
+            xx, zz = np.meshgrid(sub_x, sub_z)
+            within_radius = np.hypot(xx - cx, zz - cz) <= radius
+            value = _local_mean_value(
+                heights, row_min, row_max, col_min, col_max, within_radius, row_full, col_full,
+            )
+
+            stamps.append(Stamp(x=cx, z=cz, radius=float(radius), value=value, brush=brush, tool=TOOL_FLATTEN))
+            grid.setdefault(cell_key(cx, cz), []).append((cx, cz, plateau_r))
+
+    # Rasterize what pass 1 actually claimed (real plateau footprints,
+    # not the never-updated static field) to compute genuine crumbs.
+    covered = np.zeros_like(mask)
+    if stamps:
+        full_x_centers = bounds.min_x + (np.arange(n_cols) + 0.5) * cell_x
+        full_z_centers = bounds.min_z + (np.arange(n_rows) + 0.5) * cell_z
+        for s in stamps:
+            s_plateau_r = s.radius * plateau_fraction
+            row_min = max(0, int((s.z - s_plateau_r - bounds.min_z) / cell_z))
+            row_max = min(n_rows, int((s.z + s_plateau_r - bounds.min_z) / cell_z) + 1)
+            col_min = max(0, int((s.x - s_plateau_r - bounds.min_x) / cell_x))
+            col_max = min(n_cols, int((s.x + s_plateau_r - bounds.min_x) / cell_x) + 1)
+            sub_x = full_x_centers[col_min:col_max]
+            sub_z = full_z_centers[row_min:row_max]
+            xx, zz = np.meshgrid(sub_x, sub_z)
+            within = np.hypot(xx - s.x, zz - s.z) <= s_plateau_r
+            covered[row_min:row_max, col_min:col_max] |= within
+
+    crumbs = mask & ~covered
+    return stamps, crumbs
 
 
 def _tiered_fill_band(
@@ -552,6 +749,24 @@ def _scatter_fill_remaining(
     remaining_crop = remaining[row0:row1, col0:col1]
 
     claim_radius = radius * claim_radius_fraction
+    # Floor the claim radius at ~1.5 grid cells -- confirmed as a real,
+    # reproducible pathology otherwise: if claim_radius shrinks below
+    # one cell (e.g. a small claim_radius_fraction combined with a
+    # coarse heightmap resolution, or just an aggressive "eat" tuning),
+    # a stamp placed exactly at a cell center no longer reaches ANY
+    # neighboring cell's own center, so the claim only ever removes the
+    # single cell it was placed on -- forcing one stamp per remaining
+    # cell instead of one stamp covering many. Measured directly: 1,875
+    # stamps for 1,875 crumb cells (a 1:1 ratio) at a resolution where
+    # claim_radius (4m) was smaller than a grid cell (6.67m), versus the
+    # intended "one large stamp reaches across many cells" behavior.
+    # This floor doesn't change claim_radius_fraction's real intent at
+    # any resolution fine enough for it to matter -- it only prevents
+    # the degenerate case where the tuned value can't make progress at
+    # the grid's own resolution at all.
+    min_cell = 1.5 * max(cell_x, cell_z)
+    if claim_radius < min_cell:
+        claim_radius = min_cell
 
     while remaining_crop.any():
         if max_stamps is not None and len(stamps) >= max_stamps:
@@ -651,6 +866,109 @@ def _fill_region_greedy(
     return stamps
 
 
+def _auto_tune_candidates(
+    heights: np.ndarray,
+    bounds: BoundingBox,
+    boundaries: list[tuple[Optional[float], Optional[float]]],
+    fill_brush: int,
+    max_radius: float,
+    min_radius: float,
+    radius_step_ratio: float,
+    edge_distance_m: float,
+    smoothing_brush: int,
+    crumb_radius: float,
+    smooth_claim_fraction: float,
+    denoise_px: int,
+    sweet_spot_ratio: float,
+    sample_band_count: int,
+    seeds_per_band: int,
+    initial_candidates: int,
+    max_candidates: int,
+    time_budget_s: float = 60.0,
+) -> int:
+    """
+    Calibrates a single candidates_per_radius value for the WHOLE
+    course by searching for the point of diminishing returns on a
+    handful of regularly-spaced sample bands, rather than tuning every
+    band individually -- bands are similar enough in character that
+    per-band tuning would mostly repeat the same search for no benefit.
+
+    For each sampled band and each of seeds_per_band random seeds
+    (so one lucky/unlucky seed doesn't skew the result), doubles
+    candidates_per_radius starting from the search's own running best
+    (see WARM-STARTING below) until pass 2's own stamp count drops to
+    sweet_spot_ratio of pass 1's -- the literal criterion: past this
+    point more candidates buys diminishing pass-1 coverage, and pass 2
+    (already running for real, not estimated) is doing proportionally
+    less mop-up work. The MAX candidate count found across every
+    sampled band/seed combination is returned -- a single global value,
+    not tuned per band, since the real run needs one number that works
+    safely everywhere, not just on the bands it happened to sample.
+
+    WARM-STARTING: each trial after the first starts its own doubling
+    search from half the best candidate count found by any PRIOR trial
+    (never below initial_candidates), not always from scratch -- bands
+    are similar enough that a value which worked well for one band is a
+    much better starting guess for the next than restarting at the
+    floor every time. Confirmed necessary: naive from-scratch doubling
+    across every sampled band/seed combination took ~113s on even a
+    small test course, dominated by repeatedly re-discovering the same
+    ballpark candidate count.
+
+    time_budget_s is a hard wall-clock ceiling on the WHOLE search
+    (default 60s) -- once exceeded, whatever the best candidate count
+    found so far is gets returned immediately, rather than the
+    calibration step being able to dominate total run time
+    unpredictably on unusually large or complex terrain. Not a
+    per-trial timeout; a running total across every sampled band/seed.
+    """
+    if not boundaries:
+        return initial_candidates
+
+    sample_positions = np.linspace(0, len(boundaries) - 1, min(sample_band_count, len(boundaries)))
+    sample_indices = sorted(set(int(round(p)) for p in sample_positions))
+
+    best_candidates = initial_candidates
+    start_time = time.time()
+
+    for bi in sample_indices:
+        if time.time() - start_time > time_budget_s:
+            break
+        lo, hi = boundaries[bi]
+        mask = _band_mask(heights, lo, hi)
+        if denoise_px > 0:
+            mask = _denoise_mask(mask, denoise_px)
+        if not mask.any():
+            continue
+
+        for seed_offset in range(seeds_per_band):
+            if time.time() - start_time > time_budget_s:
+                break
+            seed = DEFAULT_RANDOM_SEED + seed_offset
+            candidates = max(initial_candidates, best_candidates // 2)
+            while candidates <= max_candidates:
+                if time.time() - start_time > time_budget_s:
+                    break
+                rng = np.random.default_rng(seed)
+                pass1_stamps, crumbs = _poisson_pack_band(
+                    mask, heights, bounds, fill_brush, max_radius, min_radius, radius_step_ratio,
+                    edge_distance_m, candidates, rng,
+                )
+                if not pass1_stamps:
+                    break
+                pass2_stamps = _scatter_fill_remaining(
+                    crumbs, heights, bounds, smoothing_brush, crumb_radius,
+                    claim_radius_fraction=smooth_claim_fraction,
+                )
+                ratio = len(pass2_stamps) / max(1, len(pass1_stamps))
+                if ratio <= sweet_spot_ratio:
+                    break
+                candidates *= 2
+            best_candidates = max(best_candidates, min(candidates, max_candidates))
+
+    return best_candidates
+
+
 def generate_contour_layers(
     heights: np.ndarray,
     bounds: BoundingBox,
@@ -659,28 +977,81 @@ def generate_contour_layers(
     min_radius: float = DEFAULT_MIN_RADIUS_M,
     max_radius: float = DEFAULT_MAX_RADIUS_M,
     radius_step_ratio: float = DEFAULT_RADIUS_STEP_RATIO,
+    edge_distance_m: float = DEFAULT_EDGE_DISTANCE_M,
     smoothing_brush: int = DEFAULT_SMOOTHING_BRUSH,
+    smoothing_min_radius: float = DEFAULT_SMOOTHING_MIN_RADIUS_M,
+    smooth_ratio: float = DEFAULT_CRUMB_SCATTER_MULTIPLIER,
+    smooth_claim_fraction: float = DEFAULT_SMOOTH_CLAIM_FRACTION,
+    candidates_per_radius: Optional[int] = None,
+    sweet_spot_ratio: float = DEFAULT_SWEET_SPOT_STAMP_RATIO,
+    sweet_spot_sample_bands: int = DEFAULT_SWEET_SPOT_SAMPLE_BANDS,
+    sweet_spot_seeds: int = DEFAULT_SWEET_SPOT_SEEDS,
+    sweet_spot_max_candidates: int = DEFAULT_SWEET_SPOT_MAX_CANDIDATES,
+    sweet_spot_time_budget_s: float = DEFAULT_SWEET_SPOT_TIME_BUDGET_S,
+    random_seed: int = DEFAULT_RANDOM_SEED,
     denoise_px: int = DEFAULT_DENOISE_PX,
     max_stamps: Optional[int] = None,
     progress_callback: Optional[Callable[[int, float], None]] = None,
 ) -> list[Stamp]:
     """
-    Generate an organic base layer by tiered multi-scale fill of every
-    elevation band's real 2D footprint -- see module docstring. Bands
-    partition the heightmap's full elevation range into band_spacing_m-
-    wide half-open intervals: below the lowest traced level, each
-    consecutive pair of traced levels, and at-or-above the highest --
-    every finite heightmap cell belongs to exactly one band.
+    Generate an organic base layer via two passes per elevation band --
+    see module docstring. Bands partition the heightmap's full
+    elevation range into band_spacing_m-wide half-open intervals: below
+    the lowest traced level, each consecutive pair of traced levels,
+    and at-or-above the highest -- every finite heightmap cell belongs
+    to exactly one band.
 
-    Each band is (1) denoised (small morphological open+close, see
-    _denoise_mask -- denoise_px=0 disables), (2) tiered-packed from
-    max_radius down to min_radius with fill_brush, 1-bit full-radius
-    claiming (see _tiered_fill_band), (3) whatever's left scattered with
-    an oversized, heavily-overlapping smoothing_brush (see
-    _scatter_fill_remaining). No ring tracing, no cross-band value
-    blending, no separate hilltop/pit/residual special-casing -- every
-    band gets identical treatment regardless of its own shape or
-    connectivity.
+    Each band is (1) denoised (see _denoise_mask -- denoise_px=0
+    disables), (2) PASS 1: fast random-candidate poisson pack with
+    fill_brush (see _poisson_pack_band) -- a hard, high-plateau brush
+    (type 8/73) doing the bulk of the work quickly, trading a per-call
+    completeness guarantee for speed, (3) PASS 2: whatever pass 1
+    leaves as genuine crumbs gets an oversized, heavily-overlapping
+    scatter fill with smoothing_brush (see _scatter_fill_remaining),
+    which IS exhaustive -- so overall coverage is still complete by
+    construction, just split across a fast bulk pass and a smaller,
+    guaranteed-complete cleanup pass instead of one mechanism doing
+    both jobs. No ring tracing, no cross-band value blending, no
+    separate hilltop/pit/residual special-casing -- every band gets
+    identical treatment regardless of its own shape or connectivity.
+
+    edge_distance_m (pass 1 only -- pass 2 always ignores it) buffers
+    every candidate's plateau an extra edge_distance_m past the band's
+    true boundary, on top of just fitting within it. Leaves a strip
+    along every band edge that pass 1's large hard stamps never get
+    close to, for pass 2's finer, more precisely-targeted crumb fill to
+    handle instead.
+
+    smoothing_min_radius / smooth_ratio together set pass 2's fixed
+    scatter radius (smoothing_min_radius * smooth_ratio -- default 4m *
+    4.0 = 16m). Deliberately independent of pass 1's own min_radius:
+    the crumb stage's scale is a property of how it does its OWN job
+    (reaching across thin leftover slivers), not of how finely pass 1
+    happened to be tiered. smooth_claim_fraction ("eat," default 0.25)
+    is pass 2's own claim fraction -- deliberately much heavier overlap
+    than pass 1's real-plateau-derived claim, since pass 2's whole job
+    is blanket-covering whatever pass 1's large hard stamps couldn't
+    reach, not precise packing.
+
+    candidates_per_radius controls pass 1's random-candidate cap per
+    tier -- left at None (default), it's auto-tuned once at the start
+    of the run (see _auto_tune_candidates) by searching a handful of
+    regularly-spaced sample bands (sweet_spot_sample_bands) across
+    multiple random seeds (sweet_spot_seeds) for the point where pass
+    2's own stamp count drops to sweet_spot_ratio of pass 1's -- past
+    that point, more candidates buys diminishing pass-1 coverage while
+    pass 2 does proportionally less mop-up work. The single highest
+    candidate count found across every sampled band/seed combination is
+    used for the WHOLE real run, not tuned per band -- bands are similar
+    enough in character that per-band tuning would mostly repeat the
+    same search for no benefit, and a single global value is what a
+    real run actually needs to be safe everywhere. Set explicitly to
+    skip auto-tuning and use one fixed value directly.
+
+    random_seed seeds pass 1's own randomness -- each band gets
+    random_seed + its own index, so the whole run is reproducible given
+    the same inputs, while still varying naturally from band to band
+    (not the identical random pattern repeated at every elevation).
 
     max_stamps, if given, stops generation as soon as that many stamps
     have been placed in total -- intended as a quick way to sanity-
@@ -696,14 +1067,12 @@ def generate_contour_layers(
     bottom N stamps gets you."
 
     Stamp order: bands ascending by elevation, and within each band,
-    two stages large-to-small: the main tiered-pack stamps (fill_brush,
-    max_radius down to min_radius), then the crumb-scatter stamps
-    (smoothing_brush, a single fixed oversized radius). Under this
+    pass 1 (fill_brush) then pass 2 (smoothing_brush). Under this
     project's sequential pull-toward-value compositing, later stamps
-    take precedence in any overlap -- this ordering means the scatter
-    pass always refines on top of the tiered pack within its own band,
-    and never gets overwritten by an unrelated later band's stamps
-    (different bands' masks don't overlap by construction).
+    take precedence in any overlap -- this ordering means pass 2 always
+    refines on top of pass 1 within its own band, and never gets
+    overwritten by an unrelated later band's stamps (different bands'
+    masks don't overlap by construction).
 
     progress_callback, if given, is called periodically (time-throttled
     to ~10s) with (stamps_placed_so_far, fraction_complete), tracked as
@@ -726,6 +1095,17 @@ def generate_contour_layers(
         boundaries += [(float(levels[i]), float(levels[i + 1])) for i in range(n_levels - 1)]
         boundaries += [(float(levels[-1]), None)]
 
+    crumb_radius = smoothing_min_radius * smooth_ratio
+
+    if candidates_per_radius is None:
+        candidates_per_radius = _auto_tune_candidates(
+            heights, bounds, boundaries, fill_brush, max_radius, min_radius, radius_step_ratio,
+            edge_distance_m, smoothing_brush, crumb_radius, smooth_claim_fraction, denoise_px,
+            sweet_spot_ratio, sweet_spot_sample_bands, sweet_spot_seeds,
+            initial_candidates=DEFAULT_CANDIDATES_PER_RADIUS, max_candidates=sweet_spot_max_candidates,
+            time_budget_s=sweet_spot_time_budget_s,
+        )
+
     total_bands = len(boundaries)
     stamps: list[Stamp] = []
     last_progress_time = time.time()
@@ -741,31 +1121,20 @@ def generate_contour_layers(
         if mask.any():
             mask = _denoise_mask(mask, denoise_px)
         if mask.any():
+            rng = np.random.default_rng(random_seed + i)
             tier_budget = None if max_stamps is None else max_stamps - len(stamps)
-            band_stamps, crumbs = _tiered_fill_band(
-                mask, heights, bounds, fill_brush, min_radius, max_radius, radius_step_ratio,
-                max_stamps=tier_budget,
+            pass1_stamps, crumbs = _poisson_pack_band(
+                mask, heights, bounds, fill_brush, max_radius, min_radius, radius_step_ratio,
+                edge_distance_m, candidates_per_radius, rng, max_stamps=tier_budget,
             )
-            stamps.extend(band_stamps)
+            stamps.extend(pass1_stamps)
 
             if crumbs.any():
-                # Scatter fill (smoothing_brush), oversized and heavily
-                # overlapping -- see _scatter_fill_remaining's docstring.
-                # Replaces an earlier two-stage design (a second tiered
-                # pack continuing the size curve down, then a live-
-                # recompute last resort): that still tried to PACK the
-                # leftover precisely, which is the wrong shape of
-                # algorithm for thin scattered slivers regardless of how
-                # many stages it gets. Scattering a single oversized
-                # radius with heavy overlap sidesteps the packing problem
-                # entirely instead of chasing it to smaller and smaller
-                # tiers.
                 crumb_budget = None if max_stamps is None else max_stamps - len(stamps)
                 if crumb_budget is None or crumb_budget > 0:
-                    crumb_radius = min_radius * DEFAULT_CRUMB_SCATTER_MULTIPLIER
                     stamps.extend(_scatter_fill_remaining(
                         crumbs, heights, bounds, smoothing_brush, crumb_radius,
-                        claim_radius_fraction=DEFAULT_CRUMB_SCATTER_CLAIM_FRACTION,
+                        claim_radius_fraction=smooth_claim_fraction,
                         max_stamps=crumb_budget,
                     ))
 
