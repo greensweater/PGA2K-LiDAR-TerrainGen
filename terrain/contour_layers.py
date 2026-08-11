@@ -992,6 +992,7 @@ def generate_contour_layers(
     denoise_px: int = DEFAULT_DENOISE_PX,
     max_stamps: Optional[int] = None,
     progress_callback: Optional[Callable[[int, float], None]] = None,
+    on_candidates_tuned: Optional[Callable[[int], None]] = None,
 ) -> list[Stamp]:
     """
     Generate an organic base layer via two passes per elevation band --
@@ -1047,6 +1048,15 @@ def generate_contour_layers(
     same search for no benefit, and a single global value is what a
     real run actually needs to be safe everywhere. Set explicitly to
     skip auto-tuning and use one fixed value directly.
+
+    on_candidates_tuned, if given, is called ONCE with the auto-tuned
+    candidates_per_radius value, right after calibration finishes and
+    before the real per-band generation starts -- lets a caller (see
+    PGA2k_gen.py's step_generate_terrain) surface that number before
+    committing to the full run, so it can be noted and passed back in
+    explicitly next time to skip re-running the calibration search.
+    Never called if candidates_per_radius was already given explicitly
+    (nothing new to report in that case).
 
     random_seed seeds pass 1's own randomness -- each band gets
     random_seed + its own index, so the whole run is reproducible given
@@ -1105,6 +1115,8 @@ def generate_contour_layers(
             initial_candidates=DEFAULT_CANDIDATES_PER_RADIUS, max_candidates=sweet_spot_max_candidates,
             time_budget_s=sweet_spot_time_budget_s,
         )
+        if on_candidates_tuned is not None:
+            on_candidates_tuned(candidates_per_radius)
 
     total_bands = len(boundaries)
     stamps: list[Stamp] = []
