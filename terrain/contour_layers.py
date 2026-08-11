@@ -39,38 +39,39 @@ repeated at decreasing scales, and it collapses the number of genuinely
 expensive distance-transform calls from "one per stamp" (hundreds of
 thousands, at real stamp counts) to "one per tier" (a few dozen).
 
-PLATEAU-RADIUS FIT TOLERANCE: a stamp's kernel weight is exactly 1.0
-out to some fraction of its own nominal radius (the "plateau") before
-falloff even begins -- see _brush_plateau_fraction, computed directly
-from the real kernel (terrain.terrain_kernel.TerrainKernel /
-terrain.brush_profiles.BRUSH_PROFILES, the same one adaptive_refine.py
-already scores candidates with), not guessed. A candidate placement is
-ACCEPTED once its PLATEAU (radius * plateau_fraction) fits within the
-remaining mask -- a candidate needs only its solid, meaningful core to
-fit, not the whole circle, which is what keeps packing dense along
-irregular boundaries. This is deliberately a LOOSER test than what
-governs claiming (see 1-BIT CLAIMING below): acceptance cares about
-fit quality, claiming is kept simple on purpose. Only needs computing
-once per brush (4 total: 8/9/10/54), not per stamp.
+PLATEAU-RADIUS FIT TOLERANCE AND CLAIMING: a stamp's real weight is at
+or near true full strength (>= 95% of max) out to some fraction of its
+own nominal radius (the "plateau") before falloff begins -- see
+_brush_plateau_fraction, computed directly from terrain.brush_profiles.
+BRUSH_PROFILES (the real module that loads the game's own measured
+brush_profiles.json), not a duplicated copy of that data and not
+derived through any separate kernel interface. Both ACCEPTANCE (is
+there room for this candidate) and CLAIMING (what counts as handled
+once it's placed) use this same real plateau radius.
 
-1-BIT CLAIMING: once a candidate is accepted, its FULL nominal radius
--- not just the plateau used to accept it -- is removed from the
-candidate surface. Two earlier attempts at a "more physically
-accurate" fractional claim each ran into real problems: claiming only
-the plateau leaves every stamp trailing a thin unclaimed ring (width
-roughly radius * (1 - plateau_fraction) -- for type 8, ~2m at most
-even at radius 40), and that ring can only ever be closed by a stamp
-with an EVEN SMALLER plateau, cascading toward arbitrarily small
-stamps that never converge -- confirmed directly: packing looked
-tight, but the real kernel-weighted influence still showed genuine
-near-zero-influence gaps. Treating the candidate surface as plain
-1-bit -- covered or not, no fractional bookkeeping -- makes packing a
-well-defined, tractable problem (classic circle-covering) instead of
-an unbounded recursive residual. The real kernel falloff still shapes
-the FINAL rendered terrain regardless of how placement bookkeeping was
-done; that's a genuinely separate concern from "is there room here for
-another stamp," and conflating the two was the mistake both earlier
-attempts made.
+Getting this right took three attempts, worth recording so it isn't
+re-litigated blind: (1) claiming only a plateau fraction derived from
+an unverified kernel interface produced near-zero fractions for some
+brushes, cascading toward arbitrarily small stamps that never
+converged -- packing looked tight, but real kernel-weighted influence
+still showed near-zero-influence gaps. (2) Claiming the FULL nominal
+radius instead ("1-bit," treating placement as a well-defined circle-
+covering problem) fixed that, but is exactly the greedy-optimal setup
+for TANGENT packing -- circles touching, not overlapping -- and a
+falloff kernel's weight is ~0 right at a tangent point for both
+neighbors, confirmed directly against real terrain even with type 73's
+hard 0/255 edge, where there should have been no ambiguity at all:
+"circles fitted but not overlapping at all." (3) Now that
+plateau_fraction comes from the real, measured brush_profiles.json
+data -- not near-zero, not guessed -- claiming exactly that (type 8
+~0.57, type 9 ~0.46, type 73 ~0.96) is correct: substantial enough
+that it doesn't cascade the way attempt (1) did, while still leaving
+real, deliberate overlap the way attempt (2)'s tangent packing didn't.
+Brushes whose real profile never reaches meaningful full strength
+anywhere (type 54: caps at 60% of true full strength; type 10: ~6%
+plateau) correctly compute to ~0 and should not be used as fill_brush
+for the main tiered pack at all -- see _scatter_fill_remaining, which
+doesn't depend on a plateau and is the right tool for those brushes.
 
 DENOISE ("schmear"): before tiering, each band's mask gets a small
 morphological opening+closing pass (scipy.ndimage) -- opening trims
@@ -125,16 +126,33 @@ from terrain.bounding_box import BoundingBox
 from terrain.stamp import TOOL_FLATTEN, Stamp
 
 try:
-    # Same interface adaptive_refine.py already relies on for real
-    # scoring. Wrapped defensively -- this module hasn't independently
-    # verified terrain_kernel.py's exact API beyond that established
-    # call pattern; a mismatch degrades to a fixed, conservative
-    # plateau fraction rather than crashing generation entirely.
+    # The real thing, not a duplicated/re-derived copy: terrain/
+    # brush_profiles.py already loads the game's own real, measured
+    # brush_profiles.json once at import time and exposes it as
+    # BRUSH_PROFILES[brush_id].samples -- an (N, 2) array of (r, weight)
+    # rows, r=0 at the stamp's CENTER through r=1 at its outer edge,
+    # weight already normalized 0..1 against TRUE full strength (not
+    # each brush's own possibly-lower max -- confirmed: type 54 caps
+    # around 0.6, never reaching 1.0 anywhere, matching this project's
+    # own earlier documented ~62% amplitude measurement). An earlier
+    # version of this module went through terrain.terrain_kernel.
+    # TerrainKernel's interface instead, wrapped defensively since that
+    # API had never been independently verified -- confirmed as the
+    # actual root cause of persistent real-terrain gaps ("circles
+    # fitted but not overlapping at all," even with type 73's hard
+    # edge, which should have made this unambiguous). A version after
+    # that re-embedded the raw JSON as a Python literal here, which
+    # just duplicated a file (and now a whole loader module) that
+    # already exists in the repo. Importing BRUSH_PROFILES directly
+    # fixes both problems at once.
     from terrain.brush_profiles import BRUSH_PROFILES
-    from terrain.terrain_kernel import TerrainKernel
-    _HAVE_TERRAIN_KERNEL = True
+    _HAVE_BRUSH_PROFILES = True
 except ImportError:
-    _HAVE_TERRAIN_KERNEL = False
+    _HAVE_BRUSH_PROFILES = False
+
+DEFAULT_CONSUME_THRESHOLD_FRACTION = 0.95  # of TRUE full strength (1.0), not the brush's own max --
+                                             # a brush whose own max never reaches this (type 54: caps
+                                             # around 0.6) has NO consumable plateau at all, correctly 0.0
 
 DEFAULT_BAND_SPACING_M = 5.0  # Delta -- GUI/CLI tweakable
 DEFAULT_FILL_BRUSH = 8  # wide flat plateau -- best plateau_fraction of the four, minimal overhang
@@ -150,7 +168,7 @@ DEFAULT_CRUMB_SCATTER_MULTIPLIER = 4.0  # crumb scatter radius = min_radius * th
                                           # own local width instead of needing many tiny stamps
 DEFAULT_CRUMB_SCATTER_CLAIM_FRACTION = 0.5  # heavy overlap for the crumb scatter -- same convention
 DEFAULT_DENOISE_PX = 1  # morphological opening+closing radius, in heightmap pixels; 0 disables
-DEFAULT_FALLBACK_PLATEAU_FRACTION = 0.5  # used only if terrain_kernel isn't importable at all
+DEFAULT_FALLBACK_PLATEAU_FRACTION = 0.5  # used only if terrain.brush_profiles isn't importable at all
 DEFAULT_MAX_TIER_ITERATIONS = 2_000_000  # true last-resort backstop against a genuine infinite-loop
                                           # bug, NOT a real limit -- confirmed the previous default of
                                           # 5000 was silently binding in normal operation: a single flat
@@ -167,32 +185,58 @@ _plateau_fraction_cache: dict[int, float] = {}
 
 def _brush_plateau_fraction(brush: int) -> float:
     """
-    Largest r_norm (0..1, fraction of nominal radius) where the
-    brush's real kernel weight is still >= 0.999 -- i.e. still
-    genuinely full-strength, not yet in its falloff. Computed once per
-    brush type and cached (module-level: this is a property of the
-    brush profile alone, not of any particular generation run).
+    Fraction of the stamp's own radius (measured outward from center)
+    over which the REAL brush weight is still >= 95% of true full
+    strength -- computed directly from terrain.brush_profiles.
+    BRUSH_PROFILES[brush].samples, the real per-pixel-scanned data
+    (r=0 at center through r=1 at edge, weight already 0..1 against
+    true full strength). Computed once per brush type and cached
+    (module-level: a property of the brush profile alone).
 
-    Falls back to DEFAULT_FALLBACK_PLATEAU_FRACTION if terrain_kernel/
-    brush_profiles aren't importable, or the brush id isn't in
-    BRUSH_PROFILES -- conservative rather than optimistic, since an
-    overestimated plateau would let placement overhang further than
-    the brush can actually back up at full strength.
+    Confirmed against the real data: type 8 -> ~0.57, type 9 -> ~0.46,
+    type 73 -> ~0.96, type 72 -> ~0.98 -- all closely matching this
+    project's own empirically-derived estimates. type 10 -> ~0.06 and
+    type 54 -> 0.0 exactly (54 never reaches 95% of true full strength
+    ANYWHERE in its profile, capping around 60%) -- both correctly read
+    as having no usable consumable plateau, matching "these brushes
+    cannot consume" directly. A brush with essentially-zero consume
+    fraction should not be used as fill_brush for the main tiered pack
+    (see generate_contour_layers) -- use it via _scatter_fill_remaining
+    instead, which doesn't depend on a plateau at all.
+
+    Falls back to DEFAULT_FALLBACK_PLATEAU_FRACTION if terrain.
+    brush_profiles isn't importable, or the brush id isn't in
+    BRUSH_PROFILES (conservative, not optimistic -- an overestimated
+    plateau would let placement overhang further than the brush can
+    actually back up at full strength).
     """
     if brush in _plateau_fraction_cache:
         return _plateau_fraction_cache[brush]
 
-    fraction = DEFAULT_FALLBACK_PLATEAU_FRACTION
-    if _HAVE_TERRAIN_KERNEL and brush in BRUSH_PROFILES:
-        try:
-            kernel = TerrainKernel(BRUSH_PROFILES[brush])
-            r_norm = np.linspace(0.0, 1.0, 1000)
-            weight = kernel.sample_many(r_norm)
-            solid = r_norm[weight >= 0.999]
-            if solid.size:
-                fraction = float(solid.max())
-        except Exception:
-            pass  # keep the conservative fallback
+    profile = BRUSH_PROFILES.get(brush) if _HAVE_BRUSH_PROFILES else None
+    if profile is None:
+        fraction = DEFAULT_FALLBACK_PLATEAU_FRACTION
+    else:
+        samples = profile.sorted_samples()  # (N, 2): r ascending 0->1, weight column
+        r = samples[:, 0]
+        w = samples[:, 1]
+        threshold = DEFAULT_CONSUME_THRESHOLD_FRACTION
+        if float(w.max()) < threshold:
+            # Never reaches meaningfully full strength anywhere in its
+            # own profile (e.g. type 54, capping around 0.6) -- no
+            # usable plateau to consume, by construction, not by
+            # omission.
+            fraction = 0.0
+        else:
+            below = np.nonzero(w < threshold)[0]
+            if below.size == 0:
+                # Stays at/above threshold all the way to r=1 -- the
+                # whole radius is a usable plateau (not expected for
+                # any real brush here, but handled rather than assumed
+                # away).
+                fraction = 1.0
+            else:
+                fraction = float(r[below[0]])
 
     _plateau_fraction_cache[brush] = fraction
     return fraction
@@ -306,11 +350,13 @@ def _tiered_fill_band(
     real area the cap cut off early, so it should not be treated as
     "this band is fully accounted for" when max_stamps actually bound.
 
-    Returns (stamps, remaining) -- `remaining` is whatever's still
-    unfilled once the scan reaches min_radius: real area no tier's own
-    radius could reach, now that claiming is full-radius/1-bit rather
-    than plateau-only (see module docstring's 1-BIT CLAIMING section).
-    Handed to _scatter_fill_remaining by the caller.
+    Returns (stamps, remaining) -- `remaining` includes both genuine
+    crumbs (real area below min_radius) and the real plateau-to-radius
+    falloff ring left around every stamp at every tier (see module
+    docstring's PLATEAU-RADIUS FIT TOLERANCE AND CLAIMING section) --
+    substantial for some brushes (~43% of radius for type 8), not a
+    thin sliver, and by design: _scatter_fill_remaining is built to
+    handle exactly this.
     """
     n_rows, n_cols = heights.shape
     cell_x = (bounds.max_x - bounds.min_x) / n_cols
@@ -356,34 +402,39 @@ def _tiered_fill_band(
             xx, zz = np.meshgrid(sub_x, sub_z)
             dist_from_center = np.hypot(xx - cx, zz - cz)
             within_radius = dist_from_center <= radius
+            within_plateau = dist_from_center <= plateau_r
 
             value = _local_mean_value(heights, row_min, row_max, col_min, col_max, within_radius, row, col)
             stamps.append(Stamp(x=cx, z=cz, radius=float(radius), value=value, brush=brush, tool=TOOL_FLATTEN))
 
-            # 1-BIT CLAIMING: once placed, the stamp's FULL nominal radius
-            # is removed from the candidate surface -- not just its
-            # plateau. Two earlier versions of this function each tried a
-            # "more physically accurate" fractional claim (plateau-only,
-            # or a full-radius claim justified differently) and both ran
-            # into real problems -- plateau-only claiming leaves every
-            # stamp trailing a thin unclaimed ring that can only ever be
-            # closed by stamps with an even smaller plateau, cascading
-            # toward arbitrarily small stamps that never converge (this is
-            # what "packing looks tight but real influence still shows red
-            # gaps" traced back to). Treating the candidate surface as
-            # plain 1-bit -- covered or not, no fractional bookkeeping --
-            # makes packing a well-defined, tractable problem (classic
-            # circle-covering) instead of an unbounded recursive residual.
-            # The real kernel falloff still shapes the FINAL rendered
-            # terrain regardless of how placement bookkeeping was done;
-            # that's a genuinely separate concern from "is there room here
-            # for another stamp," and conflating the two was the mistake.
-            # The plateau fraction still loosens ACCEPTANCE above (a
-            # candidate needs only its solid core to fit, not the whole
-            # circle) -- that's what keeps packing dense -- it just no
-            # longer governs what counts as claimed once placed.
-            remaining[row_min:row_max, col_min:col_max][within_radius] = False
-            work[row_min:row_max, col_min:col_max][within_radius] = 0.0
+            # CLAIM THE REAL PLATEAU, not the full radius. Two earlier
+            # versions of this function each got this wrong in a
+            # different direction: one claimed only the plateau using a
+            # PLATEAU FRACTION DERIVED FROM AN UNVERIFIED KERNEL
+            # INTERFACE (never independently confirmed against real
+            # data), which produced near-zero fractions for some
+            # brushes and cascaded into arbitrarily small stamps that
+            # never converged. The next one claimed the FULL radius
+            # ("1-bit," reasoning that a well-defined packing problem
+            # mattered more than fractional accuracy) -- confirmed wrong
+            # too, directly against real terrain: full-radius claiming
+            # is exactly the greedy-optimal setup for TANGENT packing
+            # (touching, not overlapping), and a cosine-falloff kernel's
+            # weight is ~0 right at a tangent point for both neighbors --
+            # "circles fitted but not overlapping at all," even with
+            # type 73's hard edge, where there should have been no
+            # ambiguity at all.
+            #
+            # Now that plateau_fraction comes from the game's own real
+            # measured brush_profiles.json (see _brush_plateau_fraction
+            # and this module's header), it's neither near-zero nor a
+            # guess: type 8 is genuinely ~0.57, type 73 ~0.96. Claiming
+            # THAT (not the full radius) means the next stamp naturally
+            # lands closer than tangent -- real, substantial overlap in
+            # the outer 5-45% of each stamp's radius, not a degenerate
+            # sliver that needs ever-smaller stamps to close.
+            remaining[row_min:row_max, col_min:col_max][within_plateau] = False
+            work[row_min:row_max, col_min:col_max][within_plateau] = 0.0
 
     return stamps, remaining
 
