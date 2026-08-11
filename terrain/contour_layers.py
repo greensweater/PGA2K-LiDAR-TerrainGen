@@ -27,7 +27,8 @@ regardless of its shape or connectivity. skimage is no longer a
 dependency of this module at all.
 
 TIERED MULTI-SCALE FILL (the actual placement algorithm): scan stamp
-radius from max_radius down to min_radius in radius_step_m increments.
+radius from max_radius down to min_radius in geometric steps (see
+_tier_radii -- radius_step_ratio, not a fixed meters step).
 At each tier, compute ONE distance transform against whatever's still
 unfilled, then greedily place every viable, non-conflicting circle at
 THAT size (via repeated peak-pick + local suppression against that
@@ -115,7 +116,8 @@ DEFAULT_BAND_SPACING_M = 5.0  # Delta -- GUI/CLI tweakable
 DEFAULT_FILL_BRUSH = 8  # wide flat plateau -- best plateau_fraction of the four, minimal overhang
 DEFAULT_MIN_RADIUS_M = 10.0
 DEFAULT_MAX_RADIUS_M = 50.0
-DEFAULT_RADIUS_STEP_M = 1.0  # tier granularity: fewer, larger steps = faster, coarser size gradation
+DEFAULT_RADIUS_STEP_RATIO = 0.85  # each tier = previous tier * this; NOT a fixed meters step -- see
+                                   # _tier_radii's docstring for why geometric spacing is the right shape
 DEFAULT_SMOOTHING_BRUSH = 10  # soft falloff for leftover sub-min_radius crumbs -- blends, no hard edge
 DEFAULT_DENOISE_PX = 1  # morphological opening+closing radius, in heightmap pixels; 0 disables
 DEFAULT_FALLBACK_PLATEAU_FRACTION = 0.5  # used only if terrain_kernel isn't importable at all
@@ -198,6 +200,35 @@ def _denoise_mask(mask: np.ndarray, radius_px: int) -> np.ndarray:
     return closed
 
 
+def _tier_radii(max_radius: float, min_radius: float, step_ratio: float) -> np.ndarray:
+    """
+    Geometric (multiplicative) sequence of tier radii from max_radius
+    down to min_radius: each tier is the previous tier * step_ratio
+    (step_ratio in (0, 1)). Chosen over a fixed additive meters step
+    because tier relevance is inherently multiplicative, not additive
+    -- a 1m difference between radius 50 and 49 is a trivial ~2%
+    change, while the same 1m difference between radius 10 and 9 is a
+    meaningful ~10% change, so a fixed step either wastes tiers at the
+    large end or is too coarse at the small end. Geometric spacing
+    keeps the RELATIVE change between consecutive tiers constant, so
+    it scales sensibly on its own if min_radius/max_radius change --
+    confirmed: a 10x larger radius range only needs ~2.4x more tiers
+    (26 vs 11 at ratio=0.85 for [10,500] vs [10,50]), not 10x, which a
+    fixed-meters step would have required re-tuning by hand to avoid.
+
+    Falls back to a single max_radius-only tier if the inputs don't
+    describe a real descending range (max_radius <= min_radius, or
+    step_ratio outside (0, 1)).
+    """
+    if max_radius <= min_radius or step_ratio <= 0.0 or step_ratio >= 1.0:
+        return np.array([max_radius])
+    radii = [max_radius]
+    while radii[-1] * step_ratio > min_radius:
+        radii.append(radii[-1] * step_ratio)
+    radii.append(min_radius)
+    return np.array(radii)
+
+
 def _local_mean_value(
     heights: np.ndarray, row_min: int, row_max: int, col_min: int, col_max: int,
     within: np.ndarray, fallback_row: int, fallback_col: int,
@@ -211,7 +242,7 @@ def _local_mean_value(
 
 def _tiered_fill_band(
     mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
-    brush: int, min_radius: float, max_radius: float, radius_step_m: float,
+    brush: int, min_radius: float, max_radius: float, radius_step_ratio: float,
     max_stamps: Optional[int] = None,
     max_tier_iterations: int = DEFAULT_MAX_TIER_ITERATIONS,
 ) -> tuple[list[Stamp], np.ndarray]:
@@ -246,8 +277,7 @@ def _tiered_fill_band(
     if not remaining.any() or max_radius <= 0 or (max_stamps is not None and max_stamps <= 0):
         return stamps, remaining
 
-    n_tiers = max(1, int(round((max_radius - min_radius) / max(radius_step_m, 1e-6))) + 1)
-    radii = np.linspace(max_radius, min_radius, n_tiers)
+    radii = _tier_radii(max_radius, min_radius, radius_step_ratio)
 
     for radius in radii:
         if not remaining.any():
@@ -375,7 +405,7 @@ def generate_contour_layers(
     fill_brush: int = DEFAULT_FILL_BRUSH,
     min_radius: float = DEFAULT_MIN_RADIUS_M,
     max_radius: float = DEFAULT_MAX_RADIUS_M,
-    radius_step_m: float = DEFAULT_RADIUS_STEP_M,
+    radius_step_ratio: float = DEFAULT_RADIUS_STEP_RATIO,
     smoothing_brush: int = DEFAULT_SMOOTHING_BRUSH,
     denoise_px: int = DEFAULT_DENOISE_PX,
     max_stamps: Optional[int] = None,
@@ -458,7 +488,7 @@ def generate_contour_layers(
         if mask.any():
             tier_budget = None if max_stamps is None else max_stamps - len(stamps)
             band_stamps, crumbs = _tiered_fill_band(
-                mask, heights, bounds, fill_brush, min_radius, max_radius, radius_step_m,
+                mask, heights, bounds, fill_brush, min_radius, max_radius, radius_step_ratio,
                 max_stamps=tier_budget,
             )
             stamps.extend(band_stamps)
