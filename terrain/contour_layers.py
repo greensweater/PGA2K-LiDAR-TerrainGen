@@ -46,19 +46,18 @@ from the real kernel (terrain.terrain_kernel.TerrainKernel /
 terrain.brush_profiles.BRUSH_PROFILES, the same one adaptive_refine.py
 already scores candidates with), not guessed. A candidate placement is
 ACCEPTED once its PLATEAU (radius * plateau_fraction) fits within the
-remaining mask -- the falloff beyond the plateau can safely overhang
-past the mask's true edge for acceptance PURPOSES, since it isn't
-pulling at full strength there anyway ("icing spreading past the edge
-of its own cake slice," but only the thin, weak, outermost icing).
-Once accepted, though, the stamp's FULL nominal radius is what gets
-CLAIMED (removed from further consideration) -- the falloff ring is
-still genuinely pulling, just not at full strength, so leaving it
-"unclaimed" would have every smaller tier (and the final crumb pass)
-redundantly re-stamp the same ring as if untouched. Loosening applies
-to acceptance only, never to what counts as handled. This replaces the
-earlier, separately-tuned edge_softness_ratio with something derived,
-not guessed, and only needs computing once per brush (4 total:
-8/9/10/54), not per stamp.
+remaining mask, AND the plateau -- not the full nominal radius -- is
+what gets CLAIMED (removed from further consideration) once placed.
+The falloff ring beyond the plateau genuinely isn't at full strength,
+so it deliberately stays "remaining": the next (smaller) tier's fresh
+distance-transform recompute picks it up and targets it with an
+appropriately-sized stamp, rather than one partial-strength pass
+marking that ring "handled" and leaving it permanently under-covered.
+An earlier version of this function claimed the full radius instead,
+reasoning that the falloff ring was "genuinely pulling, just weakly" --
+confirmed wrong against real terrain (type 8, minimal overlap): the
+falloff really isn't strong enough to count as covered, and claiming
+it anyway produced real, permanent gaps. This replaces the earlier,
 separately-tuned edge_softness_ratio with something derived, not
 guessed, and only needs computing once per brush (4 total: 8/9/10/54),
 not per stamp.
@@ -200,21 +199,26 @@ def _denoise_mask(mask: np.ndarray, radius_px: int) -> np.ndarray:
     return closed
 
 
-def _tier_radii(max_radius: float, min_radius: float, step_ratio: float) -> np.ndarray:
+def _tier_radii(
+    max_radius: float, min_radius: float, step_ratio: float, min_step_m: float = 1.0,
+) -> np.ndarray:
     """
-    Geometric (multiplicative) sequence of tier radii from max_radius
-    down to min_radius: each tier is the previous tier * step_ratio
-    (step_ratio in (0, 1)). Chosen over a fixed additive meters step
-    because tier relevance is inherently multiplicative, not additive
-    -- a 1m difference between radius 50 and 49 is a trivial ~2%
-    change, while the same 1m difference between radius 10 and 9 is a
-    meaningful ~10% change, so a fixed step either wastes tiers at the
-    large end or is too coarse at the small end. Geometric spacing
-    keeps the RELATIVE change between consecutive tiers constant, so
-    it scales sensibly on its own if min_radius/max_radius change --
-    confirmed: a 10x larger radius range only needs ~2.4x more tiers
-    (26 vs 11 at ratio=0.85 for [10,500] vs [10,50]), not 10x, which a
-    fixed-meters step would have required re-tuning by hand to avoid.
+    Curved sequence of tier radii from max_radius down to min_radius:
+    each tier's drop is max(current_radius * (1 - step_ratio),
+    min_step_m). At large radii the proportional term dominates (100m
+    at step_ratio=0.8 drops by 20m -- a big, size-appropriate jump);
+    as radius shrinks, the proportional term shrinks with it, and once
+    it would fall below min_step_m the floor takes over instead, so
+    tiers near min_radius always drop by a real, meaningful amount
+    (default 1m) rather than degenerating into wasteful sub-meter
+    steps that don't actually change placement decisions.
+
+    This replaces a pure multiplicative sequence (constant RATIO,
+    unbounded below) with one that keeps the same "big steps at large
+    sizes" shape but adds a floor -- confirmed as necessary: pure
+    ratio steps get arbitrarily small near min_radius, spending real
+    distance-transform passes on tiers that differ by a fraction of a
+    meter and don't meaningfully change what gets placed.
 
     Falls back to a single max_radius-only tier if the inputs don't
     describe a real descending range (max_radius <= min_radius, or
@@ -223,8 +227,13 @@ def _tier_radii(max_radius: float, min_radius: float, step_ratio: float) -> np.n
     if max_radius <= min_radius or step_ratio <= 0.0 or step_ratio >= 1.0:
         return np.array([max_radius])
     radii = [max_radius]
-    while radii[-1] * step_ratio > min_radius:
-        radii.append(radii[-1] * step_ratio)
+    while radii[-1] > min_radius:
+        current = radii[-1]
+        drop = max(current * (1.0 - step_ratio), min_step_m)
+        next_radius = current - drop
+        if next_radius <= min_radius:
+            break
+        radii.append(next_radius)
     radii.append(min_radius)
     return np.array(radii)
 
@@ -258,9 +267,10 @@ def _tiered_fill_band(
     real area the cap cut off early, so it should not be treated as
     "this band is fully accounted for" when max_stamps actually bound.
 
-    Returns (stamps, remaining) -- `remaining` is whatever's still
-    unfilled once the scan reaches min_radius (the "crumbs" a caller
-    should hand to a separate, softer smoothing pass; see
+    Returns (stamps, remaining) -- `remaining` includes both genuine
+    crumbs (real area below min_radius) AND any leftover falloff-ring
+    slivers no tier's plateau ever reached before bottoming out at
+    min_radius; both get handed to the same crumb-smoothing pass (see
     _fill_region_greedy).
     """
     n_rows, n_cols = heights.shape
@@ -312,17 +322,23 @@ def _tiered_fill_band(
             value = _local_mean_value(heights, row_min, row_max, col_min, col_max, within_radius, row, col)
             stamps.append(Stamp(x=cx, z=cz, radius=float(radius), value=value, brush=brush, tool=TOOL_FLATTEN))
 
-            # Claim the FULL nominal radius, not just the plateau used to
-            # accept this placement -- the falloff ring between plateau_r
-            # and radius is still genuinely pulling (weakly, not zero), so
-            # leaving it marked "remaining" caused every smaller tier (and
-            # eventually the crumb-smoothing pass) to redundantly re-stamp
-            # that same ring, confirmed as a real bug: it produced 3-4x
-            # more crumb-smoothing stamps than main tiered-fill stamps on
-            # a test course, when crumbs should be a small minority. The
-            # plateau loosens ACCEPTANCE (is there room for this stamp at
-            # all); it was never meant to loosen what counts as handled
-            # once a stamp is actually placed.
+            # Claim only the PLATEAU (true 100%-strength zone), not the
+            # full nominal radius -- reversing an earlier version of this
+            # function, which claimed the full radius specifically to
+            # avoid redundant re-stamping of the same falloff ring. That
+            # was solving the wrong problem: the falloff ring genuinely
+            # ISN'T at full strength, so marking it "handled" after only
+            # one partial-strength pass left real, permanent gaps there --
+            # confirmed directly against real terrain (type 8, minimal
+            # brush overlap). Claiming only the plateau means the falloff
+            # ring correctly stays "remaining," and the NEXT (smaller)
+            # tier's fresh distance-transform recompute -- not a stale
+            # snapshot -- naturally targets exactly that ring with an
+            # appropriately-sized stamp. Trusting the tier-to-tier
+            # recompute to do this correctly is the actual fix; the
+            # earlier full-radius claim just avoided the question.
+            remaining[row_min:row_max, col_min:col_max][within_plateau] = False
+            work[row_min:row_max, col_min:col_max][within_plateau] = 0.0
             remaining[row_min:row_max, col_min:col_max][within_radius] = False
             work[row_min:row_max, col_min:col_max][within_radius] = 0.0
 
