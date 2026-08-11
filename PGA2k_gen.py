@@ -1452,6 +1452,10 @@ def step_generate_terrain(
             print(f"  ... {elapsed:.0f}s elapsed: {stamp_count} stamps so far, "
                   f"{fraction:.1%} complete (bands ascending, lowest to highest elevation)")
 
+        def _print_auto_tuned_candidates(value: int) -> None:
+            print(f"  auto-tuned candidates_per_radius = {value} "
+                  f"(pass --candidates-per-radius {value} next time to skip this calibration step)")
+
         fitted = generate_contour_layers(
             heightmap, bounds,
             band_spacing_m=band_spacing_m,
@@ -1474,6 +1478,7 @@ def step_generate_terrain(
             denoise_px=denoise_px,
             max_stamps=max_stamps,
             progress_callback=_print_contour_progress,
+            on_candidates_tuned=_print_auto_tuned_candidates,
         )
         if max_stamps is not None and len(fitted) >= max_stamps:
             print(f"  {len(fitted)} stamps placed -- STOPPED at max_stamps={max_stamps}, "
