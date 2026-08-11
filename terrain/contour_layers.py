@@ -395,16 +395,37 @@ def _tiered_fill_band(
     if not remaining.any() or max_radius <= 0 or (max_stamps is not None and max_stamps <= 0):
         return stamps, remaining
 
+    # Crop the working region to `mask`'s own bounding box + a max_radius
+    # margin (same convention _fill_region_greedy already established) --
+    # confirmed as the dominant real cost otherwise: the inner placement
+    # loop's own work.max()/argmax were scanning the FULL heightmap-sized
+    # array on every single stamp placement, not just once per tier,
+    # regardless of how small the band actually is. Measured directly: a
+    # single tier can legitimately need ~28,000 placements on a real
+    # course, which at full 2000x2000 array size means ~28,000 x
+    # 4,000,000 element scans for ONE tier alone. `remaining_crop` is a
+    # VIEW into `remaining` (basic slicing, not fancy indexing), so
+    # mutations made through either one stay in sync automatically --
+    # no separate write-back step needed.
+    rows_nz, cols_nz = np.nonzero(remaining)
+    margin_x = int(np.ceil(max_radius / cell_x)) + 2
+    margin_z = int(np.ceil(max_radius / cell_z)) + 2
+    row0 = max(0, int(rows_nz.min()) - margin_z)
+    row1 = min(n_rows, int(rows_nz.max()) + margin_z + 1)
+    col0 = max(0, int(cols_nz.min()) - margin_x)
+    col1 = min(n_cols, int(cols_nz.max()) + margin_x + 1)
+    remaining_crop = remaining[row0:row1, col0:col1]
+
     radii = _tier_radii(max_radius, min_radius, radius_step_ratio)
 
     for radius in radii:
-        if not remaining.any():
+        if not remaining_crop.any():
             break
         plateau_r = radius * plateau_fraction
         if plateau_r <= 0:
             continue
 
-        dist = ndimage.distance_transform_edt(remaining, sampling=sampling)
+        dist = ndimage.distance_transform_edt(remaining_crop, sampling=sampling)
         work = np.where(dist >= plateau_r, dist, 0.0)
 
         for _ in range(max_tier_iterations):
@@ -413,7 +434,8 @@ def _tiered_fill_band(
             peak = float(work.max())
             if peak < plateau_r:
                 break
-            row, col = np.unravel_index(np.argmax(work), work.shape)
+            row_c, col_c = np.unravel_index(np.argmax(work), work.shape)
+            row, col = row_c + row0, col_c + col0  # crop-local -> full-array indices
             cx, cz = float(x_centers[col]), float(z_centers[row])
 
             row_min = max(0, int((cz - radius - bounds.min_z) / cell_z))
@@ -457,7 +479,13 @@ def _tiered_fill_band(
             # the outer 5-45% of each stamp's radius, not a degenerate
             # sliver that needs ever-smaller stamps to close.
             remaining[row_min:row_max, col_min:col_max][within_plateau] = False
-            work[row_min:row_max, col_min:col_max][within_plateau] = 0.0
+            # `work` is crop-local; the claim window computed above is
+            # in full-array coordinates and is guaranteed to fall
+            # entirely within the crop (radius <= max_radius, and the
+            # crop's own margin was sized to max_radius), so a plain
+            # offset by (row0, col0) is enough -- no bounds clipping
+            # needed.
+            work[row_min - row0:row_max - row0, col_min - col0:col_max - col0][within_plateau] = 0.0
 
     return stamps, remaining
 
@@ -506,13 +534,31 @@ def _scatter_fill_remaining(
     if not remaining.any() or radius <= 0 or (max_stamps is not None and max_stamps <= 0):
         return stamps
 
+    # Crop to `mask`'s own bounding box + a radius margin -- see
+    # _tiered_fill_band's matching comment for why this matters: an
+    # earlier version of this function recomputed a FULL heightmap-sized
+    # distance transform on EVERY single iteration, with no cropping at
+    # all (worse than _tiered_fill_band's own pre-fix issue, since an
+    # EDT is more expensive per call than a max/argmax, and this runs
+    # once per band). `remaining_crop` is a VIEW into `remaining`, so
+    # mutations through either stay in sync automatically.
+    rows_nz, cols_nz = np.nonzero(remaining)
+    margin_x = int(np.ceil(radius / cell_x)) + 2
+    margin_z = int(np.ceil(radius / cell_z)) + 2
+    row0 = max(0, int(rows_nz.min()) - margin_z)
+    row1 = min(n_rows, int(rows_nz.max()) + margin_z + 1)
+    col0 = max(0, int(cols_nz.min()) - margin_x)
+    col1 = min(n_cols, int(cols_nz.max()) + margin_x + 1)
+    remaining_crop = remaining[row0:row1, col0:col1]
+
     claim_radius = radius * claim_radius_fraction
 
-    while remaining.any():
+    while remaining_crop.any():
         if max_stamps is not None and len(stamps) >= max_stamps:
             break
-        dist = ndimage.distance_transform_edt(remaining, sampling=sampling)
-        row, col = np.unravel_index(np.argmax(dist), dist.shape)
+        dist = ndimage.distance_transform_edt(remaining_crop, sampling=sampling)
+        row_c, col_c = np.unravel_index(np.argmax(dist), dist.shape)
+        row, col = row_c + row0, col_c + col0  # crop-local -> full-array indices
         cx, cz = float(x_centers[col]), float(z_centers[row])
 
         row_min = max(0, int((cz - radius - bounds.min_z) / cell_z))
@@ -530,75 +576,6 @@ def _scatter_fill_remaining(
         stamps.append(Stamp(x=cx, z=cz, radius=radius, value=value, brush=brush, tool=TOOL_FLATTEN))
 
         remaining[row_min:row_max, col_min:col_max][within_claim] = False
-
-    return stamps
-
-
-def _fill_region_greedy(
-    mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
-    brush: int, min_radius: float, max_radius: float, claim_radius_fraction: float = 0.5,
-    max_stamps: Optional[int] = None,
-) -> list[Stamp]:
-    """
-    Live-recompute greedy fill for small leftover fragments (the
-    tiered scan's own "crumbs," below its own min_radius) -- carried
-    over from an earlier version of this module largely unchanged.
-    Recomputes the distance transform fresh each placement (appropriate
-    here: crumbs are small and few by construction, so this is cheap in
-    aggregate), cropped to `mask`'s own bounding box + a max_radius
-    margin so cost scales with the crumb region's own extent, not the
-    full heightmap. max_stamps (local budget, see _tiered_fill_band's
-    docstring for the same convention) stops early once reached.
-    """
-    rows_nz, cols_nz = np.nonzero(mask)
-    if rows_nz.size == 0 or (max_stamps is not None and max_stamps <= 0):
-        return []
-
-    n_rows, n_cols = heights.shape
-    cell_x = (bounds.max_x - bounds.min_x) / n_cols
-    cell_z = (bounds.max_z - bounds.min_z) / n_rows
-    margin_x = int(np.ceil(max_radius / cell_x)) + 2
-    margin_z = int(np.ceil(max_radius / cell_z)) + 2
-
-    row_min = max(0, int(rows_nz.min()) - margin_z)
-    row_max = min(n_rows, int(rows_nz.max()) + margin_z + 1)
-    col_min = max(0, int(cols_nz.min()) - margin_x)
-    col_max = min(n_cols, int(cols_nz.max()) + margin_x + 1)
-
-    remaining = mask[row_min:row_max, col_min:col_max].copy()
-    sub_heights = heights[row_min:row_max, col_min:col_max]
-    x_centers = bounds.min_x + (np.arange(col_min, col_max) + 0.5) * cell_x
-    z_centers = bounds.min_z + (np.arange(row_min, row_max) + 0.5) * cell_z
-    xx_full, zz_full = np.meshgrid(x_centers, z_centers)
-    sampling = (cell_z, cell_x)
-    plateau_fraction = _brush_plateau_fraction(brush)
-    effective_claim_fraction = max(claim_radius_fraction, plateau_fraction)
-
-    stamps: list[Stamp] = []
-    while remaining.any():
-        if max_stamps is not None and len(stamps) >= max_stamps:
-            break
-        dist = ndimage.distance_transform_edt(remaining, sampling=sampling)
-        peak = float(dist.max())
-        if peak <= 0.0:
-            break
-        row, col = np.unravel_index(np.argmax(dist), dist.shape)
-        radius = float(np.clip(peak, min_radius, max_radius))
-        claim_radius = radius * effective_claim_fraction
-        cx, cz = float(x_centers[col]), float(z_centers[row])
-
-        dist_from_center = np.hypot(xx_full - cx, zz_full - cz)
-        within_radius = dist_from_center <= radius
-        within_claim = dist_from_center <= claim_radius
-
-        sub_valid = np.isfinite(sub_heights) & within_radius
-        if not sub_valid.any():
-            remaining[row, col] = False
-            continue
-        value = float(np.mean(sub_heights[sub_valid]))
-
-        stamps.append(Stamp(x=cx, z=cz, radius=radius, value=value, brush=brush, tool=TOOL_FLATTEN))
-        remaining[within_claim] = False
 
     return stamps
 
