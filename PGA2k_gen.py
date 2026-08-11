@@ -123,7 +123,17 @@ from terrain.contour_layers import (
     DEFAULT_MIN_RADIUS_M,
     DEFAULT_MAX_RADIUS_M,
     DEFAULT_RADIUS_STEP_RATIO,
+    DEFAULT_EDGE_DISTANCE_M,
     DEFAULT_SMOOTHING_BRUSH,
+    DEFAULT_SMOOTHING_MIN_RADIUS_M,
+    DEFAULT_CRUMB_SCATTER_MULTIPLIER,
+    DEFAULT_SMOOTH_CLAIM_FRACTION,
+    DEFAULT_SWEET_SPOT_STAMP_RATIO,
+    DEFAULT_SWEET_SPOT_SAMPLE_BANDS,
+    DEFAULT_SWEET_SPOT_SEEDS,
+    DEFAULT_SWEET_SPOT_MAX_CANDIDATES,
+    DEFAULT_SWEET_SPOT_TIME_BUDGET_S,
+    DEFAULT_RANDOM_SEED,
     DEFAULT_DENOISE_PX,
     generate_contour_layers,
 )
@@ -1269,7 +1279,18 @@ def step_generate_terrain(
     min_radius: float | None = None,
     max_radius: float | None = None,
     radius_step_ratio: float | None = None,
+    edge_distance_m: float | None = None,
     smoothing_brush: int | None = None,
+    smoothing_min_radius: float | None = None,
+    smooth_ratio: float | None = None,
+    smooth_claim_fraction: float | None = None,
+    candidates_per_radius: int | None = None,
+    sweet_spot_ratio: float | None = None,
+    sweet_spot_sample_bands: int | None = None,
+    sweet_spot_seeds: int | None = None,
+    sweet_spot_max_candidates: int | None = None,
+    sweet_spot_time_budget_s: float | None = None,
+    random_seed: int | None = None,
     denoise_px: int | None = None,
     max_stamps: int | None = None,
 ) -> None:
@@ -1289,11 +1310,15 @@ def step_generate_terrain(
 
     method ("hex", default, or "contour") picks the initial-layout
     generator: "hex" is the flat lattice above; "contour" is terrain/
-    contour_layers.py's tiered multi-scale 1-bit band fill -- every
-    elevation band's real 2D footprint gets filled directly with
-    circles sized from real local geometry, valued at the real local
-    heightmap mean. Only "hex"'s parameters (pitch) apply in "hex" mode
-    and vice versa for the contour_* parameters below.
+    contour_layers.py's two-pass-per-band fill -- see that module's
+    docstring for the full design. Briefly: PASS 1 is a fast random-
+    candidate poisson pack with a hard, high-plateau fill_brush (type
+    8/73), then PASS 2 is an oversized, heavily-overlapping scatter
+    fill with a softer smoothing_brush over whatever pass 1 leaves as
+    genuine crumbs -- pass 2 IS exhaustive, so overall coverage stays
+    complete by construction even though pass 1 trades a per-call
+    guarantee for speed. Only "hex"'s parameters (pitch) apply in "hex"
+    mode and vice versa for the contour_* parameters below.
 
     Unlike hex mode, contour mode's stamps already carry their exact
     fitted value (the local heightmap mean within each stamp's own
@@ -1301,13 +1326,19 @@ def step_generate_terrain(
     the fit_stamp_heights() pass below only runs in "hex" mode.
     Re-running it against contour stamps would be redundant at best.
 
-    max_radius is the main contour-mode tuning knob for level of detail:
-    it caps how large the tiered fill's biggest stamps can be, so it
+    max_radius is the main contour-mode tuning knob for level of
+    detail: it caps how large pass 1's biggest stamps can be, so it
     should scale with how much real terrain variation exists at your
-    chosen band_spacing_m -- too large on genuinely complex terrain
-    wastes accuracy; too small on open/gentle terrain leaves everything
-    to the (slower, smaller-stamp) crumb-smoothing pass instead of the
-    efficient tiered fill.
+    chosen band_spacing_m.
+
+    candidates_per_radius (left unset) auto-tunes itself once at the
+    start of the run by searching a handful of sample bands for the
+    point of diminishing returns -- see the --candidates-per-radius
+    and --sweet-spot-* CLI help text, and generate_contour_layers'
+    own docstring, for the full calibration design. Set it explicitly
+    once you've seen a good auto-tuned value to skip re-running that
+    search on every subsequent run -- it is NOT auto-persisted from an
+    auto-tuned run, you have to note the value yourself.
 
     max_stamps (contour method only) stops generation once that many
     stamps have been placed in total -- a quick way to sanity-check a
@@ -1344,8 +1375,46 @@ def step_generate_terrain(
         max_radius = project.get("generate_terrain_max_radius_m", DEFAULT_MAX_RADIUS_M)
     if radius_step_ratio is None:
         radius_step_ratio = project.get("generate_terrain_radius_step_ratio", DEFAULT_RADIUS_STEP_RATIO)
+    if edge_distance_m is None:
+        edge_distance_m = project.get("generate_terrain_edge_distance_m", DEFAULT_EDGE_DISTANCE_M)
     if smoothing_brush is None:
         smoothing_brush = project.get("generate_terrain_smoothing_brush", DEFAULT_SMOOTHING_BRUSH)
+    if smoothing_min_radius is None:
+        smoothing_min_radius = project.get(
+            "generate_terrain_smoothing_min_radius_m", DEFAULT_SMOOTHING_MIN_RADIUS_M
+        )
+    if smooth_ratio is None:
+        smooth_ratio = project.get("generate_terrain_smooth_ratio", DEFAULT_CRUMB_SCATTER_MULTIPLIER)
+    if smooth_claim_fraction is None:
+        smooth_claim_fraction = project.get(
+            "generate_terrain_smooth_claim_fraction", DEFAULT_SMOOTH_CLAIM_FRACTION
+        )
+    if candidates_per_radius is None:
+        # Unlike every other knob here, NOT resolved to a fixed default
+        # if absent from project.json -- staying None means
+        # generate_contour_layers auto-tunes it fresh (see that
+        # function and _auto_tune_candidates). Set this explicitly
+        # (CLI/GUI) once you've seen a good auto-tuned value to skip
+        # re-running the calibration search on every subsequent run.
+        candidates_per_radius = project.get("generate_terrain_candidates_per_radius", None)
+    if sweet_spot_ratio is None:
+        sweet_spot_ratio = project.get("generate_terrain_sweet_spot_ratio", DEFAULT_SWEET_SPOT_STAMP_RATIO)
+    if sweet_spot_sample_bands is None:
+        sweet_spot_sample_bands = project.get(
+            "generate_terrain_sweet_spot_sample_bands", DEFAULT_SWEET_SPOT_SAMPLE_BANDS
+        )
+    if sweet_spot_seeds is None:
+        sweet_spot_seeds = project.get("generate_terrain_sweet_spot_seeds", DEFAULT_SWEET_SPOT_SEEDS)
+    if sweet_spot_max_candidates is None:
+        sweet_spot_max_candidates = project.get(
+            "generate_terrain_sweet_spot_max_candidates", DEFAULT_SWEET_SPOT_MAX_CANDIDATES
+        )
+    if sweet_spot_time_budget_s is None:
+        sweet_spot_time_budget_s = project.get(
+            "generate_terrain_sweet_spot_time_budget_s", DEFAULT_SWEET_SPOT_TIME_BUDGET_S
+        )
+    if random_seed is None:
+        random_seed = project.get("generate_terrain_random_seed", DEFAULT_RANDOM_SEED)
     if denoise_px is None:
         denoise_px = project.get("generate_terrain_denoise_px", DEFAULT_DENOISE_PX)
 
@@ -1366,8 +1435,10 @@ def step_generate_terrain(
     heightmap, _ = load_heightmap(heightmap_path)
 
     if method == "contour":
-        print(f"Tiered multi-scale band fill (band_spacing_m={band_spacing_m}, "
-              f"radius=[{min_radius}, {max_radius}] m, step_ratio={radius_step_ratio})...")
+        print(f"Two-pass poisson band fill (band_spacing_m={band_spacing_m}, "
+              f"pass1_radius=[{min_radius}, {max_radius}] m, step_ratio={radius_step_ratio}, "
+              f"pass2_radius={smoothing_min_radius * smooth_ratio} m, "
+              f"candidates_per_radius={'auto-tuning...' if candidates_per_radius is None else candidates_per_radius})...")
         if max_stamps is not None:
             print(f"  max_stamps={max_stamps} -- PARTIAL PREVIEW RUN, not a real generation: "
                   "bands fill ascending by elevation, so this will stop somewhere on the low-"
@@ -1388,7 +1459,18 @@ def step_generate_terrain(
             min_radius=min_radius,
             max_radius=max_radius,
             radius_step_ratio=radius_step_ratio,
+            edge_distance_m=edge_distance_m,
             smoothing_brush=smoothing_brush,
+            smoothing_min_radius=smoothing_min_radius,
+            smooth_ratio=smooth_ratio,
+            smooth_claim_fraction=smooth_claim_fraction,
+            candidates_per_radius=candidates_per_radius,
+            sweet_spot_ratio=sweet_spot_ratio,
+            sweet_spot_sample_bands=sweet_spot_sample_bands,
+            sweet_spot_seeds=sweet_spot_seeds,
+            sweet_spot_max_candidates=sweet_spot_max_candidates,
+            sweet_spot_time_budget_s=sweet_spot_time_budget_s,
+            random_seed=random_seed,
             denoise_px=denoise_px,
             max_stamps=max_stamps,
             progress_callback=_print_contour_progress,
@@ -1438,7 +1520,18 @@ def step_generate_terrain(
         "generate_terrain_min_radius_m": min_radius,
         "generate_terrain_max_radius_m": max_radius,
         "generate_terrain_radius_step_ratio": radius_step_ratio,
+        "generate_terrain_edge_distance_m": edge_distance_m,
         "generate_terrain_smoothing_brush": smoothing_brush,
+        "generate_terrain_smoothing_min_radius_m": smoothing_min_radius,
+        "generate_terrain_smooth_ratio": smooth_ratio,
+        "generate_terrain_smooth_claim_fraction": smooth_claim_fraction,
+        "generate_terrain_candidates_per_radius": candidates_per_radius,
+        "generate_terrain_sweet_spot_ratio": sweet_spot_ratio,
+        "generate_terrain_sweet_spot_sample_bands": sweet_spot_sample_bands,
+        "generate_terrain_sweet_spot_seeds": sweet_spot_seeds,
+        "generate_terrain_sweet_spot_max_candidates": sweet_spot_max_candidates,
+        "generate_terrain_sweet_spot_time_budget_s": sweet_spot_time_budget_s,
+        "generate_terrain_random_seed": random_seed,
         "generate_terrain_denoise_px": denoise_px,
     })
 
@@ -2028,18 +2121,93 @@ def main(argv: list[str] | None = None) -> int:
                          help="generate-terrain, contour method only: geometric (multiplicative) step "
                               "between tiers, scanning from --max-radius down to --min-radius -- each "
                               "tier's radius is the previous tier's radius times this ratio (0-1, not "
-                              "a fixed meters step). Closer to 1.0 means more, finer-grained tiers "
-                              "(more thorough, fewer stamps left to the crumb-smoothing fallback) at "
-                              "the cost of more distance-transform passes; automatically scales with "
-                              "whatever --min-radius/--max-radius range you choose, unlike a fixed "
-                              "meters step. Default: use whatever's saved in project.json, or "
+                              "a fixed meters step). Closer to 1.0 means more, finer-grained tiers at "
+                              "the cost of more candidate lookups; automatically scales with whatever "
+                              "--min-radius/--max-radius range you choose, unlike a fixed meters step. "
+                              "Default: use whatever's saved in project.json, or "
                               f"{DEFAULT_RADIUS_STEP_RATIO} if never set.")
+    parser.add_argument("--edge-distance-m", type=float, default=None,
+                         help="generate-terrain, contour method only: pass-1-only buffer (m) past the "
+                              "true band boundary that every candidate's plateau must additionally "
+                              "clear, on top of just fitting within it -- leaves a strip along every "
+                              "band edge for pass 2's finer crumb fill to handle instead of pass 1's "
+                              "large hard stamps. Pass 2 always ignores this. 0 disables. Default: use "
+                              f"whatever's saved in project.json, or {DEFAULT_EDGE_DISTANCE_M} if never "
+                              "set.")
     parser.add_argument("--smoothing-brush", type=int, default=None,
-                         help="generate-terrain, contour method only: brush for leftover fragments "
-                              "smaller than --min-radius -- a softer brush (type 10 default) so small "
-                              "scattered crumbs blend rather than showing a hard-edged patch. Default: "
-                              f"use whatever's saved in project.json, or {DEFAULT_SMOOTHING_BRUSH} if "
-                              "never set.")
+                         help="generate-terrain, contour method only: brush for pass 2's crumb-scatter "
+                              "fill over whatever pass 1 leaves as genuine crumbs -- a softer brush "
+                              "(type 10 default) so small scattered crumbs blend rather than showing a "
+                              "hard-edged patch. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_SMOOTHING_BRUSH} if never set.")
+    parser.add_argument("--smoothing-min-radius", type=float, default=None,
+                         help="generate-terrain, contour method only: pass 2's OWN radius floor, "
+                              "independent of --min-radius (pass 1's) -- the crumb stage's scale is a "
+                              "property of how it does its own job, not of how finely pass 1 happened "
+                              "to be tiered. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_SMOOTHING_MIN_RADIUS_M} if never set.")
+    parser.add_argument("--smooth-ratio", type=float, default=None,
+                         help="generate-terrain, contour method only: pass 2's crumb-scatter radius as "
+                              "a multiple of --smoothing-min-radius (default 4.0 -- a 16m scatter "
+                              "radius at the 4m default floor). Deliberately a ratio, not an "
+                              "independent absolute value: the crumb stage exists to reach across "
+                              "whatever pass 1 couldn't fit, so its own scale should track its own "
+                              "floor directly rather than needing separate re-tuning. Default: use "
+                              f"whatever's saved in project.json, or {DEFAULT_CRUMB_SCATTER_MULTIPLIER} "
+                              "if never set.")
+    parser.add_argument("--smooth-claim-fraction", type=float, default=None,
+                         help="generate-terrain, contour method only: \"eat\" -- how much of each "
+                              "pass-2 crumb-scatter stamp's placed radius gets claimed. Deliberately "
+                              "much heavier overlap (claim less) than pass 1's real-plateau-derived "
+                              "claim, since pass 2's whole job is blanket-covering whatever pass 1's "
+                              "large hard stamps couldn't reach, not precise packing. Default: use "
+                              f"whatever's saved in project.json, or {DEFAULT_SMOOTH_CLAIM_FRACTION} "
+                              "if never set.")
+    parser.add_argument("--candidates-per-radius", type=int, default=None,
+                         help="generate-terrain, contour method only: pass 1's random-candidate cap "
+                              "per tier. Left unset, this is AUTO-TUNED once at the start of the run "
+                              "(see --sweet-spot-* flags below) by searching a handful of sample bands "
+                              "for the point of diminishing returns, rather than defaulting to a fixed "
+                              "number -- set this explicitly, once you've seen a good auto-tuned value, "
+                              "to skip re-running that calibration search on every subsequent run. Not "
+                              "auto-persisted from an auto-tuned run -- you have to note the value "
+                              "yourself and pass it back in.")
+    parser.add_argument("--sweet-spot-ratio", type=float, default=None,
+                         help="generate-terrain, contour method only, auto-tune only (ignored if "
+                              "--candidates-per-radius is set explicitly): keep doubling "
+                              "candidates_per_radius until pass 2's own stamp count drops to this "
+                              "fraction of pass 1's -- past that point more candidates buys "
+                              "diminishing pass-1 coverage while pass 2 does proportionally less "
+                              "mop-up work. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_SWEET_SPOT_STAMP_RATIO} if never set.")
+    parser.add_argument("--sweet-spot-sample-bands", type=int, default=None,
+                         help="generate-terrain, contour method only, auto-tune only: how many "
+                              "regularly-spaced bands to calibrate against, not every band -- bands "
+                              "are similar enough in character that per-band tuning would mostly "
+                              "repeat the same search for no benefit. Default: use whatever's saved "
+                              f"in project.json, or {DEFAULT_SWEET_SPOT_SAMPLE_BANDS} if never set.")
+    parser.add_argument("--sweet-spot-seeds", type=int, default=None,
+                         help="generate-terrain, contour method only, auto-tune only: random seeds per "
+                              "sampled band, so one lucky/unlucky seed doesn't skew the calibration -- "
+                              "the MAX candidate count found across every band/seed combination is what "
+                              "actually gets used. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_SWEET_SPOT_SEEDS} if never set.")
+    parser.add_argument("--sweet-spot-max-candidates", type=int, default=None,
+                         help="generate-terrain, contour method only, auto-tune only: safety cap on "
+                              "the calibration search itself. Default: use whatever's saved in "
+                              f"project.json, or {DEFAULT_SWEET_SPOT_MAX_CANDIDATES} if never set.")
+    parser.add_argument("--sweet-spot-time-budget-s", type=float, default=None,
+                         help="generate-terrain, contour method only, auto-tune only: hard wall-clock "
+                              "ceiling (seconds) on the whole calibration search -- once exceeded, "
+                              "whatever's best so far gets used, rather than calibration being able to "
+                              "dominate total run time unpredictably. Default: use whatever's saved in "
+                              f"project.json, or {DEFAULT_SWEET_SPOT_TIME_BUDGET_S} if never set.")
+    parser.add_argument("--random-seed", type=int, default=None,
+                         help="generate-terrain, contour method only: seeds pass 1's own randomness -- "
+                              "each band gets random_seed + its own index, so the whole run is "
+                              "reproducible given the same inputs, while still varying naturally band "
+                              "to band. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RANDOM_SEED} if never set.")
     parser.add_argument("--denoise-px", type=int, default=None,
                          help="generate-terrain, contour method only: morphological open+close radius "
                               "(heightmap pixels) applied to each band's mask before filling -- trims "
@@ -2285,9 +2453,28 @@ def main(argv: list[str] | None = None) -> int:
             step_dig_water(working_dir, args.dig_depth, args.dig_buffer)
         elif args.step == "generate-terrain":
             step_generate_terrain(
-                working_dir, args.pitch, args.generate_terrain_method, args.band_spacing_m,
-                args.fill_brush, args.min_radius, args.max_radius, args.radius_step_ratio,
-                args.smoothing_brush, args.denoise_px, args.max_stamps,
+                working_dir,
+                pitch=args.pitch,
+                method=args.generate_terrain_method,
+                band_spacing_m=args.band_spacing_m,
+                fill_brush=args.fill_brush,
+                min_radius=args.min_radius,
+                max_radius=args.max_radius,
+                radius_step_ratio=args.radius_step_ratio,
+                edge_distance_m=args.edge_distance_m,
+                smoothing_brush=args.smoothing_brush,
+                smoothing_min_radius=args.smoothing_min_radius,
+                smooth_ratio=args.smooth_ratio,
+                smooth_claim_fraction=args.smooth_claim_fraction,
+                candidates_per_radius=args.candidates_per_radius,
+                sweet_spot_ratio=args.sweet_spot_ratio,
+                sweet_spot_sample_bands=args.sweet_spot_sample_bands,
+                sweet_spot_seeds=args.sweet_spot_seeds,
+                sweet_spot_max_candidates=args.sweet_spot_max_candidates,
+                sweet_spot_time_budget_s=args.sweet_spot_time_budget_s,
+                random_seed=args.random_seed,
+                denoise_px=args.denoise_px,
+                max_stamps=args.max_stamps,
             )
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
