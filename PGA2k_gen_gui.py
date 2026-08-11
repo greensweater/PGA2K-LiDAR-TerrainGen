@@ -483,50 +483,133 @@ class PGAGenGUI:
 
         # Consolidated down from the earlier ring/rough/interior/residual
         # design's 16 separate fields -- that split no longer exists:
-        # every elevation band gets identical tiered-fill treatment now,
-        # regardless of shape or connectivity, so there's only one radius
-        # range and one fill brush to tune, not four sets of them. The
-        # fit-tolerance knob (an earlier version's EDGE SOFT) is gone
-        # entirely too -- it's now derived directly from each brush's own
-        # real kernel plateau, not a separately-guessed ratio.
+        # every elevation band gets identical two-pass treatment now
+        # (pass 1: fast poisson pack, pass 2: crumb scatter), regardless
+        # of shape or connectivity. The fit-tolerance knob (an earlier
+        # version's EDGE SOFT) is gone too -- derived directly from each
+        # brush's own real measured plateau, not a separately-guessed
+        # ratio (see terrain/brush_profiles.py).
         self.band_spacing_var = tk.StringVar(value="5")
         self.fill_brush_var = tk.StringVar(value="8")
         self.min_radius_var = tk.StringVar(value="10")
         self.max_radius_var = tk.StringVar(value="50")
         self.radius_step_var = tk.StringVar(value="0.85")
+        self.edge_distance_var = tk.StringVar(value="0")
         self.smoothing_brush_var = tk.StringVar(value="10")
+        self.smoothing_min_radius_var = tk.StringVar(value="4")
+        self.smooth_ratio_var = tk.StringVar(value="4")
+        self.smooth_claim_fraction_var = tk.StringVar(value="0.25")
+        self.candidates_per_radius_var = tk.StringVar(value="")  # blank = auto-tune
         self.denoise_px_var = tk.StringVar(value="1")
 
         add_contour_field(0, 0, self.band_spacing_var, "BAND m",
                            "contour method only: elevation spacing (m) defining each band -- smaller "
                            "means more, narrower bands. Tweak and re-run to see how it behaves.")
         add_contour_field(0, 1, self.fill_brush_var, "FILL BR",
-                           "contour method only: brush for the main tiered multi-scale band fill -- "
-                           "type 8 (wide flat plateau) recommended: best plateau fraction (least "
-                           "overhang before falloff begins) of the four brush types, so it packs "
-                           "most efficiently under the plateau-radius fit tolerance.")
+                           "contour method only: PASS 1's brush -- the fast poisson pack that does "
+                           "the bulk of the work. Type 8 (wide flat plateau) recommended: best real "
+                           "measured plateau fraction of the four brush types, so it packs most "
+                           "efficiently. A brush with no real plateau (10/54) can't do this job at "
+                           "all and is refused outright.")
         add_contour_field(0, 2, self.min_radius_var, "MIN m",
-                           "contour method only: smallest tier in the multi-scale fill scan (m).")
+                           "contour method only: PASS 1's smallest tier (m).")
         add_contour_field(1, 0, self.max_radius_var, "MAX m",
-                           "contour method only: largest tier in the multi-scale fill scan (m) -- "
-                           "the main level-of-detail knob: how big the biggest stamps in a band are "
-                           "allowed to be.")
+                           "contour method only: PASS 1's largest tier (m) -- the main level-of-"
+                           "detail knob: how big the biggest stamps in a band are allowed to be.")
         add_contour_field(1, 1, self.radius_step_var, "STEP ratio",
-                           "contour method only: geometric (multiplicative) step between tiers, "
-                           "scanning from MAX m down to MIN m -- each tier's radius is the previous "
-                           "tier's radius times this ratio (0-1, NOT a fixed meters step). Closer to "
-                           "1.0 means more, finer-grained tiers (more thorough, fewer stamps left to "
-                           "crumb-smoothing) at the cost of more distance-transform passes. Scales "
-                           "automatically with whatever MIN m/MAX m range you pick.")
-        add_contour_field(1, 2, self.smoothing_brush_var, "SMOOTH BR",
-                           "contour method only: brush for leftover fragments smaller than MIN m -- "
-                           "a softer brush (type 10 default) so small scattered crumbs blend rather "
-                           "than showing a hard-edged patch.")
-        add_contour_field(2, 0, self.denoise_px_var, "DENOISE px",
+                           "contour method only: PASS 1's geometric (multiplicative) step between "
+                           "tiers, scanning from MAX m down to MIN m -- each tier's radius is the "
+                           "previous tier's radius times this ratio (0-1, NOT a fixed meters step). "
+                           "Scales automatically with whatever MIN m/MAX m range you pick.")
+        add_contour_field(1, 2, self.edge_distance_var, "EDGE dist m",
+                           "contour method only: PASS 1 ONLY -- buffer (m) past the true band "
+                           "boundary that every candidate's plateau must additionally clear, on top "
+                           "of just fitting within it. Leaves a strip along every band edge for "
+                           "PASS 2's finer crumb fill to handle instead of pass 1's large hard "
+                           "stamps. Pass 2 always ignores this. 0 disables.")
+        add_contour_field(2, 0, self.smoothing_brush_var, "SMOOTH BR",
+                           "contour method only: PASS 2's brush -- the crumb-scatter fill over "
+                           "whatever pass 1 leaves as genuine crumbs. A softer brush (type 10 "
+                           "default) so small scattered crumbs blend rather than showing a hard-"
+                           "edged patch.")
+        add_contour_field(2, 1, self.smoothing_min_radius_var, "SMOOTH MIN m",
+                           "contour method only: PASS 2's OWN radius floor, independent of MIN m "
+                           "(pass 1's) -- the crumb stage's scale is a property of how it does its "
+                           "own job, not of how finely pass 1 happened to be tiered.")
+        add_contour_field(2, 2, self.smooth_ratio_var, "SMOOTH ratio",
+                           "contour method only: PASS 2's scatter radius as a multiple of SMOOTH "
+                           "MIN m (default 4 -- a 16m scatter radius at the 4m default floor). "
+                           "Deliberately a ratio: the crumb stage's scale should track its own floor "
+                           "directly rather than needing separate re-tuning.")
+        add_contour_field(3, 0, self.smooth_claim_fraction_var, "SMOOTH eat",
+                           "contour method only: PASS 2's \"eat\" -- how much of each crumb-scatter "
+                           "stamp's placed radius gets claimed. Deliberately much heavier overlap "
+                           "(claim less) than pass 1's real-plateau-derived claim, since pass 2's "
+                           "whole job is blanket-covering whatever pass 1 couldn't reach, not "
+                           "precise packing.")
+        add_contour_field(3, 1, self.candidates_per_radius_var, "CANDID/tier",
+                           "contour method only: PASS 1's random-candidate cap per tier. Left blank, "
+                           "this is AUTO-TUNED once at the start of the run (see the auto-tune row "
+                           "below) by searching a handful of sample bands for the point of "
+                           "diminishing returns. Set this explicitly, once you've seen a good auto-"
+                           "tuned value, to skip re-running that search on every subsequent run -- "
+                           "it is NOT auto-persisted from an auto-tuned run.")
+        add_contour_field(3, 2, self.denoise_px_var, "DENOISE px",
                            "contour method only: morphological open+close radius (heightmap pixels) "
                            "applied to each band's mask before filling -- trims isolated few-pixel "
                            "bumps and fills isolated few-pixel gaps, simplifying the boundary before "
                            "it fragments the fill into unnecessary tiny stamps. 0 disables.")
+
+        # Auto-tune calibration parameters -- only matter when CANDID/tier
+        # above is left blank. Deliberately visually separated from the
+        # main grid: these tune HOW the auto-tune search itself runs, not
+        # the actual fill, so most runs shouldn't need to touch them.
+        auto_tune_label = ttk.Label(parent, text="Auto-tune calibration (only used if CANDID/tier is blank):")
+        auto_tune_label.pack(anchor="w", pady=(6, 2))
+        auto_tune_frame = ttk.Frame(parent)
+        auto_tune_frame.pack(anchor="w", fill="x", pady=(0, 4))
+
+        def add_auto_tune_field(row, col, var, label, tooltip):
+            cell = ttk.Frame(auto_tune_frame)
+            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+            lbl = ttk.Label(cell, text=label)
+            lbl.pack(anchor="w")
+            entry = ttk.Entry(cell, textvariable=var, width=8)
+            entry.pack(anchor="w")
+            _Tooltip(lbl, tooltip)
+            _Tooltip(entry, tooltip)
+
+        self.sweet_spot_ratio_var = tk.StringVar(value="0.10")
+        self.sweet_spot_sample_bands_var = tk.StringVar(value="3")
+        self.sweet_spot_seeds_var = tk.StringVar(value="2")
+        self.sweet_spot_max_candidates_var = tk.StringVar(value="50000")
+        self.sweet_spot_time_budget_var = tk.StringVar(value="60")
+        self.random_seed_var = tk.StringVar(value="1")
+
+        add_auto_tune_field(0, 0, self.sweet_spot_ratio_var, "RATIO",
+                             "keep doubling candidates-per-tier until pass 2's own stamp count "
+                             "drops to this fraction of pass 1's -- past that point more candidates "
+                             "buys diminishing pass-1 coverage while pass 2 does proportionally "
+                             "less mop-up work.")
+        add_auto_tune_field(0, 1, self.sweet_spot_sample_bands_var, "SAMPLE bands",
+                             "how many regularly-spaced bands to calibrate against, not every band "
+                             "-- bands are similar enough that per-band tuning would mostly repeat "
+                             "the same search for no benefit.")
+        add_auto_tune_field(0, 2, self.sweet_spot_seeds_var, "SEEDS",
+                             "random seeds per sampled band, so one lucky/unlucky seed doesn't skew "
+                             "the calibration -- the MAX candidate count found across every band/"
+                             "seed combination is what actually gets used.")
+        add_auto_tune_field(1, 0, self.sweet_spot_max_candidates_var, "MAX candid",
+                             "safety cap on the calibration search itself.")
+        add_auto_tune_field(1, 1, self.sweet_spot_time_budget_var, "TIME budget s",
+                             "hard wall-clock ceiling (seconds) on the whole calibration search -- "
+                             "once exceeded, whatever's best so far gets used, rather than "
+                             "calibration dominating total run time unpredictably.")
+        add_auto_tune_field(1, 2, self.random_seed_var, "SEED",
+                             "seeds pass 1's own randomness -- each band gets this + its own index, "
+                             "so the whole run is reproducible given the same inputs, while still "
+                             "varying naturally band to band.")
+
 
         # Deliberately separate from the settings grid above, not another
         # field in it -- this is a quick-preview control, not a real
@@ -1605,9 +1688,42 @@ class PGAGenGUI:
             radius_step = self.radius_step_var.get().strip()
             if radius_step:
                 args += ["--radius-step-ratio", radius_step]
+            edge_distance = self.edge_distance_var.get().strip()
+            if edge_distance:
+                args += ["--edge-distance-m", edge_distance]
             smoothing_brush = self.smoothing_brush_var.get().strip()
             if smoothing_brush:
                 args += ["--smoothing-brush", smoothing_brush]
+            smoothing_min_radius = self.smoothing_min_radius_var.get().strip()
+            if smoothing_min_radius:
+                args += ["--smoothing-min-radius", smoothing_min_radius]
+            smooth_ratio = self.smooth_ratio_var.get().strip()
+            if smooth_ratio:
+                args += ["--smooth-ratio", smooth_ratio]
+            smooth_claim_fraction = self.smooth_claim_fraction_var.get().strip()
+            if smooth_claim_fraction:
+                args += ["--smooth-claim-fraction", smooth_claim_fraction]
+            candidates_per_radius = self.candidates_per_radius_var.get().strip()
+            if candidates_per_radius:
+                args += ["--candidates-per-radius", candidates_per_radius]
+            sweet_spot_ratio = self.sweet_spot_ratio_var.get().strip()
+            if sweet_spot_ratio:
+                args += ["--sweet-spot-ratio", sweet_spot_ratio]
+            sweet_spot_sample_bands = self.sweet_spot_sample_bands_var.get().strip()
+            if sweet_spot_sample_bands:
+                args += ["--sweet-spot-sample-bands", sweet_spot_sample_bands]
+            sweet_spot_seeds = self.sweet_spot_seeds_var.get().strip()
+            if sweet_spot_seeds:
+                args += ["--sweet-spot-seeds", sweet_spot_seeds]
+            sweet_spot_max_candidates = self.sweet_spot_max_candidates_var.get().strip()
+            if sweet_spot_max_candidates:
+                args += ["--sweet-spot-max-candidates", sweet_spot_max_candidates]
+            sweet_spot_time_budget = self.sweet_spot_time_budget_var.get().strip()
+            if sweet_spot_time_budget:
+                args += ["--sweet-spot-time-budget-s", sweet_spot_time_budget]
+            random_seed = self.random_seed_var.get().strip()
+            if random_seed:
+                args += ["--random-seed", random_seed]
             denoise_px = self.denoise_px_var.get().strip()
             if denoise_px:
                 args += ["--denoise-px", denoise_px]
