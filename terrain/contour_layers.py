@@ -72,19 +72,36 @@ Doesn't touch any real heightmap value, just removes single-pixel
 noise from the boundary before it fragments the fill into unnecessary
 tiny stamps.
 
-LEFTOVER CRUMBS: whatever's still unfilled once the tiered scan
-reaches min_radius (necessarily smaller than min_radius, or it would
-have been picked up) gets a final live-recompute greedy pass (see
-_fill_region_greedy, largely unchanged from an earlier version) with
-its own (typically softer) smoothing_brush, so small fragments blend
-rather than showing a hard, differently-toned patch.
+LEFTOVER CRUMBS: claiming only the plateau (see PLATEAU-RADIUS FIT
+TOLERANCE below) means every stamp, at every size, leaves behind a
+thin ring of unclaimed falloff -- width bounded by roughly
+radius * (1 - plateau_fraction), so for type 8 (plateau ~0.9) a 40m
+stamp leaves a ring only ~2m wide at most. A ring that thin can never
+be closed by any tier in [min_radius, max_radius] if min_radius is
+much larger than that -- confirmed directly: the maximum circle that
+fits in leftover rings after a full tiered pass was well under
+min_radius in testing. Every one of those rings, from every stamp at
+every tier, used to fall straight to a single live-recompute greedy
+pass (_fill_region_greedy) -- correct, but far more expensive per unit
+area (one distance-transform recompute PER STAMP, not per tier), and
+at real stamp counts this dominated runtime and, if anything cut the
+process off early, could leave genuine gaps unclosed.
+
+Fixed by inserting a SECOND tiered pass (same cheap one-recompute-per-
+tier mechanism as the main fill, just continuing the size curve down
+from min_radius to DEFAULT_SMOOTHING_FLOOR_M with smoothing_brush)
+before ever falling back to the expensive one-at-a-time pass -- most
+ring cleanup now happens at the same efficiency as the main fill.
+_fill_region_greedy remains as the true last resort for whatever's
+still left below that floor (should be small, irregular fragments,
+not the bulk of the work).
 
 No separate residual safety-net pass is needed anymore: every pixel of
 the heightmap belongs to exactly one band by construction (bands
 partition [true_min, true_max) into consecutive half-open intervals),
-and each band is tiered-filled + crumb-smoothed to genuine saturation,
-so coverage is complete by construction rather than needing a global
-catch-all pass afterward.
+and each band is filled via this three-stage process to genuine
+saturation, so coverage is complete by construction rather than
+needing a global catch-all pass afterward.
 """
 
 from __future__ import annotations
@@ -118,6 +135,8 @@ DEFAULT_MAX_RADIUS_M = 50.0
 DEFAULT_RADIUS_STEP_RATIO = 0.85  # each tier = previous tier * this; NOT a fixed meters step -- see
                                    # _tier_radii's docstring for why geometric spacing is the right shape
 DEFAULT_SMOOTHING_BRUSH = 10  # soft falloff for leftover sub-min_radius crumbs -- blends, no hard edge
+DEFAULT_SMOOTHING_FLOOR_M = 1.0  # floor for the SECOND tiered pass (smoothing_brush); below this,
+                                  # whatever's left goes to the true one-at-a-time last resort
 DEFAULT_DENOISE_PX = 1  # morphological opening+closing radius, in heightmap pixels; 0 disables
 DEFAULT_FALLBACK_PLATEAU_FRACTION = 0.5  # used only if terrain_kernel isn't importable at all
 DEFAULT_MAX_TIER_ITERATIONS = 2_000_000  # true last-resort backstop against a genuine infinite-loop
@@ -466,8 +485,11 @@ def generate_contour_layers(
     bottom N stamps gets you."
 
     Stamp order: bands ascending by elevation, and within each band,
-    the tiered-fill stamps (large to small) followed by that band's own
-    crumb-smoothing stamps. Under this project's sequential pull-
+    three stages large-to-small: the main tiered-fill stamps (fill_brush,
+    max_radius down to min_radius), then the second tiered pass closing
+    plateau-leftover rings (smoothing_brush, min_radius down to
+    DEFAULT_SMOOTHING_FLOOR_M), then whatever true last-resort fragments
+    remain below that floor. Under this project's sequential pull-
     toward-value compositing, later stamps take precedence in any
     overlap -- this ordering means smaller, more specific stamps always
     refine on top of larger ones within their own band, and never get
@@ -516,14 +538,37 @@ def generate_contour_layers(
                 max_stamps=tier_budget,
             )
             stamps.extend(band_stamps)
+
             if crumbs.any():
-                crumb_budget = None if max_stamps is None else max_stamps - len(stamps)
-                if crumb_budget is None or crumb_budget > 0:
-                    stamps.extend(_fill_region_greedy(
+                # Second tiered pass (smoothing_brush), same cheap one-
+                # recompute-per-tier mechanism, continuing the size curve
+                # DOWN from min_radius to DEFAULT_SMOOTHING_FLOOR_M --
+                # see module docstring's LEFTOVER CRUMBS section for why
+                # this exists: the plateau-only claim leaves thin rings
+                # around every stamp that no tier >= min_radius could
+                # ever have closed, and handling them here (batched) is
+                # far cheaper than the one-at-a-time fallback below.
+                smooth_budget = None if max_stamps is None else max_stamps - len(stamps)
+                if smooth_budget is None or smooth_budget > 0:
+                    smooth_floor = min(DEFAULT_SMOOTHING_FLOOR_M, min_radius)
+                    smooth_stamps, final_crumbs = _tiered_fill_band(
                         crumbs, heights, bounds, smoothing_brush,
-                        min_radius=max(1.0, min_radius / 3.0), max_radius=min_radius,
-                        max_stamps=crumb_budget,
-                    ))
+                        smooth_floor, min_radius, radius_step_ratio,
+                        max_stamps=smooth_budget,
+                    )
+                    stamps.extend(smooth_stamps)
+
+                    if final_crumbs.any():
+                        # True last resort: whatever's still left below
+                        # DEFAULT_SMOOTHING_FLOOR_M -- expected to be small,
+                        # irregular fragments, not the bulk of the work.
+                        final_budget = None if max_stamps is None else max_stamps - len(stamps)
+                        if final_budget is None or final_budget > 0:
+                            stamps.extend(_fill_region_greedy(
+                                final_crumbs, heights, bounds, smoothing_brush,
+                                min_radius=max(0.5, smooth_floor / 3.0), max_radius=smooth_floor,
+                                max_stamps=final_budget,
+                            ))
 
         if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
             progress_callback(len(stamps), (i + 1) / total_bands)
