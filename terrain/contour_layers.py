@@ -46,21 +46,31 @@ from the real kernel (terrain.terrain_kernel.TerrainKernel /
 terrain.brush_profiles.BRUSH_PROFILES, the same one adaptive_refine.py
 already scores candidates with), not guessed. A candidate placement is
 ACCEPTED once its PLATEAU (radius * plateau_fraction) fits within the
-remaining mask, AND the plateau -- not the full nominal radius -- is
-what gets CLAIMED (removed from further consideration) once placed.
-The falloff ring beyond the plateau genuinely isn't at full strength,
-so it deliberately stays "remaining": the next (smaller) tier's fresh
-distance-transform recompute picks it up and targets it with an
-appropriately-sized stamp, rather than one partial-strength pass
-marking that ring "handled" and leaving it permanently under-covered.
-An earlier version of this function claimed the full radius instead,
-reasoning that the falloff ring was "genuinely pulling, just weakly" --
-confirmed wrong against real terrain (type 8, minimal overlap): the
-falloff really isn't strong enough to count as covered, and claiming
-it anyway produced real, permanent gaps. This replaces the earlier,
-separately-tuned edge_softness_ratio with something derived, not
-guessed, and only needs computing once per brush (4 total: 8/9/10/54),
-not per stamp.
+remaining mask -- a candidate needs only its solid, meaningful core to
+fit, not the whole circle, which is what keeps packing dense along
+irregular boundaries. This is deliberately a LOOSER test than what
+governs claiming (see 1-BIT CLAIMING below): acceptance cares about
+fit quality, claiming is kept simple on purpose. Only needs computing
+once per brush (4 total: 8/9/10/54), not per stamp.
+
+1-BIT CLAIMING: once a candidate is accepted, its FULL nominal radius
+-- not just the plateau used to accept it -- is removed from the
+candidate surface. Two earlier attempts at a "more physically
+accurate" fractional claim each ran into real problems: claiming only
+the plateau leaves every stamp trailing a thin unclaimed ring (width
+roughly radius * (1 - plateau_fraction) -- for type 8, ~2m at most
+even at radius 40), and that ring can only ever be closed by a stamp
+with an EVEN SMALLER plateau, cascading toward arbitrarily small
+stamps that never converge -- confirmed directly: packing looked
+tight, but the real kernel-weighted influence still showed genuine
+near-zero-influence gaps. Treating the candidate surface as plain
+1-bit -- covered or not, no fractional bookkeeping -- makes packing a
+well-defined, tractable problem (classic circle-covering) instead of
+an unbounded recursive residual. The real kernel falloff still shapes
+the FINAL rendered terrain regardless of how placement bookkeeping was
+done; that's a genuinely separate concern from "is there room here for
+another stamp," and conflating the two was the mistake both earlier
+attempts made.
 
 DENOISE ("schmear"): before tiering, each band's mask gets a small
 morphological opening+closing pass (scipy.ndimage) -- opening trims
@@ -72,36 +82,34 @@ Doesn't touch any real heightmap value, just removes single-pixel
 noise from the boundary before it fragments the fill into unnecessary
 tiny stamps.
 
-LEFTOVER CRUMBS: claiming only the plateau (see PLATEAU-RADIUS FIT
-TOLERANCE below) means every stamp, at every size, leaves behind a
-thin ring of unclaimed falloff -- width bounded by roughly
-radius * (1 - plateau_fraction), so for type 8 (plateau ~0.9) a 40m
-stamp leaves a ring only ~2m wide at most. A ring that thin can never
-be closed by any tier in [min_radius, max_radius] if min_radius is
-much larger than that -- confirmed directly: the maximum circle that
-fits in leftover rings after a full tiered pass was well under
-min_radius in testing. Every one of those rings, from every stamp at
-every tier, used to fall straight to a single live-recompute greedy
-pass (_fill_region_greedy) -- correct, but far more expensive per unit
-area (one distance-transform recompute PER STAMP, not per tier), and
-at real stamp counts this dominated runtime and, if anything cut the
-process off early, could leave genuine gaps unclosed.
+LEFTOVER CRUMBS: even 1-bit full-radius claiming leaves genuine gaps
+along irregular boundaries -- any spot whose true local space is
+smaller than min_radius never gets picked up by the main tiered scan
+at all. What's left is thin, scattered, irregular slivers, and trying
+to TILE those (many small stamps individually shaped to a sliver's own
+sub-meter width) doesn't converge well regardless of how many size
+tiers are added underneath min_radius -- an earlier version tried
+exactly that (a second tiered pass continuing the size curve down) and
+it was still fundamentally the wrong shape of algorithm for this kind
+of leftover.
 
-Fixed by inserting a SECOND tiered pass (same cheap one-recompute-per-
-tier mechanism as the main fill, just continuing the size curve down
-from min_radius to DEFAULT_SMOOTHING_FLOOR_M with smoothing_brush)
-before ever falling back to the expensive one-at-a-time pass -- most
-ring cleanup now happens at the same efficiency as the main fill.
-_fill_region_greedy remains as the true last resort for whatever's
-still left below that floor (should be small, irregular fragments,
-not the bulk of the work).
+Fixed with a genuinely different algorithm, not more tiers: see
+_scatter_fill_remaining. A single FIXED, deliberately oversized radius
+(min_radius * DEFAULT_CRUMB_SCATTER_MULTIPLIER) is scattered across
+whatever's left with heavy overlap (claims only
+DEFAULT_CRUMB_SCATTER_CLAIM_FRACTION of each placement) using
+smoothing_brush. Oversizing relative to a sliver's own local width
+lets one stamp reach across and cover real length along it, instead of
+needing many stamps individually shaped to fit. This sidesteps the
+packing problem entirely rather than chasing it to smaller and smaller
+tiers.
 
-No separate residual safety-net pass is needed anymore: every pixel of
-the heightmap belongs to exactly one band by construction (bands
-partition [true_min, true_max) into consecutive half-open intervals),
-and each band is filled via this three-stage process to genuine
-saturation, so coverage is complete by construction rather than
-needing a global catch-all pass afterward.
+No separate residual safety-net pass is needed: every pixel of the
+heightmap belongs to exactly one band by construction (bands partition
+[true_min, true_max) into consecutive half-open intervals), and each
+band is filled via tiered pack + scatter to genuine saturation, so
+coverage is complete by construction rather than needing a global
+catch-all pass afterward.
 """
 
 from __future__ import annotations
@@ -137,6 +145,10 @@ DEFAULT_RADIUS_STEP_RATIO = 0.85  # each tier = previous tier * this; NOT a fixe
 DEFAULT_SMOOTHING_BRUSH = 10  # soft falloff for leftover sub-min_radius crumbs -- blends, no hard edge
 DEFAULT_SMOOTHING_FLOOR_M = 1.0  # floor for the SECOND tiered pass (smoothing_brush); below this,
                                   # whatever's left goes to the true one-at-a-time last resort
+DEFAULT_CRUMB_SCATTER_MULTIPLIER = 4.0  # crumb scatter radius = min_radius * this -- deliberately
+                                          # oversized so one placement reaches across a thin sliver's
+                                          # own local width instead of needing many tiny stamps
+DEFAULT_CRUMB_SCATTER_CLAIM_FRACTION = 0.5  # heavy overlap for the crumb scatter -- same convention
 DEFAULT_DENOISE_PX = 1  # morphological opening+closing radius, in heightmap pixels; 0 disables
 DEFAULT_FALLBACK_PLATEAU_FRACTION = 0.5  # used only if terrain_kernel isn't importable at all
 DEFAULT_MAX_TIER_ITERATIONS = 2_000_000  # true last-resort backstop against a genuine infinite-loop
@@ -294,11 +306,11 @@ def _tiered_fill_band(
     real area the cap cut off early, so it should not be treated as
     "this band is fully accounted for" when max_stamps actually bound.
 
-    Returns (stamps, remaining) -- `remaining` includes both genuine
-    crumbs (real area below min_radius) AND any leftover falloff-ring
-    slivers no tier's plateau ever reached before bottoming out at
-    min_radius; both get handed to the same crumb-smoothing pass (see
-    _fill_region_greedy).
+    Returns (stamps, remaining) -- `remaining` is whatever's still
+    unfilled once the scan reaches min_radius: real area no tier's own
+    radius could reach, now that claiming is full-radius/1-bit rather
+    than plateau-only (see module docstring's 1-BIT CLAIMING section).
+    Handed to _scatter_fill_remaining by the caller.
     """
     n_rows, n_cols = heights.shape
     cell_x = (bounds.max_x - bounds.min_x) / n_cols
@@ -344,32 +356,108 @@ def _tiered_fill_band(
             xx, zz = np.meshgrid(sub_x, sub_z)
             dist_from_center = np.hypot(xx - cx, zz - cz)
             within_radius = dist_from_center <= radius
-            within_plateau = dist_from_center <= plateau_r
 
             value = _local_mean_value(heights, row_min, row_max, col_min, col_max, within_radius, row, col)
             stamps.append(Stamp(x=cx, z=cz, radius=float(radius), value=value, brush=brush, tool=TOOL_FLATTEN))
 
-            # Claim only the PLATEAU (true 100%-strength zone), not the
-            # full nominal radius -- reversing an earlier version of this
-            # function, which claimed the full radius specifically to
-            # avoid redundant re-stamping of the same falloff ring. That
-            # was solving the wrong problem: the falloff ring genuinely
-            # ISN'T at full strength, so marking it "handled" after only
-            # one partial-strength pass left real, permanent gaps there --
-            # confirmed directly against real terrain (type 8, minimal
-            # brush overlap). Claiming only the plateau means the falloff
-            # ring correctly stays "remaining," and the NEXT (smaller)
-            # tier's fresh distance-transform recompute -- not a stale
-            # snapshot -- naturally targets exactly that ring with an
-            # appropriately-sized stamp. Trusting the tier-to-tier
-            # recompute to do this correctly is the actual fix; the
-            # earlier full-radius claim just avoided the question.
-            remaining[row_min:row_max, col_min:col_max][within_plateau] = False
-            work[row_min:row_max, col_min:col_max][within_plateau] = 0.0
+            # 1-BIT CLAIMING: once placed, the stamp's FULL nominal radius
+            # is removed from the candidate surface -- not just its
+            # plateau. Two earlier versions of this function each tried a
+            # "more physically accurate" fractional claim (plateau-only,
+            # or a full-radius claim justified differently) and both ran
+            # into real problems -- plateau-only claiming leaves every
+            # stamp trailing a thin unclaimed ring that can only ever be
+            # closed by stamps with an even smaller plateau, cascading
+            # toward arbitrarily small stamps that never converge (this is
+            # what "packing looks tight but real influence still shows red
+            # gaps" traced back to). Treating the candidate surface as
+            # plain 1-bit -- covered or not, no fractional bookkeeping --
+            # makes packing a well-defined, tractable problem (classic
+            # circle-covering) instead of an unbounded recursive residual.
+            # The real kernel falloff still shapes the FINAL rendered
+            # terrain regardless of how placement bookkeeping was done;
+            # that's a genuinely separate concern from "is there room here
+            # for another stamp," and conflating the two was the mistake.
+            # The plateau fraction still loosens ACCEPTANCE above (a
+            # candidate needs only its solid core to fit, not the whole
+            # circle) -- that's what keeps packing dense -- it just no
+            # longer governs what counts as claimed once placed.
             remaining[row_min:row_max, col_min:col_max][within_radius] = False
             work[row_min:row_max, col_min:col_max][within_radius] = 0.0
 
     return stamps, remaining
+
+
+def _scatter_fill_remaining(
+    mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
+    brush: int, radius: float, claim_radius_fraction: float = 0.5,
+    max_stamps: Optional[int] = None,
+) -> list[Stamp]:
+    """
+    Fixed-radius scatter fill for whatever the main tiered pack leaves
+    behind -- deliberately NOT a precise pack: leftover area after a
+    1-bit tiered fill is thin, scattered, irregular slivers, and trying
+    to TILE those (many small stamps individually shaped to a sliver's
+    own sub-meter width) doesn't converge well. Instead this places a
+    single FIXED, deliberately oversized radius (the caller typically
+    passes something several times larger than the main fill's own
+    min_radius -- see DEFAULT_CRUMB_SCATTER_MULTIPLIER) with heavy
+    overlap: claims only claim_radius_fraction (default 0.5, same
+    convention used throughout this project) of each placement, so
+    consecutive stamps land close enough to genuinely overlap rather
+    than merely touch. Oversizing relative to the crumb's own local
+    width lets one stamp "reach across" and cover real LENGTH along a
+    thin sliver in a single placement, rather than needing many.
+
+    Placement position uses the same "farthest remaining point" greedy
+    heuristic as the main tiered fill (live EDT recompute each pick --
+    appropriate here since crumb area should be small by the time this
+    runs), but does NOT gate acceptance on whether the full radius (or
+    even the plateau) fits -- there's no fitting problem to solve here,
+    just "spread coverage out," so every remaining point gets picked in
+    turn regardless of how far a stamp's own radius overhangs past it.
+
+    Value is the real local heightmap mean within the placed radius,
+    same as every other stamp this module places.
+    """
+    n_rows, n_cols = heights.shape
+    cell_x = (bounds.max_x - bounds.min_x) / n_cols
+    cell_z = (bounds.max_z - bounds.min_z) / n_rows
+    sampling = (cell_z, cell_x)
+    x_centers = bounds.min_x + (np.arange(n_cols) + 0.5) * cell_x
+    z_centers = bounds.min_z + (np.arange(n_rows) + 0.5) * cell_z
+
+    remaining = mask.copy()
+    stamps: list[Stamp] = []
+    if not remaining.any() or radius <= 0 or (max_stamps is not None and max_stamps <= 0):
+        return stamps
+
+    claim_radius = radius * claim_radius_fraction
+
+    while remaining.any():
+        if max_stamps is not None and len(stamps) >= max_stamps:
+            break
+        dist = ndimage.distance_transform_edt(remaining, sampling=sampling)
+        row, col = np.unravel_index(np.argmax(dist), dist.shape)
+        cx, cz = float(x_centers[col]), float(z_centers[row])
+
+        row_min = max(0, int((cz - radius - bounds.min_z) / cell_z))
+        row_max = min(n_rows, int((cz + radius - bounds.min_z) / cell_z) + 1)
+        col_min = max(0, int((cx - radius - bounds.min_x) / cell_x))
+        col_max = min(n_cols, int((cx + radius - bounds.min_x) / cell_x) + 1)
+        sub_x = x_centers[col_min:col_max]
+        sub_z = z_centers[row_min:row_max]
+        xx, zz = np.meshgrid(sub_x, sub_z)
+        dist_from_center = np.hypot(xx - cx, zz - cz)
+        within_radius = dist_from_center <= radius
+        within_claim = dist_from_center <= claim_radius
+
+        value = _local_mean_value(heights, row_min, row_max, col_min, col_max, within_radius, row, col)
+        stamps.append(Stamp(x=cx, z=cz, radius=radius, value=value, brush=brush, tool=TOOL_FLATTEN))
+
+        remaining[row_min:row_max, col_min:col_max][within_claim] = False
+
+    return stamps
 
 
 def _fill_region_greedy(
@@ -387,6 +475,77 @@ def _fill_region_greedy(
     margin so cost scales with the crumb region's own extent, not the
     full heightmap. max_stamps (local budget, see _tiered_fill_band's
     docstring for the same convention) stops early once reached.
+    """
+    rows_nz, cols_nz = np.nonzero(mask)
+    if rows_nz.size == 0 or (max_stamps is not None and max_stamps <= 0):
+        return []
+
+    n_rows, n_cols = heights.shape
+    cell_x = (bounds.max_x - bounds.min_x) / n_cols
+    cell_z = (bounds.max_z - bounds.min_z) / n_rows
+    margin_x = int(np.ceil(max_radius / cell_x)) + 2
+    margin_z = int(np.ceil(max_radius / cell_z)) + 2
+
+    row_min = max(0, int(rows_nz.min()) - margin_z)
+    row_max = min(n_rows, int(rows_nz.max()) + margin_z + 1)
+    col_min = max(0, int(cols_nz.min()) - margin_x)
+    col_max = min(n_cols, int(cols_nz.max()) + margin_x + 1)
+
+    remaining = mask[row_min:row_max, col_min:col_max].copy()
+    sub_heights = heights[row_min:row_max, col_min:col_max]
+    x_centers = bounds.min_x + (np.arange(col_min, col_max) + 0.5) * cell_x
+    z_centers = bounds.min_z + (np.arange(row_min, row_max) + 0.5) * cell_z
+    xx_full, zz_full = np.meshgrid(x_centers, z_centers)
+    sampling = (cell_z, cell_x)
+    plateau_fraction = _brush_plateau_fraction(brush)
+    effective_claim_fraction = max(claim_radius_fraction, plateau_fraction)
+
+    stamps: list[Stamp] = []
+    while remaining.any():
+        if max_stamps is not None and len(stamps) >= max_stamps:
+            break
+        dist = ndimage.distance_transform_edt(remaining, sampling=sampling)
+        peak = float(dist.max())
+        if peak <= 0.0:
+            break
+        row, col = np.unravel_index(np.argmax(dist), dist.shape)
+        radius = float(np.clip(peak, min_radius, max_radius))
+        claim_radius = radius * effective_claim_fraction
+        cx, cz = float(x_centers[col]), float(z_centers[row])
+
+        dist_from_center = np.hypot(xx_full - cx, zz_full - cz)
+        within_radius = dist_from_center <= radius
+        within_claim = dist_from_center <= claim_radius
+
+        sub_valid = np.isfinite(sub_heights) & within_radius
+        if not sub_valid.any():
+            remaining[row, col] = False
+            continue
+        value = float(np.mean(sub_heights[sub_valid]))
+
+        stamps.append(Stamp(x=cx, z=cz, radius=radius, value=value, brush=brush, tool=TOOL_FLATTEN))
+        remaining[within_claim] = False
+
+    return stamps
+
+
+def _fill_region_greedy(
+    mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
+    brush: int, min_radius: float, max_radius: float, claim_radius_fraction: float = 0.5,
+    max_stamps: Optional[int] = None,
+) -> list[Stamp]:
+    """
+    Live-recompute greedy fill, locally sized (not fixed-radius): each
+    placement's radius comes from the true remaining distance-to-
+    boundary at its chosen center, clamped to [min_radius, max_radius].
+    Not currently called by generate_contour_layers -- crumb cleanup
+    there uses _scatter_fill_remaining (fixed oversized radius, heavy
+    overlap) instead, since crumbs are thin scattered slivers that a
+    locally-sized pack doesn't handle well (see that function's
+    docstring). Kept as a general-purpose utility: appropriate wherever
+    a REGION genuinely wants circles sized to its own local geometry
+    rather than one fixed size -- e.g. a compact, non-sliver-shaped
+    leftover area, unlike this module's own crumbs.
     """
     rows_nz, cols_nz = np.nonzero(mask)
     if rows_nz.size == 0 or (max_stamps is not None and max_stamps <= 0):
@@ -463,13 +622,14 @@ def generate_contour_layers(
     every finite heightmap cell belongs to exactly one band.
 
     Each band is (1) denoised (small morphological open+close, see
-    _denoise_mask -- denoise_px=0 disables), (2) tiered-filled from
-    max_radius down to min_radius with fill_brush (see
-    _tiered_fill_band), (3) whatever's left (necessarily smaller than
-    min_radius) smoothed with smoothing_brush (see _fill_region_greedy).
-    No ring tracing, no cross-band value blending, no separate hilltop/
-    pit/residual special-casing -- every band gets identical treatment
-    regardless of its own shape or connectivity.
+    _denoise_mask -- denoise_px=0 disables), (2) tiered-packed from
+    max_radius down to min_radius with fill_brush, 1-bit full-radius
+    claiming (see _tiered_fill_band), (3) whatever's left scattered with
+    an oversized, heavily-overlapping smoothing_brush (see
+    _scatter_fill_remaining). No ring tracing, no cross-band value
+    blending, no separate hilltop/pit/residual special-casing -- every
+    band gets identical treatment regardless of its own shape or
+    connectivity.
 
     max_stamps, if given, stops generation as soon as that many stamps
     have been placed in total -- intended as a quick way to sanity-
@@ -485,16 +645,14 @@ def generate_contour_layers(
     bottom N stamps gets you."
 
     Stamp order: bands ascending by elevation, and within each band,
-    three stages large-to-small: the main tiered-fill stamps (fill_brush,
-    max_radius down to min_radius), then the second tiered pass closing
-    plateau-leftover rings (smoothing_brush, min_radius down to
-    DEFAULT_SMOOTHING_FLOOR_M), then whatever true last-resort fragments
-    remain below that floor. Under this project's sequential pull-
-    toward-value compositing, later stamps take precedence in any
-    overlap -- this ordering means smaller, more specific stamps always
-    refine on top of larger ones within their own band, and never get
-    overwritten by an unrelated later band's stamps (different bands'
-    masks don't overlap by construction).
+    two stages large-to-small: the main tiered-pack stamps (fill_brush,
+    max_radius down to min_radius), then the crumb-scatter stamps
+    (smoothing_brush, a single fixed oversized radius). Under this
+    project's sequential pull-toward-value compositing, later stamps
+    take precedence in any overlap -- this ordering means the scatter
+    pass always refines on top of the tiered pack within its own band,
+    and never gets overwritten by an unrelated later band's stamps
+    (different bands' masks don't overlap by construction).
 
     progress_callback, if given, is called periodically (time-throttled
     to ~10s) with (stamps_placed_so_far, fraction_complete), tracked as
@@ -540,35 +698,25 @@ def generate_contour_layers(
             stamps.extend(band_stamps)
 
             if crumbs.any():
-                # Second tiered pass (smoothing_brush), same cheap one-
-                # recompute-per-tier mechanism, continuing the size curve
-                # DOWN from min_radius to DEFAULT_SMOOTHING_FLOOR_M --
-                # see module docstring's LEFTOVER CRUMBS section for why
-                # this exists: the plateau-only claim leaves thin rings
-                # around every stamp that no tier >= min_radius could
-                # ever have closed, and handling them here (batched) is
-                # far cheaper than the one-at-a-time fallback below.
-                smooth_budget = None if max_stamps is None else max_stamps - len(stamps)
-                if smooth_budget is None or smooth_budget > 0:
-                    smooth_floor = min(DEFAULT_SMOOTHING_FLOOR_M, min_radius)
-                    smooth_stamps, final_crumbs = _tiered_fill_band(
-                        crumbs, heights, bounds, smoothing_brush,
-                        smooth_floor, min_radius, radius_step_ratio,
-                        max_stamps=smooth_budget,
-                    )
-                    stamps.extend(smooth_stamps)
-
-                    if final_crumbs.any():
-                        # True last resort: whatever's still left below
-                        # DEFAULT_SMOOTHING_FLOOR_M -- expected to be small,
-                        # irregular fragments, not the bulk of the work.
-                        final_budget = None if max_stamps is None else max_stamps - len(stamps)
-                        if final_budget is None or final_budget > 0:
-                            stamps.extend(_fill_region_greedy(
-                                final_crumbs, heights, bounds, smoothing_brush,
-                                min_radius=max(0.5, smooth_floor / 3.0), max_radius=smooth_floor,
-                                max_stamps=final_budget,
-                            ))
+                # Scatter fill (smoothing_brush), oversized and heavily
+                # overlapping -- see _scatter_fill_remaining's docstring.
+                # Replaces an earlier two-stage design (a second tiered
+                # pack continuing the size curve down, then a live-
+                # recompute last resort): that still tried to PACK the
+                # leftover precisely, which is the wrong shape of
+                # algorithm for thin scattered slivers regardless of how
+                # many stages it gets. Scattering a single oversized
+                # radius with heavy overlap sidesteps the packing problem
+                # entirely instead of chasing it to smaller and smaller
+                # tiers.
+                crumb_budget = None if max_stamps is None else max_stamps - len(stamps)
+                if crumb_budget is None or crumb_budget > 0:
+                    crumb_radius = min_radius * DEFAULT_CRUMB_SCATTER_MULTIPLIER
+                    stamps.extend(_scatter_fill_remaining(
+                        crumbs, heights, bounds, smoothing_brush, crumb_radius,
+                        claim_radius_fraction=DEFAULT_CRUMB_SCATTER_CLAIM_FRACTION,
+                        max_stamps=crumb_budget,
+                    ))
 
         if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
             progress_callback(len(stamps), (i + 1) / total_bands)
