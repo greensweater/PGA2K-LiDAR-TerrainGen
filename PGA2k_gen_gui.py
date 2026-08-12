@@ -587,10 +587,13 @@ class PGAGenGUI:
         self.random_seed_var = tk.StringVar(value="1")
 
         add_auto_tune_field(0, 0, self.sweet_spot_ratio_var, "RATIO",
-                             "keep doubling candidates-per-tier until pass 2's own stamp count "
-                             "drops to this fraction of pass 1's -- past that point more candidates "
-                             "buys diminishing pass-1 coverage while pass 2 does proportionally "
-                             "less mop-up work.")
+                             "keep doubling candidates-per-tier as long as each doubling reduces a "
+                             "sample band's own uncovered-area fraction by at least this much, "
+                             "RELATIVE to the previous doubling's own fraction (0.10 = stop once "
+                             "another doubling buys less than a 10% relative improvement). NOT an "
+                             "absolute area target -- pass 1 has a genuine structural floor (real "
+                             "area smaller than MIN m, which no candidate count can ever close), so "
+                             "a fixed target can be unreachable regardless of true coverage quality.")
         add_auto_tune_field(0, 1, self.sweet_spot_sample_bands_var, "SAMPLE bands",
                              "how many regularly-spaced bands to calibrate against, not every band "
                              "-- bands are similar enough that per-band tuning would mostly repeat "
@@ -609,6 +612,19 @@ class PGAGenGUI:
                              "seeds pass 1's own randomness -- each band gets this + its own index, "
                              "so the whole run is reproducible given the same inputs, while still "
                              "varying naturally band to band.")
+
+        self.hex_base_layer_var = tk.BooleanVar(value=True)
+        hex_base_layer_checkbox = ttk.Checkbutton(
+            parent, text="Hex base layer under contour fill", variable=self.hex_base_layer_var,
+        )
+        hex_base_layer_checkbox.pack(anchor="w", pady=(6, 0))
+        _Tooltip(hex_base_layer_checkbox, "contour method only: places a hex grid (same PITCH as hex "
+                 "mode, fit to real local heights) UNDER the contour fill, lower precedence so "
+                 "contour still wins wherever it reaches. Fixes a confirmed bias: without it, gaps "
+                 "the contour passes miss fall back to the single course-wide median baseline, "
+                 "pulling gaps in low terrain artificially up and gaps in high terrain artificially "
+                 "down, both toward that one global number. Uncheck to get the old (pure single-"
+                 "baseline) behavior back, e.g. for a direct before/after comparison.")
 
 
         # Deliberately separate from the settings grid above, not another
@@ -1730,6 +1746,7 @@ class PGAGenGUI:
             max_stamps = self.max_stamps_var.get().strip()
             if max_stamps:
                 args += ["--max-stamps", max_stamps]
+            args.append("--hex-base-layer" if self.hex_base_layer_var.get() else "--no-hex-base-layer")
             self._run_step(args, wd)
 
     def _validate_refine_fields(self) -> bool:
@@ -2430,20 +2447,31 @@ class PGAGenGUI:
 
     def _get_cached_stamp_influence(
         self, working_dir: Path, shape: tuple[int, int], elevation: float, width: float,
+        band_mask: np.ndarray,
     ):
         """
         Real weighted influence, not binary coverage: for every cell,
         the MAX kernel weight (0..1, via terrain.terrain_kernel.
         TerrainKernel -- the same kernel adaptive_refine.py already
-        scores candidates with) among every stamp *whose own value
-        falls within [elevation, elevation+width)* whose radius reaches
-        it -- i.e. only stamps belonging to the CURRENT band, matching
-        the same half-open convention terrain/contour_layers.py's own
-        _band_mask uses. Earlier versions of this used every stamp on
-        the course regardless of value, which meant a red (near-zero)
-        cell wasn't distinguishable from "reached by a different band's
-        stamp, not this one" -- confirmed ambiguous by direct request:
-        filtering first fixes that at the source.
+        scores candidates with) among every stamp *whose own CENTER
+        POSITION falls within band_mask* (the current [elevation,
+        elevation+width) band's real spatial footprint, same mask the
+        Elevation Contour overlay itself already computed) whose radius
+        reaches it -- i.e. only stamps actually placed ON this band's
+        terrain, not just whichever stamps happen to be nearby.
+
+        Filtering by CENTER POSITION, not fitted VALUE: an earlier
+        version filtered by whether a stamp's own fitted value (the
+        local heightmap mean over ITS OWN radius, which can be 20-50m
+        for a pass-1 stamp) fell within [elevation, elevation+width).
+        Confirmed imprecise on request: that value is a blurred average
+        that can easily drift outside a stamp's own nominal band range
+        near a real edge or slope, excluding stamps that were genuinely
+        placed for this band while including stamps that weren't.
+        Checking the stamp's CENTER against the band's own real spatial
+        mask instead directly answers "was this stamp actually placed
+        on this band's terrain," independent of what its fitted value
+        (a separate, downstream computation) ended up being.
 
         A point can sit well inside a soft-falloff brush's (type
         10/9/54) nominal radius while its real weight there is close to
@@ -2457,9 +2485,9 @@ class PGAGenGUI:
         hundreds of thousands of times over.
 
         Cached and keyed on (stamps version, shape, elevation, width) --
-        filtering by value means the relevant stamp subset changes with
-        the slider, unlike the old whole-course version, so the cache
-        can't be elevation-independent anymore. Kept fast in practice
+        filtering by band means the relevant stamp subset changes with
+        the slider, unlike an even-earlier whole-course version, so the
+        cache can't be elevation-independent. Kept fast in practice
         because the FILTERED subset (one band's worth of stamps, not
         the whole course) is typically a small fraction of the total,
         so each slider tick's recompute is proportionally cheap even
@@ -2478,7 +2506,16 @@ class PGAGenGUI:
         if getattr(self, "_cached_stamp_influence_key", None) == cache_key:
             return self._cached_stamp_influence
 
-        band_stamps = [s for s in stamps if elevation <= s.value < elevation + width]
+        n_rows, n_cols = shape
+        cell_x = COURSE_SIZE_M / n_cols
+        cell_z = COURSE_SIZE_M / n_rows
+
+        band_stamps = []
+        for s in stamps:
+            col = int(s.x / cell_x)
+            row = int(s.z / cell_z)
+            if 0 <= row < n_rows and 0 <= col < n_cols and band_mask[row, col]:
+                band_stamps.append(s)
 
         kernels: dict[int, "TerrainKernel"] = {}
 
@@ -2487,9 +2524,6 @@ class PGAGenGUI:
                 kernels[brush] = TerrainKernel(BRUSH_PROFILES[brush])
             return kernels[brush]
 
-        n_rows, n_cols = shape
-        cell_x = COURSE_SIZE_M / n_cols
-        cell_z = COURSE_SIZE_M / n_rows
         x_centers = (np.arange(n_cols) + 0.5) * cell_x
         z_centers = (np.arange(n_rows) + 0.5) * cell_z
         influence = np.zeros(shape, dtype=np.float32)
@@ -2819,7 +2853,7 @@ class PGAGenGUI:
                     band_rgba = np.zeros((*band.shape, 4), dtype=np.uint8)
                     if self.show_stamp_coverage_var.get():
                         influence = self._get_cached_stamp_influence(
-                            Path(wd), heights.shape, elevation, band_width,
+                            Path(wd), heights.shape, elevation, band_width, band,
                         )
                         if influence is not None:
                             in_band_weight = influence[band]
