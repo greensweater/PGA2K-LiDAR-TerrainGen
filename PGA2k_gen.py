@@ -1293,6 +1293,7 @@ def step_generate_terrain(
     random_seed: int | None = None,
     denoise_px: int | None = None,
     max_stamps: int | None = None,
+    hex_base_layer: bool | None = None,
 ) -> None:
     """
     pitch (feature-flagged via project.json, same None-means-use-saved
@@ -1349,6 +1350,19 @@ def step_generate_terrain(
     to project.json (unlike every other contour-mode parameter here) --
     it's meant to be set explicitly each time you want a quick partial
     preview, not silently inherited by your next real run.
+
+    hex_base_layer (contour method only, default True) generates a hex
+    grid (same pitch as "hex" mode -- generate_hex_grid + fit_stamp_
+    heights, so real, locally-fit values, not a global constant) and
+    places it UNDER the contour fill (lower precedence -- contour still
+    wins wherever it actually reaches). Fixes a confirmed bias: without
+    it, any gap the contour passes genuinely miss falls back to the
+    single course-wide median baseline below, which pulls gaps in low
+    terrain artificially UP and gaps in high terrain artificially DOWN,
+    both toward that one global number -- a systematic bias in both
+    directions at whatever gaps remain, not just missing detail. Set to
+    False to get the old (pure single-baseline) behavior back, e.g. for
+    a direct before/after comparison.
     """
     if method is None:
         project = load_project(working_dir)
@@ -1417,6 +1431,8 @@ def step_generate_terrain(
         random_seed = project.get("generate_terrain_random_seed", DEFAULT_RANDOM_SEED)
     if denoise_px is None:
         denoise_px = project.get("generate_terrain_denoise_px", DEFAULT_DENOISE_PX)
+    if hex_base_layer is None:
+        hex_base_layer = project.get("generate_terrain_hex_base_layer", True)
 
     print(f"Loading {pointcloud_path}...")
     full_cloud = PointCloud.load(pointcloud_path)
@@ -1485,6 +1501,38 @@ def step_generate_terrain(
                   "course is only partially filled (see note above)")
         else:
             print(f"  {len(fitted)} stamps placed (tiered band fill + crumb smoothing, all already fitted)")
+
+        if hex_base_layer:
+            # A hex grid, fit to real LOCAL heights via fit_stamp_heights,
+            # laid down UNDER the contour stamps (earlier in the list =
+            # lower precedence -- contour stamps still win wherever they
+            # actually reach). Fixes a real, confirmed bias: the single
+            # course-wide baseline-flatten stamp below is one GLOBAL
+            # constant (the course mean), so any gap the contour passes
+            # genuinely miss falls back to that one number regardless of
+            # what the real local terrain actually does there -- pulling
+            # gaps in low terrain artificially UP toward the mean and
+            # gaps in high terrain artificially DOWN toward it, a
+            # systematic bias in both directions, not just noise. A hex
+            # grid fit to real nearby LIDAR points gives a locally
+            # accurate fallback everywhere instead of one global number,
+            # directly reducing RMS at whatever gaps remain (measured
+            # bias, not just coverage completeness -- this is why the
+            # contour method's own coverage-completeness work doesn't
+            # already make this redundant).
+            hex_stamp_radius = 2.0 * pitch
+            hex_bleed = hex_stamp_radius / 2.0
+            print(f"Generating hex base layer under the contour fill (pitch={pitch} m, "
+                  f"stamp_radius={hex_stamp_radius} m)...")
+            hex_stamps = generate_hex_grid(bounds, pitch=pitch, stamp_radius=hex_stamp_radius, bleed=hex_bleed)
+            hex_fitted = fit_stamp_heights(hex_stamps, heightmap, bounds)
+            n_hex_unfitted = sum(1 for s in hex_fitted if s.value == 0.0)
+            if n_hex_unfitted:
+                print(f"  WARNING: {n_hex_unfitted} hex base-layer stamps had too few nearby "
+                      "heightmap cells and kept their placeholder value=0.0 -- these fall through "
+                      "to the course-wide median baseline instead, same as before this existed.")
+            print(f"  {len(hex_fitted)} hex base-layer stamps placed (under the contour fill)")
+            fitted = hex_fitted + fitted
     else:
         stamp_radius = 2.0 * pitch
         bleed = stamp_radius / 2.0
@@ -1538,6 +1586,7 @@ def step_generate_terrain(
         "generate_terrain_sweet_spot_time_budget_s": sweet_spot_time_budget_s,
         "generate_terrain_random_seed": random_seed,
         "generate_terrain_denoise_px": denoise_px,
+        "generate_terrain_hex_base_layer": hex_base_layer,
     })
 
     print("Refreshing previews...")
@@ -2180,10 +2229,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sweet-spot-ratio", type=float, default=None,
                          help="generate-terrain, contour method only, auto-tune only (ignored if "
                               "--candidates-per-radius is set explicitly): keep doubling "
-                              "candidates_per_radius until pass 2's own stamp count drops to this "
-                              "fraction of pass 1's -- past that point more candidates buys "
-                              "diminishing pass-1 coverage while pass 2 does proportionally less "
-                              "mop-up work. Default: use whatever's saved in project.json, or "
+                              "candidates_per_radius as long as each doubling reduces a sample "
+                              "band's own uncovered-area fraction by at least this much, RELATIVE "
+                              "to the previous doubling's own uncovered fraction (0.10 = stop once "
+                              "another doubling buys less than a 10%% relative improvement). NOT an "
+                              "absolute area target -- pass 1 has a genuine structural floor (real "
+                              "area smaller than --min-radius, which no candidate count can ever "
+                              "close), so a fixed target can be unreachable regardless of true "
+                              "coverage quality. Default: use whatever's saved in project.json, or "
                               f"{DEFAULT_SWEET_SPOT_STAMP_RATIO} if never set.")
     parser.add_argument("--sweet-spot-sample-bands", type=int, default=None,
                          help="generate-terrain, contour method only, auto-tune only: how many "
@@ -2228,6 +2281,15 @@ def main(argv: list[str] | None = None) -> int:
                               "of the course will be genuinely unfilled, not just coarser -- this is a "
                               "partial-preview tool, not a real generation mode. Not saved to "
                               "project.json -- pass it explicitly each time.")
+    parser.add_argument("--hex-base-layer", action=argparse.BooleanOptionalAction, default=None,
+                         help="generate-terrain, contour method only: places a hex grid (same --pitch "
+                              "as hex mode, fit to real local heights) UNDER the contour fill, lower "
+                              "precedence so contour still wins wherever it reaches. Fixes a confirmed "
+                              "bias: without it, gaps the contour passes miss fall back to the single "
+                              "course-wide median baseline, pulling gaps in low terrain artificially "
+                              "up and gaps in high terrain artificially down, both toward that one "
+                              "global number. Default: use whatever's saved in project.json, or True "
+                              "if never set.")
     parser.add_argument("--error-resolution", type=int, default=None,
                          help="visualize: grid resolution for preview_error.png, overriding the "
                               "default of inheriting whatever --resolution refine-terrain last used "
@@ -2480,6 +2542,7 @@ def main(argv: list[str] | None = None) -> int:
                 random_seed=args.random_seed,
                 denoise_px=args.denoise_px,
                 max_stamps=args.max_stamps,
+                hex_base_layer=args.hex_base_layer,
             )
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
