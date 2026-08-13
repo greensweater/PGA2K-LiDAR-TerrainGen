@@ -1,5 +1,5 @@
 """
-water.py
+course_output/water.py
 
 Builds userLayers.json's "water" entries (see userLayers.py's
 _BLANK_USER_LAYERS_SCHEMA) from OSM water Features -- one flat,
