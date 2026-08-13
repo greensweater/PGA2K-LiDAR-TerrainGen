@@ -1,5 +1,9 @@
-# course_extract.py
+"""
+util/course_extract.py
 
+Extract a .course file into a target folder using gzip
+
+"""
 import json
 import base64
 import gzip
