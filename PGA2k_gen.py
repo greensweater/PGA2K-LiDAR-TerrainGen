@@ -138,6 +138,11 @@ from terrain.contour_layers import (
     generate_contour_layers,
 )
 from terrain.stamp import Stamp
+from terrain.cart_paths import (
+    CART_PATH_STAMP_TYPE, CART_PATH_STAMP_RADIUS, CART_PATH_SPACING_M,
+    CART_PATH_HEIGHT_AVG_RADIUS_M, CartPathSpline, bezier_waypoints_to_linestring,
+    generate_cart_path_stamps,
+)
 from terrain.terrain_model import TerrainModel
 from course_output.userLayers import (
     build_baseline_flatten_stamp, build_registration_mark_stamps, normalize_stamp_heights,
@@ -1593,6 +1598,191 @@ def step_generate_terrain(
     step_visualize(working_dir)
 
 
+def step_generate_cart_paths(
+    working_dir: Path,
+    splines_path: Path | None = None,
+    cart_path_surface: int | None = None,
+    stamp_radius: float | None = None,
+    spacing_m: float | None = None,
+    height_avg_radius_m: float | None = None,
+) -> None:
+    """
+    Cart path terrain-flattening stamps -- see terrain/cart_paths.py
+    for the real algorithm (pearl necklace, directional rotation,
+    real-heightmap height averaging, all built on this pipeline's own
+    Stamp/BoundingBox primitives, not raw JSON dicts). This function is
+    I/O only: load real inputs, call the algorithm, save real output --
+    matching the same separation this project already keeps between
+    contour_layers.py's algorithm and step_generate_terrain's I/O.
+
+    ############################################################
+    ASSUMPTION, not a confirmed fact: cart path spline data is read
+    from splines_path (default: working_dir/"surfaceSplines.json",
+    falling back to a couple of other plausible names -- see below),
+    parsed as the same bezier waypoint JSON structure the course's own
+    exported surfaceSplines.json uses. This project's OWN Feature
+    system (features.geojson, loaded via load_features -- already used
+    for water via `f.kind == "water"`) is a more "internal" possible
+    source, but I have no confirmation cart paths are actually
+    OSM-derivable the way water bodies are -- golf cart paths are
+    often course-editor-drawn, not present in real-world OSM data for
+    a given parcel. If cart paths DO exist as Feature objects with some
+    kind (e.g. "cart_path"), that would be the better, more-internal
+    source and this function should be pointed at it instead -- ask
+    before assuming either way if uncertain.
+    ############################################################
+
+    Output is saved using the SAME refine_stamps_{n}.json naming/
+    loading convention every other refine pass uses (see
+    _refine_stamps_files/load_all_stamps) -- not a separate file type
+    needing its own plumbing through preview/export machinery that
+    already knows how to composite every refine_stamps_N.json in
+    order. The metadata's own "step" field still reads
+    "generate-cart-paths" so it stays clearly distinguishable from a
+    real adaptive-refine pass despite sharing the loading mechanism.
+    """
+    heightmap_path = working_dir / HEIGHTMAP_FILE
+    if not heightmap_path.exists():
+        raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
+    if not (_stamps_dir(working_dir) / INITIAL_STAMPS_FILE).exists():
+        raise StepError(f"No {INITIAL_STAMPS_FILE} found under {_stamps_dir(working_dir)}. "
+                         "Run --step generate-terrain first -- cart path stamps flatten to the "
+                         "average of terrain that should already exist.")
+
+    project = load_project(working_dir)
+    if cart_path_surface is None:
+        cart_path_surface = project.get("cart_paths_surface_value", None)
+    if stamp_radius is None:
+        stamp_radius = project.get("cart_paths_stamp_radius_m", CART_PATH_STAMP_RADIUS)
+    if spacing_m is None:
+        spacing_m = project.get("cart_paths_spacing_m", CART_PATH_SPACING_M)
+    if height_avg_radius_m is None:
+        height_avg_radius_m = project.get("cart_paths_height_avg_radius_m", CART_PATH_HEIGHT_AVG_RADIUS_M)
+
+    if cart_path_surface is None:
+        raise StepError(
+            "cart_path_surface is not set (no --cart-path-surface given and none saved in "
+            "project.json) -- this is the surface value that identifies a cart path spline in "
+            "the source JSON, and there's no safe default to fall back to. Set it explicitly."
+        )
+
+    if splines_path is None:
+        for candidate in ("surfaceSplines2.json", "surfaceSplines.json"):
+            candidate_path = working_dir / candidate
+            if candidate_path.exists():
+                splines_path = candidate_path
+                break
+        else:
+            raise StepError(
+                f"No surfaceSplines2.json or surfaceSplines.json found under {working_dir} -- "
+                "pass --splines-path explicitly if cart path spline data lives somewhere else."
+            )
+    if not splines_path.exists():
+        raise StepError(f"{splines_path} does not exist.")
+
+    print(f"Loading heightmap from {heightmap_path}...")
+    heights, bounds = load_heightmap(heightmap_path)
+
+    print(f"Loading cart path splines from {splines_path}...")
+    with splines_path.open() as f:
+        raw_splines = json.load(f)
+
+    def _get_surface_value(spline: dict) -> int | None:
+        for container in (spline, spline.get("Value", {}), spline.get("value", {})):
+            if not isinstance(container, dict):
+                continue
+            v = container.get("surface")
+            if v is None:
+                continue
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def _get_is_closed(spline: dict) -> bool:
+        for container in (spline, spline.get("Value", {}), spline.get("value", {})):
+            if not isinstance(container, dict):
+                continue
+            for key in ("isClosed", "state"):
+                v = container.get(key)
+                if v is not None:
+                    return bool(v)
+        return False
+
+    def _get_is_filled(spline: dict) -> bool:
+        # ASSUMPTION -- see this function's own docstring header note.
+        for container in (spline, spline.get("Value", {}), spline.get("value", {})):
+            if not isinstance(container, dict):
+                continue
+            v = container.get("isFilled")
+            if v is not None:
+                return bool(v)
+        return False
+
+    cart_path_splines: list[CartPathSpline] = []
+    n_skipped_wrong_surface = 0
+    n_skipped_closed_or_filled = 0
+    n_skipped_bad_geometry = 0
+
+    for idx, spline in enumerate(raw_splines):
+        surface = _get_surface_value(spline)
+        if surface != cart_path_surface:
+            n_skipped_wrong_surface += 1
+            continue
+        if _get_is_closed(spline) or _get_is_filled(spline):
+            n_skipped_closed_or_filled += 1
+            continue
+
+        line = bezier_waypoints_to_linestring(spline.get("waypoints", []))
+        if line is None:
+            n_skipped_bad_geometry += 1
+            continue
+
+        cart_path_splines.append(CartPathSpline(line=line, source_id=str(idx)))
+
+    print(f"  {len(raw_splines)} total splines: {len(cart_path_splines)} cart paths to process, "
+          f"{n_skipped_wrong_surface} different surface, {n_skipped_closed_or_filled} closed/filled, "
+          f"{n_skipped_bad_geometry} unusable geometry")
+
+    if not cart_path_splines:
+        print("  No cart path splines to process -- nothing to do.")
+        return
+
+    print(f"Generating cart path stamps (radius={stamp_radius:.4f}m, spacing={spacing_m:.4f}m, "
+          f"height_avg_radius={height_avg_radius_m:.4f}m)...")
+    stamps = generate_cart_path_stamps(
+        cart_path_splines, heights, bounds,
+        spacing_m=spacing_m, stamp_radius=stamp_radius, height_avg_radius_m=height_avg_radius_m,
+        brush=CART_PATH_STAMP_TYPE,
+    )
+    print(f"  {len(stamps)} cart path stamps generated across {len(cart_path_splines)} paths")
+
+    next_n = 1
+    while (_stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=next_n)).exists():
+        next_n += 1
+    out_path = _stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=next_n)
+    save_stamp_file(
+        stamps, out_path, step="generate-cart-paths",
+        parameters={
+            "splines_path": str(splines_path), "cart_path_surface": cart_path_surface,
+            "stamp_radius_m": stamp_radius, "spacing_m": spacing_m,
+            "height_avg_radius_m": height_avg_radius_m,
+        },
+    )
+    print(f"  wrote {out_path}")
+
+    save_project(working_dir, {
+        "cart_paths_surface_value": cart_path_surface,
+        "cart_paths_stamp_radius_m": stamp_radius,
+        "cart_paths_spacing_m": spacing_m,
+        "cart_paths_height_avg_radius_m": height_avg_radius_m,
+    })
+
+    print("Refreshing previews...")
+    step_visualize(working_dir)
+
+
 def step_refine_terrain(
     working_dir: Path,
     tolerance: float,
@@ -2113,6 +2303,7 @@ STEPS = {
     "ingest-course": step_ingest_course,
     "dig-water": step_dig_water,
     "generate-terrain": step_generate_terrain,
+    "generate-cart-paths": step_generate_cart_paths,
     "refine-terrain": step_refine_terrain,
     "output-terrain": step_output_terrain,
     "write-splines": step_write_splines,
@@ -2290,6 +2481,31 @@ def main(argv: list[str] | None = None) -> int:
                               "up and gaps in high terrain artificially down, both toward that one "
                               "global number. Default: use whatever's saved in project.json, or True "
                               "if never set.")
+    parser.add_argument("--splines-path", type=Path, default=None,
+                         help="generate-cart-paths: path to the exported spline JSON (bezier waypoint "
+                              "format) containing cart path data. Default: looks for "
+                              "surfaceSplines2.json then surfaceSplines.json directly under the "
+                              "working directory.")
+    parser.add_argument("--cart-path-surface", type=int, default=None,
+                         help="generate-cart-paths: the surface value identifying a cart path spline "
+                              "in the source JSON. No safe default -- must be set (CLI or saved in "
+                              "project.json from a prior run) before this step will run.")
+    parser.add_argument("--cart-path-stamp-radius", type=float, default=None,
+                         help="generate-cart-paths: type 15 stamp radius (m), a true center-to-edge "
+                              "distance -- controls the flattened path's real width via the brush's "
+                              "own measured plateau geometry. Default: use whatever's saved in "
+                              f"project.json, or {CART_PATH_STAMP_RADIUS:.4f} if never set (gives "
+                              "exactly a 1.7m plateau width).")
+    parser.add_argument("--cart-path-spacing", type=float, default=None,
+                         help="generate-cart-paths: pearl spacing (m) along each cart path -- how far "
+                              "apart consecutive stamps are placed. Default: use whatever's saved in "
+                              f"project.json, or {CART_PATH_SPACING_M:.4f} if never set (85% of the "
+                              "1.7m plateau width, for genuine along-path overlap).")
+    parser.add_argument("--cart-path-height-avg-radius", type=float, default=None,
+                         help="generate-cart-paths: radius (m) to average real heightmap data over at "
+                              "each stamp. Default: use whatever's saved in project.json, or "
+                              f"{CART_PATH_HEIGHT_AVG_RADIUS_M:.4f} if never set (half the stamp's own "
+                              "active/nonzero footprint).")
     parser.add_argument("--error-resolution", type=int, default=None,
                          help="visualize: grid resolution for preview_error.png, overriding the "
                               "default of inheriting whatever --resolution refine-terrain last used "
@@ -2543,6 +2759,15 @@ def main(argv: list[str] | None = None) -> int:
                 denoise_px=args.denoise_px,
                 max_stamps=args.max_stamps,
                 hex_base_layer=args.hex_base_layer,
+            )
+        elif args.step == "generate-cart-paths":
+            step_generate_cart_paths(
+                working_dir,
+                splines_path=args.splines_path,
+                cart_path_surface=args.cart_path_surface,
+                stamp_radius=args.cart_path_stamp_radius,
+                spacing_m=args.cart_path_spacing,
+                height_avg_radius_m=args.cart_path_height_avg_radius,
             )
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
