@@ -135,6 +135,7 @@ from terrain.contour_layers import (
     DEFAULT_SWEET_SPOT_TIME_BUDGET_S,
     DEFAULT_RANDOM_SEED,
     DEFAULT_DENOISE_PX,
+    DEFAULT_N_WORKERS,
     generate_contour_layers,
 )
 from terrain.stamp import Stamp
@@ -1299,6 +1300,7 @@ def step_generate_terrain(
     denoise_px: int | None = None,
     max_stamps: int | None = None,
     hex_base_layer: bool | None = None,
+    n_workers: int | None = None,
 ) -> None:
     """
     pitch (feature-flagged via project.json, same None-means-use-saved
@@ -1368,6 +1370,17 @@ def step_generate_terrain(
     directions at whatever gaps remain, not just missing detail. Set to
     False to get the old (pure single-baseline) behavior back, e.g. for
     a direct before/after comparison.
+
+    n_workers (contour method only) parallelizes the main per-band loop
+    across separate OS processes -- bands never spatially overlap by
+    construction, so this is embarrassingly parallel with no
+    coordination needed. None (default) auto-detects via os.cpu_count();
+    1 forces sequential (e.g. for debugging). Output is BYTE-FOR-BYTE
+    IDENTICAL to a sequential run at the same random_seed -- confirmed
+    directly, not just assumed -- this only changes how fast it gets
+    there, never what it produces. Forced to 1 regardless of what's
+    passed whenever max_stamps is set (that flag needs a running total
+    checked band-by-band, which is fundamentally sequential).
     """
     if method is None:
         project = load_project(working_dir)
@@ -1438,6 +1451,8 @@ def step_generate_terrain(
         denoise_px = project.get("generate_terrain_denoise_px", DEFAULT_DENOISE_PX)
     if hex_base_layer is None:
         hex_base_layer = project.get("generate_terrain_hex_base_layer", True)
+    if n_workers is None:
+        n_workers = project.get("generate_terrain_n_workers", DEFAULT_N_WORKERS)
 
     print(f"Loading {pointcloud_path}...")
     full_cloud = PointCloud.load(pointcloud_path)
@@ -1498,6 +1513,7 @@ def step_generate_terrain(
             random_seed=random_seed,
             denoise_px=denoise_px,
             max_stamps=max_stamps,
+            n_workers=n_workers,
             progress_callback=_print_contour_progress,
             on_candidates_tuned=_print_auto_tuned_candidates,
         )
@@ -1592,6 +1608,7 @@ def step_generate_terrain(
         "generate_terrain_random_seed": random_seed,
         "generate_terrain_denoise_px": denoise_px,
         "generate_terrain_hex_base_layer": hex_base_layer,
+        "generate_terrain_n_workers": n_workers,
     })
 
     print("Refreshing previews...")
@@ -2481,6 +2498,16 @@ def main(argv: list[str] | None = None) -> int:
                               "up and gaps in high terrain artificially down, both toward that one "
                               "global number. Default: use whatever's saved in project.json, or True "
                               "if never set.")
+    parser.add_argument("--n-workers", type=int, default=None,
+                         help="generate-terrain, contour method only: parallelize the main per-band "
+                              "loop across this many OS processes. Bands never spatially overlap, so "
+                              "this is embarrassingly parallel -- output is byte-for-byte identical to "
+                              "a sequential run at the same --random-seed, confirmed directly, only "
+                              "faster. 1 forces sequential (e.g. for debugging). Forced to 1 regardless "
+                              "of what's given whenever --max-stamps is set (that flag needs a running "
+                              "total checked band-by-band, which is fundamentally sequential). Default: "
+                              "use whatever's saved in project.json, or auto-detect via CPU count if "
+                              "never set.")
     parser.add_argument("--splines-path", type=Path, default=None,
                          help="generate-cart-paths: path to the exported spline JSON (bezier waypoint "
                               "format) containing cart path data. Default: looks for "
@@ -2759,6 +2786,7 @@ def main(argv: list[str] | None = None) -> int:
                 denoise_px=args.denoise_px,
                 max_stamps=args.max_stamps,
                 hex_base_layer=args.hex_base_layer,
+                n_workers=args.n_workers,
             )
         elif args.step == "generate-cart-paths":
             step_generate_cart_paths(
