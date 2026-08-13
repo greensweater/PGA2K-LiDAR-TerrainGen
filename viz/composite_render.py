@@ -1,4 +1,6 @@
 """
+viz/composite_render.py
+
 An independent, alternate terrain renderer: composites the REAL brush
 PNG assets (not terrain/terrain_kernel.py's measured/interpolated 1D
 radial approximation) onto a 16-bit-equivalent canvas, using actual
