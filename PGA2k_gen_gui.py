@@ -629,6 +629,20 @@ class PGAGenGUI:
                  "down, both toward that one global number. Uncheck to get the old (pure single-"
                  "baseline) behavior back, e.g. for a direct before/after comparison.")
 
+        n_workers_row = ttk.Frame(parent)
+        n_workers_row.pack(anchor="w", fill="x", pady=(4, 0))
+        ttk.Label(n_workers_row, text="Workers:").pack(side="left")
+        self.n_workers_var = tk.StringVar(value="")
+        n_workers_entry = ttk.Entry(n_workers_row, textvariable=self.n_workers_var, width=6)
+        n_workers_entry.pack(side="left", padx=4)
+        _Tooltip(n_workers_entry, "contour method only: parallelize the main per-band loop across "
+                 "this many OS processes. Bands never spatially overlap, so this is embarrassingly "
+                 "parallel -- output is byte-for-byte identical to a sequential run at the same "
+                 "SEED, confirmed directly, only faster. Blank = auto-detect via CPU count. 1 forces "
+                 "sequential (e.g. for debugging). Forced to 1 regardless of this setting whenever "
+                 "max_stamps is set (that flag needs a running total checked band-by-band, which is "
+                 "fundamentally sequential).")
+
 
         # Deliberately separate from the settings grid above, not another
         # field in it -- this is a quick-preview control, not a real
@@ -1802,6 +1816,9 @@ class PGAGenGUI:
             if max_stamps:
                 args += ["--max-stamps", max_stamps]
             args.append("--hex-base-layer" if self.hex_base_layer_var.get() else "--no-hex-base-layer")
+            n_workers = self.n_workers_var.get().strip()
+            if n_workers:
+                args += ["--n-workers", n_workers]
             self._run_step(args, wd)
 
     def _browse_cart_path_splines(self) -> None:
