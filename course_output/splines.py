@@ -1,5 +1,5 @@
 """
-splines.py
+course_output/splines.py
 
 Generates PGA surface splines (surfaceSplines.json) from this
 project's own Feature objects (see ingest/osm.py), using the spline-
