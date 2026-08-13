@@ -69,6 +69,9 @@ from ingest.osm import (  # noqa: E402
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
 from terrain.hexgrid import HEX_LATTICE_PITCH_M  # noqa: E402
+from terrain.cart_paths import (  # noqa: E402
+    CART_PATH_STAMP_RADIUS, CART_PATH_SPACING_M, CART_PATH_HEIGHT_AVG_RADIUS_M,
+)
 from shapely.ops import unary_union  # noqa: E402
 import viz.visualize as viz  # noqa: E402
 
@@ -646,6 +649,58 @@ class PGAGenGUI:
                  "for a real run. Not saved to project.json -- set explicitly each time.")
 
         self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Cart Paths", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+
+        splines_row = ttk.Frame(parent)
+        splines_row.pack(fill="x", pady=2)
+        ttk.Label(splines_row, text="Splines path:").pack(side="left")
+        self.cart_path_splines_path_var = tk.StringVar(value="")
+        splines_entry = ttk.Entry(splines_row, textvariable=self.cart_path_splines_path_var, width=28)
+        splines_entry.pack(side="left", padx=4)
+        ttk.Button(splines_row, text="Browse...", command=self._browse_cart_path_splines).pack(side="left")
+        _Tooltip(splines_entry, "Path to the exported spline JSON (bezier waypoint format) containing "
+                 "cart path data. Blank = auto-detect surfaceSplines2.json then surfaceSplines.json "
+                 "directly under the working directory.")
+
+        cart_path_grid = ttk.Frame(parent)
+        cart_path_grid.pack(fill="x", pady=2)
+
+        def add_cart_path_field(row, col, var, label, tooltip):
+            cell = ttk.Frame(cart_path_grid)
+            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+            lbl = ttk.Label(cell, text=label)
+            lbl.pack(anchor="w")
+            entry = ttk.Entry(cell, textvariable=var, width=10)
+            entry.pack(anchor="w")
+            _Tooltip(lbl, tooltip)
+            _Tooltip(entry, tooltip)
+
+        self.cart_path_surface_var = tk.StringVar(value="")
+        self.cart_path_stamp_radius_var = tk.StringVar(value=f"{CART_PATH_STAMP_RADIUS:.4f}")
+        self.cart_path_spacing_var = tk.StringVar(value=f"{CART_PATH_SPACING_M:.4f}")
+        self.cart_path_height_avg_radius_var = tk.StringVar(value=f"{CART_PATH_HEIGHT_AVG_RADIUS_M:.4f}")
+
+        add_cart_path_field(0, 0, self.cart_path_surface_var, "SURFACE",
+                             "The surface value identifying a cart path spline in the source JSON. "
+                             "No safe default -- must be set (here, or saved in project.json from a "
+                             "prior run) before this step will run.")
+        add_cart_path_field(0, 1, self.cart_path_stamp_radius_var, "RADIUS m",
+                             "Type 15 stamp radius (m), a true center-to-edge distance -- controls "
+                             "the flattened path's real width via the brush's own measured plateau "
+                             f"geometry. Default {CART_PATH_STAMP_RADIUS:.4f} gives exactly a 1.7m "
+                             "plateau width.")
+        add_cart_path_field(0, 2, self.cart_path_spacing_var, "SPACING m",
+                             "Pearl spacing (m) along each cart path -- how far apart consecutive "
+                             f"stamps are placed. Default {CART_PATH_SPACING_M:.4f} is 85% of the "
+                             "1.7m plateau width, for genuine along-path overlap.")
+        add_cart_path_field(1, 0, self.cart_path_height_avg_radius_var, "HEIGHT AVG m",
+                             "Radius (m) to average real heightmap data over at each stamp. Default "
+                             f"{CART_PATH_HEIGHT_AVG_RADIUS_M:.4f} is half the stamp's own active/"
+                             "nonzero footprint.")
+
+        self._add_step_button(parent, "Generate Cart Paths", self._run_generate_cart_paths)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         method_row = ttk.Frame(parent)
@@ -1748,6 +1803,43 @@ class PGAGenGUI:
                 args += ["--max-stamps", max_stamps]
             args.append("--hex-base-layer" if self.hex_base_layer_var.get() else "--no-hex-base-layer")
             self._run_step(args, wd)
+
+    def _browse_cart_path_splines(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select cart path splines JSON", filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if path:
+            self.cart_path_splines_path_var.set(path)
+
+    def _run_generate_cart_paths(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+
+        surface = self.cart_path_surface_var.get().strip()
+        if not surface:
+            messagebox.showerror(
+                "Missing SURFACE", "SURFACE must be set -- it's the value identifying a cart path "
+                "spline in the source JSON, and there's no safe default to fall back to.",
+            )
+            return
+
+        args = ["--step", "generate-cart-paths", "--cart-path-surface", surface]
+
+        splines_path = self.cart_path_splines_path_var.get().strip()
+        if splines_path:
+            args += ["--splines-path", splines_path]
+        stamp_radius = self.cart_path_stamp_radius_var.get().strip()
+        if stamp_radius:
+            args += ["--cart-path-stamp-radius", stamp_radius]
+        spacing = self.cart_path_spacing_var.get().strip()
+        if spacing:
+            args += ["--cart-path-spacing", spacing]
+        height_avg_radius = self.cart_path_height_avg_radius_var.get().strip()
+        if height_avg_radius:
+            args += ["--cart-path-height-avg-radius", height_avg_radius]
+
+        self._run_step(args, wd)
 
     def _validate_refine_fields(self) -> bool:
         """Highlight (in red) any required Refine Terrain field left empty; returns True if all are filled."""
