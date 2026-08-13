@@ -1,5 +1,5 @@
 """
-osm.py
+ingest/osm.py
 
 Parses an OSM XML export into this compiler's internal vector Feature
 representation -- Shapely geometries tagged with a `kind` and the raw
