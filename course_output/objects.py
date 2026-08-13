@@ -1,5 +1,5 @@
 """
-objects.py
+course_output/objects.py
 
 Placed objects -- trees to start, plus building corner stakes -- for
 the game's placedObjects2.json (course/CourseDescription_nodes/).
