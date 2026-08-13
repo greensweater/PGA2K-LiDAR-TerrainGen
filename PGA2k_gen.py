@@ -2526,7 +2526,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cart-path-spacing", type=float, default=None,
                          help="generate-cart-paths: pearl spacing (m) along each cart path -- how far "
                               "apart consecutive stamps are placed. Default: use whatever's saved in "
-                              f"project.json, or {CART_PATH_SPACING_M:.4f} if never set (85% of the "
+                              f"project.json, or {CART_PATH_SPACING_M:.4f} if never set (85%% of the "
                               "1.7m plateau width, for genuine along-path overlap).")
     parser.add_argument("--cart-path-height-avg-radius", type=float, default=None,
                          help="generate-cart-paths: radius (m) to average real heightmap data over at "
