@@ -1,5 +1,8 @@
-# course_repack.py
+"""
+util/course_repack.py
 
+Repack the target folder into a .course file using gzip
+"""
 import json
 import base64
 import gzip
