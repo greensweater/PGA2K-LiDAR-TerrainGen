@@ -1,3 +1,8 @@
+"""
+util/extract_brush_profiles.py
+
+Generate "real" 8-bit brush profiles (stamps) from game asset PNGs
+"""
 import argparse
 import json
 from pathlib import Path
