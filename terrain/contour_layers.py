@@ -384,11 +384,71 @@ def _local_mean_value(
     heights: np.ndarray, row_min: int, row_max: int, col_min: int, col_max: int,
     within: np.ndarray, fallback_row: int, fallback_col: int,
 ) -> float:
+    """
+    Area average of `heights` within `within`, falling back to a
+    single point if nothing in that window is finite. Not currently
+    called anywhere in this module -- superseded by
+    _nearest_point_value for stamp value fitting specifically (see
+    that function's own docstring for why an area average was the
+    wrong tool for the job: confirmed as a real source of blurred
+    stamp values pulling in neighboring elevation data). Kept as a
+    general-purpose utility, same rationale as _fill_region_greedy
+    elsewhere in this module -- appropriate wherever an area average
+    genuinely is what's wanted, unlike stamp value fitting.
+    """
     sub_heights = heights[row_min:row_max, col_min:col_max]
     sub_valid = np.isfinite(sub_heights) & within
     if sub_valid.any():
         return float(np.mean(sub_heights[sub_valid]))
     return float(heights[fallback_row, fallback_col])
+
+
+def _nearest_point_value(heights: np.ndarray, row: int, col: int, max_search_radius_px: int = 50) -> float:
+    """
+    Real LIDAR value at the exact heightmap cell nearest a stamp's own
+    center -- (row, col) IS that cell already at every call site (the
+    stamp's x/z position is derived directly from this pixel's own
+    center coordinates), so this is normally a plain lookup, not a
+    search.
+
+    Replaces _local_mean_value (an area average over the stamp's FULL
+    nominal radius) at both active fill stages. Confirmed as a real
+    problem, not just a theoretical one: acceptance and claiming both
+    key off the PLATEAU (which stays tightly within the current band
+    by design), but the value was being averaged over the full nominal
+    radius, whose outer falloff ring routinely extends past the
+    plateau into neighboring elevation territory -- for pass 1's large
+    stamps especially, that averaging window can be huge, pulling a
+    stamp's fitted value toward whatever surrounds it rather than
+    reflecting what's actually at its own center. A single point
+    sample can't have that problem: there's no window to blur into
+    something else.
+
+    Falls back to an expanding search for the nearest FINITE cell only
+    if the exact center is itself NaN (a gap the heightmap's own gap-
+    filling missed) -- should be rare in practice, and this is a
+    correctness fallback, not the intended common path.
+    """
+    n_rows, n_cols = heights.shape
+    if 0 <= row < n_rows and 0 <= col < n_cols and np.isfinite(heights[row, col]):
+        return float(heights[row, col])
+
+    for r in range(1, max_search_radius_px + 1):
+        row_min = max(0, row - r)
+        row_max = min(n_rows, row + r + 1)
+        col_min = max(0, col - r)
+        col_max = min(n_cols, col + r + 1)
+        sub = heights[row_min:row_max, col_min:col_max]
+        finite_rows, finite_cols = np.nonzero(np.isfinite(sub))
+        if finite_rows.size == 0:
+            continue
+        finite_rows = finite_rows + row_min
+        finite_cols = finite_cols + col_min
+        dist_sq = (finite_rows - row) ** 2 + (finite_cols - col) ** 2
+        nearest = np.argmin(dist_sq)
+        return float(heights[finite_rows[nearest], finite_cols[nearest]])
+
+    return 0.0  # total fallback -- should never trigger given the heightmap's own gap-filling
 
 
 def _poisson_pack_band(
@@ -531,9 +591,7 @@ def _poisson_pack_band(
             sub_z = bounds.min_z + (np.arange(row_min, row_max) + 0.5) * cell_z
             xx, zz = np.meshgrid(sub_x, sub_z)
             within_radius = np.hypot(xx - cx, zz - cz) <= radius
-            value = _local_mean_value(
-                heights, row_min, row_max, col_min, col_max, within_radius, row_full, col_full,
-            )
+            value = _nearest_point_value(heights, row_full, col_full)
 
             stamps.append(Stamp(x=cx, z=cz, radius=float(radius), value=value, brush=brush, tool=TOOL_FLATTEN))
             grid.setdefault(cell_key(cx, cz), []).append((cx, cz, plateau_r))
@@ -654,7 +712,7 @@ def _tiered_fill_band(
             within_radius = dist_from_center <= radius
             within_plateau = dist_from_center <= plateau_r
 
-            value = _local_mean_value(heights, row_min, row_max, col_min, col_max, within_radius, row, col)
+            value = _nearest_point_value(heights, row, col)
             stamps.append(Stamp(x=cx, z=cz, radius=float(radius), value=value, brush=brush, tool=TOOL_FLATTEN))
 
             # CLAIM THE REAL PLATEAU, not the full radius. Two earlier
@@ -795,7 +853,7 @@ def _scatter_fill_remaining(
         within_radius = dist_from_center <= radius
         within_claim = dist_from_center <= claim_radius
 
-        value = _local_mean_value(heights, row_min, row_max, col_min, col_max, within_radius, row, col)
+        value = _nearest_point_value(heights, row, col)
         stamps.append(Stamp(x=cx, z=cz, radius=radius, value=value, brush=brush, tool=TOOL_FLATTEN))
 
         remaining[row_min:row_max, col_min:col_max][within_claim] = False
