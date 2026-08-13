@@ -122,7 +122,9 @@ catch-all pass afterward.
 
 from __future__ import annotations
 
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Optional
 
 import numpy as np
@@ -185,10 +187,16 @@ DEFAULT_SMOOTH_CLAIM_FRACTION = 0.25  # "eat" -- how much of each crumb-scatter 
                                         # the main pack's large hard stamps couldn't reach
 DEFAULT_CANDIDATES_PER_RADIUS = 2000  # starting point for auto-tuning (see _auto_tune_candidates), or
                                         # used directly if candidates_per_radius is set explicitly
-DEFAULT_SWEET_SPOT_STAMP_RATIO = 0.10  # auto-tune target: keep doubling candidates_per_radius until
-                                         # pass 2's own stamp count drops to this fraction of pass 1's --
-                                         # past that point more candidates buys diminishing pass-1
-                                         # coverage while pass 2 does proportionally less mop-up work
+DEFAULT_SWEET_SPOT_STAMP_RATIO = 0.10  # auto-tune target: keep doubling candidates_per_radius as
+                                         # long as each doubling reduces a band's own uncovered-area
+                                         # fraction by at least this much, RELATIVE to the previous
+                                         # doubling's own uncovered fraction (0.10 = stop once another
+                                         # doubling buys less than a 10% relative improvement) -- NOT
+                                         # an absolute area target (see _auto_tune_candidates' docstring
+                                         # for why: pass 1 has a genuine structural floor -- real area
+                                         # smaller than min_radius -- that no candidate count can ever
+                                         # close, so a fixed target can be unreachable regardless of
+                                         # true coverage quality, exhausting the search uselessly)
 DEFAULT_SWEET_SPOT_SAMPLE_BANDS = 3  # how many regularly-spaced bands to calibrate against, not every
                                        # band -- bands are similar enough in character that per-band
                                        # tuning would mostly repeat the same search for no benefit
@@ -875,9 +883,6 @@ def _auto_tune_candidates(
     min_radius: float,
     radius_step_ratio: float,
     edge_distance_m: float,
-    smoothing_brush: int,
-    crumb_radius: float,
-    smooth_claim_fraction: float,
     denoise_px: int,
     sweet_spot_ratio: float,
     sample_band_count: int,
@@ -896,14 +901,43 @@ def _auto_tune_candidates(
     For each sampled band and each of seeds_per_band random seeds
     (so one lucky/unlucky seed doesn't skew the result), doubles
     candidates_per_radius starting from the search's own running best
-    (see WARM-STARTING below) until pass 2's own stamp count drops to
-    sweet_spot_ratio of pass 1's -- the literal criterion: past this
-    point more candidates buys diminishing pass-1 coverage, and pass 2
-    (already running for real, not estimated) is doing proportionally
-    less mop-up work. The MAX candidate count found across every
-    sampled band/seed combination is returned -- a single global value,
-    not tuned per band, since the real run needs one number that works
-    safely everywhere, not just on the bands it happened to sample.
+    (see WARM-STARTING below) until another doubling's improvement in
+    the band's own uncovered AREA fraction drops to sweet_spot_ratio or
+    below (a RELATIVE, diminishing-returns criterion -- see DIMINISHING
+    RETURNS below, not an absolute target). The MAX candidate count
+    found across every sampled band/seed combination is returned -- a
+    single global value, not tuned per band, since the real run needs
+    one number that works safely everywhere, not just on the bands it
+    happened to sample.
+
+    AREA, not stamp count: an earlier version compared pass 2's own
+    stamp count against pass 1's instead -- confirmed wrong, because
+    that conflates two unrelated things. Stamp count ratio depends
+    heavily on the RADIUS SCALE MISMATCH between the two passes (pass 1
+    placing few large stamps, pass 2 needing many small ones for even a
+    tiny leftover sliver), not on how much real area pass 1 actually
+    left uncovered -- confirmed directly: auto-tune hit its max
+    candidate cap without ever satisfying a stamp-count-ratio target,
+    even where pass 1's own coverage was already good, simply because
+    pass 1 and pass 2's radii were scaled very differently. Measuring
+    the crumb mask's own area fraction instead is invariant to that
+    mismatch, directly measures what actually matters (how much of the
+    band pass 1 left behind), and is cheaper too -- pass 2 doesn't need
+    to run at all during calibration, only pass 1's own crumb output.
+
+    DIMINISHING RETURNS, not an absolute target: a version after that
+    stopped once uncovered_fraction dropped below a FIXED threshold --
+    also confirmed wrong, because pass 1 has a genuine STRUCTURAL floor
+    (real area smaller than min_radius, which no candidate count can
+    ever close) that can sit above any fixed target regardless of how
+    well pass 1 is actually doing. Measured directly on one real band:
+    uncovered area plateaued at ~15.67% starting around 8,000 candidates
+    and never improved further even at 50,000 -- a fixed target simply
+    unreachable there, so the search exhausted to the cap uselessly
+    every single time. Comparing each doubling's improvement against
+    the PREVIOUS doubling instead correctly recognizes "more candidates
+    stopped helping," regardless of what the achievable floor actually
+    is for that particular band's geometry.
 
     WARM-STARTING: each trial after the first starts its own doubling
     search from half the best candidate count found by any PRIOR trial
@@ -938,7 +972,8 @@ def _auto_tune_candidates(
         mask = _band_mask(heights, lo, hi)
         if denoise_px > 0:
             mask = _denoise_mask(mask, denoise_px)
-        if not mask.any():
+        band_area = int(mask.sum())
+        if band_area == 0:
             continue
 
         for seed_offset in range(seeds_per_band):
@@ -946,6 +981,7 @@ def _auto_tune_candidates(
                 break
             seed = DEFAULT_RANDOM_SEED + seed_offset
             candidates = max(initial_candidates, best_candidates // 2)
+            prev_uncovered: Optional[float] = None
             while candidates <= max_candidates:
                 if time.time() - start_time > time_budget_s:
                     break
@@ -956,17 +992,94 @@ def _auto_tune_candidates(
                 )
                 if not pass1_stamps:
                     break
-                pass2_stamps = _scatter_fill_remaining(
-                    crumbs, heights, bounds, smoothing_brush, crumb_radius,
-                    claim_radius_fraction=smooth_claim_fraction,
-                )
-                ratio = len(pass2_stamps) / max(1, len(pass1_stamps))
-                if ratio <= sweet_spot_ratio:
-                    break
+                uncovered_fraction = float(crumbs.sum()) / band_area
+
+                # DIMINISHING RETURNS, not an absolute target: an earlier
+                # version stopped once uncovered_fraction dropped below a
+                # fixed threshold -- confirmed wrong, because pass 1 has
+                # a genuine STRUCTURAL floor (real area smaller than
+                # min_radius, which no candidate count can ever reach)
+                # that can sit above any fixed target regardless of how
+                # well pass 1 is actually doing. Measured directly:
+                # uncovered area plateaued at ~15.67% starting around
+                # 8,000 candidates and never improved further even at
+                # 50,000 -- a fixed 2% target made every search exhaust
+                # to the cap uselessly. Comparing each doubling's
+                # improvement against the PREVIOUS doubling instead
+                # correctly recognizes "more candidates stopped helping"
+                # regardless of what the achievable floor actually is.
+                if prev_uncovered is not None and prev_uncovered > 0:
+                    relative_improvement = (prev_uncovered - uncovered_fraction) / prev_uncovered
+                    if relative_improvement <= sweet_spot_ratio:
+                        break
+                prev_uncovered = uncovered_fraction
                 candidates *= 2
             best_candidates = max(best_candidates, min(candidates, max_candidates))
 
     return best_candidates
+
+
+DEFAULT_N_WORKERS = None  # None = auto (os.cpu_count()); see generate_contour_layers' own docstring
+
+# Per-worker-process globals, set once by _init_band_worker -- avoids
+# re-pickling the (potentially large, e.g. 2000x2000 floats = 32MB)
+# heights array and bounds for every single band task. Each worker
+# process gets ONE copy at pool startup; every band task after that
+# just references these directly.
+_worker_heights: Optional[np.ndarray] = None
+_worker_bounds: Optional[BoundingBox] = None
+
+
+def _init_band_worker(heights: np.ndarray, bounds: BoundingBox) -> None:
+    global _worker_heights, _worker_bounds
+    _worker_heights = heights
+    _worker_bounds = bounds
+
+
+def _process_one_band(args: tuple) -> list[Stamp]:
+    """
+    Top-level (picklable) per-band worker: everything a single call to
+    generate_contour_layers' own sequential loop body does for ONE
+    band -- mask, denoise, pass 1, pass 2 -- packaged so it can run in
+    a separate process. Reads heights/bounds from the per-process
+    globals set by _init_band_worker, not from `args`, to avoid
+    re-pickling them per task (see that function's own docstring).
+
+    Bands never spatially overlap by construction (different bands'
+    masks partition the heightmap into disjoint elevation ranges), so
+    this is safe to run fully independently, with no shared state and
+    no coordination needed between bands -- confirmed throughout this
+    module's own design, not a new assumption introduced for
+    parallelism specifically.
+    """
+    (band_index, lo, hi, fill_brush, min_radius, max_radius, radius_step_ratio, edge_distance_m,
+     denoise_px, random_seed, candidates_per_radius, smoothing_brush, crumb_radius,
+     smooth_claim_fraction) = args
+
+    heights = _worker_heights
+    bounds = _worker_bounds
+    assert heights is not None and bounds is not None  # _init_band_worker must have run first
+
+    mask = _band_mask(heights, lo, hi)
+    if mask.any():
+        mask = _denoise_mask(mask, denoise_px)
+    if not mask.any():
+        return []
+
+    rng = np.random.default_rng(random_seed + band_index)
+    pass1_stamps, crumbs = _poisson_pack_band(
+        mask, heights, bounds, fill_brush, max_radius, min_radius, radius_step_ratio,
+        edge_distance_m, candidates_per_radius, rng,
+    )
+    stamps = list(pass1_stamps)
+
+    if crumbs.any():
+        stamps.extend(_scatter_fill_remaining(
+            crumbs, heights, bounds, smoothing_brush, crumb_radius,
+            claim_radius_fraction=smooth_claim_fraction,
+        ))
+
+    return stamps
 
 
 def generate_contour_layers(
@@ -991,6 +1104,7 @@ def generate_contour_layers(
     random_seed: int = DEFAULT_RANDOM_SEED,
     denoise_px: int = DEFAULT_DENOISE_PX,
     max_stamps: Optional[int] = None,
+    n_workers: Optional[int] = DEFAULT_N_WORKERS,
     progress_callback: Optional[Callable[[int, float], None]] = None,
     on_candidates_tuned: Optional[Callable[[int], None]] = None,
 ) -> list[Stamp]:
@@ -1074,7 +1188,29 @@ def generate_contour_layers(
     LOW-elevation end -- if you specifically want to preview a band
     somewhere in the middle of the elevation range, this cap can't
     target that; it only ever gives you "however far up from the
-    bottom N stamps gets you."
+    bottom N stamps gets you." FORCES n_workers=1 regardless of what's
+    passed -- max_stamps needs a running total checked band-by-band to
+    know when to stop, which is fundamentally sequential/streaming and
+    doesn't parallelize; it's also explicitly a quick-preview tool
+    where speed matters far less than it does for a real full run.
+
+    n_workers parallelizes the main per-band loop across separate OS
+    processes (concurrent.futures.ProcessPoolExecutor) -- bands never
+    spatially overlap by construction (different bands' masks
+    partition the heightmap into disjoint elevation ranges), so each
+    band's own mask/denoise/pass-1/pass-2 work is fully independent and
+    embarrassingly parallel, with no coordination needed between bands.
+    None (default) auto-detects via os.cpu_count(); 1 forces the old
+    single-process sequential behavior (e.g. for debugging, or when
+    max_stamps is set, which forces this regardless -- see above). The
+    heights array is sent to each worker process ONCE at pool startup
+    (not re-pickled per band task), and results are reassembled in the
+    SAME ascending-elevation order the sequential version always used,
+    not whatever order workers happen to finish in -- output is
+    identical to a sequential run at the same random_seed, this only
+    changes how fast it gets there. progress_callback still fires the
+    same way, just as each band's result comes back rather than as it
+    completes in-process.
 
     Stamp order: bands ascending by elevation, and within each band,
     pass 1 (fill_brush) then pass 2 (smoothing_brush). Under this
@@ -1110,7 +1246,7 @@ def generate_contour_layers(
     if candidates_per_radius is None:
         candidates_per_radius = _auto_tune_candidates(
             heights, bounds, boundaries, fill_brush, max_radius, min_radius, radius_step_ratio,
-            edge_distance_m, smoothing_brush, crumb_radius, smooth_claim_fraction, denoise_px,
+            edge_distance_m, denoise_px,
             sweet_spot_ratio, sweet_spot_sample_bands, sweet_spot_seeds,
             initial_candidates=DEFAULT_CANDIDATES_PER_RADIUS, max_candidates=sweet_spot_max_candidates,
             time_budget_s=sweet_spot_time_budget_s,
@@ -1124,35 +1260,66 @@ def generate_contour_layers(
     progress_interval_s = 10.0
     bands_reached = 0
 
-    for i, (lo, hi) in enumerate(boundaries):
-        if max_stamps is not None and len(stamps) >= max_stamps:
-            break
-        bands_reached = i + 1
+    # max_stamps needs a running total checked band-by-band to know
+    # when to stop -- fundamentally sequential/streaming, and it's
+    # explicitly a quick-preview tool where speed matters far less
+    # than for a real full run, so it isn't worth parallelizing around.
+    effective_workers = 1 if max_stamps is not None else (n_workers or os.cpu_count() or 1)
 
-        mask = _band_mask(heights, lo, hi)
-        if mask.any():
-            mask = _denoise_mask(mask, denoise_px)
-        if mask.any():
-            rng = np.random.default_rng(random_seed + i)
-            tier_budget = None if max_stamps is None else max_stamps - len(stamps)
-            pass1_stamps, crumbs = _poisson_pack_band(
-                mask, heights, bounds, fill_brush, max_radius, min_radius, radius_step_ratio,
-                edge_distance_m, candidates_per_radius, rng, max_stamps=tier_budget,
-            )
-            stamps.extend(pass1_stamps)
+    if effective_workers <= 1:
+        for i, (lo, hi) in enumerate(boundaries):
+            if max_stamps is not None and len(stamps) >= max_stamps:
+                break
+            bands_reached = i + 1
 
-            if crumbs.any():
-                crumb_budget = None if max_stamps is None else max_stamps - len(stamps)
-                if crumb_budget is None or crumb_budget > 0:
-                    stamps.extend(_scatter_fill_remaining(
-                        crumbs, heights, bounds, smoothing_brush, crumb_radius,
-                        claim_radius_fraction=smooth_claim_fraction,
-                        max_stamps=crumb_budget,
-                    ))
+            mask = _band_mask(heights, lo, hi)
+            if mask.any():
+                mask = _denoise_mask(mask, denoise_px)
+            if mask.any():
+                rng = np.random.default_rng(random_seed + i)
+                tier_budget = None if max_stamps is None else max_stamps - len(stamps)
+                pass1_stamps, crumbs = _poisson_pack_band(
+                    mask, heights, bounds, fill_brush, max_radius, min_radius, radius_step_ratio,
+                    edge_distance_m, candidates_per_radius, rng, max_stamps=tier_budget,
+                )
+                stamps.extend(pass1_stamps)
 
-        if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
-            progress_callback(len(stamps), (i + 1) / total_bands)
-            last_progress_time = time.time()
+                if crumbs.any():
+                    crumb_budget = None if max_stamps is None else max_stamps - len(stamps)
+                    if crumb_budget is None or crumb_budget > 0:
+                        stamps.extend(_scatter_fill_remaining(
+                            crumbs, heights, bounds, smoothing_brush, crumb_radius,
+                            claim_radius_fraction=smooth_claim_fraction,
+                            max_stamps=crumb_budget,
+                        ))
+
+            if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
+                progress_callback(len(stamps), (i + 1) / total_bands)
+                last_progress_time = time.time()
+    else:
+        # max_stamps is None here (forced effective_workers=1 above if
+        # it were set), so no per-band budget to thread through -- every
+        # band runs to full completion, matching a real (non-preview) run.
+        tasks = [
+            (i, lo, hi, fill_brush, min_radius, max_radius, radius_step_ratio, edge_distance_m,
+             denoise_px, random_seed, candidates_per_radius, smoothing_brush, crumb_radius,
+             smooth_claim_fraction)
+            for i, (lo, hi) in enumerate(boundaries)
+        ]
+        with ProcessPoolExecutor(
+            max_workers=effective_workers, initializer=_init_band_worker, initargs=(heights, bounds),
+        ) as executor:
+            # executor.map preserves SUBMISSION order in its results,
+            # regardless of which worker finishes which band first --
+            # this is what keeps output identical to the sequential
+            # version (ascending elevation order), not just "correct
+            # but shuffled."
+            for i, band_stamps in enumerate(executor.map(_process_one_band, tasks)):
+                stamps.extend(band_stamps)
+                bands_reached = i + 1
+                if progress_callback is not None and time.time() - last_progress_time >= progress_interval_s:
+                    progress_callback(len(stamps), (i + 1) / total_bands)
+                    last_progress_time = time.time()
 
     if progress_callback is not None:
         # Real fraction reached, not a fake 1.0/0.0 -- a max_stamps cutoff
