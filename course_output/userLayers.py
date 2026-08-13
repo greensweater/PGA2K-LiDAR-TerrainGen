@@ -1,5 +1,7 @@
 """
-userLayers.py (formerly writer.py -- renamed for clarity: this writes
+course_output/userLayers.py (formerly writer.py) 
+
+*renamed for clarity: this writes
 userLayers.json specifically, not every course_output file)
 
 Writes a list of Stamps into userLayers.json, matching PGA's .course
