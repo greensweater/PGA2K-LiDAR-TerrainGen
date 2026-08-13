@@ -1,4 +1,6 @@
 """
+course_output/holes.py
+
 Hole routing export -- holes.json (course/CourseDescription_nodes/holes.json).
 
 Deliberately a separate module/CLI step from splines.py -- holes.json
