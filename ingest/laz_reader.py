@@ -1,5 +1,6 @@
 """
-io/laz_reader.py
+ingest/laz_reader.py
+
 Based on https://github.com/chadrockey/TGC-Designer-Tools
 
 Reads USGS LAZ/LAS tiles into a merged, origin-aligned point cloud.
