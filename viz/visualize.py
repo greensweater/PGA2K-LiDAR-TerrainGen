@@ -1,5 +1,5 @@
 """
-visualize.py
+viz/visualize.py
 
 Diagnostic PNG previews for every major pipeline stage. These are
 output-only: nothing here is ever read back in as terrain data (see
