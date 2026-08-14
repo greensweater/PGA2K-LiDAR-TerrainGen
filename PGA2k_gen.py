@@ -37,9 +37,12 @@ independently resumable and inspectable, never a black box.
                              bounds, course origin, course_name) carried
                              between steps so they don't need re-specifying
     pointcloud.npz            ingest-laz output (ingest.laz_reader.PointCloud)
-    initial_stamps.json      generate-terrain output (Stamp list)
-    refine_stamps_N.json      refine-terrain output: only the stamps
-                             pass N added (not a cumulative snapshot);
+    stamps/stamps_N.json      one file per layering pass (generate-terrain,
+                             refine-terrain, generate-cart-paths, ...), in
+                             the order they were run -- each holds only the
+                             stamps THAT pass added (not a cumulative
+                             snapshot), and later layers take precedence
+                             over earlier ones wherever they overlap;
                              deleting the highest N undoes that pass
     course/                  extracted blank .course, always at this
                              fixed path (see ingest-course / output-terrain)
@@ -62,6 +65,7 @@ from pathlib import Path
 import numpy as np
 import pyproj
 from shapely.ops import unary_union
+import shapely.vectorized
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -151,11 +155,10 @@ from course_output.userLayers import (
 )
 from course_output.water import build_water_objects
 
-INITIAL_STAMPS_FILE = "initial_stamps.json"
 FEATURES_FILE = "features.geojson"
 HEIGHT_MASK_FILE = "height_mask.geojson"
 HEIGHTMAP_FILE = "heightmap.npz"
-REFINE_STAMPS_PATTERN = "refine_stamps_{n}.json"
+STAMPS_PATTERN = "stamps_{n}.json"
 PLACED_OBJECTS_FILE = "placedObjects2.json"
 OBJECT_LIST_FILE = "object_list.json"
 
@@ -167,49 +170,52 @@ def _stamps_dir(working_dir: Path) -> Path:
     return working_dir / STAMPS_DIR
 
 
-def _refine_stamps_files(working_dir: Path) -> list[Path]:
-    """Every refine_stamps_N.json present under stamps/, in order (N=1, 2, 3, ...)."""
+def _stamps_files(working_dir: Path) -> list[Path]:
+    """Every stamps_N.json present under stamps/, in order (N=1, 2, 3, ...)."""
     files = []
     n = 1
-    while (_stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=n)).exists():
-        files.append(_stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=n))
+    while (_stamps_dir(working_dir) / STAMPS_PATTERN.format(n=n)).exists():
+        files.append(_stamps_dir(working_dir) / STAMPS_PATTERN.format(n=n))
         n += 1
     return files
 
 
 def load_all_stamps(working_dir: Path) -> list[Stamp]:
     """
-    Reconstruct the full, current stamp list: initial_stamps.json plus
-    every refine_stamps_N.json in order, all under stamps/.
+    Reconstruct the full, current stamp list: every stamps_N.json
+    under stamps/, in order.
 
-    Each refine-terrain pass writes only the stamps *it* added, not a
+    Every layering pass (generate-terrain, refine-terrain, generate-
+    cart-paths, ...) writes only the stamps *it* added, not a
     cumulative snapshot -- so deleting the highest-numbered
-    refine_stamps_N.json is a natural undo of just the most recent
-    pass, and every earlier pass's file stays exactly as it was
-    (nothing gets rewritten/renumbered by later passes).
+    stamps_N.json is a natural undo of just the most recent pass, and
+    every earlier pass's file stays exactly as it was (nothing gets
+    rewritten/renumbered by later passes).
     """
-    initial_path = _stamps_dir(working_dir) / INITIAL_STAMPS_FILE
-    if not initial_path.exists():
+    files = _stamps_files(working_dir)
+    if not files:
         raise StepError(
-            f"No {INITIAL_STAMPS_FILE} found under {_stamps_dir(working_dir)}. "
+            f"No stamp layers found under {_stamps_dir(working_dir)}. "
             "Run --step generate-terrain first."
         )
 
-    stamps, _ = load_stamp_file(initial_path)
-    for path in _refine_stamps_files(working_dir):
+    stamps: list[Stamp] = []
+    for path in files:
         more_stamps, _ = load_stamp_file(path)
         stamps.extend(more_stamps)
     return stamps
 
 
-def load_latest_refine_metadata(working_dir: Path) -> dict | None:
+def load_latest_stamp_metadata(working_dir: Path) -> dict | None:
     """
-    Metadata (step/parameters/timestamp/hotspot_count -- see
-    save_stamp_file) from the most recent refine_stamps_N.json, or
-    None if no refine pass has run yet. Used to label previews with
-    whatever settings actually produced the terrain being looked at.
+    Metadata (step/parameters/timestamp/... -- see save_stamp_file)
+    from the most recent stamps_N.json, or None if no layer has been
+    written yet. Used to label previews with whatever settings
+    actually produced the terrain being looked at, whichever step
+    (generate-terrain, refine-terrain, generate-cart-paths, ...) wrote
+    that layer.
     """
-    files = _refine_stamps_files(working_dir)
+    files = _stamps_files(working_dir)
     if not files:
         return None
     _, metadata = load_stamp_file(files[-1])
@@ -247,7 +253,7 @@ def save_project(working_dir: Path, updates: dict) -> None:
 # Each file is self-contained: whatever step/parameters produced these
 # stamps travels with them in the same file, rather than living in a
 # separate history in project.json. That matters specifically because
-# refine_stamps_N.json files can be deleted individually (undoing one
+# stamps_N.json files can be deleted individually (undoing one
 # pass) -- a separate history would leave orphaned entries referencing
 # files that no longer exist, needing its own cleanup logic to stay in
 # sync. Keeping metadata and stamps in the same file means deleting the
@@ -388,8 +394,8 @@ def step_visualize(
         print(f"{PREVIEW_LIDAR} / {PREVIEW_LIDAR_HEIGHTMAP} already up to date with "
               f"{POINTCLOUD_FILE} -- skipping (re-run --step ingest-laz to force a refresh)")
 
-    if not (_stamps_dir(working_dir) / INITIAL_STAMPS_FILE).exists():
-        print(f"No {INITIAL_STAMPS_FILE} yet -- run --step generate-terrain for the "
+    if not _stamps_files(working_dir):
+        print("No stamp layers yet -- run --step generate-terrain for the "
               "hex/stamps/height/error previews. Stopping after the LIDAR previews.")
         return
 
@@ -397,29 +403,48 @@ def step_visualize(
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
     model = TerrainModel(stamps)
 
-    # Label the terrain-related previews with whatever refine-terrain
-    # parameters actually produced the latest stamps, if any pass has
-    # run -- self-documenting, without cross-referencing a separate
-    # log (see terrain/adaptive_refine.py's stamp-file metadata).
+    # Label the terrain-related previews with whatever parameters
+    # actually produced the latest layer, if any layer has been
+    # written -- self-documenting, without cross-referencing a
+    # separate log (see save_stamp_file's stamp-file metadata). Which
+    # fields are meaningful depends on which step wrote that layer
+    # (generate-terrain vs. refine-terrain vs. generate-cart-paths all
+    # save different parameter shapes), so branch on the "step" field
+    # rather than assuming refine-terrain's shape unconditionally --
+    # unification means the latest layer is no longer necessarily a
+    # refine pass.
     extra_label = None
     mask_grid = None
-    latest_refine = load_latest_refine_metadata(working_dir)
-    if latest_refine is not None:
-        p = latest_refine["parameters"]
-        extra_label = (
-            f"method={p.get('method', 'adaptive')} rad={p.get('rad_m', 'n/a')} "
-            f"tol={p['tolerance']} res={p['resolution']} hot={p['min_hotspot_radius_cells']} "
-            f"claim={p['claim_radius_fraction']} spread={p['brush_radius_spread_ratio']}"
-        )
-        if p.get("max_planar_rms") is not None:
-            extra_label += f" planar_rms={p['max_planar_rms']} shrink={p.get('planar_shrink_factor')}"
+    latest_layer = load_latest_stamp_metadata(working_dir)
+    if latest_layer is not None:
+        p = latest_layer["parameters"]
+        step_name = latest_layer.get("step", "?")
+        if step_name == "refine-terrain":
+            extra_label = (
+                f"refine: method={p.get('method', 'adaptive')} rad={p.get('rad_m', 'n/a')} "
+                f"tol={p.get('tolerance')} res={p.get('resolution')} hot={p.get('min_hotspot_radius_cells')} "
+                f"claim={p.get('claim_radius_fraction')} spread={p.get('brush_radius_spread_ratio')}"
+            )
+            if p.get("max_planar_rms") is not None:
+                extra_label += f" planar_rms={p['max_planar_rms']} shrink={p.get('planar_shrink_factor')}"
+        elif step_name == "generate-terrain":
+            extra_label = (
+                f"generate: method={p.get('method')} pitch={p.get('pitch_m')} "
+                f"band_spacing={p.get('band_spacing_m')}"
+            )
+        elif step_name == "generate-cart-paths":
+            extra_label = (
+                f"cart-paths: stamp_radius={p.get('stamp_radius_m')} spacing={p.get('spacing_m')}"
+            )
+        else:
+            extra_label = f"step={step_name}"
         if p.get("use_height_mask"):
             buffer_note = f" buffer={p['mask_buffer_px']:.0f}px" if p.get("mask_buffer_px") is not None else ""
             extra_label += f" mask=on{buffer_note}"
             mask_path = working_dir / HEIGHT_MASK_FILE
             if mask_path.exists():
                 mask_geometry = load_height_mask(mask_path)
-                mask_grid = rasterize_mask(mask_geometry, bounds, p["resolution"])
+                mask_grid = rasterize_mask(mask_geometry, bounds, p.get("resolution", DEFAULT_RESOLUTION))
 
     if overwrite_current_version:
         _overwrite_latest(PREVIEW_HEX)
@@ -509,7 +534,9 @@ def step_visualize(
         _overwrite_latest(PREVIEW_ERROR)
     print(f"Writing {PREVIEW_ERROR} (course-cropped point cloud vs. TerrainModel)...")
     if error_resolution is None:
-        error_resolution = latest_refine["parameters"]["resolution"] if latest_refine is not None else 200
+        error_resolution = (
+            latest_layer["parameters"].get("resolution", 200) if latest_layer is not None else 200
+        )
     error_stats = viz.render_error_preview(
         model, course_cloud, bounds, preview_dir / PREVIEW_ERROR,
         resolution=error_resolution, extra_label=extra_label, mask=mask_grid,
@@ -1299,7 +1326,8 @@ def step_generate_terrain(
     random_seed: int | None = None,
     denoise_px: int | None = None,
     max_stamps: int | None = None,
-    hex_base_layer: bool | None = None,
+    use_height_mask: bool | None = None,
+    mask_buffer_px: float | None = None,
     n_workers: int | None = None,
 ) -> None:
     """
@@ -1358,18 +1386,34 @@ def step_generate_terrain(
     it's meant to be set explicitly each time you want a quick partial
     preview, not silently inherited by your next real run.
 
-    hex_base_layer (contour method only, default True) generates a hex
-    grid (same pitch as "hex" mode -- generate_hex_grid + fit_stamp_
-    heights, so real, locally-fit values, not a global constant) and
-    places it UNDER the contour fill (lower precedence -- contour still
-    wins wherever it actually reaches). Fixes a confirmed bias: without
-    it, any gap the contour passes genuinely miss falls back to the
-    single course-wide median baseline below, which pulls gaps in low
-    terrain artificially UP and gaps in high terrain artificially DOWN,
-    both toward that one global number -- a systematic bias in both
-    directions at whatever gaps remain, not just missing detail. Set to
-    False to get the old (pure single-baseline) behavior back, e.g. for
-    a direct before/after comparison.
+    use_height_mask/mask_buffer_px follow the exact same pattern
+    step_refine_terrain uses: use_height_mask restricts this layer to
+    inside height_mask.geojson (fairway/green/tee + buffered hole-path
+    corridors, see ingest-osm) -- stamps whose center falls outside it
+    are dropped from THIS layer's output before it's written (the
+    course-wide baseline-flatten stamp below is never masked -- it's
+    a separate, always-on safety net, not part of the masked fill).
+    mask_buffer_px is record-keeping only (shows up in preview titles
+    and stamp-file metadata) -- the mask itself is already baked into
+    height_mask.geojson at ingest-osm time, not rebuilt here. This is
+    what makes a targeted pass possible now that generate-terrain is
+    layerable: e.g. run a finer contour pass restricted to just the
+    green complexes without touching the rest of the course.
+
+    This step never overwrites a previous run: each call determines
+    the next available stamps_N.json (same auto-increment convention
+    refine-terrain's passes already use -- see _stamps_files) and
+    writes its own new layer there, on top of whatever layers already
+    exist. Layers are composited in order -- later layers take
+    precedence wherever they overlap an earlier one (the same
+    sequential pull-toward-value compositing every other stamp layer
+    already uses), so e.g. a coarse hex pass, then a contour pass,
+    then a finer contour pass restricted to one area, is three
+    separate, independently addressable/deletable layers, not one
+    growing blob. Note this is NOT idempotent -- contour mode's
+    poisson sampling has genuine randomness, so re-running identical
+    parameters produces a distinct (not byte-identical) layer, by
+    design.
 
     n_workers (contour method only) parallelizes the main per-band loop
     across separate OS processes -- bands never spatially overlap by
@@ -1449,8 +1493,10 @@ def step_generate_terrain(
         random_seed = project.get("generate_terrain_random_seed", DEFAULT_RANDOM_SEED)
     if denoise_px is None:
         denoise_px = project.get("generate_terrain_denoise_px", DEFAULT_DENOISE_PX)
-    if hex_base_layer is None:
-        hex_base_layer = project.get("generate_terrain_hex_base_layer", True)
+    if use_height_mask is None:
+        use_height_mask = project.get("generate_terrain_use_height_mask", False)
+    if mask_buffer_px is None:
+        mask_buffer_px = project.get("generate_terrain_mask_buffer_px", None)
     if n_workers is None:
         n_workers = project.get("generate_terrain_n_workers", DEFAULT_N_WORKERS)
 
@@ -1523,37 +1569,6 @@ def step_generate_terrain(
         else:
             print(f"  {len(fitted)} stamps placed (tiered band fill + crumb smoothing, all already fitted)")
 
-        if hex_base_layer:
-            # A hex grid, fit to real LOCAL heights via fit_stamp_heights,
-            # laid down UNDER the contour stamps (earlier in the list =
-            # lower precedence -- contour stamps still win wherever they
-            # actually reach). Fixes a real, confirmed bias: the single
-            # course-wide baseline-flatten stamp below is one GLOBAL
-            # constant (the course mean), so any gap the contour passes
-            # genuinely miss falls back to that one number regardless of
-            # what the real local terrain actually does there -- pulling
-            # gaps in low terrain artificially UP toward the mean and
-            # gaps in high terrain artificially DOWN toward it, a
-            # systematic bias in both directions, not just noise. A hex
-            # grid fit to real nearby LIDAR points gives a locally
-            # accurate fallback everywhere instead of one global number,
-            # directly reducing RMS at whatever gaps remain (measured
-            # bias, not just coverage completeness -- this is why the
-            # contour method's own coverage-completeness work doesn't
-            # already make this redundant).
-            hex_stamp_radius = 2.0 * pitch
-            hex_bleed = hex_stamp_radius / 2.0
-            print(f"Generating hex base layer under the contour fill (pitch={pitch} m, "
-                  f"stamp_radius={hex_stamp_radius} m)...")
-            hex_stamps = generate_hex_grid(bounds, pitch=pitch, stamp_radius=hex_stamp_radius, bleed=hex_bleed)
-            hex_fitted = fit_stamp_heights(hex_stamps, heightmap, bounds)
-            n_hex_unfitted = sum(1 for s in hex_fitted if s.value == 0.0)
-            if n_hex_unfitted:
-                print(f"  WARNING: {n_hex_unfitted} hex base-layer stamps had too few nearby "
-                      "heightmap cells and kept their placeholder value=0.0 -- these fall through "
-                      "to the course-wide median baseline instead, same as before this existed.")
-            print(f"  {len(hex_fitted)} hex base-layer stamps placed (under the contour fill)")
-            fitted = hex_fitted + fitted
     else:
         stamp_radius = 2.0 * pitch
         bleed = stamp_radius / 2.0
@@ -1568,20 +1583,41 @@ def step_generate_terrain(
             print(f"  WARNING: {n_unfitted} stamps had too few nearby heightmap cells and kept "
                   "their placeholder value=0.0")
 
+    if use_height_mask:
+        mask_path = working_dir / HEIGHT_MASK_FILE
+        if not mask_path.exists():
+            raise StepError(
+                f"use_height_mask is on but no {HEIGHT_MASK_FILE} found under {working_dir}. "
+                "Run --step ingest-osm first."
+            )
+        mask_geometry = load_height_mask(mask_path)
+        if mask_geometry is not None:
+            xs = np.array([s.x for s in fitted])
+            zs = np.array([s.z for s in fitted])
+            inside = shapely.vectorized.contains(mask_geometry, xs, zs)
+            n_dropped = int((~inside).sum())
+            fitted = [s for s, keep in zip(fitted, inside) if keep]
+            print(f"  height mask restricts this layer to inside height_mask.geojson -- "
+                  f"kept {len(fitted)}, dropped {n_dropped} stamps centered outside it")
+        else:
+            print(f"  use_height_mask is on but {HEIGHT_MASK_FILE} has no geometry -- nothing to "
+                  "mask, keeping every stamp")
+
     mean_elevation = float(np.nanmean(heightmap))
     print(f"Prepending a course-wide baseline-flatten stamp at the mean ground "
           f"elevation ({mean_elevation:.2f} m)...")
     baseline_stamp = build_baseline_flatten_stamp(bounds, mean_elevation)
     fitted = [baseline_stamp] + fitted
 
-    out_path = _stamps_dir(working_dir) / INITIAL_STAMPS_FILE
+    next_n = len(_stamps_files(working_dir)) + 1
+    out_path = _stamps_dir(working_dir) / STAMPS_PATTERN.format(n=next_n)
     save_stamp_file(
         fitted, out_path, step="generate-terrain",
         parameters={"course_size_m": COURSE_SIZE_M, "pitch_m": pitch, "method": method,
-                     "band_spacing_m": band_spacing_m},
+                     "band_spacing_m": band_spacing_m, "use_height_mask": use_height_mask,
+                     "mask_buffer_px": mask_buffer_px},
     )
     print(f"  wrote {out_path}")
-
 
     save_project(working_dir, {
         "course_origin_x": course_cloud.origin_x,
@@ -1607,7 +1643,8 @@ def step_generate_terrain(
         "generate_terrain_sweet_spot_time_budget_s": sweet_spot_time_budget_s,
         "generate_terrain_random_seed": random_seed,
         "generate_terrain_denoise_px": denoise_px,
-        "generate_terrain_hex_base_layer": hex_base_layer,
+        "generate_terrain_use_height_mask": use_height_mask,
+        "generate_terrain_mask_buffer_px": mask_buffer_px,
         "generate_terrain_n_workers": n_workers,
     })
 
@@ -1649,20 +1686,20 @@ def step_generate_cart_paths(
     before assuming either way if uncertain.
     ############################################################
 
-    Output is saved using the SAME refine_stamps_{n}.json naming/
-    loading convention every other refine pass uses (see
-    _refine_stamps_files/load_all_stamps) -- not a separate file type
+    Output is saved using the SAME stamps_{n}.json naming/loading
+    convention every other layering step uses (see
+    _stamps_files/load_all_stamps) -- not a separate file type
     needing its own plumbing through preview/export machinery that
-    already knows how to composite every refine_stamps_N.json in
-    order. The metadata's own "step" field still reads
-    "generate-cart-paths" so it stays clearly distinguishable from a
-    real adaptive-refine pass despite sharing the loading mechanism.
+    already knows how to composite every stamps_N.json in order. The
+    metadata's own "step" field still reads "generate-cart-paths" so
+    it stays clearly distinguishable from a real adaptive-refine pass
+    despite sharing the loading mechanism.
     """
     heightmap_path = working_dir / HEIGHTMAP_FILE
     if not heightmap_path.exists():
         raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
-    if not (_stamps_dir(working_dir) / INITIAL_STAMPS_FILE).exists():
-        raise StepError(f"No {INITIAL_STAMPS_FILE} found under {_stamps_dir(working_dir)}. "
+    if not _stamps_files(working_dir):
+        raise StepError(f"No stamp layers found under {_stamps_dir(working_dir)}. "
                          "Run --step generate-terrain first -- cart path stamps flatten to the "
                          "average of terrain that should already exist.")
 
@@ -1775,10 +1812,8 @@ def step_generate_cart_paths(
     )
     print(f"  {len(stamps)} cart path stamps generated across {len(cart_path_splines)} paths")
 
-    next_n = 1
-    while (_stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=next_n)).exists():
-        next_n += 1
-    out_path = _stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=next_n)
+    next_n = len(_stamps_files(working_dir)) + 1
+    out_path = _stamps_dir(working_dir) / STAMPS_PATTERN.format(n=next_n)
     save_stamp_file(
         stamps, out_path, step="generate-cart-paths",
         parameters={
@@ -1837,13 +1872,12 @@ def step_refine_terrain(
       raster approach, just organically spaced).
 
     Either way, only the newly-added stamps (not the whole cumulative
-    list) are written to the next refine_stamps_N.json. Safe to run
+    list) are written to the next stamps_N.json. Safe to run
     repeatedly -- each call reconstructs the full current terrain via
-    load_all_stamps() (initial_stamps.json plus every prior
-    refine_stamps_N.json) and builds against that, so "run this a few
-    times, watch coverage improve" is the expected way to iterate.
-    Deleting the highest-numbered refine_stamps_N.json undoes just
-    that pass.
+    load_all_stamps() (every stamps_N.json under stamps/, in order)
+    and builds against that, so "run this a few times, watch coverage
+    improve" is the expected way to iterate. Deleting the highest-
+    numbered stamps_N.json undoes just that pass.
 
     rad_m ("RAD") is the literal target stamp radius (m) for THIS
     pass, replacing the old radius_decay_per_pass percentage as the
@@ -1968,8 +2002,8 @@ def step_refine_terrain(
         )
 
     stamps = load_all_stamps(working_dir)
-    pass_number = len(_refine_stamps_files(working_dir)) + 1
-    print(f"  {len(stamps)} stamps (cumulative: initial + {pass_number - 1} prior refine pass(es))")
+    n_prior_layers = len(_stamps_files(working_dir))
+    print(f"  {len(stamps)} stamps (cumulative across {n_prior_layers} prior layer(s))")
     print(f"  method={method}  rad_m={rad_m}  claim_radius_fraction={claim_radius_fraction}  "
           f"brush_radius_spread_ratio={brush_radius_spread_ratio}  use_height_mask={use_height_mask}")
 
@@ -2111,8 +2145,8 @@ def step_refine_terrain(
     }
 
     if new_stamps:
-        next_n = len(_refine_stamps_files(working_dir)) + 1
-        out_path = _stamps_dir(working_dir) / REFINE_STAMPS_PATTERN.format(n=next_n)
+        next_n = len(_stamps_files(working_dir)) + 1
+        out_path = _stamps_dir(working_dir) / STAMPS_PATTERN.format(n=next_n)
         save_stamp_file(
             new_stamps, out_path, step="refine-terrain", parameters=parameters,
             extra={"hotspot_count": len(hotspots), "mean_fit_rms": mean_fit_rms, "max_fit_rms": max_fit_rms},
@@ -2176,7 +2210,7 @@ def _set_course_name_in_file(path: Path, course_name: str, key: str) -> None:
 def step_output_terrain(working_dir: Path, registration_marks: bool = False) -> None:
     course_dir = working_dir / "course"
 
-    print(f"Loading stamps from {working_dir} (initial + all refine passes)...")
+    print(f"Loading stamps from {working_dir} (all layers)...")
     stamps = load_all_stamps(working_dir)
     print(f"  {len(stamps)} stamps")
 
@@ -2489,15 +2523,18 @@ def main(argv: list[str] | None = None) -> int:
                               "of the course will be genuinely unfilled, not just coarser -- this is a "
                               "partial-preview tool, not a real generation mode. Not saved to "
                               "project.json -- pass it explicitly each time.")
-    parser.add_argument("--hex-base-layer", action=argparse.BooleanOptionalAction, default=None,
-                         help="generate-terrain, contour method only: places a hex grid (same --pitch "
-                              "as hex mode, fit to real local heights) UNDER the contour fill, lower "
-                              "precedence so contour still wins wherever it reaches. Fixes a confirmed "
-                              "bias: without it, gaps the contour passes miss fall back to the single "
-                              "course-wide median baseline, pulling gaps in low terrain artificially "
-                              "up and gaps in high terrain artificially down, both toward that one "
-                              "global number. Default: use whatever's saved in project.json, or True "
-                              "if never set.")
+    parser.add_argument("--generate-terrain-use-height-mask", action=argparse.BooleanOptionalAction, default=None,
+                         help="generate-terrain: restrict this layer to inside height_mask.geojson "
+                              "(fairway/green, see ingest-osm) -- stamps whose center falls outside it "
+                              "are dropped from this layer before it's written (the course-wide "
+                              "baseline-flatten stamp is never masked). Default: use whatever's saved "
+                              "in project.json, or off if never set.")
+    parser.add_argument("--generate-terrain-mask-buffer-px", type=float, default=None,
+                         help="generate-terrain: record-keeping only -- the buffer distance (m) the "
+                              "current height_mask.geojson was built with, saved alongside this layer's "
+                              "other parameters so it shows up in preview titles and stamp-file "
+                              "metadata. Doesn't affect the mask itself (already baked into "
+                              "height_mask.geojson) or any computation here.")
     parser.add_argument("--n-workers", type=int, default=None,
                          help="generate-terrain, contour method only: parallelize the main per-band "
                               "loop across this many OS processes. Bands never spatially overlap, so "
@@ -2785,7 +2822,8 @@ def main(argv: list[str] | None = None) -> int:
                 random_seed=args.random_seed,
                 denoise_px=args.denoise_px,
                 max_stamps=args.max_stamps,
-                hex_base_layer=args.hex_base_layer,
+                use_height_mask=args.generate_terrain_use_height_mask,
+                mask_buffer_px=args.generate_terrain_mask_buffer_px,
                 n_workers=args.n_workers,
             )
         elif args.step == "generate-cart-paths":

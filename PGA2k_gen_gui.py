@@ -22,10 +22,12 @@ still works without Pillow, previews just won't render).
 from __future__ import annotations
 
 import json
+import os
 import platform
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -616,18 +618,16 @@ class PGAGenGUI:
                              "so the whole run is reproducible given the same inputs, while still "
                              "varying naturally band to band.")
 
-        self.hex_base_layer_var = tk.BooleanVar(value=True)
-        hex_base_layer_checkbox = ttk.Checkbutton(
-            parent, text="Hex base layer under contour fill", variable=self.hex_base_layer_var,
+        self.generate_terrain_use_height_mask_var = tk.BooleanVar(value=False)
+        generate_terrain_mask_checkbox = ttk.Checkbutton(
+            parent, text="Restrict to mask", variable=self.generate_terrain_use_height_mask_var,
         )
-        hex_base_layer_checkbox.pack(anchor="w", pady=(6, 0))
-        _Tooltip(hex_base_layer_checkbox, "contour method only: places a hex grid (same PITCH as hex "
-                 "mode, fit to real local heights) UNDER the contour fill, lower precedence so "
-                 "contour still wins wherever it reaches. Fixes a confirmed bias: without it, gaps "
-                 "the contour passes miss fall back to the single course-wide median baseline, "
-                 "pulling gaps in low terrain artificially up and gaps in high terrain artificially "
-                 "down, both toward that one global number. Uncheck to get the old (pure single-"
-                 "baseline) behavior back, e.g. for a direct before/after comparison.")
+        generate_terrain_mask_checkbox.pack(anchor="w", pady=(6, 0))
+        _Tooltip(generate_terrain_mask_checkbox, "Restrict this layer to inside height_mask.geojson "
+                 "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM) -- stamps "
+                 "whose center falls outside it are dropped from this layer before it's written "
+                 "(the course-wide baseline-flatten stamp is never masked). Uses the same "
+                 "Buffer (px) slider as Refine Terrain's Mask option, in the Preview panel.")
 
         n_workers_row = ttk.Frame(parent)
         n_workers_row.pack(anchor="w", fill="x", pady=(4, 0))
@@ -1137,7 +1137,7 @@ class PGAGenGUI:
         )
         stamp_cov_checkbox.pack(side="left")
         _Tooltip(stamp_cov_checkbox, "Only has an effect while Elevation contour is also checked. "
-                 "Filters the real current stamp list (initial_stamps.json + every refine_stamps_N.json) "
+                 "Filters the real current stamp list (every stamps_N.json layer under stamps/) "
                  "to only stamps whose own VALUE falls within the current [Elev, Elev+Width) band -- "
                  "not the whole course -- then evaluates the REAL kernel weight (via terrain."
                  "terrain_kernel.TerrainKernel -- the same kernel adaptive_refine.py scores candidates "
@@ -1753,6 +1753,23 @@ class PGAGenGUI:
     def _run_generate_terrain(self) -> None:
         wd = self._require_working_dir()
         if wd:
+            # Same snapshot-before-run fix as _run_refine_terrain, and for
+            # the same reason: step_generate_terrain loads whatever's
+            # currently saved in height_mask.geojson, which otherwise
+            # reflects whichever buffer was set the last time Ingest OSM
+            # (or a refine-terrain run) touched that file, not necessarily
+            # what's actually on screen here.
+            if self.generate_terrain_use_height_mask_var.get():
+                merged_geom = self._get_cached_mask_merged_geometry(Path(wd))
+                if merged_geom is not None:
+                    buffer_px = self.mask_buffer_preview_var.get()
+                    buffered = merged_geom.buffer(buffer_px)
+                    save_height_mask(buffered, Path(wd) / HEIGHT_MASK_FILE)
+                    self._append_log(
+                        f"\n[snapshotting height_mask.geojson at buffer={buffer_px:.0f} px "
+                        "before generate-terrain]\n"
+                    )
+
             args = ["--step", "generate-terrain",
                      "--generate-terrain-method", self.generate_terrain_method_var.get()]
             pitch = self.pitch_var.get().strip()
@@ -1815,7 +1832,12 @@ class PGAGenGUI:
             max_stamps = self.max_stamps_var.get().strip()
             if max_stamps:
                 args += ["--max-stamps", max_stamps]
-            args.append("--hex-base-layer" if self.hex_base_layer_var.get() else "--no-hex-base-layer")
+            args.append(
+                "--generate-terrain-use-height-mask" if self.generate_terrain_use_height_mask_var.get()
+                else "--no-generate-terrain-use-height-mask"
+            )
+            if self.generate_terrain_use_height_mask_var.get():
+                args += ["--generate-terrain-mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}"]
             n_workers = self.n_workers_var.get().strip()
             if n_workers:
                 args += ["--n-workers", n_workers]
@@ -2115,9 +2137,17 @@ class PGAGenGUI:
 
     def _run_subprocess(self, cmd: list[str]) -> None:
         try:
+            # start_new_session=True (POSIX only -- ignored on Windows,
+            # where _stop_current_step instead uses `taskkill /T` to
+            # reach the same goal) puts the child in its own process
+            # group rather than the GUI's own, so _stop_current_step can
+            # signal that whole group without also hitting this GUI
+            # process. See _stop_current_step's docstring for why
+            # killing only the immediate child isn't enough here.
+            popen_kwargs = {} if platform.system() == "Windows" else {"start_new_session": True}
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, bufsize=1, **popen_kwargs,
             )
             self._current_proc = proc
             for line in proc.stdout:
@@ -2131,20 +2161,50 @@ class PGAGenGUI:
 
     def _stop_current_step(self) -> None:
         """
-        Kill the running subprocess. terminate() sends SIGTERM on
-        Unix / calls TerminateProcess on Windows -- both end the
-        process immediately regardless of what it's doing (a tight
-        numpy loop included), since Python doesn't install a custom
-        SIGTERM handler by default. The read loop in _run_subprocess
-        just sees EOF once the process dies and falls through to
-        proc.wait()/the "done" message as usual -- no special handling
-        needed there, only here (to label it distinctly from a normal
-        finish or an actual failure) and in _poll_log_queue.
+        Kill the running subprocess AND every process it spawned, not
+        just the immediate child. Plain terminate()/SIGTERM on only
+        the immediate child (the old behavior) is enough for most
+        steps, but generate-terrain's contour method with n_workers>1
+        runs a ProcessPoolExecutor -- separate OS worker processes
+        that inherit this Popen's stdout PIPE handle (on both Windows
+        and POSIX, a spawned/forked child inherits its parent's open
+        handles/fds unless something explicitly closes them, and
+        neither multiprocessing nor this code does). Killing only the
+        immediate child leaves those workers alive, each still holding
+        that handle open -- so the pipe's write end never fully
+        closes, _run_subprocess's `for line in proc.stdout` read loop
+        never sees EOF, and it hangs forever waiting for output that
+        will never come. That's what looked like Stop "doing nothing"
+        and the whole run "freezing": the background thread wedged,
+        so "done" never reached the log queue and the UI never
+        reflected the stop (the Tk main loop itself was never
+        actually blocked, but nothing looked like it was happening).
+
+        Fixed by reaching the whole tree/group instead of just the
+        one process: `taskkill /T` walks and kills the full process
+        tree by recorded parent PID on Windows; os.killpg signals
+        every process in the child's process group on POSIX (which is
+        why _run_subprocess launches it with start_new_session=True --
+        without a group of its own, killpg here would hit this GUI
+        process too). Either way, once every handle-holder actually
+        exits, the pipe closes for real and the read loop unblocks
+        exactly like a normal exit.
         """
         if self._current_proc is None:
             return
         self._stop_requested = True
-        self._current_proc.terminate()
+        pid = self._current_proc.pid
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+            else:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            self._current_proc.terminate()  # belt-and-suspenders in case the above missed it
+        except OSError:
+            pass
         self.stop_button.config(state="disabled")
 
     def _poll_log_queue(self) -> None:
@@ -2276,27 +2336,32 @@ class PGAGenGUI:
         PREVIEW_HEX, PREVIEW_STAMPS, PREVIEW_HEIGHT, PREVIEW_LIDAR_GROUND, PREVIEW_COMPOSITE, PREVIEW_ERROR,
     )
 
-    def _find_latest_refine_stamps(self, working_dir: Path) -> Path | None:
+    def _find_latest_stamps_file(self, working_dir: Path) -> Path | None:
         stamps_dir = working_dir / STAMPS_DIR
         n = 1
         latest = None
-        while (stamps_dir / f"refine_stamps_{n}.json").exists():
-            latest = stamps_dir / f"refine_stamps_{n}.json"
+        while (stamps_dir / f"stamps_{n}.json").exists():
+            latest = stamps_dir / f"stamps_{n}.json"
             n += 1
         return latest
 
     def _find_undo_group(self, working_dir: Path) -> list[Path]:
         """
-        Files that make up "the last refine-terrain iteration": the
-        latest refine_stamps_N.json, plus the latest version of each
-        terrain-related preview (hex/stamps/height/lidar_ground/error) --
-        the same set refine-terrain's auto-visualize always regenerates
-        together.
-        Deliberately doesn't touch initial_stamps.json or its own
-        previews -- there's nothing more fundamental to undo back to.
+        Files that make up "the last layering pass": the latest
+        stamps_N.json (whichever step -- generate-terrain, refine-
+        terrain, generate-cart-paths -- wrote it), plus the latest
+        version of each terrain-related preview (hex/stamps/height/
+        lidar_ground/error) -- the same set every layering step's
+        auto-visualize always regenerates together.
+
+        Every layer is a peer here, including the very first one --
+        unlike the old initial_stamps.json/refine_stamps_N.json split,
+        there's no more fundamentally-non-undoable "initial" file, since
+        generate-terrain is itself now a repeatable, addressable layering
+        step. Undoing down to zero layers is a valid (if unusual) result.
         """
         files = []
-        latest_stamps = self._find_latest_refine_stamps(working_dir)
+        latest_stamps = self._find_latest_stamps_file(working_dir)
         if latest_stamps is not None:
             files.append(latest_stamps)
         preview_dir = working_dir / PREVIEW_DIR
@@ -2329,7 +2394,7 @@ class PGAGenGUI:
         wd = Path(wd)
         files = self._find_undo_group(wd)
         if not files:
-            messagebox.showinfo("Nothing to undo", "No refine-terrain pass found to undo.")
+            messagebox.showinfo("Nothing to undo", "No stamp layer found to undo.")
             return
 
         timestamp = time.strftime("%Y%m%d%H%M%S")
@@ -2527,15 +2592,15 @@ class PGAGenGUI:
 
     def _get_cached_stamps(self, working_dir: Path):
         """
-        Lazily load the full current stamp list (initial_stamps.json
-        plus every refine_stamps_N.json, via PGA2k_gen.load_all_stamps)
-        and cache it, keyed on the mtime of every *.json file present
-        under stamps/ -- so running another refine-terrain pass (or
-        undoing one) properly invalidates this the next time the
-        overlay redraws. Returns None if there's no initial_stamps.json
-        yet (load_all_stamps raises in that case; caught here so a
-        missing stamp file just means "no overlay" rather than an
-        error swallowing the whole preview).
+        Lazily load the full current stamp list (every stamps_N.json
+        layer under stamps/, via PGA2k_gen.load_all_stamps) and cache
+        it, keyed on the mtime of every *.json file present under
+        stamps/ -- so running another layering pass (or undoing one)
+        properly invalidates this the next time the overlay redraws.
+        Returns None if there's no stamp layer yet (load_all_stamps
+        raises in that case; caught here so a missing stamp file just
+        means "no overlay" rather than an error swallowing the whole
+        preview).
         """
         stamps_dir = working_dir / STAMPS_DIR
         if not stamps_dir.exists():
