@@ -34,12 +34,23 @@ TOOL_RAISE = 1
 
 @dataclass(slots=True)
 class Stamp:
-    """A single PGA terrain stamp in world coordinates."""
+    """
+    A single PGA terrain stamp in world coordinates.
+
+    scale_x/scale_z: independent per-axis center-to-edge half-extent
+    (world meters), replacing a single `radius`. For a circular brush
+    the two must be equal (there's no other sensible reading of a
+    single-radius falloff curve); for a square/rectangular brush
+    (SHAPE_SQUARE -- currently just type 72) they may differ, giving an
+    axis-aligned rectangle rather than a square. See terrain_model.py
+    for how each shape interprets (scale_x, scale_z).
+    """
 
     x: float
     z: float
 
-    radius: float
+    scale_x: float
+    scale_z: float
     value: float
 
     brush: int

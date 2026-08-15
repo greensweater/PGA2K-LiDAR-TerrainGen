@@ -70,7 +70,11 @@ from ingest.osm import (  # noqa: E402
     rasterize_mask_rgba, save_features, save_height_mask, shift_features,
 )
 from terrain.bounding_box import BoundingBox  # noqa: E402
-from terrain.hexgrid import HEX_LATTICE_PITCH_M  # noqa: E402
+from terrain.hexgrid import (  # noqa: E402
+    DEFAULT_BRUSH as HEX_DEFAULT_BRUSH,
+    HEX_DEFAULT_SPREAD_RATIO,
+    HEX_LATTICE_PITCH_M,
+)
 from terrain.cart_paths import (  # noqa: E402
     CART_PATH_STAMP_RADIUS, CART_PATH_SPACING_M, CART_PATH_HEIGHT_AVG_RADIUS_M,
 )
@@ -86,7 +90,7 @@ try:
     # terrain_kernel.py's exact API beyond that established call pattern;
     # a mismatch here should degrade to the plain coverage overlay, not
     # crash preview rendering entirely.
-    from terrain.brush_profiles import BRUSH_PROFILES  # noqa: E402
+    from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE  # noqa: E402
     from terrain.terrain_kernel import TerrainKernel  # noqa: E402
     _HAVE_TERRAIN_KERNEL = True
 except ImportError:
@@ -468,10 +472,87 @@ class PGAGenGUI:
         pitch_entry = ttk.Entry(pitch_row, textvariable=self.pitch_var, width=8)
         pitch_entry.pack(side="left", padx=4)
         _Tooltip(pitch_entry, "hex method only: spacing (m) of the initial coarse hex-grid stamp "
-                 "lattice (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch means more, "
-                 "smaller, more tightly-packed initial stamps. Stamp radius and edge bleed both "
-                 "derive from this automatically (radius=2*pitch, bleed=pitch), no separate fields "
-                 "needed.")
+                 "lattice CENTERS (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch means "
+                 "more, more tightly-packed lattice points. Edge bleed derives from this "
+                 "automatically (bleed=pitch); stamp radius instead comes from the Spread field.")
+
+        ttk.Label(pitch_row, text="Spread:").pack(side="left", padx=(10, 0))
+        self.hex_spread_ratio_var = tk.StringVar(value=str(HEX_DEFAULT_SPREAD_RATIO))
+        hex_spread_entry = ttk.Entry(pitch_row, textvariable=self.hex_spread_ratio_var, width=5)
+        hex_spread_entry.pack(side="left", padx=4)
+        _Tooltip(hex_spread_entry, "hex method only: scales stamp radius independently of pitch -- "
+                 "stamp_radius = 2*pitch*spread. 1 (default) reproduces the original fixed radius = "
+                 "2*pitch (each stamp reaches exactly to its nearest neighbors' centers); >1 grows "
+                 "stamps past their neighbors for more overlap/blending, <1 shrinks them, "
+                 "potentially opening coverage gaps between lattice centers. Does NOT move any "
+                 "lattice center or affect edge bleed (bleed always = pitch).")
+
+        ttk.Label(pitch_row, text="Brush:").pack(side="left", padx=(10, 0))
+        self.hex_brush_var = tk.StringVar(value=str(HEX_DEFAULT_BRUSH))
+        hex_brush_entry = ttk.Entry(pitch_row, textvariable=self.hex_brush_var, width=4)
+        hex_brush_entry.pack(side="left", padx=4)
+        _Tooltip(hex_brush_entry, "hex method only: brush every lattice stamp uses. Default: "
+                 f"{HEX_DEFAULT_BRUSH} (terrain/hexgrid.py's DEFAULT_BRUSH).")
+
+        ttk.Label(pitch_row, text="Tool:").pack(side="left", padx=(10, 0))
+        self.hex_tool_var = tk.StringVar(value="flatten")
+        hex_tool_box = ttk.Combobox(
+            pitch_row, textvariable=self.hex_tool_var, state="readonly", width=8,
+            values=["flatten", "raise"],
+        )
+        hex_tool_box.pack(side="left", padx=4)
+        _Tooltip(hex_tool_box, "hex method only: tool every lattice stamp uses -- flatten (0) pulls "
+                 "terrain toward an absolute target height; raise (1) adds a delta instead, "
+                 "preserving whatever relief already exists (see terrain/stamp.py). Most useful "
+                 "for a masked pass that should build up an area without flattening it.")
+
+        fill_mode_row = ttk.Frame(parent)
+        fill_mode_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(fill_mode_row, text="Fill mode:").pack(side="left")
+        self.fill_mode_var = tk.StringVar(value="poisson")
+        fill_mode_box = ttk.Combobox(
+            fill_mode_row, textvariable=self.fill_mode_var, state="readonly", width=10,
+            values=["poisson", "rect"],
+        )
+        fill_mode_box.pack(side="left", padx=4)
+        _Tooltip(fill_mode_box, "contour method only: per-band fill algorithm. poisson (default) is "
+                 "the two-pass circle fill below (PASS 1 tiered pack + PASS 2 crumb scatter). rect "
+                 "instead fills each band with axis-aligned type-72 rectangles (RECT BR/RECT MIN "
+                 "side m/RECT ratio cap below), falling through to the same PASS 2 SMOOTH crumb "
+                 "scatter for whatever it can't cleanly place -- see terrain/contour_layers.py's "
+                 "RECT FILL MODE docstring section. FILL BR/MIN m/MAX m/STEP ratio/EDGE dist m and "
+                 "the CANDID/tier auto-tune knobs apply to poisson only.")
+
+        rect_frame = ttk.Frame(parent)
+        rect_frame.pack(anchor="w", fill="x", pady=(0, 4))
+
+        def add_rect_field(row, col, var, label, tooltip):
+            cell = ttk.Frame(rect_frame)
+            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+            lbl = ttk.Label(cell, text=label)
+            lbl.pack(anchor="w")
+            entry = ttk.Entry(cell, textvariable=var, width=8)
+            entry.pack(anchor="w")
+            _Tooltip(lbl, tooltip)
+            _Tooltip(entry, tooltip)
+
+        self.rect_brush_var = tk.StringVar(value="72")
+        self.rect_min_side_var = tk.StringVar(value="4")
+        self.rect_size_ratio_cap_var = tk.StringVar(value="2")
+
+        add_rect_field(0, 0, self.rect_brush_var, "RECT BR",
+                       "rect fill_mode only: brush for the main rectangle-covering pass -- must be a "
+                       "square-shaped brush (type 72 is the only one today).")
+        add_rect_field(0, 1, self.rect_min_side_var, "RECT MIN side m",
+                       "rect fill_mode only: shorter-side floor (m) below which a candidate rectangle "
+                       "is treated as a genuine crumb and handed to the same PASS 2 SMOOTH crumb "
+                       "scatter poisson mode uses.")
+        add_rect_field(0, 2, self.rect_size_ratio_cap_var, "RECT ratio cap",
+                       "rect fill_mode only: seam-step mitigation -- no rectangle's own longer side "
+                       "may exceed this multiple of an already-placed, directly-touching neighbor's "
+                       "longer side (too-big candidates are clipped down; too-small ones are deferred "
+                       "to crumb scatter instead, rather than placing a small hard-edged stamp "
+                       "directly against a much larger one).")
 
         contour_frame = ttk.Frame(parent)
         contour_frame.pack(anchor="w", fill="x", pady=(0, 4))
@@ -565,6 +646,17 @@ class PGAGenGUI:
                            "bumps and fills isolated few-pixel gaps, simplifying the boundary before "
                            "it fragments the fill into unnecessary tiny stamps. 0 disables.")
 
+        self.enable_secondary_fill_var = tk.BooleanVar(value=True)
+        secondary_fill_checkbox = ttk.Checkbutton(
+            parent, text="Enable secondary fill (PASS 2 crumb scatter)",
+            variable=self.enable_secondary_fill_var,
+        )
+        secondary_fill_checkbox.pack(anchor="w", pady=(0, 4))
+        _Tooltip(secondary_fill_checkbox, "contour method only: whether PASS 2's crumb-scatter cleanup "
+                 "runs after PASS 1. Unchecked skips it entirely -- whatever PASS 1 leaves as crumbs "
+                 "stays unfilled, so coverage is no longer complete. Trades that guarantee for speed, "
+                 "e.g. for a quick look at PASS 1's own plateau shape.")
+
         # Auto-tune calibration parameters -- only matter when CANDID/tier
         # above is left blank. Deliberately visually separated from the
         # main grid: these tune HOW the auto-tune search itself runs, not
@@ -624,8 +716,11 @@ class PGAGenGUI:
         )
         generate_terrain_mask_checkbox.pack(anchor="w", pady=(6, 0))
         _Tooltip(generate_terrain_mask_checkbox, "Restrict this layer to inside height_mask.geojson "
-                 "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM) -- stamps "
-                 "whose center falls outside it are dropped from this layer before it's written "
+                 "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM) -- restriction "
+                 "happens BEFORE generation, not as a filter afterward: contour mode crops each "
+                 "band's fill to the mask before the poisson-pack/crumb-scatter search runs, and hex "
+                 "mode never places a lattice stamp outside it, so a small masked region does "
+                 "proportionally less work, not full-course work followed by discarding most of it "
                  "(the course-wide baseline-flatten stamp is never masked). Uses the same "
                  "Buffer (px) slider as Refine Terrain's Mask option, in the Preview panel.")
 
@@ -1775,9 +1870,19 @@ class PGAGenGUI:
             pitch = self.pitch_var.get().strip()
             if pitch:
                 args += ["--pitch", pitch]
+            hex_spread_ratio = self.hex_spread_ratio_var.get().strip()
+            if hex_spread_ratio:
+                args += ["--hex-spread-ratio", hex_spread_ratio]
+            hex_brush = self.hex_brush_var.get().strip()
+            if hex_brush:
+                args += ["--hex-brush", hex_brush]
+            args += ["--hex-tool", "1" if self.hex_tool_var.get() == "raise" else "0"]
             band_spacing = self.band_spacing_var.get().strip()
             if band_spacing:
                 args += ["--band-spacing-m", band_spacing]
+            fill_mode = self.fill_mode_var.get().strip()
+            if fill_mode:
+                args += ["--fill-mode", fill_mode]
             fill_brush = self.fill_brush_var.get().strip()
             if fill_brush:
                 args += ["--fill-brush", fill_brush]
@@ -1793,6 +1898,15 @@ class PGAGenGUI:
             edge_distance = self.edge_distance_var.get().strip()
             if edge_distance:
                 args += ["--edge-distance-m", edge_distance]
+            rect_brush = self.rect_brush_var.get().strip()
+            if rect_brush:
+                args += ["--rect-brush", rect_brush]
+            rect_min_side = self.rect_min_side_var.get().strip()
+            if rect_min_side:
+                args += ["--rect-min-side-m", rect_min_side]
+            rect_size_ratio_cap = self.rect_size_ratio_cap_var.get().strip()
+            if rect_size_ratio_cap:
+                args += ["--rect-size-ratio-cap", rect_size_ratio_cap]
             smoothing_brush = self.smoothing_brush_var.get().strip()
             if smoothing_brush:
                 args += ["--smoothing-brush", smoothing_brush]
@@ -1805,6 +1919,10 @@ class PGAGenGUI:
             smooth_claim_fraction = self.smooth_claim_fraction_var.get().strip()
             if smooth_claim_fraction:
                 args += ["--smooth-claim-fraction", smooth_claim_fraction]
+            args.append(
+                "--generate-terrain-secondary-fill" if self.enable_secondary_fill_var.get()
+                else "--no-generate-terrain-secondary-fill"
+            )
             candidates_per_radius = self.candidates_per_radius_var.get().strip()
             if candidates_per_radius:
                 args += ["--candidates-per-radius", candidates_per_radius]
@@ -2654,9 +2772,14 @@ class PGAGenGUI:
         "geometrically reached" from "meaningfully pulled," and this
         can.
 
-        One TerrainKernel per brush type (4 total: 8/9/10/54), not per
-        stamp -- construction cost, whatever it is, shouldn't be paid
-        hundreds of thousands of times over.
+        One TerrainKernel per brush type actually in use (not per
+        stamp) -- construction cost, whatever it is, shouldn't be paid
+        hundreds of thousands of times over. Shape-aware per stamp: a
+        SHAPE_SQUARE brush (type 72, e.g. contour rect fill_mode's own
+        stamps) gets the same per-axis Chebyshev rectangle test
+        terrain_model.py itself uses, not a circular approximation --
+        so a rectangular stamp reads as a rectangle here too, not a
+        bounding circle.
 
         Cached and keyed on (stamps version, shape, elevation, width) --
         filtering by band means the relevant stamp subset changes with
@@ -2703,22 +2826,38 @@ class PGAGenGUI:
         influence = np.zeros(shape, dtype=np.float32)
 
         for s in band_stamps:
-            if s.radius <= 0:
+            if s.scale_x <= 0 or s.scale_z <= 0:
                 continue
-            col_min = max(0, int((s.x - s.radius) / cell_x))
-            col_max = min(n_cols, int((s.x + s.radius) / cell_x) + 1)
-            row_min = max(0, int((s.z - s.radius) / cell_z))
-            row_max = min(n_rows, int((s.z + s.radius) / cell_z) + 1)
+            profile = BRUSH_PROFILES.get(s.brush)
+            is_square = profile is not None and profile.shape == SHAPE_SQUARE
+            # Bounding box: tight per-axis (scale_x, scale_z) for a
+            # rectangle -- correct as-is, not just a safe superset, same
+            # as terrain_model.py's own render() -- since the exact
+            # per-cell test below is already an axis-aligned box for
+            # SHAPE_SQUARE brushes (type 72's rect-fill stamps included).
+            reach_x = s.scale_x
+            reach_z = s.scale_z if is_square else s.scale_x
+            col_min = max(0, int((s.x - reach_x) / cell_x))
+            col_max = min(n_cols, int((s.x + reach_x) / cell_x) + 1)
+            row_min = max(0, int((s.z - reach_z) / cell_z))
+            row_max = min(n_rows, int((s.z + reach_z) / cell_z) + 1)
             if col_min >= col_max or row_min >= row_max:
                 continue
             sub_x = x_centers[col_min:col_max]
             sub_z = z_centers[row_min:row_max]
             xx, zz = np.meshgrid(sub_x, sub_z)
-            dist = np.hypot(xx - s.x, zz - s.z)
-            within = dist <= s.radius
+            # Same per-axis normalized distance terrain_model.py's own
+            # evaluate_many()/render() use: Chebyshev-per-axis (a true
+            # rectangle test, not a bounding circle) for SHAPE_SQUARE
+            # brushes, plain Euclidean/scale_x for circular ones.
+            if is_square:
+                r_full = np.maximum(np.abs(xx - s.x) / s.scale_x, np.abs(zz - s.z) / s.scale_z)
+            else:
+                r_full = np.hypot(xx - s.x, zz - s.z) / s.scale_x
+            within = r_full <= 1.0
             if not within.any():
                 continue
-            r_norm = np.clip(dist[within] / s.radius, 0.0, 1.0)
+            r_norm = r_full[within]
             weight = _kernel_for(s.brush).sample_many(r_norm)
 
             sub_view = influence[row_min:row_max, col_min:col_max]

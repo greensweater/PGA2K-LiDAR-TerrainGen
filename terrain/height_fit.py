@@ -96,20 +96,33 @@ def fit_stamp_heights(
     -- left for a later pass to handle.
     """
     kernels: dict[int, TerrainKernel] = {}
-    fitted: list[Stamp] = list(existing_stamps)
-    n_seed = len(fitted)
+    n_seed = len(existing_stamps)
 
-    for stamp in stamps:
+    # Stamp positions are fixed for the whole call -- only their
+    # values get filled in as we go -- so the KD-tree only needs
+    # building once, not once per stamp. Each stamp's fitted value is
+    # patched into model.stamps in place as soon as it's known;
+    # max_stamp_index on evaluate() keeps a stamp's own "current"
+    # height from folding in later stamps that haven't been fitted
+    # yet (still holding their placeholder value).
+    model = TerrainModel(list(existing_stamps) + list(stamps))
+
+    for offset, stamp in enumerate(stamps):
+        index = n_seed + offset
         if stamp.brush not in kernels:
             if stamp.brush not in BRUSH_PROFILES:
                 raise ValueError(f"No BrushProfile registered for brush type {stamp.brush}")
             kernels[stamp.brush] = TerrainKernel(BRUSH_PROFILES[stamp.brush])
 
+        # sample_heightmap_mean does a single-radius circular average --
+        # only ever called against hex-grid stamps here (see this
+        # module's docstring), which are always isotropic
+        # (scale_x == scale_z), so max() is exact, not just a bound.
         target = sample_heightmap_mean(
-            heights, bounds, stamp.x, stamp.z, stamp.radius, min_valid_cells=min_valid_cells,
+            heights, bounds, stamp.x, stamp.z, max(stamp.scale_x, stamp.scale_z),
+            min_valid_cells=min_valid_cells,
         )
         if target is None:
-            fitted.append(stamp)
             continue
 
         weight_at_center = kernels[stamp.brush].sample(0.0)
@@ -117,14 +130,13 @@ def fit_stamp_heights(
             # No registered brush should hit this (every profile has a
             # nonzero center weight), but guard against div-by-zero
             # rather than producing an inf/nan value.
-            fitted.append(stamp)
             continue
 
-        current = TerrainModel(fitted).evaluate(stamp.x, stamp.z)
+        current = model.evaluate(stamp.x, stamp.z, max_stamp_index=index)
         if stamp.tool == TOOL_RAISE:
             value = (target - current) / weight_at_center
         else:
             value = current + (target - current) / weight_at_center
-        fitted.append(replace(stamp, value=value))
+        model.stamps[index] = replace(stamp, value=value)
 
-    return fitted[n_seed:]
+    return model.stamps[n_seed:]

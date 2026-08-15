@@ -86,29 +86,44 @@ class TerrainModel:
 
     @staticmethod
     def _euclidean_reach(stamp: Stamp) -> float:
-        """Furthest Euclidean distance from center this stamp can affect -- radius for circular, radius*sqrt(2) for square (its corners)."""
+        """
+        Furthest Euclidean distance from center this stamp can affect --
+        scale_x (== scale_z, by construction -- see terrain/stamp.py) for
+        circular stamps, hypot(scale_x, scale_z) for square/rectangular
+        ones (their corners).
+        """
         profile = BRUSH_PROFILES.get(stamp.brush)
         if profile is not None and profile.shape == SHAPE_SQUARE:
-            return stamp.radius * math.sqrt(2.0)
-        return stamp.radius
+            return math.hypot(stamp.scale_x, stamp.scale_z)
+        return stamp.scale_x
 
-    def _affecting_stamp_indices(self, x: float, z: float) -> np.ndarray:
+    def _affecting_stamp_indices(self, x: float, z: float, max_index: Optional[int] = None) -> np.ndarray:
         """
         Indices of stamps whose radius reaches (x, z), sorted ascending.
 
         Ascending index order recovers original list order (the
         placement/application order), which matters here since pulls
         must be replayed in that order, not summed unordered.
+
+        max_index, if given, drops any index >= it -- lets a caller
+        that's still fitting values into the tail of self.stamps (see
+        height_fit.py) query against only the prefix that already has
+        real (non-placeholder) values, without needing a separate
+        TerrainModel over just that prefix.
         """
         if self._tree is None:
             return np.empty(0, dtype=np.int64)
         idx = np.asarray(
             self._tree.query_ball_point([x, z], self._max_radius), dtype=np.int64
         )
+        if max_index is not None:
+            idx = idx[idx < max_index]
         idx.sort()
         return idx
 
-    def evaluate(self, x: float, z: float, start_height: float = 0.0) -> float:
+    def evaluate(
+        self, x: float, z: float, start_height: float = 0.0, max_stamp_index: Optional[int] = None,
+    ) -> float:
         """
         Predicted terrain height at a single (x, z), in meters.
 
@@ -118,25 +133,29 @@ class TerrainModel:
         within one find_error_hotspots pass) be folded on top of this
         model's own result, without needing to rebuild this model's
         (potentially large) KD-tree to include those newer stamps too.
+
+        max_stamp_index, if given, is forwarded to
+        _affecting_stamp_indices (see there).
         """
         height = start_height
-        for i in self._affecting_stamp_indices(x, z):
+        for i in self._affecting_stamp_indices(x, z, max_index=max_stamp_index):
             stamp = self.stamps[i]
             dx = x - stamp.x
             dz = z - stamp.z
             profile = BRUSH_PROFILES.get(stamp.brush)
             if profile is not None and profile.shape == SHAPE_SQUARE:
-                # Square footprint, axis-aligned (rotation=0 only --
-                # see terrain/stamp.py): Chebyshev/L-infinity distance,
-                # not Euclidean. A rotated square would need dx/dz
-                # rotated into the stamp's local frame first; not
-                # supported yet since nothing uses rotation != 0.
-                dist = max(abs(dx), abs(dz))
+                # Axis-aligned rectangle (rotation=0 only -- see
+                # terrain/stamp.py): per-axis normalized Chebyshev/
+                # L-infinity distance, not Euclidean. A rotated
+                # rectangle would need dx/dz rotated into the stamp's
+                # local frame first; not supported yet since nothing
+                # uses rotation != 0.
+                r = max(abs(dx) / stamp.scale_x, abs(dz) / stamp.scale_z)
             else:
                 dist = (dx * dx + dz * dz) ** 0.5
-            if dist > stamp.radius:
+                r = dist / stamp.scale_x
+            if r > 1.0:
                 continue
-            r = dist / stamp.radius
             weight = self._kernels[stamp.brush].sample(r)
             if stamp.tool == TOOL_RAISE:
                 height += stamp.value * weight
@@ -208,15 +227,16 @@ class TerrainModel:
             dz = pz - stamp.z
             profile = BRUSH_PROFILES.get(stamp.brush)
             if profile is not None and profile.shape == SHAPE_SQUARE:
-                dist = np.maximum(np.abs(dx), np.abs(dz))
+                r_full = np.maximum(np.abs(dx) / stamp.scale_x, np.abs(dz) / stamp.scale_z)
             else:
                 dist = np.hypot(dx, dz)
+                r_full = dist / stamp.scale_x
 
-            mask = dist <= stamp.radius
+            mask = r_full <= 1.0
             if not np.any(mask):
                 continue
 
-            r = dist[mask] / stamp.radius
+            r = r_full[mask]
             weight = self._kernels[stamp.brush].sample_many(r)
             if stamp.tool == TOOL_RAISE:
                 heights[mask] += stamp.value * weight
@@ -276,18 +296,18 @@ class TerrainModel:
         for stamp in self.stamps:
             profile = BRUSH_PROFILES.get(stamp.brush)
             is_square = profile is not None and profile.shape == SHAPE_SQUARE
-            # Bounding box uses the stamp's full Euclidean reach (radius
-            # for circles, radius*sqrt(2) for squares' corners) -- the
-            # exact per-cell shape test below (Chebyshev vs Euclidean
-            # distance) is what actually decides inclusion; this box
-            # only needs to be a safe superset, same principle as
-            # TerrainModel._euclidean_reach for the KD-tree case.
-            reach = stamp.radius * math.sqrt(2.0) if is_square else stamp.radius
+            # Bounding box: for a rectangle (is_square) the true reach is
+            # exactly (scale_x, scale_z) independently per axis -- no
+            # diagonal needed, since the Chebyshev-per-axis test below is
+            # already an axis-aligned box, not a corner-Euclidean shape.
+            # For circles both axes use the same scale_x (== scale_z).
+            reach_x = stamp.scale_x
+            reach_z = stamp.scale_z if is_square else stamp.scale_x
 
-            col_min = max(0, int((stamp.x - reach - bounds.min_x) / cell_size_x))
-            col_max = min(resolution, int((stamp.x + reach - bounds.min_x) / cell_size_x) + 1)
-            row_min = max(0, int((stamp.z - reach - bounds.min_z) / cell_size_z))
-            row_max = min(resolution, int((stamp.z + reach - bounds.min_z) / cell_size_z) + 1)
+            col_min = max(0, int((stamp.x - reach_x - bounds.min_x) / cell_size_x))
+            col_max = min(resolution, int((stamp.x + reach_x - bounds.min_x) / cell_size_x) + 1)
+            row_min = max(0, int((stamp.z - reach_z - bounds.min_z) / cell_size_z))
+            row_max = min(resolution, int((stamp.z + reach_z - bounds.min_z) / cell_size_z) + 1)
             if col_min >= col_max or row_min >= row_max:
                 continue
 
@@ -296,12 +316,13 @@ class TerrainModel:
             xx, zz = np.meshgrid(sub_x, sub_z)
             dx = xx - stamp.x
             dz = zz - stamp.z
-            dist = np.maximum(np.abs(dx), np.abs(dz)) if is_square else np.hypot(dx, dz)
+            dist = np.maximum(np.abs(dx) / stamp.scale_x, np.abs(dz) / stamp.scale_z) if is_square \
+                else np.hypot(dx, dz) / stamp.scale_x
 
-            mask = dist <= stamp.radius
+            mask = dist <= 1.0
             if not np.any(mask):
                 continue
-            r = dist[mask] / stamp.radius
+            r = dist[mask]
             weight = self._kernels[stamp.brush].sample_many(r)
 
             sub_accum = accum[row_min:row_max, col_min:col_max]

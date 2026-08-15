@@ -186,10 +186,10 @@ def composite_stamps_to_canvas(
             # Stubbed in, not yet applied -- see docstring.
             pass
 
-        col_min = max(0, int((stamp.x - stamp.radius - bounds.min_x) / cell_size_x))
-        col_max = min(resolution, int((stamp.x + stamp.radius - bounds.min_x) / cell_size_x) + 1)
-        row_min = max(0, int((stamp.z - stamp.radius - bounds.min_z) / cell_size_z))
-        row_max = min(resolution, int((stamp.z + stamp.radius - bounds.min_z) / cell_size_z) + 1)
+        col_min = max(0, int((stamp.x - stamp.scale_x - bounds.min_x) / cell_size_x))
+        col_max = min(resolution, int((stamp.x + stamp.scale_x - bounds.min_x) / cell_size_x) + 1)
+        row_min = max(0, int((stamp.z - stamp.scale_z - bounds.min_z) / cell_size_z))
+        row_max = min(resolution, int((stamp.z + stamp.scale_z - bounds.min_z) / cell_size_z) + 1)
         if col_min >= col_max or row_min >= row_max:
             continue  # entirely off-canvas
 
@@ -198,9 +198,11 @@ def composite_stamps_to_canvas(
         xx, zz = np.meshgrid(sub_x, sub_z)  # shape (n_rows, n_cols)
 
         # Normalized offset from stamp center, in [-1, 1] across the
-        # stamp's own radius.
-        nx = (xx - stamp.x) / stamp.radius
-        nz = (zz - stamp.z) / stamp.radius
+        # stamp's own scale -- independent per axis, so a rectangular
+        # (scale_x != scale_z) stamp samples the brush image stretched
+        # to fit, same as the game's own per-axis scale.x/scale.z.
+        nx = (xx - stamp.x) / stamp.scale_x
+        nz = (zz - stamp.z) / stamp.scale_z
 
         # Map into the brush image's own pixel coordinates.
         brush_rows = brush_center_px + nz * brush_radius_px

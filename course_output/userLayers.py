@@ -42,7 +42,7 @@ Field mapping from Stamp -> one entry in the "height" array:
     orientation / _orientation -- both set to stamp.rotation (degrees).
                 Duplicated because the schema carries the same value
                 under two different keys.
-    scale    -- {x: stamp.radius, y: 1.0, z: stamp.radius}. Scale, not
+    scale    -- {x: stamp.scale_x, y: 1.0, z: stamp.scale_z}. Scale, not
                 the separate "radius" field, is what actually sizes a
                 landscape stamp; radius stays 0.0 (see below).
     type     -- stamp.brush (the brush id, e.g. 8 / 9 / 10 / 54)
@@ -171,7 +171,7 @@ def build_registration_mark_stamps(course_size_m: float) -> list[Stamp]:
     """
     return [
         Stamp(
-            x=x, z=z, radius=REGISTRATION_MARK_STAMP_RADIUS_M,
+            x=x, z=z, scale_x=REGISTRATION_MARK_STAMP_RADIUS_M, scale_z=REGISTRATION_MARK_STAMP_RADIUS_M,
             value=REGISTRATION_MARK_STAMP_HEIGHT_M, brush=REGISTRATION_MARK_TYPE_73_CIRCLE,
             tool=TOOL_RAISE,
         )
@@ -205,7 +205,8 @@ def build_course_wide_stamp(bounds: BoundingBox, value: float, tool: int) -> Sta
     return Stamp(
         x=(bounds.min_x + bounds.max_x) / 2.0,
         z=(bounds.min_z + bounds.max_z) / 2.0,
-        radius=half_width + margin,
+        scale_x=half_width + margin,
+        scale_z=half_width + margin,
         value=value,
         brush=72,
         tool=tool,
@@ -311,7 +312,6 @@ def normalize_stamp_heights(
 def stamp_to_entry(stamp: Stamp) -> dict:
     """Convert a single Stamp into one "height" array entry."""
     orientation = _round(stamp.rotation)
-    radius = _round(stamp.radius)
     return {
         "tool": stamp.tool,
         "position": {
@@ -322,9 +322,9 @@ def stamp_to_entry(stamp: Stamp) -> dict:
         "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
         "_orientation": orientation,
         "scale": {
-            "x": radius,
+            "x": _round(stamp.scale_x),
             "y": 1.0,
-            "z": radius,
+            "z": _round(stamp.scale_z),
         },
         "type": stamp.brush,
         "value": _round(stamp.value),

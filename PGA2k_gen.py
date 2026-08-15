@@ -65,7 +65,6 @@ from pathlib import Path
 import numpy as np
 import pyproj
 from shapely.ops import unary_union
-import shapely.vectorized
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -120,14 +119,23 @@ from terrain.adaptive_refine import (
 )
 from terrain.bounding_box import BoundingBox
 from terrain.height_fit import fit_stamp_heights
-from terrain.hexgrid import HEX_LATTICE_PITCH_M, generate_hex_grid
+from terrain.hexgrid import (
+    DEFAULT_BRUSH as HEX_DEFAULT_BRUSH,
+    HEX_DEFAULT_SPREAD_RATIO,
+    HEX_LATTICE_PITCH_M,
+    generate_hex_grid,
+)
 from terrain.contour_layers import (
     DEFAULT_BAND_SPACING_M,
+    DEFAULT_FILL_MODE,
     DEFAULT_FILL_BRUSH,
     DEFAULT_MIN_RADIUS_M,
     DEFAULT_MAX_RADIUS_M,
     DEFAULT_RADIUS_STEP_RATIO,
     DEFAULT_EDGE_DISTANCE_M,
+    DEFAULT_RECT_BRUSH,
+    DEFAULT_RECT_MIN_SIDE_M,
+    DEFAULT_RECT_SIZE_RATIO_CAP,
     DEFAULT_SMOOTHING_BRUSH,
     DEFAULT_SMOOTHING_MIN_RADIUS_M,
     DEFAULT_CRUMB_SCATTER_MULTIPLIER,
@@ -142,7 +150,7 @@ from terrain.contour_layers import (
     DEFAULT_N_WORKERS,
     generate_contour_layers,
 )
-from terrain.stamp import Stamp
+from terrain.stamp import TOOL_FLATTEN, TOOL_RAISE, Stamp
 from terrain.cart_paths import (
     CART_PATH_STAMP_TYPE, CART_PATH_STAMP_RADIUS, CART_PATH_SPACING_M,
     CART_PATH_HEIGHT_AVG_RADIUS_M, CartPathSpline, bezier_waypoints_to_linestring,
@@ -275,11 +283,27 @@ def save_stamp_file(
         json.dump(payload, f, indent=2)
 
 
+def _migrate_stamp_entry(entry: dict) -> dict:
+    """
+    Stamp.radius was replaced by independent scale_x/scale_z (see
+    terrain/stamp.py) -- stamps_N.json files saved before that change
+    still have "radius" instead. Every stamp this compiler has ever
+    written was isotropic (scale_x == scale_z) at save time, so this
+    is a lossless, not approximate, migration.
+    """
+    if "radius" in entry and "scale_x" not in entry:
+        entry = dict(entry)
+        radius = entry.pop("radius")
+        entry["scale_x"] = radius
+        entry["scale_z"] = radius
+    return entry
+
+
 def load_stamp_file(path: Path) -> tuple[list[Stamp], dict]:
     """Returns (stamps, metadata) -- metadata is everything in the file except "stamps" itself."""
     with path.open() as f:
         payload = json.load(f)
-    stamps = [Stamp(**entry) for entry in payload["stamps"]]
+    stamps = [Stamp(**_migrate_stamp_entry(entry)) for entry in payload["stamps"]]
     metadata = {k: v for k, v in payload.items() if k != "stamps"}
     return stamps, metadata
 
@@ -432,6 +456,9 @@ def step_visualize(
                 f"generate: method={p.get('method')} pitch={p.get('pitch_m')} "
                 f"band_spacing={p.get('band_spacing_m')}"
             )
+            if p.get("method") == "hex":
+                tool_name = "raise" if p.get("hex_tool") == 1 else "flatten"
+                extra_label += f" hex_brush={p.get('hex_brush')} hex_tool={tool_name}"
         elif step_name == "generate-cart-paths":
             extra_label = (
                 f"cart-paths: stamp_radius={p.get('stamp_radius_m')} spacing={p.get('spacing_m')}"
@@ -443,8 +470,26 @@ def step_visualize(
             extra_label += f" mask=on{buffer_note}"
             mask_path = working_dir / HEIGHT_MASK_FILE
             if mask_path.exists():
+                # Rasterized at error_resolution (resolved here, once,
+                # rather than at render_error_preview's own call site
+                # below) -- mask_grid is only ever actually consumed by
+                # render_error_preview, which requires it to match the
+                # `error` array's own shape exactly (both index the same
+                # resolution x resolution grid). Previously rasterized at
+                # p.get("resolution", DEFAULT_RESOLUTION) instead -- a key
+                # only refine-terrain's saved parameters ever have, so a
+                # generate-terrain layer always fell back to
+                # DEFAULT_RESOLUTION regardless of what error_resolution
+                # (explicitly passed, or refine-terrain's own inherited
+                # value) actually was, a real shape-mismatch bug confirmed
+                # directly: a 1000x1000 error grid against a 200x200 mask.
+                if error_resolution is None:
+                    error_resolution = (
+                        latest_layer["parameters"].get("resolution", 200)
+                        if latest_layer is not None else 200
+                    )
                 mask_geometry = load_height_mask(mask_path)
-                mask_grid = rasterize_mask(mask_geometry, bounds, p.get("resolution", DEFAULT_RESOLUTION))
+                mask_grid = rasterize_mask(mask_geometry, bounds, error_resolution)
 
     if overwrite_current_version:
         _overwrite_latest(PREVIEW_HEX)
@@ -1306,17 +1351,25 @@ def step_dig_water(
 def step_generate_terrain(
     working_dir: Path,
     pitch: float | None = None,
+    hex_spread_ratio: float | None = None,
     method: str | None = None,
+    hex_brush: int | None = None,
+    hex_tool: int | None = None,
     band_spacing_m: float | None = None,
+    fill_mode: str | None = None,
     fill_brush: int | None = None,
     min_radius: float | None = None,
     max_radius: float | None = None,
     radius_step_ratio: float | None = None,
     edge_distance_m: float | None = None,
+    rect_brush: int | None = None,
+    rect_min_side_m: float | None = None,
+    rect_size_ratio_cap: float | None = None,
     smoothing_brush: int | None = None,
     smoothing_min_radius: float | None = None,
     smooth_ratio: float | None = None,
     smooth_claim_fraction: float | None = None,
+    enable_secondary_fill: bool | None = None,
     candidates_per_radius: int | None = None,
     sweet_spot_ratio: float | None = None,
     sweet_spot_sample_bands: int | None = None,
@@ -1334,15 +1387,22 @@ def step_generate_terrain(
     pitch (feature-flagged via project.json, same None-means-use-saved
     pattern used throughout this file) is terrain/hexgrid.py's
     HEX_LATTICE_PITCH_M, exposed here rather than hardcoded -- controls
-    the spacing of the initial coarse hex-grid stamp lattice (smaller
-    pitch = more, smaller, more tightly-packed initial stamps). Stamp
-    radius and edge bleed both derive from pitch using the exact same
-    ratios hexgrid.py's own module-level constants encode (radius =
-    2*pitch, bleed = radius/2 = pitch) -- generate_hex_grid() itself
-    only defaults those two to the ORIGINAL fixed pitch's values (Python
+    the spacing (i.e. the lattice CENTERS) of the initial coarse hex-grid
+    stamp lattice (smaller pitch = more, smaller, more tightly-packed
+    initial stamps). Edge bleed derives from pitch alone (bleed = pitch,
+    a center-geometry fact -- see terrain/hexgrid.py's module docstring)
+    and is unaffected by hex_spread_ratio below.
+
+    hex_spread_ratio (same None-means-use-saved pattern) independently
+    scales stamp RADIUS without moving any lattice center: stamp_radius
+    = 2*pitch*hex_spread_ratio. Default 1.0 reproduces the original
+    fixed radius = 2*pitch (each stamp reaches exactly to its nearest
+    neighbors' centers). generate_hex_grid() itself only defaults
+    stamp_radius/bleed to the ORIGINAL fixed pitch's values (Python
     default arguments are evaluated once, not re-derived from whatever
-    `pitch` is actually passed), so both are computed explicitly here
-    for whatever pitch is in play, not left to fall back silently.
+    `pitch`/`hex_spread_ratio` are actually passed), so both are
+    computed explicitly here for whatever pitch/spread are in play, not
+    left to fall back silently.
 
     method ("hex", default, or "contour") picks the initial-layout
     generator: "hex" is the flat lattice above; "contour" is terrain/
@@ -1355,6 +1415,27 @@ def step_generate_terrain(
     complete by construction even though pass 1 trades a per-call
     guarantee for speed. Only "hex"'s parameters (pitch) apply in "hex"
     mode and vice versa for the contour_* parameters below.
+
+    enable_secondary_fill (contour method only, default True) turns
+    pass 2 off entirely when False -- whatever pass 1 leaves as crumbs
+    stays unfilled, so coverage is no longer complete. Trades that
+    guarantee for speed, e.g. for a quick look at pass 1's own plateau
+    shape.
+
+    fill_mode ("poisson", default, or "rect") only applies within
+    method="contour" -- it picks terrain/contour_layers.py's own
+    per-band fill algorithm: "poisson" is the two-pass circle fill
+    above; "rect" instead fills each band with axis-aligned type-72
+    rectangles (see generate_contour_layers' and contour_layers.py's
+    own docstrings, module section RECT FILL MODE, for the full
+    design). Everything else about method="contour" -- band_spacing_m,
+    the per-band loop, n_workers parallelization, layering behavior --
+    is identical between the two; only the shape of what fills one
+    band's own mask differs. fill_brush/min_radius/max_radius/
+    radius_step_ratio/edge_distance_m/candidates_per_radius and the
+    sweet-spot auto-tuning knobs apply to fill_mode="poisson" only;
+    rect_brush/rect_min_side_m/rect_size_ratio_cap apply to
+    fill_mode="rect" only.
 
     Unlike hex mode, contour mode's stamps already carry their exact
     fitted value (the local heightmap mean within each stamp's own
@@ -1389,10 +1470,18 @@ def step_generate_terrain(
     use_height_mask/mask_buffer_px follow the exact same pattern
     step_refine_terrain uses: use_height_mask restricts this layer to
     inside height_mask.geojson (fairway/green/tee + buffered hole-path
-    corridors, see ingest-osm) -- stamps whose center falls outside it
-    are dropped from THIS layer's output before it's written (the
-    course-wide baseline-flatten stamp below is never masked -- it's
-    a separate, always-on safety net, not part of the masked fill).
+    corridors, see ingest-osm). Unlike step_refine_terrain, restriction
+    happens BEFORE generation, not as a filter on the output -- contour
+    mode ANDs a rasterized mask into every band's own footprint before
+    the poisson-pack/crumb-scatter search runs (see
+    generate_contour_layers' region_mask), and hex mode tests each
+    lattice candidate against the mask polygon before ever constructing
+    a Stamp (see generate_hex_grid's mask_geometry) -- so a masked pass
+    over a small fraction of the course does proportionally less work,
+    not the same full-course work followed by discarding most of it
+    (the course-wide baseline-flatten stamp below, when added at all, is
+    never masked -- it's a safety net for the very first contour-mode
+    layer only, not part of the masked fill).
     mask_buffer_px is record-keeping only (shows up in preview titles
     and stamp-file metadata) -- the mask itself is already baked into
     height_mask.geojson at ingest-osm time, not rebuilt here. This is
@@ -1441,8 +1530,28 @@ def step_generate_terrain(
     project = load_project(working_dir)
     if pitch is None:
         pitch = project.get("generate_terrain_pitch_m", HEX_LATTICE_PITCH_M)
+    if hex_spread_ratio is None:
+        hex_spread_ratio = project.get(
+            "generate_terrain_hex_spread_ratio", HEX_DEFAULT_SPREAD_RATIO
+        )
+    if hex_brush is None:
+        hex_brush = project.get("generate_terrain_hex_brush", HEX_DEFAULT_BRUSH)
+    if hex_tool is None:
+        hex_tool = project.get("generate_terrain_hex_tool", TOOL_FLATTEN)
     if band_spacing_m is None:
         band_spacing_m = project.get("generate_terrain_band_spacing_m", DEFAULT_BAND_SPACING_M)
+    if fill_mode is None:
+        fill_mode = project.get("generate_terrain_fill_mode", DEFAULT_FILL_MODE)
+    if fill_mode not in ("poisson", "rect"):
+        raise StepError(f"fill_mode must be 'poisson' or 'rect', got {fill_mode!r}")
+    if rect_brush is None:
+        rect_brush = project.get("generate_terrain_rect_brush", DEFAULT_RECT_BRUSH)
+    if rect_min_side_m is None:
+        rect_min_side_m = project.get("generate_terrain_rect_min_side_m", DEFAULT_RECT_MIN_SIDE_M)
+    if rect_size_ratio_cap is None:
+        rect_size_ratio_cap = project.get(
+            "generate_terrain_rect_size_ratio_cap", DEFAULT_RECT_SIZE_RATIO_CAP
+        )
     if fill_brush is None:
         fill_brush = project.get("generate_terrain_fill_brush", DEFAULT_FILL_BRUSH)
     if min_radius is None:
@@ -1465,6 +1574,8 @@ def step_generate_terrain(
         smooth_claim_fraction = project.get(
             "generate_terrain_smooth_claim_fraction", DEFAULT_SMOOTH_CLAIM_FRACTION
         )
+    if enable_secondary_fill is None:
+        enable_secondary_fill = project.get("generate_terrain_enable_secondary_fill", True)
     if candidates_per_radius is None:
         # Unlike every other knob here, NOT resolved to a fixed default
         # if absent from project.json -- staying None means
@@ -1516,11 +1627,44 @@ def step_generate_terrain(
         raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
     heightmap, _ = load_heightmap(heightmap_path)
 
+    mask_geometry = None
+    region_mask = None
+    if use_height_mask:
+        mask_path = working_dir / HEIGHT_MASK_FILE
+        if not mask_path.exists():
+            raise StepError(
+                f"use_height_mask is on but no {HEIGHT_MASK_FILE} found under {working_dir}. "
+                "Run --step ingest-osm first."
+            )
+        mask_geometry = load_height_mask(mask_path)
+        if mask_geometry is None:
+            print(f"  use_height_mask is on but {HEIGHT_MASK_FILE} has no geometry -- nothing to "
+                  "mask, generating across the whole course")
+        elif method == "contour":
+            # Rasterized at the heightmap's own resolution so cells align
+            # 1:1 with _band_mask's array inside generate_contour_layers --
+            # restricts each band's fill footprint BEFORE the expensive
+            # poisson pack/crumb scatter runs, not after.
+            region_mask = rasterize_mask(mask_geometry, bounds, resolution=heightmap.shape[0])
+            print(f"  height mask restricts this layer to {region_mask.mean():.1%} of the course "
+                  "(cropped before filling, not filtered after)")
+        else:
+            print(f"  height mask restricts this layer's hex lattice to inside "
+                  f"{HEIGHT_MASK_FILE} (stamps outside it are never generated)")
+
     if method == "contour":
-        print(f"Two-pass poisson band fill (band_spacing_m={band_spacing_m}, "
-              f"pass1_radius=[{min_radius}, {max_radius}] m, step_ratio={radius_step_ratio}, "
-              f"pass2_radius={smoothing_min_radius * smooth_ratio} m, "
-              f"candidates_per_radius={'auto-tuning...' if candidates_per_radius is None else candidates_per_radius})...")
+        if fill_mode == "rect":
+            print(f"Rect band fill (band_spacing_m={band_spacing_m}, rect_brush={rect_brush}, "
+                  f"rect_min_side_m={rect_min_side_m}, rect_size_ratio_cap={rect_size_ratio_cap}, "
+                  f"pass2_radius={smoothing_min_radius * smooth_ratio} m)...")
+        else:
+            print(f"Two-pass poisson band fill (band_spacing_m={band_spacing_m}, "
+                  f"pass1_radius=[{min_radius}, {max_radius}] m, step_ratio={radius_step_ratio}, "
+                  f"pass2_radius={smoothing_min_radius * smooth_ratio} m, "
+                  f"candidates_per_radius={'auto-tuning...' if candidates_per_radius is None else candidates_per_radius})...")
+        if not enable_secondary_fill:
+            print("  enable_secondary_fill is OFF -- pass 2 crumb cleanup is skipped, so coverage "
+                  "will NOT be complete (whatever pass 1 leaves as crumbs stays unfilled)")
         if max_stamps is not None:
             print(f"  max_stamps={max_stamps} -- PARTIAL PREVIEW RUN, not a real generation: "
                   "bands fill ascending by elevation, so this will stop somewhere on the low-"
@@ -1541,15 +1685,20 @@ def step_generate_terrain(
         fitted = generate_contour_layers(
             heightmap, bounds,
             band_spacing_m=band_spacing_m,
+            fill_mode=fill_mode,
             fill_brush=fill_brush,
             min_radius=min_radius,
             max_radius=max_radius,
             radius_step_ratio=radius_step_ratio,
             edge_distance_m=edge_distance_m,
+            rect_brush=rect_brush,
+            rect_min_side_m=rect_min_side_m,
+            rect_size_ratio_cap=rect_size_ratio_cap,
             smoothing_brush=smoothing_brush,
             smoothing_min_radius=smoothing_min_radius,
             smooth_ratio=smooth_ratio,
             smooth_claim_fraction=smooth_claim_fraction,
+            enable_secondary_fill=enable_secondary_fill,
             candidates_per_radius=candidates_per_radius,
             sweet_spot_ratio=sweet_spot_ratio,
             sweet_spot_sample_bands=sweet_spot_sample_bands,
@@ -1562,6 +1711,7 @@ def step_generate_terrain(
             n_workers=n_workers,
             progress_callback=_print_contour_progress,
             on_candidates_tuned=_print_auto_tuned_candidates,
+            region_mask=region_mask,
         )
         if max_stamps is not None and len(fitted) >= max_stamps:
             print(f"  {len(fitted)} stamps placed -- STOPPED at max_stamps={max_stamps}, "
@@ -1570,10 +1720,15 @@ def step_generate_terrain(
             print(f"  {len(fitted)} stamps placed (tiered band fill + crumb smoothing, all already fitted)")
 
     else:
-        stamp_radius = 2.0 * pitch
-        bleed = stamp_radius / 2.0
-        print(f"Generating hex grid (pitch={pitch} m, stamp_radius={stamp_radius} m, bleed={bleed} m)...")
-        stamps = generate_hex_grid(bounds, pitch=pitch, stamp_radius=stamp_radius, bleed=bleed)
+        stamp_radius = 2.0 * pitch * hex_spread_ratio
+        bleed = pitch
+        print(f"Generating hex grid (pitch={pitch} m, spread_ratio={hex_spread_ratio}, "
+              f"stamp_radius={stamp_radius} m, bleed={bleed} m, "
+              f"brush={hex_brush}, tool={'raise' if hex_tool == TOOL_RAISE else 'flatten'})...")
+        stamps = generate_hex_grid(
+            bounds, pitch=pitch, stamp_radius=stamp_radius, brush=hex_brush, tool=hex_tool,
+            bleed=bleed, mask_geometry=mask_geometry,
+        )
         print(f"  {len(stamps)} stamps placed")
 
         print("Fitting stamp heights from the rasterized ground heightmap...")
@@ -1583,38 +1738,31 @@ def step_generate_terrain(
             print(f"  WARNING: {n_unfitted} stamps had too few nearby heightmap cells and kept "
                   "their placeholder value=0.0")
 
-    if use_height_mask:
-        mask_path = working_dir / HEIGHT_MASK_FILE
-        if not mask_path.exists():
-            raise StepError(
-                f"use_height_mask is on but no {HEIGHT_MASK_FILE} found under {working_dir}. "
-                "Run --step ingest-osm first."
-            )
-        mask_geometry = load_height_mask(mask_path)
-        if mask_geometry is not None:
-            xs = np.array([s.x for s in fitted])
-            zs = np.array([s.z for s in fitted])
-            inside = shapely.vectorized.contains(mask_geometry, xs, zs)
-            n_dropped = int((~inside).sum())
-            fitted = [s for s, keep in zip(fitted, inside) if keep]
-            print(f"  height mask restricts this layer to inside height_mask.geojson -- "
-                  f"kept {len(fitted)}, dropped {n_dropped} stamps centered outside it")
-        else:
-            print(f"  use_height_mask is on but {HEIGHT_MASK_FILE} has no geometry -- nothing to "
-                  "mask, keeping every stamp")
-
-    mean_elevation = float(np.nanmean(heightmap))
-    print(f"Prepending a course-wide baseline-flatten stamp at the mean ground "
-          f"elevation ({mean_elevation:.2f} m)...")
-    baseline_stamp = build_baseline_flatten_stamp(bounds, mean_elevation)
-    fitted = [baseline_stamp] + fitted
-
     next_n = len(_stamps_files(working_dir)) + 1
+    if method == "contour" and next_n == 1:
+        mean_elevation = float(np.nanmean(heightmap))
+        print(f"Prepending a course-wide baseline-flatten stamp at the mean ground "
+              f"elevation ({mean_elevation:.2f} m)...")
+        baseline_stamp = build_baseline_flatten_stamp(bounds, mean_elevation)
+        fitted = [baseline_stamp] + fitted
+    elif method == "hex":
+        print("Skipping the course-wide baseline-flatten stamp -- hex mode's lattice "
+              "already has full coverage on its own.")
+    else:
+        print(f"Skipping the course-wide baseline-flatten stamp -- this is layer "
+              f"{next_n}, not the first, so prior layers already cover the course "
+              "(re-adding it would flatten them back to mean elevation).")
+
     out_path = _stamps_dir(working_dir) / STAMPS_PATTERN.format(n=next_n)
     save_stamp_file(
         fitted, out_path, step="generate-terrain",
-        parameters={"course_size_m": COURSE_SIZE_M, "pitch_m": pitch, "method": method,
-                     "band_spacing_m": band_spacing_m, "use_height_mask": use_height_mask,
+        parameters={"course_size_m": COURSE_SIZE_M, "pitch_m": pitch,
+                     "hex_spread_ratio": hex_spread_ratio, "method": method,
+                     "hex_brush": hex_brush, "hex_tool": hex_tool,
+                     "band_spacing_m": band_spacing_m, "fill_mode": fill_mode,
+                     "rect_brush": rect_brush, "rect_min_side_m": rect_min_side_m,
+                     "rect_size_ratio_cap": rect_size_ratio_cap,
+                     "use_height_mask": use_height_mask,
                      "mask_buffer_px": mask_buffer_px},
     )
     print(f"  wrote {out_path}")
@@ -1624,17 +1772,25 @@ def step_generate_terrain(
         "course_origin_y": course_cloud.origin_y,
         "stamp_count": len(fitted),
         "generate_terrain_pitch_m": pitch,
+        "generate_terrain_hex_spread_ratio": hex_spread_ratio,
         "generate_terrain_method": method,
+        "generate_terrain_hex_brush": hex_brush,
+        "generate_terrain_hex_tool": hex_tool,
         "generate_terrain_band_spacing_m": band_spacing_m,
+        "generate_terrain_fill_mode": fill_mode,
         "generate_terrain_fill_brush": fill_brush,
         "generate_terrain_min_radius_m": min_radius,
         "generate_terrain_max_radius_m": max_radius,
         "generate_terrain_radius_step_ratio": radius_step_ratio,
         "generate_terrain_edge_distance_m": edge_distance_m,
+        "generate_terrain_rect_brush": rect_brush,
+        "generate_terrain_rect_min_side_m": rect_min_side_m,
+        "generate_terrain_rect_size_ratio_cap": rect_size_ratio_cap,
         "generate_terrain_smoothing_brush": smoothing_brush,
         "generate_terrain_smoothing_min_radius_m": smoothing_min_radius,
         "generate_terrain_smooth_ratio": smooth_ratio,
         "generate_terrain_smooth_claim_fraction": smooth_claim_fraction,
+        "generate_terrain_enable_secondary_fill": enable_secondary_fill,
         "generate_terrain_candidates_per_radius": candidates_per_radius,
         "generate_terrain_sweet_spot_ratio": sweet_spot_ratio,
         "generate_terrain_sweet_spot_sample_bands": sweet_spot_sample_bands,
@@ -2383,11 +2539,21 @@ def main(argv: list[str] | None = None) -> int:
                               "from error scoring/fitting downstream (old behavior).")
     parser.add_argument("--pitch", type=float, default=None,
                          help="generate-terrain, hex method only: spacing (m) of the initial coarse "
-                              "hex-grid stamp lattice (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- "
-                              "smaller pitch means more, smaller, more tightly-packed initial stamps. "
-                              "Stamp radius and edge bleed both derive from this automatically "
-                              "(radius=2*pitch, bleed=pitch). Default: use whatever's saved in "
-                              f"project.json, or {HEX_LATTICE_PITCH_M} if never set.")
+                              "hex-grid stamp lattice CENTERS (terrain/hexgrid.py's "
+                              "HEX_LATTICE_PITCH_M) -- smaller pitch means more, more tightly-packed "
+                              "lattice points. Edge bleed derives from this automatically (bleed="
+                              "pitch); stamp radius instead comes from --hex-spread-ratio. Default: "
+                              f"use whatever's saved in project.json, or {HEX_LATTICE_PITCH_M} if "
+                              "never set.")
+    parser.add_argument("--hex-spread-ratio", type=float, default=None,
+                         help="generate-terrain, hex method only: scales stamp radius independently "
+                              "of pitch -- stamp_radius = 2*pitch*hex_spread_ratio. 1.0 (default) "
+                              "reproduces the original fixed radius = 2*pitch (each stamp reaches "
+                              "exactly to its nearest neighbors' centers); >1 grows stamps past their "
+                              "neighbors for more overlap/blending, <1 shrinks them, potentially "
+                              "opening coverage gaps between lattice centers. Does NOT affect edge "
+                              "bleed or lattice center spacing. Default: use whatever's saved in "
+                              f"project.json, or {HEX_DEFAULT_SPREAD_RATIO} if never set.")
     parser.add_argument("--generate-terrain-method", type=str, default=None, choices=["hex", "contour"],
                          help="generate-terrain: 'hex' (default) is the flat hex lattice. 'contour' "
                               "traces elevation-band contours of the real heightmap and places stamps "
@@ -2395,10 +2561,48 @@ def main(argv: list[str] | None = None) -> int:
                               "gap-fill pass for flat interiors ring-tracing can't reach on its own -- "
                               "see terrain/contour_layers.py. Default: use whatever's saved in "
                               "project.json, or 'hex' if never set.")
+    parser.add_argument("--hex-brush", type=int, default=None,
+                         help="generate-terrain, hex method only: brush every lattice stamp uses. "
+                              "Default: use whatever's saved in project.json, or "
+                              f"{HEX_DEFAULT_BRUSH} (terrain/hexgrid.py's DEFAULT_BRUSH) if never set.")
+    parser.add_argument("--hex-tool", type=int, default=None, choices=[0, 1],
+                         help="generate-terrain, hex method only: tool every lattice stamp uses -- "
+                              "0=flatten (pulls terrain toward an absolute target height, the default) "
+                              "or 1=raise (adds a delta, preserving existing relief -- see "
+                              "terrain/stamp.py). Most useful for a masked pass that should build up "
+                              "an area without flattening it. Default: use whatever's saved in "
+                              "project.json, or 0 (flatten) if never set.")
     parser.add_argument("--band-spacing-m", type=float, default=None,
                          help="generate-terrain, contour method only: elevation spacing (m) defining "
                               "each band -- smaller means more, narrower bands. Default: use whatever's "
                               f"saved in project.json, or {DEFAULT_BAND_SPACING_M} if never set.")
+    parser.add_argument("--fill-mode", type=str, default=None, choices=["poisson", "rect"],
+                         help="generate-terrain, contour method only: per-band fill algorithm. "
+                              "'poisson' (default) is the two-pass circle fill (--fill-brush tiered "
+                              "pack + --smoothing-brush crumb scatter). 'rect' instead fills each band "
+                              "with axis-aligned type-72 rectangles (--rect-brush/--rect-min-side-m/"
+                              "--rect-size-ratio-cap), falling through to the same --smoothing-brush "
+                              "crumb scatter for whatever it can't cleanly place -- see "
+                              "terrain/contour_layers.py's RECT FILL MODE docstring section. Default: "
+                              f"use whatever's saved in project.json, or {DEFAULT_FILL_MODE!r} if never set.")
+    parser.add_argument("--rect-brush", type=int, default=None,
+                         help="generate-terrain, contour rect fill_mode only: brush for the main "
+                              "rectangle-covering pass -- must be a square-shaped brush (type 72 is the "
+                              "only one today). Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RECT_BRUSH} if never set.")
+    parser.add_argument("--rect-min-side-m", type=float, default=None,
+                         help="generate-terrain, contour rect fill_mode only: shorter-side floor (m) "
+                              "below which a candidate rectangle is treated as a genuine crumb and "
+                              "handed to the same --smoothing-brush crumb scatter 'poisson' mode uses. "
+                              "Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RECT_MIN_SIDE_M} if never set.")
+    parser.add_argument("--rect-size-ratio-cap", type=float, default=None,
+                         help="generate-terrain, contour rect fill_mode only: seam-step mitigation -- no "
+                              "rectangle's own longer side may exceed this multiple of an already-"
+                              "placed, directly-touching neighbor's longer side (too-big candidates are "
+                              "clipped down; too-small ones are deferred to crumb scatter instead). "
+                              "Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RECT_SIZE_RATIO_CAP} if never set.")
     parser.add_argument("--fill-brush", type=int, default=None,
                          help="generate-terrain, contour method only: brush for the main tiered multi-"
                               "scale band fill -- type 8 (wide flat plateau) recommended, has the best "
@@ -2459,6 +2663,12 @@ def main(argv: list[str] | None = None) -> int:
                               "large hard stamps couldn't reach, not precise packing. Default: use "
                               f"whatever's saved in project.json, or {DEFAULT_SMOOTH_CLAIM_FRACTION} "
                               "if never set.")
+    parser.add_argument("--generate-terrain-secondary-fill", action=argparse.BooleanOptionalAction,
+                         default=None,
+                         help="generate-terrain, contour method only: whether pass 2's crumb-scatter "
+                              "cleanup runs after pass 1. Off trades pass 2's completeness guarantee "
+                              "for speed -- whatever pass 1 leaves as crumbs stays unfilled. Default: "
+                              "use whatever's saved in project.json, or ON if never set.")
     parser.add_argument("--candidates-per-radius", type=int, default=None,
                          help="generate-terrain, contour method only: pass 1's random-candidate cap "
                               "per tier. Left unset, this is AUTO-TUNED once at the start of the run "
@@ -2802,17 +3012,25 @@ def main(argv: list[str] | None = None) -> int:
             step_generate_terrain(
                 working_dir,
                 pitch=args.pitch,
+                hex_spread_ratio=args.hex_spread_ratio,
                 method=args.generate_terrain_method,
+                hex_brush=args.hex_brush,
+                hex_tool=args.hex_tool,
                 band_spacing_m=args.band_spacing_m,
+                fill_mode=args.fill_mode,
                 fill_brush=args.fill_brush,
                 min_radius=args.min_radius,
                 max_radius=args.max_radius,
                 radius_step_ratio=args.radius_step_ratio,
                 edge_distance_m=args.edge_distance_m,
+                rect_brush=args.rect_brush,
+                rect_min_side_m=args.rect_min_side_m,
+                rect_size_ratio_cap=args.rect_size_ratio_cap,
                 smoothing_brush=args.smoothing_brush,
                 smoothing_min_radius=args.smoothing_min_radius,
                 smooth_ratio=args.smooth_ratio,
                 smooth_claim_fraction=args.smooth_claim_fraction,
+                enable_secondary_fill=args.generate_terrain_secondary_fill,
                 candidates_per_radius=args.candidates_per_radius,
                 sweet_spot_ratio=args.sweet_spot_ratio,
                 sweet_spot_sample_bands=args.sweet_spot_sample_bands,

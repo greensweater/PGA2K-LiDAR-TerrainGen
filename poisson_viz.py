@@ -281,7 +281,7 @@ class CircleFillApp:
             h, w = self.target.shape
             coverage_mask = np.zeros((h, w), dtype=bool)
             for s in all_stamps:
-                x, z, r = s.x, s.z, s.radius
+                x, z, r = s.x, s.z, s.scale_x
                 x0 = max(0, int(x - r))
                 x1 = min(w, int(x + r) + 1)
                 y0 = max(0, int(z - r))
@@ -324,14 +324,14 @@ class CircleFillApp:
 
         if self.show_pass1.get():
             for s in self.pass1_stamps:
-                r = s.radius
+                r = s.scale_x
                 draw.ellipse(
                     (s.x - r, s.z - r, s.x + r, s.z + r),
                     outline=(220, 40, 40, 210), width=max(1, min(3, int(r) // 8 or 1)),
                 )
         if self.show_pass2.get():
             for s in self.pass2_stamps:
-                r = s.radius
+                r = s.scale_x
                 draw.ellipse(
                     (s.x - r, s.z - r, s.x + r, s.z + r),
                     outline=(60, 120, 230, 190), width=max(1, min(3, int(r) // 8 or 1)),

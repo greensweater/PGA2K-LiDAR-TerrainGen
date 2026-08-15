@@ -469,7 +469,8 @@ def render_lidar_heightmap(
 def _make_stamp_patch(stamp: Stamp):
     """
     A Circle for round-brush stamps, or an axis-aligned Rectangle
-    (side = 2*radius, centered on the stamp) for square-brush ones --
+    (width/height = 2*scale_x/2*scale_z, centered on the stamp) for
+    square-brush ones --
     e.g. type 72, used by the course-wide baseline-flatten stamp and
     zero-height shim, both of which are square, not circular, and were
     previously always drawn as a circle regardless of actual brush
@@ -481,9 +482,10 @@ def _make_stamp_patch(stamp: Stamp):
     """
     profile = BRUSH_PROFILES.get(stamp.brush)
     if profile is not None and profile.shape == SHAPE_SQUARE:
-        side = 2.0 * stamp.radius
-        return Rectangle((stamp.x - stamp.radius, stamp.z - stamp.radius), side, side)
-    return Circle((stamp.x, stamp.z), stamp.radius)
+        width = 2.0 * stamp.scale_x
+        height = 2.0 * stamp.scale_z
+        return Rectangle((stamp.x - stamp.scale_x, stamp.z - stamp.scale_z), width, height)
+    return Circle((stamp.x, stamp.z), stamp.scale_x)
 
 
 def _stamp_patches(stamps: Sequence[Stamp], colors: list[str]) -> PatchCollection:

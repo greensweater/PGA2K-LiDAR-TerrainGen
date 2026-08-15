@@ -26,16 +26,17 @@ site below. Confirm/correct all three before trusting real output:
    by analogy with generate_streams.py's own isClosed/state pattern
    and the isFilled field its own polygon_to_object_spline() writes.
 
-3. Stamp.radius's real-world meaning for a SQUARE (non-circular)
-   brush. Every circular-brush usage elsewhere in this pipeline
-   treats Stamp.radius as a true center-to-edge distance (checked
-   directly: `dist_from_center <= radius`), and this module follows
-   that same convention for type 15's plateau-scale calculation. If
-   writer.py converts Stamp.radius to the game's own scale.x/scale.z
-   JSON fields differently for square brushes specifically (e.g. a
-   factor-of-2 diameter/radius mismatch), the resulting path will
-   come out at 2x or 0.5x the intended width -- verify in-game and
-   report back if so.
+3. Stamp.scale_x/scale_z's real-world meaning for a SQUARE (non-
+   circular) brush. Every circular-brush usage elsewhere in this
+   pipeline treats Stamp.scale_x/scale_z as a true center-to-edge
+   distance (checked directly: `dist_from_center <= radius`), and
+   this module follows that same convention for type 15's plateau-
+   scale calculation (scale_x == scale_z here, isotropic). If
+   writer.py converts scale_x/scale_z to the game's own scale.x/
+   scale.z JSON fields differently for square brushes specifically
+   (e.g. a factor-of-2 diameter/radius mismatch), the resulting path
+   will come out at 2x or 0.5x the intended width -- verify in-game
+   and report back if so.
 ############################################################
 """
 
@@ -244,7 +245,7 @@ def generate_cart_path_stamps(
                 continue
 
             stamps.append(Stamp(
-                x=float(cur.x), z=float(cur.y), radius=float(stamp_radius),
+                x=float(cur.x), z=float(cur.y), scale_x=float(stamp_radius), scale_z=float(stamp_radius),
                 value=avg_h, brush=brush, rotation=float(rot_y), tool=TOOL_FLATTEN,
             ))
 

@@ -46,13 +46,20 @@ than guess at a margin, this was checked numerically: scanning the
 whole play area for its true worst-covered point (not just the interior
 deep holes) found it sitting exactly at an odd row's missing corner,
 at ~89% combined pull weight -- weaker than interior coverage, but not
-a literal hole. HEX_BLEED_M = radius / 2 (= pitch) allows exactly one
-extra stamp per side on odd rows only (verified: adds exactly 24
-stamps at this pitch, all outside [0, 2000]), restoring the same
-coverage odd rows would have gotten from an uncropped, infinite hex
-lattice. Bleed is horizontal (east/west) only -- vertical centering
-doesn't have the same alternating-row asymmetry, so top/bottom edges
-don't need it.
+a literal hole. HEX_BLEED_M = pitch allows exactly one extra stamp per
+side on odd rows only (verified: adds exactly 24 stamps at this pitch,
+all outside [0, 2000]), restoring the same coverage odd rows would have
+gotten from an uncropped, infinite hex lattice. Bleed is horizontal
+(east/west) only -- vertical centering doesn't have the same
+alternating-row asymmetry, so top/bottom edges don't need it.
+
+Bleed is purely a lattice-CENTER concept -- the phantom odd-row stamp
+it admits sits exactly `pitch` outside the boundary regardless of how
+big any stamp's radius is (see generate_hex_grid's callers, which may
+scale stamp_radius independently of pitch via a spread ratio) -- so
+HEX_BLEED_M is defined directly from HEX_LATTICE_PITCH_M, not from
+HEX_STAMP_RADIUS_M, even though the two constants are numerically equal
+at HEX_STAMP_RADIUS_M's default (unscaled) value.
 
 Stamps here carry a placeholder value=0.0 -- this module only decides
 *where* stamps go and how big they are, never what height they pull
@@ -66,16 +73,20 @@ generate-terrain step.
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import numpy as np
+import shapely.vectorized
 from scipy.spatial import cKDTree
+from shapely.geometry.base import BaseGeometry
 
 from terrain.bounding_box import BoundingBox
-from terrain.stamp import Stamp
+from terrain.stamp import TOOL_FLATTEN, Stamp
 
 HEX_LATTICE_PITCH_M = 50.0             # doubled resolution; derived from 2*pitch * 40 == course width
 HEX_STAMP_RADIUS_M = 2.0 * HEX_LATTICE_PITCH_M  # reaches nearest-neighbor centers
-HEX_BLEED_M = HEX_STAMP_RADIUS_M / 2.0  # = pitch; closes the offset-row edge gap, see module docstring
+HEX_DEFAULT_SPREAD_RATIO = 1.0         # scales stamp radius independently of pitch; 1 = HEX_STAMP_RADIUS_M unchanged
+HEX_BLEED_M = HEX_LATTICE_PITCH_M      # = pitch; closes the offset-row edge gap -- a center-geometry fact, NOT radius/2 (see module docstring)
 DEFAULT_BRUSH = 8  # type 8: widest flat plateau, sharpest edge -- empirically the best-performing default in practice
 PLACEHOLDER_VALUE = 0.0                # overwritten by height fitting
 
@@ -87,7 +98,9 @@ def generate_hex_grid(
     pitch: float = HEX_LATTICE_PITCH_M,
     stamp_radius: float = HEX_STAMP_RADIUS_M,
     brush: int = DEFAULT_BRUSH,
+    tool: int = TOOL_FLATTEN,
     bleed: float = HEX_BLEED_M,
+    mask_geometry: Optional[BaseGeometry] = None,
 ) -> list[Stamp]:
     """
     Generate a flat-top hexagonal (triangular) lattice of Stamps covering
@@ -102,12 +115,28 @@ def generate_hex_grid(
     relative to even rows -- inherent to proper hex tiling, not a bug --
     which leaves a strip near the east/west edges covered only by
     vertically-neighboring stamps rather than a same-row one. `bleed`
-    (default pitch, i.e. radius/2) allows one extra stamp per side on
-    odd rows only, centered outside [min_x, max_x], so its radius still
-    reaches the true edge without changing any other row's positions.
+    (default pitch -- a center-geometry fact, independent of
+    `stamp_radius`) allows one extra stamp per side on odd rows only,
+    centered outside [min_x, max_x], so its radius still reaches the
+    true edge without changing any other row's positions.
     Bleed is horizontal (east/west) only -- vertical centering doesn't
     have the same alternating-row asymmetry, so top/bottom edges don't
     need it.
+
+    mask_geometry, if given, restricts which lattice points actually
+    become Stamps to those whose CENTER falls inside it -- checked here,
+    during generation, not as a later filter over the full-course lattice.
+    Row/column phase is still derived from the full `bounds` exactly as
+    above (shrinking `bounds` itself to the mask's extent would silently
+    re-derive a different, wrongly-phased lattice -- see module
+    docstring's corner-alignment discussion) -- mask_geometry only decides
+    which of that same full-course lattice's points survive, and skips
+    whole rows outside its bounding box before even walking their
+    columns. This matters beyond just avoiding wasted Stamp objects: every
+    stamp that reaches fit_stamp_heights() costs more to fit than the
+    last one (it rebuilds a KD-tree over every already-fitted stamp), so
+    not generating masked-out stamps in the first place is a real,
+    superlinear saving, not just a cosmetic one.
     """
     col_spacing = 2.0 * pitch
     row_spacing = math.sqrt(3.0) * pitch
@@ -123,9 +152,16 @@ def generate_hex_grid(
     total_row_span = (n_rows - 1) * row_spacing
     z_start = bounds.min_z + (height - total_row_span) / 2.0
 
+    mask_min_z = mask_max_z = None
+    if mask_geometry is not None:
+        mask_min_x, mask_min_z, mask_max_x, mask_max_z = mask_geometry.bounds
+
     stamps: list[Stamp] = []
     for row in range(n_rows):
         z = z_start + row * row_spacing
+        if mask_min_z is not None and not (mask_min_z <= z <= mask_max_z):
+            continue
+
         x_offset = pitch if (row % 2 == 1) else 0.0
         first_x = bounds.min_x + x_offset
 
@@ -139,11 +175,22 @@ def generate_hex_grid(
         while x - col_spacing >= bounds.min_x - bleed - _EPS:
             x -= col_spacing
 
+        row_xs = []
         while x <= bounds.max_x + bleed + _EPS:
-            stamps.append(
-                Stamp(x=x, z=z, radius=stamp_radius, value=PLACEHOLDER_VALUE, brush=brush)
-            )
+            row_xs.append(x)
             x += col_spacing
+
+        if mask_geometry is not None:
+            inside = shapely.vectorized.contains(
+                mask_geometry, np.asarray(row_xs), np.full(len(row_xs), z),
+            )
+            row_xs = [px for px, keep in zip(row_xs, inside) if keep]
+
+        for px in row_xs:
+            stamps.append(
+                Stamp(x=px, z=z, scale_x=stamp_radius, scale_z=stamp_radius,
+                      value=PLACEHOLDER_VALUE, brush=brush, tool=tool)
+            )
 
     return stamps
 

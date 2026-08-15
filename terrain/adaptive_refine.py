@@ -322,7 +322,11 @@ class ErrorHotspot:
     fit_rms: float
 
     def to_stamp(self) -> Stamp:
-        return Stamp(x=self.x, z=self.z, radius=self.radius, value=self.value,
+        # Every candidate/scattered hotspot here is one of the circular
+        # brushes (8/9/10/54 -- see CANDIDATE_BRUSHES), never type 72,
+        # so scale_x == scale_z is the correct isotropic reading of
+        # this single radius, not an assumption specific to this call.
+        return Stamp(x=self.x, z=self.z, scale_x=self.radius, scale_z=self.radius, value=self.value,
                      brush=self.brush, tool=self.tool)
 
 
