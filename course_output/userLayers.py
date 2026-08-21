@@ -37,11 +37,10 @@ Field mapping from Stamp -> one entry in the "height" array:
                 x/z each have GRID_ORIGIN_OFFSET subtracted at write
                 time -- nowhere else in the pipeline needs to know
                 about PGA's centered frame.
-    rotation -- {x: 0, y: 0, z: 0}. Unused for terrain stamps; PGA
-                tracks yaw separately via orientation/_orientation.
-    orientation / _orientation -- both set to stamp.rotation (degrees).
-                Duplicated because the schema carries the same value
-                under two different keys.
+    rotation -- {x: 0, y: stamp.rotation (degrees), z: 0}. "orientation"
+                and "_orientation" are not real PGA fields for stamps --
+                yaw is read from rotation.y, so that's the only place
+                stamp.rotation gets written.
     scale    -- {x: stamp.scale_x, y: 1.0, z: stamp.scale_z}. Scale, not
                 the separate "radius" field, is what actually sizes a
                 landscape stamp; radius stays 0.0 (see below).
@@ -309,9 +308,71 @@ def normalize_stamp_heights(
     return list(stamps) + [shim]
 
 
+def normalize_stamp_heights_by_value_shift(
+    stamps: Sequence[Stamp],
+    bounds: BoundingBox,
+    resolution: int = 200,
+) -> list[Stamp]:
+    """
+    A/B alternative to normalize_stamp_heights() above -- same goal
+    (shift the resolved terrain so its minimum lands at exactly 0), but
+    instead of folding in one extra course-wide raise-tool stamp at the
+    end, shifts every existing stamp's own `value` field directly by
+    the same constant and appends nothing.
+
+    Motivation: normalize_stamp_heights()'s course-wide shim stamp is
+    suspected of being the cause of a "cheese grater" seam pattern
+    where a lattice of stamps meant to tile edge-to-edge at full (1.0)
+    weight -- e.g. 500 m square stamps that should abut perfectly --
+    instead show visible feathering at their shared edges once the
+    shim is folded in on top. If writing userLayers.json with THIS
+    function instead of normalize_stamp_heights() makes those seams go
+    away, that's evidence the renderer used to preview/verify this
+    export blends a huge, low-slope stamp differently than the game's
+    own implementation does -- worth knowing regardless of which
+    method ends up shipping for real.
+
+    NOT a mathematically equivalent shift, and that's expected:
+    normalize_stamp_heights()'s own docstring explains why the shim
+    approach was chosen over exactly this -- a uniform shift applied
+    to every stamp's value does not generally produce a uniformly
+    shifted resolved terrain once raise-tool stamps or partial
+    (non-1.0) blend weights are involved. It only reduces to the same
+    result wherever a point is fully committed (weight 1.0) to the
+    stamps covering it. Kept strictly for side-by-side comparison
+    against the default method -- do not remove
+    normalize_stamp_heights() in favor of this, and do not make this
+    the default without confirming the comparison actually explains
+    the artifact.
+    """
+    if not stamps:
+        return list(stamps)
+
+    model = TerrainModel(stamps)
+    heights = model.render(resolution=resolution, bounds=bounds)
+    true_min = float(np.min(heights))
+    true_max = float(np.max(heights))
+    span = true_max - true_min
+
+    if span > MAX_INGAME_HEIGHT_M:
+        raise ValueError(
+            f"Terrain relief ({span:.1f} m, from {true_min:.1f} to {true_max:.1f} m) "
+            f"exceeds the known in-game height ceiling of {MAX_INGAME_HEIGHT_M} m even "
+            "after shifting the minimum to 0. Writing this would require clipping real "
+            "terrain shape -- consider a smaller/different crop rather than exporting "
+            "as-is."
+        )
+
+    shift = -true_min
+    if abs(shift) < 1e-9:
+        return list(stamps)
+
+    return [replace(s, value=s.value + shift) for s in stamps]
+
+
 def stamp_to_entry(stamp: Stamp) -> dict:
     """Convert a single Stamp into one "height" array entry."""
-    orientation = _round(stamp.rotation)
+    rotation_y = _round(stamp.rotation)
     return {
         "tool": stamp.tool,
         "position": {
@@ -319,8 +380,7 @@ def stamp_to_entry(stamp: Stamp) -> dict:
             "y": POSITION_Y,
             "z": _round(stamp.z - GRID_ORIGIN_OFFSET),
         },
-        "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
-        "_orientation": orientation,
+        "rotation": {"x": 0.0, "y": rotation_y, "z": 0.0},
         "scale": {
             "x": _round(stamp.scale_x),
             "y": 1.0,
@@ -330,7 +390,6 @@ def stamp_to_entry(stamp: Stamp) -> dict:
         "value": _round(stamp.value),
         "holeId": HOLE_ID_NONE,
         "radius": UNUSED_RADIUS_FIELD,
-        "orientation": orientation,
     }
 
 

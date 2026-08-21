@@ -26,6 +26,7 @@ optimizer.py). JSON is produced only by writer.py -- never here.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 TOOL_FLATTEN = 0
@@ -57,3 +58,32 @@ class Stamp:
 
     rotation: float = 0.0
     tool: int = TOOL_FLATTEN
+
+
+def local_square_offsets(stamp: Stamp, dx, dz):
+    """
+    Rotate a world-space (dx, dz) offset from `stamp`'s center into the
+    stamp's own local frame -- `across` along the scale_x axis, `along`
+    along the scale_z axis -- so a SHAPE_SQUARE stamp's per-axis
+    Chebyshev reach test still applies correctly when rotation != 0.
+    Identity (returns dx, dz unchanged) when rotation == 0, so every
+    existing axis-aligned call site is unaffected.
+
+    dx/dz may be Python floats or numpy arrays (evaluate() vs.
+    evaluate_many()/render()'s vectorized callers).
+
+    Convention matches fallline_fill_viz.py's build_interior_fill_stamps/
+    _stamp_corners: rotation = degrees(atan2(perp_x, perp_z)), where perp
+    (the scale_z "along" direction) is (sin theta, cos theta) and across
+    (the scale_x direction) is (cos theta, -sin theta). Kept as the one
+    shared implementation of this formula -- fallline_fill_viz.py's own
+    docstring records a real bug from two independently-reasoned-but-
+    unverified copies of this exact rotation convention disagreeing.
+    """
+    if stamp.rotation == 0.0:
+        return dx, dz
+    theta = math.radians(stamp.rotation)
+    sin_t, cos_t = math.sin(theta), math.cos(theta)
+    across = dx * cos_t - dz * sin_t
+    along = dx * sin_t + dz * cos_t
+    return across, along

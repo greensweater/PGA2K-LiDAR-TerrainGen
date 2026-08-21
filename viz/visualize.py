@@ -20,6 +20,7 @@ Five previews, one per stage:
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Optional, Sequence
@@ -28,7 +29,7 @@ import matplotlib
 matplotlib.use("Agg")  # headless: never opens a window, just writes files
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Circle, Rectangle
+from matplotlib.patches import Circle, Polygon, Rectangle
 from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE
 from matplotlib.collections import PatchCollection
 
@@ -37,6 +38,7 @@ from ingest.laz_reader import PointCloud
 from ingest.osm import Feature
 from shapely.geometry.base import BaseGeometry
 from terrain.bounding_box import BoundingBox
+
 from terrain.stamp import Stamp
 from terrain.terrain_model import TerrainModel
 from matplotlib.lines import Line2D
@@ -468,23 +470,39 @@ def render_lidar_heightmap(
 
 def _make_stamp_patch(stamp: Stamp):
     """
-    A Circle for round-brush stamps, or an axis-aligned Rectangle
-    (width/height = 2*scale_x/2*scale_z, centered on the stamp) for
-    square-brush ones --
-    e.g. type 72, used by the course-wide baseline-flatten stamp and
-    zero-height shim, both of which are square, not circular, and were
-    previously always drawn as a circle regardless of actual brush
-    shape (a real, previously-latent bug: harmless-looking when the
-    only square stamp was the shim, appended after preview_hex.png was
-    already generated, but now visibly wrong now that the baseline
-    stamp -- square, and huge, covering nearly the whole course -- is
-    part of initial_stamps.json from the start).
+    A Circle for round-brush stamps, or a (possibly rotated) Polygon
+    quad for square-brush ones -- e.g. type 72, used by the course-wide
+    baseline-flatten stamp and zero-height shim (both square, not
+    circular, and were previously always drawn as a circle regardless
+    of actual brush shape -- a real, previously-latent bug), and by
+    contour_layers.py's fallline-based "rect" fill_mode, whose stamps
+    are genuinely rotated per boundary edge.
+
+    Always builds the 4 world-space corners directly (rather than an
+    axis-aligned Rectangle) using the same perp/across construction as
+    fallline_fill_viz.py's _stamp_corners -- one code path for both
+    rotated and unrotated stamps, since rotation=0 already reduces to
+    the same axis-aligned quad an axis-aligned Rectangle would draw.
     """
     profile = BRUSH_PROFILES.get(stamp.brush)
     if profile is not None and profile.shape == SHAPE_SQUARE:
-        width = 2.0 * stamp.scale_x
-        height = 2.0 * stamp.scale_z
-        return Rectangle((stamp.x - stamp.scale_x, stamp.z - stamp.scale_z), width, height)
+        theta = math.radians(stamp.rotation)
+        perp = (math.sin(theta), math.cos(theta))     # "length" (scale_z) direction
+        across = (math.cos(theta), -math.sin(theta))  # "width" (scale_x) direction
+
+        half_len = stamp.scale_z
+        half_wid = stamp.scale_x
+
+        near = (stamp.x - perp[0] * half_len, stamp.z - perp[1] * half_len)
+        far = (stamp.x + perp[0] * half_len, stamp.z + perp[1] * half_len)
+
+        corners = [
+            (near[0] - across[0] * half_wid, near[1] - across[1] * half_wid),
+            (near[0] + across[0] * half_wid, near[1] + across[1] * half_wid),
+            (far[0] + across[0] * half_wid, far[1] + across[1] * half_wid),
+            (far[0] - across[0] * half_wid, far[1] - across[1] * half_wid),
+        ]
+        return Polygon(corners, closed=True)
     return Circle((stamp.x, stamp.z), stamp.scale_x)
 
 

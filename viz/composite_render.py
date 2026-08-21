@@ -24,15 +24,16 @@ TerrainModel's vectorized numpy approach -- fine for an explicit,
 manually-triggered preview, not for something regenerated automatically
 after every pass.
 
-Requires the 6 real brush PNG assets (type8.png, type9.png, type10.png,
-type54.png, type72.png, type73.png -- 512x512 grayscale, stored as RGB
-with R==G==B) to be present in a "brushes/" directory. These aren't
+Requires the 7 real brush PNG assets (type8.png, type9.png, type10.png,
+type54.png, type72.png, type73.png, type74.png -- 512x512 grayscale,
+stored as RGB with R==G==B) to be present in a "brushes/" directory. These aren't
 included with the pipeline itself (not free to redistribute) -- place
 your own copies in a "brushes" folder alongside these source files, or
 pass an explicit brush_dir to composite_stamps_to_canvas.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -41,7 +42,8 @@ from PIL import Image
 from scipy import ndimage
 
 from terrain.bounding_box import BoundingBox
-from terrain.stamp import Stamp, TOOL_RAISE
+from terrain.brush_profiles import BRUSH_PROFILES
+from terrain.stamp import Stamp, TOOL_RAISE, local_square_offsets
 
 DEFAULT_BRUSH_DIR = Path(__file__).parent / "brushes"
 
@@ -55,6 +57,7 @@ BRUSH_FILENAMES = {
     54: "type54.png",
     72: "type72.png",
     73: "type73.png",
+    74: "type74.png",
 }
 
 # 16-bit canvas convention: 0-65535 maps to [0, MAX_INGAME_HEIGHT_M]
@@ -143,13 +146,11 @@ def composite_stamps_to_canvas(
     the canvas sub-region actually covered by each stamp's own radius
     gets touched, not the whole canvas.
 
-    rotation (Stamp.rotation) is accepted but not yet applied -- every
-    stamp we've seen in practice so far uses rotation=0; stubbed in
-    for later rather than silently ignored, so it's an easy, contained
-    change when it's actually needed (rotate the normalized offset
-    (nx, nz) below by -rotation before mapping to brush pixel
-    coordinates, matching how a rotated stamp's footprint would need
-    to be sampled).
+    rotation (Stamp.rotation) is applied by sampling the brush image at
+    each canvas cell's offset rotated into the stamp's own local frame
+    (local_square_offsets, terrain/stamp.py -- the same shared formula
+    TerrainModel and viz/visualize.py's preview patches use, so all
+    three agree on what a rotated stamp's footprint actually covers).
     """
     cell_size_x = (bounds.max_x - bounds.min_x) / resolution
     cell_size_z = (bounds.max_z - bounds.min_z) / resolution
@@ -182,14 +183,21 @@ def composite_stamps_to_canvas(
         brush_center_px = (brush_size - 1) / 2.0
         brush_radius_px = brush_size / 2.0  # brush's own radius reaches to the image edge
 
+        # Bounding box: for a rotated stamp the true axis-aligned reach
+        # is tighter than this, but hypot(scale_x, scale_z) (same loose-
+        # but-safe convention TerrainModel._euclidean_reach/render() use)
+        # is simpler and still a correct superset -- rotation is a no-op
+        # for a circular stamp (scale_x == scale_z) so widening it costs
+        # nothing there beyond a few always-zero-weight extra samples.
         if stamp.rotation != 0.0:
-            # Stubbed in, not yet applied -- see docstring.
-            pass
+            reach_x = reach_z = math.hypot(stamp.scale_x, stamp.scale_z)
+        else:
+            reach_x, reach_z = stamp.scale_x, stamp.scale_z
 
-        col_min = max(0, int((stamp.x - stamp.scale_x - bounds.min_x) / cell_size_x))
-        col_max = min(resolution, int((stamp.x + stamp.scale_x - bounds.min_x) / cell_size_x) + 1)
-        row_min = max(0, int((stamp.z - stamp.scale_z - bounds.min_z) / cell_size_z))
-        row_max = min(resolution, int((stamp.z + stamp.scale_z - bounds.min_z) / cell_size_z) + 1)
+        col_min = max(0, int((stamp.x - reach_x - bounds.min_x) / cell_size_x))
+        col_max = min(resolution, int((stamp.x + reach_x - bounds.min_x) / cell_size_x) + 1)
+        row_min = max(0, int((stamp.z - reach_z - bounds.min_z) / cell_size_z))
+        row_max = min(resolution, int((stamp.z + reach_z - bounds.min_z) / cell_size_z) + 1)
         if col_min >= col_max or row_min >= row_max:
             continue  # entirely off-canvas
 
@@ -201,12 +209,25 @@ def composite_stamps_to_canvas(
         # stamp's own scale -- independent per axis, so a rectangular
         # (scale_x != scale_z) stamp samples the brush image stretched
         # to fit, same as the game's own per-axis scale.x/scale.z.
-        nx = (xx - stamp.x) / stamp.scale_x
-        nz = (zz - stamp.z) / stamp.scale_z
+        # Rotated into the stamp's own local frame first (identity when
+        # rotation==0) so a rotated stamp samples the brush image along
+        # its own actual footprint, not the world axes.
+        ax, az = local_square_offsets(stamp, xx - stamp.x, zz - stamp.z)
+        nx = ax / stamp.scale_x
+        nz = az / stamp.scale_z
 
-        # Map into the brush image's own pixel coordinates.
-        brush_rows = brush_center_px + nz * brush_radius_px
-        brush_cols = brush_center_px + nx * brush_radius_px
+        # Map into the brush image's own pixel coordinates. Brushes whose
+        # bright/effective point isn't at the source image's geometric
+        # center (see BrushProfile.center_offset_x/center_offset_z) get
+        # that fixed shift applied here, in the brush's own un-rotated
+        # local frame -- since nx/nz above are already rotated into that
+        # frame, the shift stays glued to the brush's own axes and so
+        # rotates along with the stamp in world space.
+        profile = BRUSH_PROFILES.get(stamp.brush)
+        offset_x = profile.center_offset_x if profile is not None else 0.0
+        offset_z = profile.center_offset_z if profile is not None else 0.0
+        brush_rows = brush_center_px + (nz + offset_z) * brush_radius_px
+        brush_cols = brush_center_px + (nx + offset_x) * brush_radius_px
 
         weight = ndimage.map_coordinates(
             brush_img, [brush_rows, brush_cols], order=1, mode="constant", cval=0.0,

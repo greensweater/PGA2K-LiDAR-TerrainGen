@@ -307,6 +307,35 @@ def query_heightmap_cells(
     return xx[valid], zz[valid], sub_heights[valid]
 
 
+def sample_heightmap_nearest(
+    heights: np.ndarray, bounds: BoundingBox, x: float, z: float,
+) -> Optional[float]:
+    """
+    Value of the single heightmap cell whose center is nearest (x, z) --
+    no radius, no averaging, just direct nearest-cell lookup. Unlike
+    query_heightmap_cells/sample_heightmap_mean (both radius-based
+    searches meant for a stamp's own footprint average), this is for
+    callers that want the raw local sample itself -- e.g. terrain/
+    rastergrid.py's raster grid, whose stamps are already spaced fine
+    enough that "nearest sample" is a faithful value on its own,
+    without needing a fit. Returns None if the nearest cell is NaN (no
+    bare-earth LIDAR coverage there, e.g. a lake or building) --
+    there's no radius to widen the search with, so a miss here just
+    means "no data," not "try harder."
+    """
+    resolution_z, resolution_x = heights.shape
+    cell_size_x = (bounds.max_x - bounds.min_x) / resolution_x
+    cell_size_z = (bounds.max_z - bounds.min_z) / resolution_z
+
+    col = int((x - bounds.min_x) / cell_size_x)
+    row = int((z - bounds.min_z) / cell_size_z)
+    col = min(max(col, 0), resolution_x - 1)
+    row = min(max(row, 0), resolution_z - 1)
+
+    value = heights[row, col]
+    return float(value) if np.isfinite(value) else None
+
+
 def sample_heightmap_mean(
     heights: np.ndarray, bounds: BoundingBox, x: float, z: float, radius: float,
     min_valid_cells: int = 1,

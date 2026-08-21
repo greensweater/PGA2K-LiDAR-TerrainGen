@@ -85,6 +85,7 @@ exist in v2019 at all) and are next up once v2019 is solid.
 from __future__ import annotations
 
 import json
+import math
 import random
 from pathlib import Path
 from typing import Optional
@@ -95,6 +96,7 @@ from shapely.geometry import Point
 
 from ingest.osm import Feature, latlon_to_local
 from terrain.bounding_box import BoundingBox
+from terrain.cart_paths import CART_PATH_WIDTH_M
 from course_output.userLayers import GRID_ORIGIN_OFFSET
 
 # All versions this project knows *about*; only IMPLEMENTED_GAME_VERSIONS
@@ -111,6 +113,34 @@ DEFAULT_GAME_VERSION = "2019"
 # radius/height, same idea as Chad's OSMTGC.py newTree() used.
 TREE_RADIUS_M = 7.0
 TREE_HEIGHT_M = 10.0
+
+# Cart-path keepout is intentionally just enough to clear the TRUNK,
+# not the canopy -- CART_PATH_WIDTH_M/2 (0.85m) + this clearance, ~1.85m
+# total, not the tree's full TREE_RADIUS_M/TREE_RADIUS_TAG canopy
+# radius. A canopy-sized keepout (~8m) was flagging far more trees as
+# "on the path" than are actually visibly overlapping it, and pushing
+# them proportionally farther -- more likely to land on a second,
+# nearby path in a connected network. See move_trees_off_cartpaths.
+TREE_CARTPATH_CLEARANCE_M = 2.0
+
+# Tag set on a tree that's been detected sitting on a cart path when
+# move_trees_off_cartpaths runs in debug_mark_only mode (see that
+# function and PGA2k_gen.py's --mark-cartpath-trees) -- left in place
+# rather than relocated, so build_tree_objects_v2019 can swap it for an
+# oversized, obviously-not-a-tree marker instead, letting you eyeball
+# in-game exactly which trees the detector is flagging before trusting
+# it to actually move anything.
+CARTPATH_DEBUG_MARKER_TAG = "pga_cartpath_debug_marker"
+# theme=false, category/type values below confirmed directly by the
+# user from a real placedObjects2.json (not guessed): an arbitrary
+# decorative prop, not specifically meaningful, just distinct and easy
+# to spot -- freely tunable to whatever's easiest to pick out in-game.
+# v2019 only -- v2021+ has no known equivalent generic marker id (see
+# build_tree_objects_v2021), so debug-tagged trees there are currently
+# just built as ordinary trees.
+CARTPATH_DEBUG_MARKER_CATEGORY_V2019 = 13
+CARTPATH_DEBUG_MARKER_TYPE_V2019 = 34
+CARTPATH_DEBUG_MARKER_SCALE = 6.0  # deliberately oversized (real trees scale ~0.5-1.2) so it's unmistakable in-game
 
 # Custom OSM tag keys this module looks for on natural=tree nodes, on
 # top of the standard natural=tree itself -- lets a hand-placed OSM
@@ -294,6 +324,209 @@ def apply_area_tree_type_hints(
     return result
 
 
+def _nearest_cartpath_line(point: Point, lines: list) -> tuple[object, float]:
+    """(line, distance) for whichever of `lines` is closest to `point` --
+    factored out of move_trees_off_cartpaths since it's called fresh on
+    every relocation attempt (the nearest path can change once a tree
+    moves)."""
+    best_line, best_dist = lines[0], lines[0].distance(point)
+    for line in lines[1:]:
+        d = line.distance(point)
+        if d < best_dist:
+            best_line, best_dist = line, d
+    return best_line, best_dist
+
+
+def _perpendicular_at(line, point: Point) -> Optional[tuple[Point, tuple[float, float]]]:
+    """(nearest_point_on_line, unit_perpendicular) at `point`'s
+    projection onto `line` -- the perpendicular is line's tangent there
+    rotated 90 degrees, found via a small-delta interpolate() step
+    either side of the projection (same tangent technique
+    terrain/cart_paths.py's generate_cart_path_stamps uses for its
+    pearl-to-pearl direction). Returns None if the tangent is
+    degenerate (zero-length line, or projection pinned to one end of a
+    near-zero-length segment)."""
+    proj = line.project(point)
+    eps = max(1e-3, min(0.5, line.length / 4.0))
+    a = line.interpolate(max(0.0, proj - eps))
+    b = line.interpolate(min(line.length, proj + eps))
+    tx, tz = b.x - a.x, b.y - a.y
+    mag = math.hypot(tx, tz)
+    if mag <= 1e-9:
+        return None
+    tx, tz = tx / mag, tz / mag
+    nearest = line.interpolate(proj)
+    return nearest, (-tz, tx)
+
+
+def _min_clearance(x: float, z: float, lines: list) -> float:
+    """Distance from (x, z) to the nearest of `lines` -- the "is this
+    candidate actually clear of EVERY cart path, not just the one it
+    was just pushed off of" check move_trees_off_cartpaths needs at
+    every retry (a course's cart paths are usually a connected network
+    -- parallel out-and-back paths, loops around tee/green complexes --
+    so a push that only checks the path it's dodging can easily land
+    the tree on a different, nearby one)."""
+    point = Point(x, z)
+    return min(line.distance(point) for line in lines)
+
+
+def move_trees_off_cartpaths(
+    trees: list[tuple[float, float, dict]],
+    cartpath_lines: list,
+    hole_features: list[Feature],
+    max_attempts: int = 8,
+    debug_mark_only: bool = False,
+    printf=print,
+) -> list[tuple[float, float, dict]]:
+    """
+    Push any tree sitting on top of a cart path off to the side, clear
+    of the path's real rendered width (terrain.cart_paths.CART_PATH_WIDTH_M)
+    plus TREE_CARTPATH_CLEARANCE_M -- ~1.85m total, deliberately just
+    enough to clear the TRUNK, not the canopy (a tree's TREE_RADIUS_M/
+    TREE_RADIUS_TAG canopy radius is NOT part of this -- that would
+    flag/move far more trees than are actually visibly overlapping the
+    path). Movement is always perpendicular to the path at the tree's
+    nearest point on it (never along the path).
+
+    debug_mark_only=True skips relocation entirely: a tree detected
+    within keepout of a path is left exactly where it is and tagged
+    with CARTPATH_DEBUG_MARKER_TAG instead, so build_tree_objects_v2019
+    can swap it for an oversized, obvious marker object in place of a
+    real tree -- lets you eyeball in-game exactly which trees are being
+    detected before trusting this function to actually move anything.
+
+    Each retry computes BOTH perpendicular candidates and checks each
+    one's clearance against EVERY line in cartpath_lines, not just the
+    one being dodged -- a candidate that only clears the nearest path
+    can still land squarely on a different, nearby one. Between two
+    candidates that both fully clear every path, picks whichever is
+    farther from the nearest hole centerline (hole_features) -- pushes
+    a tree toward rough rather than the fairway/hole line; with no
+    hole_features, falls back to whichever side the tree was already
+    leaning toward, so the choice stays deterministic. If only one
+    candidate clears, that one wins regardless of hole preference. If
+    NEITHER clears (a tight spot -- e.g. two paths closer together than
+    2x the keepout distance), the less-bad (larger-clearance) one is
+    taken and the loop retries from there.
+
+    Retries up to max_attempts times, tracking the best (max-clearance)
+    position seen across all attempts rather than just the last one --
+    a tree can legitimately oscillate between two nearby paths without
+    strictly improving every single attempt, and returning the actual
+    best-found position avoids the final result regressing below an
+    earlier attempt. If a tree still hasn't fully cleared every path
+    once attempts are exhausted, its best-found (least-bad) position is
+    used anyway, and printf (same injectable-print convention
+    parse_osm_trees uses) gets one summary line -- not per-tree spam --
+    reporting how many trees that happened to.
+
+    cartpath_lines is a plain list of Shapely geometries (LineString or
+    Polygon -- a Polygon, e.g. an explicit-area path or cart parking,
+    is reduced to its exterior ring internally) -- source-agnostic, so
+    callers can pass OSM Feature.geometry, hand-drawn spline geometry,
+    or any mix, without this function caring where it came from. KNOWN
+    LIMITATION: a Polygon is only measured as distance-to-boundary, not
+    distance-to-interior -- a tree deep inside a Polygon much WIDER
+    than keepout (e.g. a large cart parking lot) could be several
+    meters from every edge and go undetected. Harmless for the common
+    case (a real OSM cart path is a LineString, and even an explicit-
+    area one is normally only a couple meters wide, well under
+    keepout), but worth knowing if this is ever pointed at a genuinely
+    wide paved area.
+
+    cartpath_lines/hole_features must already be cropped to the course
+    and in the same local [0, COURSE_SIZE_M] frame as `trees`, same
+    convention as apply_area_tree_type_hints. Returns a new list
+    (trees itself is never mutated); tags is always passed through as
+    the same dict reference (this function only ever changes x/z).
+    """
+    lines = []
+    for geom in cartpath_lines:
+        line = geom.exterior if geom.geom_type == "Polygon" else geom
+        if line.length > 0:
+            lines.append(line)
+    if not lines:
+        return trees
+
+    hole_lines = [f.geometry for f in hole_features if f.geometry.length > 0]
+
+    keepout = CART_PATH_WIDTH_M / 2.0 + TREE_CARTPATH_CLEARANCE_M
+
+    result = []
+    n_flagged = 0
+    n_relocated = 0
+    n_still_stuck = 0
+    for x, z, tags in trees:
+        best_x, best_z, best_clearance = x, z, _min_clearance(x, z, lines)
+        if best_clearance >= keepout:
+            result.append((x, z, tags))
+            continue
+
+        n_flagged += 1
+        if debug_mark_only:
+            tags = dict(tags)
+            tags[CARTPATH_DEBUG_MARKER_TAG] = True
+            result.append((x, z, tags))
+            continue
+
+        cur_x, cur_z = x, z
+        for _ in range(max_attempts):
+            point = Point(cur_x, cur_z)
+            line, dist = _nearest_cartpath_line(point, lines)
+            if dist >= keepout:
+                break
+            perp = _perpendicular_at(line, point)
+            if perp is None:
+                break
+            nearest, (px, pz) = perp
+            push = keepout + 0.05
+            cand_a = (nearest.x + px * push, nearest.y + pz * push)
+            cand_b = (nearest.x - px * push, nearest.y - pz * push)
+            clearance_a = _min_clearance(cand_a[0], cand_a[1], lines)
+            clearance_b = _min_clearance(cand_b[0], cand_b[1], lines)
+            a_clear, b_clear = clearance_a >= keepout, clearance_b >= keepout
+
+            if a_clear and b_clear:
+                if hole_lines:
+                    dist_a = min(hl.distance(Point(*cand_a)) for hl in hole_lines)
+                    dist_b = min(hl.distance(Point(*cand_b)) for hl in hole_lines)
+                    pick_a = dist_a >= dist_b
+                else:
+                    ox, oz = point.x - nearest.x, point.y - nearest.y
+                    pick_a = (ox * px + oz * pz) >= 0
+            elif a_clear:
+                pick_a = True
+            elif b_clear:
+                pick_a = False
+            else:
+                pick_a = clearance_a >= clearance_b
+
+            cur_x, cur_z = cand_a if pick_a else cand_b
+            cur_clearance = clearance_a if pick_a else clearance_b
+            if cur_clearance > best_clearance:
+                best_x, best_z, best_clearance = cur_x, cur_z, cur_clearance
+            if best_clearance >= keepout:
+                break
+
+        n_relocated += 1
+        if best_clearance < keepout:
+            n_still_stuck += 1
+        result.append((best_x, best_z, tags))
+
+    if debug_mark_only:
+        if n_flagged:
+            printf(f"  DEBUG: tagged {n_flagged} tree(s) detected on a cart path for marker "
+                   "replacement -- positions left unchanged (course_output/objects.py's "
+                   "CARTPATH_DEBUG_MARKER_TAG)")
+    elif n_still_stuck:
+        printf(f"  WARNING: {n_still_stuck} of {n_relocated} relocated tree(s) could not be fully "
+               f"cleared of a cart path after {max_attempts} attempt(s) each -- likely squeezed "
+               "between two paths closer together than the keepout distance")
+
+    return result
+
+
 def _placed_item(x: float, z: float, scale: float, rotation_degrees: float = 0.0) -> dict:
     """One placed-object instance, position shifted into the game's
     origin-centered grid (see module docstring), scale.x = scale.y =
@@ -367,41 +600,109 @@ def build_tree_objects_v2019(
     of y from height; this project deliberately does not reproduce
     that (see prior conversation: scale should track height alone,
     uniformly, not stretch/squash per axis).
+
+    Any tree carrying CARTPATH_DEBUG_MARKER_TAG (see
+    move_trees_off_cartpaths' debug_mark_only mode) is pulled out
+    before any of the above and built into its own separate group
+    instead -- Key {"category": CARTPATH_DEBUG_MARKER_CATEGORY_V2019,
+    "type": CARTPATH_DEBUG_MARKER_TYPE_V2019, "theme": False}, items at
+    CARTPATH_DEBUG_MARKER_SCALE -- so it shows up in-game as an
+    oversized, obviously-not-a-tree prop instead of a real tree.
     """
     if rng is None:
         rng = random.Random()
     if not trees:
         return []
 
-    normal_tree_ids = NORMAL_TREES_V2019.get(theme, [0])
-    if (not tree_variety) or len(normal_tree_ids) == 0:
-        normal_tree_ids = [0]
-    skinny_tree_ids = SKINNY_TREES_V2019.get(theme, normal_tree_ids)
-    if (not tree_variety) or len(skinny_tree_ids) == 0:
-        skinny_tree_ids = []
+    debug_marker_items = [
+        _placed_item(x, z, CARTPATH_DEBUG_MARKER_SCALE)
+        for x, z, tags in trees if tags.get(CARTPATH_DEBUG_MARKER_TAG)
+    ]
+    trees = [(x, z, tags) for x, z, tags in trees if not tags.get(CARTPATH_DEBUG_MARKER_TAG)]
 
-    def _group(tree_type: int) -> dict:
-        return {"Key": {"category": 0, "type": tree_type, "theme": True}, "Value": {"items": [], "clusters": []}}
+    groups: list[dict] = []
+    if trees:
+        normal_tree_ids = NORMAL_TREES_V2019.get(theme, [0])
+        if (not tree_variety) or len(normal_tree_ids) == 0:
+            normal_tree_ids = [0]
+        skinny_tree_ids = SKINNY_TREES_V2019.get(theme, normal_tree_ids)
+        if (not tree_variety) or len(skinny_tree_ids) == 0:
+            skinny_tree_ids = []
 
-    normal_groups = {t: _group(t) for t in normal_tree_ids}
-    skinny_groups = {t: _group(t) for t in skinny_tree_ids}
+        def _group(tree_type: int) -> dict:
+            return {"Key": {"category": 0, "type": tree_type, "theme": True}, "Value": {"items": [], "clusters": []}}
 
-    heights, min_h, min_scale, scale_multiplier = _height_scale_lookup(trees)
+        normal_groups = {t: _group(t) for t in normal_tree_ids}
+        skinny_groups = {t: _group(t) for t in skinny_tree_ids}
 
-    for (x, z, tags), h in zip(trees, heights):
-        scale = (h - min_h) * scale_multiplier + min_scale
-        item = _placed_item(x, z, scale, rng.uniform(0, 359))
-        try:
-            radius = float(tags.get(TREE_RADIUS_TAG, TREE_RADIUS_M))
-        except (TypeError, ValueError):
-            radius = TREE_RADIUS_M
-        if radius > 0 and h / radius >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019 and skinny_groups:
-            group = rng.choice(list(skinny_groups.values()))
-        else:
-            group = rng.choice(list(normal_groups.values()))
-        group["Value"]["items"].append(item)
+        heights, min_h, min_scale, scale_multiplier = _height_scale_lookup(trees)
 
-    return [g for g in list(normal_groups.values()) + list(skinny_groups.values()) if g["Value"]["items"]]
+        for (x, z, tags), h in zip(trees, heights):
+            scale = (h - min_h) * scale_multiplier + min_scale
+            item = _placed_item(x, z, scale, rng.uniform(0, 359))
+            try:
+                radius = float(tags.get(TREE_RADIUS_TAG, TREE_RADIUS_M))
+            except (TypeError, ValueError):
+                radius = TREE_RADIUS_M
+            if radius > 0 and h / radius >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019 and skinny_groups:
+                group = rng.choice(list(skinny_groups.values()))
+            else:
+                group = rng.choice(list(normal_groups.values()))
+            group["Value"]["items"].append(item)
+
+        groups = [g for g in list(normal_groups.values()) + list(skinny_groups.values()) if g["Value"]["items"]]
+
+    if debug_marker_items:
+        groups.append({
+            "Key": {
+                "category": CARTPATH_DEBUG_MARKER_CATEGORY_V2019,
+                "type": CARTPATH_DEBUG_MARKER_TYPE_V2019,
+                "theme": False,
+            },
+            "Value": {"items": debug_marker_items, "clusters": []},
+        })
+
+    return groups
+
+
+# Same fence-post prop CARTPATH_DEBUG_MARKER_CATEGORY_V2019/TYPE_V2019 use
+# for an oversized cart-path debug marker (confirmed directly by the
+# user against a real placedObjects2.json: it's literally the same
+# category/type ids -- category=13/type=34, not the koi fish an earlier
+# guess of 11/43 turned out to be) -- reused here for a building-corner
+# stake instead, at a subtle scale rather than an obvious one.
+BUILDING_STAKE_CATEGORY_V2019 = CARTPATH_DEBUG_MARKER_CATEGORY_V2019
+BUILDING_STAKE_TYPE_V2019 = CARTPATH_DEBUG_MARKER_TYPE_V2019
+BUILDING_STAKE_SCALE_V2019 = 0.5  # subtle -- just enough to mark a corner, not call attention to itself
+
+
+def build_building_stake_objects_v2019(features: list[Feature]) -> list[dict]:
+    """
+    v2019 counterpart to build_building_stake_objects_v2021 -- one
+    stake at every exterior vertex of every "building" Feature (see
+    ingest/osm.py), all in a single placedObjects2.json group: Key
+    {"category": BUILDING_STAKE_CATEGORY_V2019, "type":
+    BUILDING_STAKE_TYPE_V2019, "theme": False}, items scaled to
+    BUILDING_STAKE_SCALE_V2019 (0.5x -- vs. the same prop's oversized
+    6.0x CARTPATH_DEBUG_MARKER_SCALE when used as a cart-path debug
+    marker). No rotation (a stake has no meaningful facing).
+
+    Only Polygon-geometry building features contribute vertices --
+    matches how splines.py's feature_to_spline already only handles
+    building as an area/fairway-like shape, never a bare line (same
+    restriction build_building_stake_objects_v2021 uses).
+    """
+    group = {
+        "Key": {"category": BUILDING_STAKE_CATEGORY_V2019, "type": BUILDING_STAKE_TYPE_V2019, "theme": False},
+        "Value": {"items": [], "clusters": []},
+    }
+    for f in features:
+        if f.kind != "building" or f.geometry.geom_type != "Polygon":
+            continue
+        for x, z in f.geometry.exterior.coords[:-1]:  # [:-1] drops the closing repeat of the first point
+            group["Value"]["items"].append(_placed_item(x, z, scale=BUILDING_STAKE_SCALE_V2019))
+
+    return [group] if group["Value"]["items"] else []
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +742,12 @@ def build_tree_objects_v2021(
 
     Scale is the same shared height-driven uniform x=y=z rule every
     version uses (see _height_scale_lookup / module docstring).
+
+    Unlike build_tree_objects_v2019, a CARTPATH_DEBUG_MARKER_TAG tree is
+    NOT special-cased here -- built as an ordinary tree, same as any
+    other -- since there's no known v2021 marker asset path to swap it
+    for (v2019's CARTPATH_DEBUG_MARKER_CATEGORY_V2019/TYPE_V2019 debug
+    marker has no v2021 equivalent yet).
     """
     if rng is None:
         rng = random.Random()

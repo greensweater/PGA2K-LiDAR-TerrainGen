@@ -21,7 +21,7 @@ from scipy.spatial import cKDTree
 
 from terrain.bounding_box import BoundingBox
 from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE
-from terrain.stamp import TOOL_RAISE, Stamp
+from terrain.stamp import TOOL_RAISE, Stamp, local_square_offsets
 from terrain.terrain_kernel import TerrainKernel
 
 
@@ -144,13 +144,13 @@ class TerrainModel:
             dz = z - stamp.z
             profile = BRUSH_PROFILES.get(stamp.brush)
             if profile is not None and profile.shape == SHAPE_SQUARE:
-                # Axis-aligned rectangle (rotation=0 only -- see
-                # terrain/stamp.py): per-axis normalized Chebyshev/
-                # L-infinity distance, not Euclidean. A rotated
-                # rectangle would need dx/dz rotated into the stamp's
-                # local frame first; not supported yet since nothing
-                # uses rotation != 0.
-                r = max(abs(dx) / stamp.scale_x, abs(dz) / stamp.scale_z)
+                # Per-axis normalized Chebyshev/L-infinity distance, in
+                # the stamp's own local frame -- identity when
+                # rotation==0 (see local_square_offsets), so this still
+                # reduces to the plain axis-aligned test for every
+                # unrotated square stamp.
+                ax, az = local_square_offsets(stamp, dx, dz)
+                r = max(abs(ax) / stamp.scale_x, abs(az) / stamp.scale_z)
             else:
                 dist = (dx * dx + dz * dz) ** 0.5
                 r = dist / stamp.scale_x
@@ -227,7 +227,8 @@ class TerrainModel:
             dz = pz - stamp.z
             profile = BRUSH_PROFILES.get(stamp.brush)
             if profile is not None and profile.shape == SHAPE_SQUARE:
-                r_full = np.maximum(np.abs(dx) / stamp.scale_x, np.abs(dz) / stamp.scale_z)
+                ax, az = local_square_offsets(stamp, dx, dz)
+                r_full = np.maximum(np.abs(ax) / stamp.scale_x, np.abs(az) / stamp.scale_z)
             else:
                 dist = np.hypot(dx, dz)
                 r_full = dist / stamp.scale_x
@@ -296,13 +297,23 @@ class TerrainModel:
         for stamp in self.stamps:
             profile = BRUSH_PROFILES.get(stamp.brush)
             is_square = profile is not None and profile.shape == SHAPE_SQUARE
-            # Bounding box: for a rectangle (is_square) the true reach is
-            # exactly (scale_x, scale_z) independently per axis -- no
-            # diagonal needed, since the Chebyshev-per-axis test below is
-            # already an axis-aligned box, not a corner-Euclidean shape.
-            # For circles both axes use the same scale_x (== scale_z).
-            reach_x = stamp.scale_x
-            reach_z = stamp.scale_z if is_square else stamp.scale_x
+            # Bounding box: for an AXIS-ALIGNED rectangle (is_square,
+            # rotation==0) the true reach is exactly (scale_x, scale_z)
+            # independently per axis -- no diagonal needed, since the
+            # Chebyshev-per-axis test below is already an axis-aligned
+            # box, not a corner-Euclidean shape. A ROTATED square stamp's
+            # true axis-aligned bounding box is tighter than this, but
+            # computing it exactly needs the 4 rotated corners; using the
+            # same loose-but-safe hypot(scale_x, scale_z) reach
+            # _euclidean_reach already uses for KD-tree pruning is simpler
+            # and still correct (just samples a few extra always-rejected
+            # cells near the corners). For circles both axes use the same
+            # scale_x (== scale_z), where rotation is a no-op anyway.
+            if is_square and stamp.rotation != 0.0:
+                reach_x = reach_z = math.hypot(stamp.scale_x, stamp.scale_z)
+            else:
+                reach_x = stamp.scale_x
+                reach_z = stamp.scale_z if is_square else stamp.scale_x
 
             col_min = max(0, int((stamp.x - reach_x - bounds.min_x) / cell_size_x))
             col_max = min(resolution, int((stamp.x + reach_x - bounds.min_x) / cell_size_x) + 1)
@@ -316,8 +327,11 @@ class TerrainModel:
             xx, zz = np.meshgrid(sub_x, sub_z)
             dx = xx - stamp.x
             dz = zz - stamp.z
-            dist = np.maximum(np.abs(dx) / stamp.scale_x, np.abs(dz) / stamp.scale_z) if is_square \
-                else np.hypot(dx, dz) / stamp.scale_x
+            if is_square:
+                ax, az = local_square_offsets(stamp, dx, dz)
+                dist = np.maximum(np.abs(ax) / stamp.scale_x, np.abs(az) / stamp.scale_z)
+            else:
+                dist = np.hypot(dx, dz) / stamp.scale_x
 
             mask = dist <= 1.0
             if not np.any(mask):

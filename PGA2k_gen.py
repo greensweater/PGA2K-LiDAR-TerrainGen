@@ -15,9 +15,9 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
                                  [--method adaptive|scatter] [--rad-m M]
     PGA2k_gen.py <working_dir> --step output-terrain
-    PGA2k_gen.py <working_dir> --step generate-trees [--detect-lidar-trees]
+    PGA2k_gen.py <working_dir> --step generate-trees [--detect-lidar-trees] [--mark-cartpath-trees]
     PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023|2025>]
-                                 [--theme <id-or-name>] [--tree-variety]              (2019)
+                                 [--theme <id-or-name>] [--tree-variety] [--stake-buildings]  (2019)
                                  [--tree-asset-path <path>]...
                                  [--tree-type-asset-path <TAG=path>]... [--stake-asset-path <path>]  (2021+)
     PGA2k_gen.py <working_dir> --step repack --repack-filename <name>
@@ -97,9 +97,9 @@ from course_output.splines import (
 from course_output.holes import build_holes, save_holes
 from course_output.objects import (
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_TYPE_TAG,
-    apply_area_tree_type_hints, build_building_stake_objects_v2021, build_tree_objects_v2019,
-    build_tree_objects_v2021, lidar_trees_to_tagged, load_object_list, object_counts,
-    parse_osm_trees, save_object_list, save_placed_objects,
+    apply_area_tree_type_hints, build_building_stake_objects_v2019, build_building_stake_objects_v2021,
+    build_tree_objects_v2019, build_tree_objects_v2021, lidar_trees_to_tagged, load_object_list,
+    move_trees_off_cartpaths, object_counts, parse_osm_trees, save_object_list, save_placed_objects,
 )
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -125,6 +125,14 @@ from terrain.hexgrid import (
     HEX_LATTICE_PITCH_M,
     generate_hex_grid,
 )
+from terrain.rastergrid import (
+    RASTER_BRUSH,
+    RASTER_SIZES,
+    DEFAULT_RASTER_SIZE,
+    DEFAULT_RASTER_SPREAD_RATIO,
+    DEFAULT_RASTER_CENTER_BIAS_RATIO,
+    generate_raster_grid,
+)
 from terrain.contour_layers import (
     DEFAULT_BAND_SPACING_M,
     DEFAULT_FILL_MODE,
@@ -134,8 +142,10 @@ from terrain.contour_layers import (
     DEFAULT_RADIUS_STEP_RATIO,
     DEFAULT_EDGE_DISTANCE_M,
     DEFAULT_RECT_BRUSH,
-    DEFAULT_RECT_MIN_SIDE_M,
-    DEFAULT_RECT_SIZE_RATIO_CAP,
+    DEFAULT_RECT_TOLERANCE_M,
+    DEFAULT_RECT_MIN_LENGTH_M,
+    DEFAULT_RECT_MAX_SEARCH_DISTANCE_M,
+    DEFAULT_RECT_WIDTH_SAMPLES,
     DEFAULT_SMOOTHING_BRUSH,
     DEFAULT_SMOOTHING_MIN_RADIUS_M,
     DEFAULT_CRUMB_SCATTER_MULTIPLIER,
@@ -148,6 +158,7 @@ from terrain.contour_layers import (
     DEFAULT_RANDOM_SEED,
     DEFAULT_DENOISE_PX,
     DEFAULT_N_WORKERS,
+    TYPE72_PLATEAU_FRACTION,
     generate_contour_layers,
 )
 from terrain.stamp import TOOL_FLATTEN, TOOL_RAISE, Stamp
@@ -157,9 +168,10 @@ from terrain.cart_paths import (
     generate_cart_path_stamps,
 )
 from terrain.terrain_model import TerrainModel
+from terrain.stamp_pruning import prune_overwritten_stamps
 from course_output.userLayers import (
     build_baseline_flatten_stamp, build_registration_mark_stamps, normalize_stamp_heights,
-    write_user_layers,
+    normalize_stamp_heights_by_value_shift, write_user_layers,
 )
 from course_output.water import build_water_objects
 
@@ -459,6 +471,13 @@ def step_visualize(
             if p.get("method") == "hex":
                 tool_name = "raise" if p.get("hex_tool") == 1 else "flatten"
                 extra_label += f" hex_brush={p.get('hex_brush')} hex_tool={tool_name}"
+            elif p.get("method") == "raster":
+                extra_label += (
+                    f" raster_size={p.get('raster_size')} raster_spread={p.get('raster_spread_ratio')} "
+                    f"raster_center_bias_x={p.get('raster_center_bias_ratio_x')} "
+                    f"raster_center_bias_z={p.get('raster_center_bias_ratio_z')} "
+                    f"raster_brush={p.get('raster_brush')}"
+                )
         elif step_name == "generate-cart-paths":
             extra_label = (
                 f"cart-paths: stamp_radius={p.get('stamp_radius_m')} spacing={p.get('spacing_m')}"
@@ -977,13 +996,29 @@ def _resolve_theme(theme_arg: str | None) -> int | None:
     return None
 
 
-def step_generate_trees(working_dir: Path, detect_lidar_trees: bool | None = None) -> None:
+def step_generate_trees(
+    working_dir: Path, detect_lidar_trees: bool | None = None, mark_cartpath_trees: bool | None = None,
+) -> None:
     """
     Generate the intermediate, VERSION-AGNOSTIC object_list.json (see
     objects.py's save_object_list) -- trees parsed from map.osm's
     natural=tree nodes, plus, optionally, trees individually detected
     from LIDAR canopy points (ingest/tree_detection.py), combined into
     one list.
+
+    mark_cartpath_trees is a DEBUG mode: trees detected sitting on a
+    cart path are left in place and tagged instead of relocated, so
+    step_write_objects (v2019 only) swaps them for an oversized, obvious
+    marker object instead of a real tree -- see
+    objects.py's move_trees_off_cartpaths(debug_mark_only=...). Use this
+    to eyeball in-game exactly which trees the detector is flagging
+    before trusting it to actually move anything. Deliberately NOT the
+    same None-means-use-saved-project.json pattern detect_lidar_trees
+    uses -- always defaults to False (normal relocation behavior)
+    unless explicitly passed True, so a debug run never silently
+    becomes the sticky default for every future run. The last value
+    used IS still saved to project.json, but only for the record (e.g.
+    a GUI could show it), never read back as this run's default.
 
     Deliberately does NOT know about game_version or write
     placedObjects2.json at all -- that's step_write_objects' job, kept
@@ -1024,6 +1059,8 @@ def step_generate_trees(working_dir: Path, detect_lidar_trees: bool | None = Non
     project = load_project(working_dir)
     if detect_lidar_trees is None:
         detect_lidar_trees = project.get("objects_detect_lidar_trees", True)
+    if mark_cartpath_trees is None:
+        mark_cartpath_trees = False
 
     required = ["crs_wkt", "origin_x", "origin_y", "horizontal_unit_factor", "merged_bounds_local"]
     missing = [k for k in required if k not in project]
@@ -1100,6 +1137,20 @@ def step_generate_trees(working_dir: Path, detect_lidar_trees: bool | None = Non
                 print(f"  applied area-based tree-type hints from {len(wood_features)} wood "
                       f"polygon(s): {untyped_before - untyped_after} tree(s) tagged "
                       "(course_output/objects.py's LEAF_TYPE_TREE_HINTS)")
+
+        cartpath_features = [f for f in features if f.kind == "cartpath"]
+        if cartpath_features:
+            cartpath_lines = [f.geometry for f in cartpath_features]
+            hole_features = [f for f in features if f.kind == "hole"]
+            before_xz = [(x, z) for x, z, _ in trees]
+            trees = move_trees_off_cartpaths(
+                trees, cartpath_lines, hole_features, debug_mark_only=mark_cartpath_trees,
+            )
+            moved = sum(1 for (bx, bz), (x, z, _) in zip(before_xz, trees) if (bx, bz) != (x, z))
+            if moved:
+                print(f"  moved {moved} tree(s) off {len(cartpath_features)} cart path feature(s), "
+                      "perpendicular to the path and away from the nearest hole centerline "
+                      "(course_output/objects.py's move_trees_off_cartpaths)")
     elif trees:
         print(f"  No {FEATURES_FILE} found -- skipping area-based tree-type hints "
               "(run --step ingest-osm first if you want wood-polygon leaf_type hints applied).")
@@ -1110,6 +1161,7 @@ def step_generate_trees(working_dir: Path, detect_lidar_trees: bool | None = Non
 
     save_project(working_dir, {
         "objects_detect_lidar_trees": detect_lidar_trees,
+        "objects_mark_cartpath_trees_debug": mark_cartpath_trees,
         "objects_tree_count": len(trees),
     })
 
@@ -1122,12 +1174,19 @@ def step_write_objects(
     tree_asset_paths: list[str] | None = None,
     tree_type_asset_paths: dict[str, str] | None = None,
     stake_asset_path: str | None = None,
+    stake_buildings: bool | None = None,
 ) -> None:
     """
     Generate placedObjects2.json -- formats object_list.json (see
     step_generate_trees; run that first) into the target game_version's
-    schema, plus, optionally (v2021+ only), a stake at every building
-    corner (from features.geojson's "building" ways).
+    schema, plus, optionally, a stake at every building corner (from
+    features.geojson's "building" ways): stake_buildings for v2019 (the
+    fence-post prop at category=objects.BUILDING_STAKE_CATEGORY_V2019/
+    type=objects.BUILDING_STAKE_TYPE_V2019, scaled to
+    objects.BUILDING_STAKE_SCALE_V2019 -- see
+    build_building_stake_objects_v2019), stake_asset_path for v2021+
+    (see build_building_stake_objects_v2021). Each is only consulted
+    for its own game_version -- see below.
 
     game_version selects which of objects.py's two confirmed schemas
     to write (see that module's docstring: v2019 is Chad Rockey's
@@ -1140,7 +1199,7 @@ def step_write_objects(
     yet -- see objects.py's module docstring) rather than silently
     guessing at an unconfirmed schema.
 
-    theme / tree_variety (v2019) and tree_asset_paths /
+    theme / tree_variety / stake_buildings (v2019) and tree_asset_paths /
     tree_type_asset_paths / stake_asset_path (v2021+) are all feature-
     flagged via project.json, same pattern as refine-terrain's
     parameters: pass None here to use whatever was last saved, or an
@@ -1150,6 +1209,11 @@ def step_write_objects(
     used; the others are still accepted (and persisted, if given) so a
     project can carry both versions' settings across a future
     game_version switch without losing them.
+
+    stake_buildings defaults to False -- unlike tree_variety, there's no
+    reason to want stakes on by default. The GUI's "Stake Buildings" /
+    "Clear Building Stakes" buttons are both just this same step run
+    with --stake-buildings / --no-stake-buildings.
 
     tree_variety defaults to True (not just "off unless set") -- there's
     no real reason to want the flat, single-generic-type result it
@@ -1183,6 +1247,8 @@ def step_write_objects(
         tree_type_asset_paths = project.get("objects_tree_type_asset_paths", {})
     if stake_asset_path is None:
         stake_asset_path = project.get("objects_stake_asset_path")
+    if stake_buildings is None:
+        stake_buildings = project.get("objects_stake_buildings", False)
 
     trees = load_object_list(object_list_path)
     print(f"game_version={game_version}  loaded {len(trees)} tree(s) from {OBJECT_LIST_FILE}")
@@ -1193,10 +1259,24 @@ def step_write_objects(
         if trees:
             print(f"  theme={theme}  tree_variety={tree_variety}")
             placed_objects += build_tree_objects_v2019(trees, theme=theme, tree_variety=tree_variety)
+        if stake_buildings:
+            features_path = working_dir / FEATURES_FILE
+            if not features_path.exists():
+                raise StepError(
+                    f"--stake-buildings was given but no {FEATURES_FILE} found under {working_dir} "
+                    "(needed for building corners) -- run --step ingest-osm first."
+                )
+            features = load_features(features_path)
+            features = _crop_features_to_course(working_dir, features)
+            building_count = sum(1 for f in features if f.kind == "building")
+            stakes = build_building_stake_objects_v2019(features)
+            stake_count = sum(len(g["Value"]["items"]) for g in stakes)
+            print(f"  {stake_count} stake(s) at corners of {building_count} building(s)")
+            placed_objects += stakes
         if stake_asset_path:
             print("  NOTE: --stake-asset-path is set but ignored for game_version=2019 -- "
-                  "building stakes need v2021+'s asset-path scheme (see objects.py's "
-                  "build_building_stake_objects_v2021 docstring).")
+                  "that's a v2021+-only scheme (see objects.py's build_building_stake_objects_v2021 "
+                  "docstring). Use --stake-buildings for v2019 instead.")
     else:  # 2021+ (only "2021" itself is in IMPLEMENTED_GAME_VERSIONS right now)
         if trees:
             if not tree_asset_paths and not tree_type_asset_paths:
@@ -1242,6 +1322,7 @@ def step_write_objects(
         "objects_tree_asset_paths": tree_asset_paths,
         "objects_tree_type_asset_paths": tree_type_asset_paths,
         "objects_stake_asset_path": stake_asset_path,
+        "objects_stake_buildings": stake_buildings,
     })
 
 
@@ -1355,6 +1436,11 @@ def step_generate_terrain(
     method: str | None = None,
     hex_brush: int | None = None,
     hex_tool: int | None = None,
+    raster_size: float | None = None,
+    raster_spread_ratio: float | None = None,
+    raster_center_bias_ratio_x: float | None = None,
+    raster_center_bias_ratio_z: float | None = None,
+    raster_brush: int | None = None,
     band_spacing_m: float | None = None,
     fill_mode: str | None = None,
     fill_brush: int | None = None,
@@ -1363,8 +1449,10 @@ def step_generate_terrain(
     radius_step_ratio: float | None = None,
     edge_distance_m: float | None = None,
     rect_brush: int | None = None,
-    rect_min_side_m: float | None = None,
-    rect_size_ratio_cap: float | None = None,
+    rect_tolerance_m: float | None = None,
+    rect_min_length_m: float | None = None,
+    rect_max_search_distance_m: float | None = None,
+    rect_width_samples: int | None = None,
     smoothing_brush: int | None = None,
     smoothing_min_radius: float | None = None,
     smooth_ratio: float | None = None,
@@ -1404,17 +1492,64 @@ def step_generate_terrain(
     computed explicitly here for whatever pitch/spread are in play, not
     left to fall back silently.
 
-    method ("hex", default, or "contour") picks the initial-layout
-    generator: "hex" is the flat lattice above; "contour" is terrain/
-    contour_layers.py's two-pass-per-band fill -- see that module's
-    docstring for the full design. Briefly: PASS 1 is a fast random-
-    candidate poisson pack with a hard, high-plateau fill_brush (type
-    8/73), then PASS 2 is an oversized, heavily-overlapping scatter
-    fill with a softer smoothing_brush over whatever pass 1 leaves as
-    genuine crumbs -- pass 2 IS exhaustive, so overall coverage stays
-    complete by construction even though pass 1 trades a per-call
-    guarantee for speed. Only "hex"'s parameters (pitch) apply in "hex"
-    mode and vice versa for the contour_* parameters below.
+    method ("hex", default, "contour", or "raster") picks the initial-
+    layout generator: "hex" is the flat lattice above; "contour" is
+    terrain/contour_layers.py's two-pass-per-band fill -- see that
+    module's docstring for the full design. Briefly: PASS 1 is a fast
+    random-candidate poisson pack with a hard, high-plateau fill_brush
+    (type 8/73), then PASS 2 is an oversized, heavily-overlapping
+    scatter fill with a softer smoothing_brush over whatever pass 1
+    leaves as genuine crumbs -- pass 2 IS exhaustive, so overall
+    coverage stays complete by construction even though pass 1 trades a
+    per-call guarantee for speed. "raster" is terrain/rastergrid.py's
+    flat, non-offset square grid of hard type-72 stamps, each valued at
+    the nearest heightmap cell to its own center (no fitting, no
+    averaging) -- see that module's docstring for the sizing math. Only
+    "hex"'s parameters (pitch) apply in "hex" mode, only "raster"'s
+    (raster_size) apply in "raster" mode, and vice versa for the
+    contour_* parameters below.
+
+    raster_size ("raster" method only) is the raster grid's center-to-
+    center spacing (m) -- must be one of terrain/rastergrid.py's
+    RASTER_SIZES (256, 64, 32, 16, 8, 4, 2), not a free value. Each
+    call places one flat grid at ONE size; layer coarse-to-fine
+    yourself by re-running this step at each size in turn (same
+    layering this docstring describes below for contour/hex).
+
+    raster_spread_ratio ("raster" method only, same None-means-use-
+    saved pattern as hex_spread_ratio) scales each raster stamp's
+    radius independently of raster_size -- lattice centers are
+    unaffected, only scale_x/scale_z change (see
+    terrain/rastergrid.py's SPREAD section). Default 1.0 reproduces
+    the exact edge-to-edge tiling radius; mainly useful as an A/B knob
+    against that default when investigating stamp-seam artifacts (see
+    course_output/userLayers.py's normalize_stamp_heights_by_value_shift).
+
+    raster_center_bias_ratio_x/raster_center_bias_ratio_z ("raster"
+    method only, same None-means-use-saved pattern) shift each raster
+    stamp's placement (not its sampled value) by raster_size *
+    raster_center_bias_ratio_x along x and raster_size *
+    raster_center_bias_ratio_z along z, independently -- compensates
+    for a resolution-dependent "drop shadow" caused by TerrainModel's
+    order-dependent overlap fold always favoring the +x/+z neighbor in
+    this lattice's own generation order (see terrain/rastergrid.py's
+    module docstring's CENTER BIAS section for the full mechanism).
+    Default 0.0 (each) is off; there's no derived "correct" value, so
+    like raster_spread_ratio these are meant to be dialed in
+    empirically.
+
+    raster_brush ("raster" method only) is the brush every lattice
+    stamp uses -- terrain/rastergrid.py's RASTER_BRUSH (type 72,
+    "hard square") by default. The grid's own center-to-center spacing
+    math (raster_radius above) is derived specifically from type 72's
+    measured flat-plateau/instant-edge profile (see
+    terrain/rastergrid.py's module docstring's STAMP SIZING section)
+    so it tiles edge-to-edge with no gap or overlap; picking any other
+    (circular) brush here keeps that same radius but no longer tiles
+    exactly -- a circle inscribed in each square cell leaves the
+    corners uncovered -- so treat this as a cosmetic/blending choice
+    (pair with raster_spread_ratio > 1 to close the resulting gaps),
+    not a like-for-like swap.
 
     enable_secondary_fill (contour method only, default True) turns
     pass 2 off entirely when False -- whatever pass 1 leaves as crumbs
@@ -1425,23 +1560,26 @@ def step_generate_terrain(
     fill_mode ("poisson", default, or "rect") only applies within
     method="contour" -- it picks terrain/contour_layers.py's own
     per-band fill algorithm: "poisson" is the two-pass circle fill
-    above; "rect" instead fills each band with axis-aligned type-72
-    rectangles (see generate_contour_layers' and contour_layers.py's
-    own docstrings, module section RECT FILL MODE, for the full
-    design). Everything else about method="contour" -- band_spacing_m,
-    the per-band loop, n_workers parallelization, layering behavior --
-    is identical between the two; only the shape of what fills one
-    band's own mask differs. fill_brush/min_radius/max_radius/
-    radius_step_ratio/edge_distance_m/candidates_per_radius and the
-    sweet-spot auto-tuning knobs apply to fill_mode="poisson" only;
-    rect_brush/rect_min_side_m/rect_size_ratio_cap apply to
+    above; "rect" instead traces each band's own real boundary and
+    places one type-72 stamp per boundary edge (see generate_contour_layers'
+    and contour_layers.py's own docstrings, module section RECT FILL
+    MODE, for the full design). Everything else about method="contour"
+    -- band_spacing_m, the per-band loop, n_workers parallelization,
+    layering behavior -- is identical between the two; only the shape
+    of what fills one band's own mask differs. fill_brush/min_radius/
+    max_radius/radius_step_ratio/edge_distance_m/candidates_per_radius
+    and the sweet-spot auto-tuning knobs apply to fill_mode="poisson"
+    only; rect_brush/rect_tolerance_m/rect_min_length_m/
+    rect_max_search_distance_m/rect_width_samples apply to
     fill_mode="rect" only.
 
-    Unlike hex mode, contour mode's stamps already carry their exact
-    fitted value (the local heightmap mean within each stamp's own
-    footprint, computed inside generate_contour_layers itself) -- so
-    the fit_stamp_heights() pass below only runs in "hex" mode.
-    Re-running it against contour stamps would be redundant at best.
+    Unlike hex mode, contour and raster mode stamps already carry their
+    exact final value (contour: the local heightmap mean within each
+    stamp's own footprint, computed inside generate_contour_layers
+    itself; raster: the nearest heightmap cell to each stamp's center,
+    computed inside generate_raster_grid itself) -- so the
+    fit_stamp_heights() pass below only runs in "hex" mode. Re-running
+    it against contour/raster stamps would be redundant at best.
 
     max_radius is the main contour-mode tuning knob for level of
     detail: it caps how large pass 1's biggest stamps can be, so it
@@ -1474,10 +1612,11 @@ def step_generate_terrain(
     happens BEFORE generation, not as a filter on the output -- contour
     mode ANDs a rasterized mask into every band's own footprint before
     the poisson-pack/crumb-scatter search runs (see
-    generate_contour_layers' region_mask), and hex mode tests each
-    lattice candidate against the mask polygon before ever constructing
-    a Stamp (see generate_hex_grid's mask_geometry) -- so a masked pass
-    over a small fraction of the course does proportionally less work,
+    generate_contour_layers' region_mask), and hex/raster mode each
+    test lattice/grid candidates against the mask polygon before ever
+    constructing a Stamp (see generate_hex_grid's/generate_raster_grid's
+    own mask_geometry) -- so a masked pass over a small fraction of the
+    course does proportionally less work,
     not the same full-course work followed by discarding most of it
     (the course-wide baseline-flatten stamp below, when added at all, is
     never masked -- it's a safety net for the very first contour-mode
@@ -1518,8 +1657,8 @@ def step_generate_terrain(
     if method is None:
         project = load_project(working_dir)
         method = project.get("generate_terrain_method", "hex")
-    if method not in ("hex", "contour"):
-        raise StepError(f"method must be 'hex' or 'contour', got {method!r}")
+    if method not in ("hex", "contour", "raster"):
+        raise StepError(f"method must be 'hex', 'contour', or 'raster', got {method!r}")
 
     pointcloud_path = working_dir / POINTCLOUD_FILE
     if not pointcloud_path.exists():
@@ -1538,6 +1677,24 @@ def step_generate_terrain(
         hex_brush = project.get("generate_terrain_hex_brush", HEX_DEFAULT_BRUSH)
     if hex_tool is None:
         hex_tool = project.get("generate_terrain_hex_tool", TOOL_FLATTEN)
+    if raster_size is None:
+        raster_size = project.get("generate_terrain_raster_size", DEFAULT_RASTER_SIZE)
+    if raster_size not in RASTER_SIZES:
+        raise StepError(f"raster_size must be one of {RASTER_SIZES}, got {raster_size!r}")
+    if raster_spread_ratio is None:
+        raster_spread_ratio = project.get(
+            "generate_terrain_raster_spread_ratio", DEFAULT_RASTER_SPREAD_RATIO
+        )
+    if raster_center_bias_ratio_x is None:
+        raster_center_bias_ratio_x = project.get(
+            "generate_terrain_raster_center_bias_ratio_x", DEFAULT_RASTER_CENTER_BIAS_RATIO
+        )
+    if raster_center_bias_ratio_z is None:
+        raster_center_bias_ratio_z = project.get(
+            "generate_terrain_raster_center_bias_ratio_z", DEFAULT_RASTER_CENTER_BIAS_RATIO
+        )
+    if raster_brush is None:
+        raster_brush = project.get("generate_terrain_raster_brush", RASTER_BRUSH)
     if band_spacing_m is None:
         band_spacing_m = project.get("generate_terrain_band_spacing_m", DEFAULT_BAND_SPACING_M)
     if fill_mode is None:
@@ -1546,12 +1703,16 @@ def step_generate_terrain(
         raise StepError(f"fill_mode must be 'poisson' or 'rect', got {fill_mode!r}")
     if rect_brush is None:
         rect_brush = project.get("generate_terrain_rect_brush", DEFAULT_RECT_BRUSH)
-    if rect_min_side_m is None:
-        rect_min_side_m = project.get("generate_terrain_rect_min_side_m", DEFAULT_RECT_MIN_SIDE_M)
-    if rect_size_ratio_cap is None:
-        rect_size_ratio_cap = project.get(
-            "generate_terrain_rect_size_ratio_cap", DEFAULT_RECT_SIZE_RATIO_CAP
+    if rect_tolerance_m is None:
+        rect_tolerance_m = project.get("generate_terrain_rect_tolerance_m", DEFAULT_RECT_TOLERANCE_M)
+    if rect_min_length_m is None:
+        rect_min_length_m = project.get("generate_terrain_rect_min_length_m", DEFAULT_RECT_MIN_LENGTH_M)
+    if rect_max_search_distance_m is None:
+        rect_max_search_distance_m = project.get(
+            "generate_terrain_rect_max_search_distance_m", DEFAULT_RECT_MAX_SEARCH_DISTANCE_M
         )
+    if rect_width_samples is None:
+        rect_width_samples = project.get("generate_terrain_rect_width_samples", DEFAULT_RECT_WIDTH_SAMPLES)
     if fill_brush is None:
         fill_brush = project.get("generate_terrain_fill_brush", DEFAULT_FILL_BRUSH)
     if min_radius is None:
@@ -1649,13 +1810,15 @@ def step_generate_terrain(
             print(f"  height mask restricts this layer to {region_mask.mean():.1%} of the course "
                   "(cropped before filling, not filtered after)")
         else:
-            print(f"  height mask restricts this layer's hex lattice to inside "
+            print(f"  height mask restricts this layer's {method} lattice to inside "
                   f"{HEIGHT_MASK_FILE} (stamps outside it are never generated)")
 
     if method == "contour":
         if fill_mode == "rect":
             print(f"Rect band fill (band_spacing_m={band_spacing_m}, rect_brush={rect_brush}, "
-                  f"rect_min_side_m={rect_min_side_m}, rect_size_ratio_cap={rect_size_ratio_cap}, "
+                  f"rect_tolerance_m={rect_tolerance_m}, rect_min_length_m={rect_min_length_m}, "
+                  f"rect_max_search_distance_m={rect_max_search_distance_m}, "
+                  f"rect_width_samples={rect_width_samples}, "
                   f"pass2_radius={smoothing_min_radius * smooth_ratio} m)...")
         else:
             print(f"Two-pass poisson band fill (band_spacing_m={band_spacing_m}, "
@@ -1692,8 +1855,10 @@ def step_generate_terrain(
             radius_step_ratio=radius_step_ratio,
             edge_distance_m=edge_distance_m,
             rect_brush=rect_brush,
-            rect_min_side_m=rect_min_side_m,
-            rect_size_ratio_cap=rect_size_ratio_cap,
+            rect_tolerance_m=rect_tolerance_m,
+            rect_min_length_m=rect_min_length_m,
+            rect_max_search_distance_m=rect_max_search_distance_m,
+            rect_width_samples=rect_width_samples,
             smoothing_brush=smoothing_brush,
             smoothing_min_radius=smoothing_min_radius,
             smooth_ratio=smooth_ratio,
@@ -1718,6 +1883,26 @@ def step_generate_terrain(
                   "course is only partially filled (see note above)")
         else:
             print(f"  {len(fitted)} stamps placed (tiered band fill + crumb smoothing, all already fitted)")
+
+    elif method == "raster":
+        raster_radius = (raster_size / (2.0 * TYPE72_PLATEAU_FRACTION)) * raster_spread_ratio
+        print(f"Generating raster grid (size={raster_size} m, spread_ratio={raster_spread_ratio}, "
+              f"center_bias_ratio_x={raster_center_bias_ratio_x}, "
+              f"center_bias_ratio_z={raster_center_bias_ratio_z}, brush={raster_brush}, "
+              f"radius={raster_radius:.3f} m)...")
+        if raster_brush != RASTER_BRUSH:
+            print(f"  NOTE: brush {raster_brush} isn't type {RASTER_BRUSH} (the square brush this "
+                  "grid's spacing math is derived from) -- stamps are placed at the same exact-"
+                  "tiling radius regardless, so a circular brush leaves each cell's corners "
+                  "uncovered rather than tiling seamlessly.")
+        fitted, n_skipped = generate_raster_grid(
+            bounds, heightmap, bounds, size=raster_size, spread_ratio=raster_spread_ratio,
+            center_bias_ratio_x=raster_center_bias_ratio_x, center_bias_ratio_z=raster_center_bias_ratio_z,
+            brush=raster_brush, mask_geometry=mask_geometry,
+        )
+        print(f"  {len(fitted)} stamps placed"
+              + (f", {n_skipped} grid points skipped (no bare-earth heightmap coverage there)"
+                 if n_skipped else "") + " (nearest-heightmap-sample, no fitting needed)")
 
     else:
         stamp_radius = 2.0 * pitch * hex_spread_ratio
@@ -1745,8 +1930,8 @@ def step_generate_terrain(
               f"elevation ({mean_elevation:.2f} m)...")
         baseline_stamp = build_baseline_flatten_stamp(bounds, mean_elevation)
         fitted = [baseline_stamp] + fitted
-    elif method == "hex":
-        print("Skipping the course-wide baseline-flatten stamp -- hex mode's lattice "
+    elif method in ("hex", "raster"):
+        print(f"Skipping the course-wide baseline-flatten stamp -- {method} mode's lattice "
               "already has full coverage on its own.")
     else:
         print(f"Skipping the course-wide baseline-flatten stamp -- this is layer "
@@ -1759,9 +1944,15 @@ def step_generate_terrain(
         parameters={"course_size_m": COURSE_SIZE_M, "pitch_m": pitch,
                      "hex_spread_ratio": hex_spread_ratio, "method": method,
                      "hex_brush": hex_brush, "hex_tool": hex_tool,
+                     "raster_size": raster_size, "raster_spread_ratio": raster_spread_ratio,
+                     "raster_center_bias_ratio_x": raster_center_bias_ratio_x,
+                     "raster_center_bias_ratio_z": raster_center_bias_ratio_z,
+                     "raster_brush": raster_brush,
                      "band_spacing_m": band_spacing_m, "fill_mode": fill_mode,
-                     "rect_brush": rect_brush, "rect_min_side_m": rect_min_side_m,
-                     "rect_size_ratio_cap": rect_size_ratio_cap,
+                     "rect_brush": rect_brush, "rect_tolerance_m": rect_tolerance_m,
+                     "rect_min_length_m": rect_min_length_m,
+                     "rect_max_search_distance_m": rect_max_search_distance_m,
+                     "rect_width_samples": rect_width_samples,
                      "use_height_mask": use_height_mask,
                      "mask_buffer_px": mask_buffer_px},
     )
@@ -1776,6 +1967,11 @@ def step_generate_terrain(
         "generate_terrain_method": method,
         "generate_terrain_hex_brush": hex_brush,
         "generate_terrain_hex_tool": hex_tool,
+        "generate_terrain_raster_size": raster_size,
+        "generate_terrain_raster_spread_ratio": raster_spread_ratio,
+        "generate_terrain_raster_center_bias_ratio_x": raster_center_bias_ratio_x,
+        "generate_terrain_raster_center_bias_ratio_z": raster_center_bias_ratio_z,
+        "generate_terrain_raster_brush": raster_brush,
         "generate_terrain_band_spacing_m": band_spacing_m,
         "generate_terrain_fill_mode": fill_mode,
         "generate_terrain_fill_brush": fill_brush,
@@ -1784,8 +1980,10 @@ def step_generate_terrain(
         "generate_terrain_radius_step_ratio": radius_step_ratio,
         "generate_terrain_edge_distance_m": edge_distance_m,
         "generate_terrain_rect_brush": rect_brush,
-        "generate_terrain_rect_min_side_m": rect_min_side_m,
-        "generate_terrain_rect_size_ratio_cap": rect_size_ratio_cap,
+        "generate_terrain_rect_tolerance_m": rect_tolerance_m,
+        "generate_terrain_rect_min_length_m": rect_min_length_m,
+        "generate_terrain_rect_max_search_distance_m": rect_max_search_distance_m,
+        "generate_terrain_rect_width_samples": rect_width_samples,
         "generate_terrain_smoothing_brush": smoothing_brush,
         "generate_terrain_smoothing_min_radius_m": smoothing_min_radius,
         "generate_terrain_smooth_ratio": smooth_ratio,
@@ -2363,12 +2561,19 @@ def _set_course_name_in_file(path: Path, course_name: str, key: str) -> None:
     print(f"Set course name to '{course_name}' in {path}")
 
 
-def step_output_terrain(working_dir: Path, registration_marks: bool = False) -> None:
+def step_output_terrain(
+    working_dir: Path, registration_marks: bool = False, direct_height_shift: bool = False,
+) -> None:
     course_dir = working_dir / "course"
 
     print(f"Loading stamps from {working_dir} (all layers)...")
     stamps = load_all_stamps(working_dir)
     print(f"  {len(stamps)} stamps")
+
+    stamps, pruned_count = prune_overwritten_stamps(stamps)
+    if pruned_count:
+        print(f"  Pruned {pruned_count} stamp(s) fully overwritten by later stamps "
+              f"({len(stamps)} remain)")
 
     if registration_marks:
         marks = build_registration_mark_stamps(COURSE_SIZE_M)
@@ -2381,7 +2586,12 @@ def step_output_terrain(working_dir: Path, registration_marks: bool = False) -> 
     print(f"Normalizing heights: actual resolved range [{true_min:.3f}, {true_max:.3f}] m "
           f"-> shifting by {-true_min:.3f} m so minimum lands at 0")
     try:
-        stamps = normalize_stamp_heights(stamps, bounds)
+        if direct_height_shift:
+            print("  Using --direct-height-shift: shifting each stamp's own value directly "
+                  "(A/B test) instead of appending a course-wide shim stamp.")
+            stamps = normalize_stamp_heights_by_value_shift(stamps, bounds)
+        else:
+            stamps = normalize_stamp_heights(stamps, bounds)
     except ValueError as e:
         raise StepError(str(e)) from e
 
@@ -2554,12 +2764,16 @@ def main(argv: list[str] | None = None) -> int:
                               "opening coverage gaps between lattice centers. Does NOT affect edge "
                               "bleed or lattice center spacing. Default: use whatever's saved in "
                               f"project.json, or {HEX_DEFAULT_SPREAD_RATIO} if never set.")
-    parser.add_argument("--generate-terrain-method", type=str, default=None, choices=["hex", "contour"],
+    parser.add_argument("--generate-terrain-method", type=str, default=None,
+                         choices=["hex", "contour", "raster"],
                          help="generate-terrain: 'hex' (default) is the flat hex lattice. 'contour' "
                               "traces elevation-band contours of the real heightmap and places stamps "
                               "along each ring, spaced by local curvature, with a distance-transform "
                               "gap-fill pass for flat interiors ring-tracing can't reach on its own -- "
-                              "see terrain/contour_layers.py. Default: use whatever's saved in "
+                              "see terrain/contour_layers.py. 'raster' is a flat, non-offset square "
+                              "grid of hard type-72 stamps, each valued at the nearest heightmap cell "
+                              "to its own center (no fitting, no averaging) -- see "
+                              "terrain/rastergrid.py. Default: use whatever's saved in "
                               "project.json, or 'hex' if never set.")
     parser.add_argument("--hex-brush", type=int, default=None,
                          help="generate-terrain, hex method only: brush every lattice stamp uses. "
@@ -2572,6 +2786,43 @@ def main(argv: list[str] | None = None) -> int:
                               "terrain/stamp.py). Most useful for a masked pass that should build up "
                               "an area without flattening it. Default: use whatever's saved in "
                               "project.json, or 0 (flatten) if never set.")
+    parser.add_argument("--raster-size", type=int, default=None, choices=list(RASTER_SIZES),
+                         help="generate-terrain, raster method only: center-to-center spacing (m) of "
+                              "the flat square-stamp grid (terrain/rastergrid.py's RASTER_SIZES) -- "
+                              "each call places ONE flat grid at this size; layer coarse-to-fine "
+                              "yourself by re-running generate-terrain at each size in turn. Default: "
+                              f"use whatever's saved in project.json, or {DEFAULT_RASTER_SIZE} if "
+                              "never set.")
+    parser.add_argument("--raster-spread-ratio", type=float, default=None,
+                         help="generate-terrain, raster method only: scales stamp radius (x/z scale) "
+                              "independently of raster_size -- lattice centers are unaffected, only "
+                              "scale_x/scale_z change (terrain/rastergrid.py's SPREAD section). 1.0 "
+                              "(default) reproduces the exact edge-to-edge tiling radius; >1 grows "
+                              "stamps past their own cell so neighbors overlap; <1 leaves a gap between "
+                              "cells. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RASTER_SPREAD_RATIO} if never set.")
+    parser.add_argument("--raster-center-bias-ratio-x", type=float, default=None,
+                         help="generate-terrain, raster method only: shifts each raster stamp's "
+                              "placement (not its sampled value) along x by raster_size * this ratio "
+                              "-- compensates for a resolution-dependent 'drop shadow' caused by "
+                              "TerrainModel's order-dependent overlap fold always favoring the +x/+z "
+                              "neighbor in this lattice's own generation order (terrain/rastergrid.py's "
+                              "CENTER BIAS section). No derived 'correct' value -- dial in empirically, "
+                              "same as raster_spread_ratio. Default: use whatever's saved in "
+                              f"project.json, or {DEFAULT_RASTER_CENTER_BIAS_RATIO} (off) if never set.")
+    parser.add_argument("--raster-center-bias-ratio-z", type=float, default=None,
+                         help="generate-terrain, raster method only: same as "
+                              "--raster-center-bias-ratio-x but along z. Default: use whatever's saved "
+                              f"in project.json, or {DEFAULT_RASTER_CENTER_BIAS_RATIO} (off) if never "
+                              "set.")
+    parser.add_argument("--raster-brush", type=int, default=None,
+                         help="generate-terrain, raster method only: brush every lattice stamp uses. "
+                              f"The grid's spacing math is derived from type {RASTER_BRUSH}'s (the "
+                              "default) measured square flat-plateau/instant-edge profile, so it tiles "
+                              "edge-to-edge exactly only for that brush -- any other (circular) brush "
+                              "keeps the same radius but leaves each cell's corners uncovered instead "
+                              "of tiling seamlessly. Default: use whatever's saved in project.json, or "
+                              f"{RASTER_BRUSH} if never set.")
     parser.add_argument("--band-spacing-m", type=float, default=None,
                          help="generate-terrain, contour method only: elevation spacing (m) defining "
                               "each band -- smaller means more, narrower bands. Default: use whatever's "
@@ -2579,30 +2830,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fill-mode", type=str, default=None, choices=["poisson", "rect"],
                          help="generate-terrain, contour method only: per-band fill algorithm. "
                               "'poisson' (default) is the two-pass circle fill (--fill-brush tiered "
-                              "pack + --smoothing-brush crumb scatter). 'rect' instead fills each band "
-                              "with axis-aligned type-72 rectangles (--rect-brush/--rect-min-side-m/"
-                              "--rect-size-ratio-cap), falling through to the same --smoothing-brush "
-                              "crumb scatter for whatever it can't cleanly place -- see "
-                              "terrain/contour_layers.py's RECT FILL MODE docstring section. Default: "
+                              "pack + --smoothing-brush crumb scatter). 'rect' instead traces each "
+                              "band's own real boundary and places one type-72 stamp per boundary edge "
+                              "(--rect-brush/--rect-tolerance-m/--rect-min-length-m/"
+                              "--rect-max-search-distance-m/--rect-width-samples), falling through to "
+                              "the same --smoothing-brush crumb scatter for whatever it can't reach -- "
+                              "see terrain/contour_layers.py's RECT FILL MODE docstring section. Default: "
                               f"use whatever's saved in project.json, or {DEFAULT_FILL_MODE!r} if never set.")
     parser.add_argument("--rect-brush", type=int, default=None,
                          help="generate-terrain, contour rect fill_mode only: brush for the main "
-                              "rectangle-covering pass -- must be a square-shaped brush (type 72 is the "
+                              "per-boundary-edge pass -- must be a square-shaped brush (type 72 is the "
                               "only one today). Default: use whatever's saved in project.json, or "
                               f"{DEFAULT_RECT_BRUSH} if never set.")
-    parser.add_argument("--rect-min-side-m", type=float, default=None,
-                         help="generate-terrain, contour rect fill_mode only: shorter-side floor (m) "
-                              "below which a candidate rectangle is treated as a genuine crumb and "
-                              "handed to the same --smoothing-brush crumb scatter 'poisson' mode uses. "
-                              "Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_RECT_MIN_SIDE_M} if never set.")
-    parser.add_argument("--rect-size-ratio-cap", type=float, default=None,
-                         help="generate-terrain, contour rect fill_mode only: seam-step mitigation -- no "
-                              "rectangle's own longer side may exceed this multiple of an already-"
-                              "placed, directly-touching neighbor's longer side (too-big candidates are "
-                              "clipped down; too-small ones are deferred to crumb scatter instead). "
-                              "Default: use whatever's saved in project.json, or "
-                              f"{DEFAULT_RECT_SIZE_RATIO_CAP} if never set.")
+    parser.add_argument("--rect-tolerance-m", type=float, default=None,
+                         help="generate-terrain, contour rect fill_mode only: Douglas-Peucker "
+                              "boundary-simplify tolerance (m) when tracing each band's own shape into "
+                              "vector polygons before placing per-edge stamps. Default: use whatever's "
+                              f"saved in project.json, or {DEFAULT_RECT_TOLERANCE_M} if never set.")
+    parser.add_argument("--rect-min-length-m", type=float, default=None,
+                         help="generate-terrain, contour rect fill_mode only: floor length (m) for a "
+                              "per-edge stamp when no opposite wall is found within "
+                              "--rect-max-search-distance-m. Default: use whatever's saved in "
+                              f"project.json, or {DEFAULT_RECT_MIN_LENGTH_M} if never set.")
+    parser.add_argument("--rect-max-search-distance-m", type=float, default=None,
+                         help="generate-terrain, contour rect fill_mode only: cap (m) on the ray-cast "
+                              "search for the wall opposite each boundary edge. Default: use whatever's "
+                              f"saved in project.json, or {DEFAULT_RECT_MAX_SEARCH_DISTANCE_M} if never set.")
+    parser.add_argument("--rect-width-samples", type=int, default=None,
+                         help="generate-terrain, contour rect fill_mode only: points sampled across each "
+                              "boundary edge's own width (not just its center) when ray-casting for the "
+                              "opposite wall. Default: use whatever's saved in project.json, or "
+                              f"{DEFAULT_RECT_WIDTH_SAMPLES} if never set.")
     parser.add_argument("--fill-brush", type=int, default=None,
                          help="generate-terrain, contour method only: brush for the main tiered multi-"
                               "scale band fill -- type 8 (wide flat plateau) recommended, has the best "
@@ -2866,6 +3124,14 @@ def main(argv: list[str] | None = None) -> int:
                               "confirming in-game that terrain and splines land exactly where "
                               "expected, and that the game isn't scaling/repositioning either one "
                               "unexpectedly. Opt-in; off by default.")
+    parser.add_argument("--direct-height-shift", action="store_true",
+                         help="output-terrain: A/B test for the 'cheese grater' stamp-seam artifact -- "
+                              "normalize final heights by shifting every stamp's own value directly "
+                              "(normalize_stamp_heights_by_value_shift) instead of the default method's "
+                              "appended course-wide raise stamp (normalize_stamp_heights). Not a "
+                              "mathematically equivalent shift (see that function's docstring); this "
+                              "exists to check whether the default method's shim stamp is what's "
+                              "causing the seams, not to replace it. Opt-in; off by default.")
     parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
@@ -2971,9 +3237,18 @@ def main(argv: list[str] | None = None) -> int:
                               "--tree-asset-path pool for just that tree. Repeatable. Default: use "
                               "whatever's saved in project.json, or none if never set.")
     parser.add_argument("--stake-asset-path", type=str, default=None,
-                         help="write-objects: Unity asset path for a stake placed at every corner of "
-                              "every 'building' feature. Omit to skip stakes entirely. Default: use "
-                              "whatever's saved in project.json, or none if never set.")
+                         help="write-objects (game_version=2021+ only): Unity asset path for a stake "
+                              "placed at every corner of every 'building' feature. Omit to skip stakes "
+                              "entirely. Default: use whatever's saved in project.json, or none if "
+                              "never set.")
+    parser.add_argument("--stake-buildings", action=argparse.BooleanOptionalAction, default=None,
+                         help="write-objects (game_version=2019 only): place a stake (the same fence-"
+                              "post prop as the cart-path debug marker, category="
+                              "objects.BUILDING_STAKE_CATEGORY_V2019/type="
+                              "objects.BUILDING_STAKE_TYPE_V2019, but at a subtle "
+                              "objects.BUILDING_STAKE_SCALE_V2019 scale) at every corner of every "
+                              "'building' feature. Default: use whatever's saved in project.json, or "
+                              "OFF if never set.")
     parser.add_argument("--detect-lidar-trees", action=argparse.BooleanOptionalAction, default=None,
                          help="generate-trees: also detect individual trees directly from LIDAR canopy "
                               "points (ingest/tree_detection.py), added on top of any OSM natural=tree "
@@ -2982,6 +3257,14 @@ def main(argv: list[str] | None = None) -> int:
                               "everywhere else). Needs heightmap.npz and pointcloud.npz (--step "
                               "ingest-laz). Default: use whatever's saved in project.json, or ON if "
                               "never set (OSM alone typically finds few or no trees on a real course).")
+    parser.add_argument("--mark-cartpath-trees", action=argparse.BooleanOptionalAction, default=None,
+                         help="generate-trees: DEBUG mode -- trees detected sitting on a cart path are "
+                              "left in place (not relocated) and tagged so write-objects "
+                              "(game_version=2019 only) swaps them for an oversized, obvious marker "
+                              "object (see objects.py's CARTPATH_DEBUG_MARKER_CATEGORY_V2019/TYPE/SCALE) "
+                              "instead of a real tree, so you can see in-game exactly which trees are "
+                              "being flagged. NOT sticky -- always OFF by default even if a previous run "
+                              "used it; pass this flag explicitly every time you want it.")
     parser.add_argument("--repack-filename", type=str, default=None,
                          help="repack: output filename (without .course extension)")
     args = parser.parse_args(argv)
@@ -3016,6 +3299,11 @@ def main(argv: list[str] | None = None) -> int:
                 method=args.generate_terrain_method,
                 hex_brush=args.hex_brush,
                 hex_tool=args.hex_tool,
+                raster_size=args.raster_size,
+                raster_spread_ratio=args.raster_spread_ratio,
+                raster_center_bias_ratio_x=args.raster_center_bias_ratio_x,
+                raster_center_bias_ratio_z=args.raster_center_bias_ratio_z,
+                raster_brush=args.raster_brush,
                 band_spacing_m=args.band_spacing_m,
                 fill_mode=args.fill_mode,
                 fill_brush=args.fill_brush,
@@ -3024,8 +3312,10 @@ def main(argv: list[str] | None = None) -> int:
                 radius_step_ratio=args.radius_step_ratio,
                 edge_distance_m=args.edge_distance_m,
                 rect_brush=args.rect_brush,
-                rect_min_side_m=args.rect_min_side_m,
-                rect_size_ratio_cap=args.rect_size_ratio_cap,
+                rect_tolerance_m=args.rect_tolerance_m,
+                rect_min_length_m=args.rect_min_length_m,
+                rect_max_search_distance_m=args.rect_max_search_distance_m,
+                rect_width_samples=args.rect_width_samples,
                 smoothing_brush=args.smoothing_brush,
                 smoothing_min_radius=args.smoothing_min_radius,
                 smooth_ratio=args.smooth_ratio,
@@ -3068,13 +3358,14 @@ def main(argv: list[str] | None = None) -> int:
                                  args.variation_contrast_gamma, args.density_weighted,
                                  args.subpixel_jitter_fraction)
         elif args.step == "output-terrain":
-            step_output_terrain(working_dir, registration_marks=args.registration_marks)
+            step_output_terrain(working_dir, registration_marks=args.registration_marks,
+                                 direct_height_shift=args.direct_height_shift)
         elif args.step == "write-splines":
             step_write_splines(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-holes":
             step_write_holes(working_dir)
         elif args.step == "generate-trees":
-            step_generate_trees(working_dir, args.detect_lidar_trees)
+            step_generate_trees(working_dir, args.detect_lidar_trees, args.mark_cartpath_trees)
         elif args.step == "write-objects":
             tree_type_asset_paths = None
             if args.tree_type_asset_paths is not None:
@@ -3087,6 +3378,7 @@ def main(argv: list[str] | None = None) -> int:
             step_write_objects(
                 working_dir, args.game_version, _resolve_theme(args.theme), args.tree_variety,
                 args.tree_asset_paths, tree_type_asset_paths, args.stake_asset_path,
+                args.stake_buildings,
             )
         elif args.step == "repack":
             if not args.repack_filename:

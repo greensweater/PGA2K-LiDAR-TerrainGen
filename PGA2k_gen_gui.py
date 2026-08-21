@@ -65,7 +65,7 @@ from course_output.objects import (  # noqa: E402
     TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, save_object_list,
 )
 from ingest.osm import (  # noqa: E402
-    DEFAULT_HOLE_CORRIDOR_BUFFER_PX, build_height_mask, crop_features,
+    DEFAULT_HOLE_CORRIDOR_BUFFER_PX, Feature, build_height_mask, crop_features,
     merge_height_mask_features, load_features,
     rasterize_mask_rgba, save_features, save_height_mask, shift_features,
 )
@@ -74,6 +74,13 @@ from terrain.hexgrid import (  # noqa: E402
     DEFAULT_BRUSH as HEX_DEFAULT_BRUSH,
     HEX_DEFAULT_SPREAD_RATIO,
     HEX_LATTICE_PITCH_M,
+)
+from terrain.rastergrid import (  # noqa: E402
+    RASTER_SIZES,
+    RASTER_BRUSH as DEFAULT_RASTER_BRUSH,
+    DEFAULT_RASTER_SIZE,
+    DEFAULT_RASTER_SPREAD_RATIO,
+    DEFAULT_RASTER_CENTER_BIAS_RATIO,
 )
 from terrain.cart_paths import (  # noqa: E402
     CART_PATH_STAMP_RADIUS, CART_PATH_SPACING_M, CART_PATH_HEIGHT_AVG_RADIUS_M,
@@ -92,6 +99,7 @@ try:
     # crash preview rendering entirely.
     from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE  # noqa: E402
     from terrain.terrain_kernel import TerrainKernel  # noqa: E402
+    from terrain.stamp import local_square_offsets  # noqa: E402
     _HAVE_TERRAIN_KERNEL = True
 except ImportError:
     _HAVE_TERRAIN_KERNEL = False
@@ -119,6 +127,24 @@ PREVIEW_FILES = [
 GAME_VERSION_FOLDERS = {
     "2019": "The Golf Club 2019",
 }
+
+
+def _spline_tag_detail(f: Feature) -> str:
+    """
+    Extra OSM tag value to show alongside a spline's kind in the
+    Splines tab list, e.g. distinguishing a broadleaved wood from a
+    needleleaved one, or a stream from a ditch -- info classify_way
+    collapses into one `kind` but is still on the raw `tags`.
+    """
+    if f.kind == "wood":
+        leaf_type = f.tags.get("leaf_type")
+        if leaf_type:
+            return leaf_type
+    if f.kind == "water":
+        waterway = f.tags.get("waterway")
+        if waterway:
+            return waterway
+    return f.tags.get("natural", "")
 
 
 class _Tooltip:
@@ -451,20 +477,60 @@ class PGAGenGUI:
         self._add_step_button(parent, "Visualize", self._run_visualize)
 
     def _build_terrain_tab(self, parent: ttk.Frame) -> None:
-        gen_method_row = ttk.Frame(parent)
-        gen_method_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(gen_method_row, text="Method:").pack(side="left")
-        self.generate_terrain_method_var = tk.StringVar(value="hex")
-        gen_method_box = ttk.Combobox(
-            gen_method_row, textvariable=self.generate_terrain_method_var, state="readonly", width=10,
-            values=["hex", "contour"],
-        )
-        gen_method_box.pack(side="left", padx=4)
-        _Tooltip(gen_method_box, "hex: flat hex-grid lattice (the original behavior). contour: fills "
-                 "every elevation band's real 2D footprint directly with a tiered multi-scale scan of "
-                 "circles (large to small), each valued at the real local heightmap mean -- no ring "
-                 "tracing, no cross-band blending -- see terrain/contour_layers.py.")
+        self._build_generate_section(parent)
 
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._build_refine_section(parent)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._build_cart_paths_section(parent)
+
+    # ------------------------------------------------------------------
+    # Generate -- hex / contour / raster each live in their own tab with
+    # only the fields that method actually reads (see PGA2k_gen.py's
+    # step_generate_terrain). Restrict to mask is shared above the tabs:
+    # every method respects it, just via a different mechanism (contour
+    # crops each band's fill, hex/raster skip lattice points outside it
+    # -- see generate_hex_grid/generate_raster_grid's mask_geometry arg).
+    # ------------------------------------------------------------------
+
+    def _build_generate_section(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Generate", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+
+        self.generate_terrain_method_var = tk.StringVar(value="hex")
+
+        self.generate_terrain_use_height_mask_var = tk.BooleanVar(value=False)
+        generate_terrain_mask_checkbox = ttk.Checkbutton(
+            parent, text="Restrict to mask", variable=self.generate_terrain_use_height_mask_var,
+        )
+        generate_terrain_mask_checkbox.pack(anchor="w", pady=(0, 4))
+        _Tooltip(generate_terrain_mask_checkbox, "Restrict this layer to inside height_mask.geojson "
+                 "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM) -- restriction "
+                 "happens BEFORE generation, not as a filter afterward: contour mode crops each "
+                 "band's fill to the mask before the poisson-pack/crumb-scatter search runs, and hex "
+                 "mode never places a lattice stamp outside it, so a small masked region does "
+                 "proportionally less work, not full-course work followed by discarding most of it "
+                 "(the course-wide baseline-flatten stamp is never masked). Uses the same "
+                 "Buffer (px) slider as Refine's Mask option, in the Preview panel.")
+
+        gen_notebook = ttk.Notebook(parent)
+        gen_notebook.pack(fill="x", pady=(0, 4))
+        hex_tab = ttk.Frame(gen_notebook, padding=4)
+        contour_tab = ttk.Frame(gen_notebook, padding=4)
+        raster_tab = ttk.Frame(gen_notebook, padding=4)
+        gen_notebook.add(hex_tab, text="Hex")
+        gen_notebook.add(contour_tab, text="Contour")
+        gen_notebook.add(raster_tab, text="Raster")
+
+        self._build_generate_hex_tab(hex_tab)
+        self._build_generate_contour_tab(contour_tab)
+        self._build_generate_raster_tab(raster_tab)
+
+    def _run_generate_terrain_as(self, method: str) -> None:
+        self.generate_terrain_method_var.set(method)
+        self._run_generate_terrain()
+
+    def _build_generate_hex_tab(self, parent: ttk.Frame) -> None:
         pitch_row = ttk.Frame(parent)
         pitch_row.pack(fill="x", pady=(0, 4))
         ttk.Label(pitch_row, text="Pitch (m):").pack(side="left")
@@ -506,6 +572,75 @@ class PGAGenGUI:
                  "preserving whatever relief already exists (see terrain/stamp.py). Most useful "
                  "for a masked pass that should build up an area without flattening it.")
 
+        self._add_step_button(parent, "Generate Terrain", lambda: self._run_generate_terrain_as("hex"))
+
+    def _build_generate_raster_tab(self, parent: ttk.Frame) -> None:
+        def _field(column: ttk.Frame, label: str, var: tk.Variable, width: int,
+                    tooltip: str, combo_values: Optional[list[str]] = None) -> ttk.Widget:
+            row = ttk.Frame(column)
+            row.pack(fill="x", pady=2)
+            ttk.Label(row, text=label, width=14, anchor="w").pack(side="left")
+            if combo_values is not None:
+                widget: ttk.Widget = ttk.Combobox(
+                    row, textvariable=var, state="readonly", width=width, values=combo_values,
+                )
+            else:
+                widget = ttk.Entry(row, textvariable=var, width=width)
+            widget.pack(side="left", padx=4)
+            _Tooltip(widget, tooltip)
+            return widget
+
+        columns = ttk.Frame(parent)
+        columns.pack(fill="x", pady=(0, 4))
+        left_col = ttk.Frame(columns)
+        left_col.pack(side="left", fill="y", padx=(0, 24))
+        right_col = ttk.Frame(columns)
+        right_col.pack(side="left", fill="y")
+
+        self.raster_size_var = tk.StringVar(value=str(DEFAULT_RASTER_SIZE))
+        _field(left_col, "Raster size (m):", self.raster_size_var, 5,
+               "raster method only: center-to-center spacing (m) of the flat square-stamp grid "
+               "(terrain/rastergrid.py's RASTER_SIZES). Each run places ONE flat grid at this size -- "
+               "layer coarse-to-fine yourself by re-running Generate Terrain at each size in turn, "
+               "largest first.", combo_values=[str(s) for s in RASTER_SIZES])
+
+        self.raster_spread_ratio_var = tk.StringVar(value=str(DEFAULT_RASTER_SPREAD_RATIO))
+        _field(left_col, "Raster spread:", self.raster_spread_ratio_var, 5,
+               "raster method only: scales stamp radius (x/z scale) independently of raster size -- "
+               "lattice centers are unaffected. 1 (default) reproduces the exact edge-to-edge tiling "
+               "radius; >1 grows stamps past their own cell for more overlap/blending, <1 shrinks "
+               "them, opening a gap between cells. Does NOT move any lattice center, only how big "
+               "each stamp is.")
+
+        self.raster_brush_var = tk.StringVar(value=str(DEFAULT_RASTER_BRUSH))
+        _field(left_col, "Brush:", self.raster_brush_var, 4,
+               "raster method only: brush every lattice stamp uses. Default: "
+               f"{DEFAULT_RASTER_BRUSH} (terrain/rastergrid.py's RASTER_BRUSH, the square 'hard "
+               "square' brush) -- the grid's own center-to-center spacing is derived specifically "
+               f"from type {DEFAULT_RASTER_BRUSH}'s measured flat-plateau/instant-edge profile, so "
+               "it tiles edge-to-edge with no gap or overlap. Picking any other (circular) brush "
+               "keeps that same radius but no longer tiles exactly -- a circle inscribed in each "
+               "square cell leaves the corners uncovered -- so treat this as a cosmetic/blending "
+               "choice (pair with a wider Raster spread to close the resulting gaps), not a "
+               "like-for-like swap.")
+
+        center_bias_tooltip = (
+            "raster method only: shifts each stamp's placement (not its sampled value) along this "
+            "axis by raster size * this ratio. Compensates for a resolution-dependent 'drop shadow' "
+            "at mask edges, caused by TerrainModel always favoring the +x/+z neighbor when stamps "
+            "overlap (see terrain/rastergrid.py's CENTER BIAS section). 0 (default) is off -- no "
+            "derived 'correct' value, dial in independently per axis, empirically, same as Raster "
+            "spread."
+        )
+        self.raster_center_bias_ratio_x_var = tk.StringVar(value=str(DEFAULT_RASTER_CENTER_BIAS_RATIO))
+        _field(right_col, "Center bias X:", self.raster_center_bias_ratio_x_var, 5, center_bias_tooltip)
+
+        self.raster_center_bias_ratio_z_var = tk.StringVar(value=str(DEFAULT_RASTER_CENTER_BIAS_RATIO))
+        _field(right_col, "Center bias Z:", self.raster_center_bias_ratio_z_var, 5, center_bias_tooltip)
+
+        self._add_step_button(parent, "Generate Terrain", lambda: self._run_generate_terrain_as("raster"))
+
+    def _build_generate_contour_tab(self, parent: ttk.Frame) -> None:
         fill_mode_row = ttk.Frame(parent)
         fill_mode_row.pack(fill="x", pady=(0, 4))
         ttk.Label(fill_mode_row, text="Fill mode:").pack(side="left")
@@ -517,11 +652,12 @@ class PGAGenGUI:
         fill_mode_box.pack(side="left", padx=4)
         _Tooltip(fill_mode_box, "contour method only: per-band fill algorithm. poisson (default) is "
                  "the two-pass circle fill below (PASS 1 tiered pack + PASS 2 crumb scatter). rect "
-                 "instead fills each band with axis-aligned type-72 rectangles (RECT BR/RECT MIN "
-                 "side m/RECT ratio cap below), falling through to the same PASS 2 SMOOTH crumb "
-                 "scatter for whatever it can't cleanly place -- see terrain/contour_layers.py's "
-                 "RECT FILL MODE docstring section. FILL BR/MIN m/MAX m/STEP ratio/EDGE dist m and "
-                 "the CANDID/tier auto-tune knobs apply to poisson only.")
+                 "instead traces each band's own real boundary and places one type-72 stamp per "
+                 "boundary edge (RECT BR/RECT tol m/RECT min len m/RECT max search m/RECT width "
+                 "samples below), falling through to the same PASS 2 SMOOTH crumb scatter for "
+                 "whatever it can't reach -- see terrain/contour_layers.py's RECT FILL MODE "
+                 "docstring section. FILL BR/MIN m/MAX m/STEP ratio/EDGE dist m and the CANDID/tier "
+                 "auto-tune knobs apply to poisson only.")
 
         rect_frame = ttk.Frame(parent)
         rect_frame.pack(anchor="w", fill="x", pady=(0, 4))
@@ -537,22 +673,27 @@ class PGAGenGUI:
             _Tooltip(entry, tooltip)
 
         self.rect_brush_var = tk.StringVar(value="72")
-        self.rect_min_side_var = tk.StringVar(value="4")
-        self.rect_size_ratio_cap_var = tk.StringVar(value="2")
+        self.rect_tolerance_var = tk.StringVar(value="1.5")
+        self.rect_min_length_var = tk.StringVar(value="1")
+        self.rect_max_search_distance_var = tk.StringVar(value="400")
+        self.rect_width_samples_var = tk.StringVar(value="5")
 
         add_rect_field(0, 0, self.rect_brush_var, "RECT BR",
-                       "rect fill_mode only: brush for the main rectangle-covering pass -- must be a "
+                       "rect fill_mode only: brush for the main per-boundary-edge pass -- must be a "
                        "square-shaped brush (type 72 is the only one today).")
-        add_rect_field(0, 1, self.rect_min_side_var, "RECT MIN side m",
-                       "rect fill_mode only: shorter-side floor (m) below which a candidate rectangle "
-                       "is treated as a genuine crumb and handed to the same PASS 2 SMOOTH crumb "
-                       "scatter poisson mode uses.")
-        add_rect_field(0, 2, self.rect_size_ratio_cap_var, "RECT ratio cap",
-                       "rect fill_mode only: seam-step mitigation -- no rectangle's own longer side "
-                       "may exceed this multiple of an already-placed, directly-touching neighbor's "
-                       "longer side (too-big candidates are clipped down; too-small ones are deferred "
-                       "to crumb scatter instead, rather than placing a small hard-edged stamp "
-                       "directly against a much larger one).")
+        add_rect_field(0, 1, self.rect_tolerance_var, "RECT tol m",
+                       "rect fill_mode only: Douglas-Peucker boundary-simplify tolerance (m) when "
+                       "tracing each band's own shape into vector polygons before placing per-edge "
+                       "stamps.")
+        add_rect_field(0, 2, self.rect_min_length_var, "RECT min len m",
+                       "rect fill_mode only: floor length (m) for a per-edge stamp when no opposite "
+                       "wall is found within RECT max search m.")
+        add_rect_field(0, 3, self.rect_max_search_distance_var, "RECT max search m",
+                       "rect fill_mode only: cap (m) on the ray-cast search for the wall opposite each "
+                       "boundary edge.")
+        add_rect_field(0, 4, self.rect_width_samples_var, "RECT width samples",
+                       "rect fill_mode only: points sampled across each boundary edge's own width "
+                       "(not just its center) when ray-casting for the opposite wall.")
 
         contour_frame = ttk.Frame(parent)
         contour_frame.pack(anchor="w", fill="x", pady=(0, 4))
@@ -710,20 +851,6 @@ class PGAGenGUI:
                              "so the whole run is reproducible given the same inputs, while still "
                              "varying naturally band to band.")
 
-        self.generate_terrain_use_height_mask_var = tk.BooleanVar(value=False)
-        generate_terrain_mask_checkbox = ttk.Checkbutton(
-            parent, text="Restrict to mask", variable=self.generate_terrain_use_height_mask_var,
-        )
-        generate_terrain_mask_checkbox.pack(anchor="w", pady=(6, 0))
-        _Tooltip(generate_terrain_mask_checkbox, "Restrict this layer to inside height_mask.geojson "
-                 "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM) -- restriction "
-                 "happens BEFORE generation, not as a filter afterward: contour mode crops each "
-                 "band's fill to the mask before the poisson-pack/crumb-scatter search runs, and hex "
-                 "mode never places a lattice stamp outside it, so a small masked region does "
-                 "proportionally less work, not full-course work followed by discarding most of it "
-                 "(the course-wide baseline-flatten stamp is never masked). Uses the same "
-                 "Buffer (px) slider as Refine Terrain's Mask option, in the Preview panel.")
-
         n_workers_row = ttk.Frame(parent)
         n_workers_row.pack(anchor="w", fill="x", pady=(4, 0))
         ttk.Label(n_workers_row, text="Workers:").pack(side="left")
@@ -737,7 +864,6 @@ class PGAGenGUI:
                  "sequential (e.g. for debugging). Forced to 1 regardless of this setting whenever "
                  "max_stamps is set (that flag needs a running total checked band-by-band, which is "
                  "fundamentally sequential).")
-
 
         # Deliberately separate from the settings grid above, not another
         # field in it -- this is a quick-preview control, not a real
@@ -757,9 +883,13 @@ class PGAGenGUI:
                  "coarser -- this is a partial-preview tool, not a real generation mode. Leave blank "
                  "for a real run. Not saved to project.json -- set explicitly each time.")
 
-        self._add_step_button(parent, "Generate Terrain", self._run_generate_terrain)
+        self._add_step_button(parent, "Generate Terrain", lambda: self._run_generate_terrain_as("contour"))
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+    # ------------------------------------------------------------------
+    # Cart Paths
+    # ------------------------------------------------------------------
+
+    def _build_cart_paths_section(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Cart Paths", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
 
         splines_row = ttk.Frame(parent)
@@ -811,21 +941,38 @@ class PGAGenGUI:
 
         self._add_step_button(parent, "Generate Cart Paths", self._run_generate_cart_paths)
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        method_row = ttk.Frame(parent)
-        method_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(method_row, text="Method:").pack(side="left")
+    # ------------------------------------------------------------------
+    # Refine -- adaptive / scatter each live in their own tab with only
+    # the fields that method actually reads (see PGA2k_gen.py's
+    # step_refine_terrain). Resolution/Mask/brush-type/RAD m/EAT %/
+    # SPR %/SHR % are shared above the tabs: both methods take the same
+    # rad_m / claim_radius_fraction / brush_radius_spread_ratio /
+    # planar_shrink_factor params -- SHR % does double duty (RMS-shrink
+    # step in adaptive, radius jitter magnitude in scatter), same knob,
+    # method-appropriate meaning, not two separate fields.
+    # ------------------------------------------------------------------
+
+    def _add_refine_field(self, target, row, col, key, abbrev, tooltip, variable, required,
+                           combobox_values=None):
+        cell = ttk.Frame(target)
+        cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+        label = ttk.Label(cell, text=abbrev)
+        label.pack(anchor="w")
+        if combobox_values:
+            entry = ttk.Combobox(cell, textvariable=variable, values=combobox_values, width=7, state="normal")
+        else:
+            entry = ttk.Entry(cell, textvariable=variable, width=8)
+        entry.pack(anchor="w")
+        full_tooltip = tooltip + ("" if required else " (optional)")
+        _Tooltip(label, full_tooltip)
+        _Tooltip(entry, full_tooltip)
+        if required:
+            self.refine_labels[key] = label
+
+    def _build_refine_section(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Refine", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+
         self.refine_method_var = tk.StringVar(value="adaptive")
-        method_box = ttk.Combobox(
-            method_row, textvariable=self.refine_method_var, state="readonly", width=10,
-            values=["adaptive", "scatter"],
-        )
-        method_box.pack(side="left", padx=4)
-        method_box.bind("<<ComboboxSelected>>", lambda e: self._on_refine_method_changed())
-        _Tooltip(method_box, "adaptive: targets error hotspots (the original behavior). "
-                 "scatter: ignores error, places well-spaced random stamps flattened to the real "
-                 "local LIDAR average -- closer in spirit to Chad's fixed-grid raster approach, "
-                 "just organically spaced instead of on a fixed lattice.")
 
         brush_type_row = ttk.Frame(parent)
         brush_type_row.pack(fill="x", pady=(0, 6))
@@ -864,142 +1011,62 @@ class PGAGenGUI:
         self.subpixel_jitter_var = tk.StringVar(value="0.5")
         self.refine_labels: dict[str, ttk.Label] = {}
 
-        grid_frame = ttk.Frame(parent)
-        grid_frame.pack(anchor="w", fill="x")
+        shared_grid = ttk.Frame(parent)
+        shared_grid.pack(anchor="w", fill="x")
 
-        def add_field(row, col, key, abbrev, tooltip, variable, required, combobox_values=None):
-            cell = ttk.Frame(grid_frame)
-            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
-            label = ttk.Label(cell, text=abbrev)
-            label.pack(anchor="w")
-            if combobox_values:
-                entry = ttk.Combobox(cell, textvariable=variable, values=combobox_values, width=7, state="normal")
-            else:
-                entry = ttk.Entry(cell, textvariable=variable, width=8)
-            entry.pack(anchor="w")
-            full_tooltip = tooltip + ("" if required else " (optional)")
-            _Tooltip(label, full_tooltip)
-            _Tooltip(entry, full_tooltip)
-            if required:
-                self.refine_labels[key] = label
-
-        add_field(0, 0, "tolerance", "TOL m", "Error tolerance (m): |predicted - actual| above this "
-                  "counts as a hotspot.", self.tolerance_var, required=True)
         _RESOLUTION_PRESETS = ["25", "50", "100", "125", "200", "250", "400", "500", "1000", "2000"]
-        add_field(0, 1, "resolution", "RES px", "Error grid resolution (cells per side) -- same grid "
-                  "preview_error.png uses. Presets are exact divisors of the 2000 m course, so every "
-                  "cell lands on a whole-meter boundary matching the ground heightmap's own 1 px = 1 m "
-                  "grid -- other values still work, they just won't align as cleanly (e.g. 1600 gives "
-                  "1.25 m cells, straddling heightmap pixel boundaries).", self.resolution_var,
-                  required=True, combobox_values=_RESOLUTION_PRESETS)
+        self._add_refine_field(shared_grid, 0, 0, "resolution", "RES px", "Error grid resolution "
+                  "(cells per side) -- same grid preview_error.png uses. Presets are exact divisors "
+                  "of the 2000 m course, so every cell lands on a whole-meter boundary matching the "
+                  "ground heightmap's own 1 px = 1 m grid -- other values still work, they just "
+                  "won't align as cleanly (e.g. 1600 gives 1.25 m cells, straddling heightmap pixel "
+                  "boundaries).", self.resolution_var, required=True, combobox_values=_RESOLUTION_PRESETS)
 
         self.use_height_mask_var = tk.BooleanVar(value=False)
-        mask_checkbox = ttk.Checkbutton(grid_frame, text="Mask", variable=self.use_height_mask_var)
-        mask_checkbox.grid(row=0, column=2, sticky="w", padx=3, pady=2)
+        mask_checkbox = ttk.Checkbutton(shared_grid, text="Mask", variable=self.use_height_mask_var)
+        mask_checkbox.grid(row=0, column=1, sticky="w", padx=3, pady=2)
         _Tooltip(mask_checkbox, "Restrict hotspot placement to inside height_mask.geojson "
                  "(fairway/green/tee + buffered hole-path corridors, from Ingest OSM). Everything "
                  "outside is treated like no-data -- never becomes a hotspot.")
 
-        add_field(1, 0, "min_hotspot", "HOT px", "Min hotspot radius, in cells at the CURRENT "
-                  "resolution (not meters -- a cell is 2000/RES m, so this floor scales with "
-                  "resolution, not tied to a fixed real-world size). Smaller "
-                  "regions are treated as noise, not a real feature.", self.min_hotspot_radius_cells_var,
-                  required=True)
-        add_field(1, 1, "max_new", "MAX n", "Cap on new stamps this pass. Leave blank for no cap.",
-                  self.max_new_var, required=False)
-        add_field(1, 2, "model_rebuild_interval", "INT n", "Model rebuild interval: how many new "
-                  "stamps accumulate before the error grid gets fully re-rendered against everything "
-                  "placed so far this pass (see terrain/adaptive_refine.py). Higher = fewer, more "
-                  "expensive-per-stamp-count rebuilds -- the single biggest lever on how long a pass "
-                  "takes at high resolution/stamp counts, at the cost of later candidates in the same "
-                  "pass being fit against a slightly staler model (bounded by this many stamps' worth "
-                  "of staleness). Leave blank to use the default (25).",
-                  self.model_rebuild_interval_var, required=False)
-
-        add_field(2, 0, "spread_ratio", "SPR %", "Brush radius spread ratio: every brush is scored "
-                  "at the same base radius (a fair comparison of which brush shape fits best), but the "
-                  "winning brush is PLACED at radius scaled by spread_ratio ** rank (ranks 0..3 for "
-                  "types 8/9/10/54) -- higher-rank (smoother) brushes end up placed wider, forcing "
-                  "more overlap as the falloff gets gentler. 1 disables it.", self.spread_ratio_var,
-                  required=True)
-        add_field(2, 1, "claim_fraction", "EAT %", "Claimed radius fraction: how much of the placed "
-                  "radius gets marked done. Below 1 lets neighboring stamps overlap. adaptive: 1 "
-                  "disables it (old behavior). scatter: RAD * EAT is the minimum center-to-center "
-                  "spacing between stamps (the actual Poisson-disc constraint) AND the radius within "
-                  "which real LIDAR points are averaged for each stamp's flatten target.",
-                  self.claim_fraction_var, required=True)
-        add_field(2, 2, "rad", "RAD m", "Literal target stamp radius (m) for this pass. adaptive: "
-                  "becomes max_radius (min_radius derives from the same fixed 0.5 ratio as before). "
-                  "scatter: the literal per-stamp placement radius before jitter. Replaces the old "
-                  "DEC % (radius_decay_per_pass) -- the implied decay vs. the last run is now shown "
-                  "as a computed, read-only value below instead of being something you type in.",
-                  self.rad_var, required=True)
-
-        add_field(3, 0, "max_planar_rms", "PLN m", "Max planar-fit RMS (m): shrinks a hotspot's radius "
-                  "until the region's actual LIDAR heights fit a single tilted plane within this "
-                  "tolerance -- catches valleys/ridges/creases an error-sign-only region never stops "
-                  "growing across (e.g. a V-shaped valley cross-section stays one sign of error from "
-                  "floor to rim, so without this it gets averaged into one stamp that pulls the floor "
-                  "up and the rim down). Leave blank to disable (old behavior).",
-                  self.max_planar_rms_var, required=False)
-        add_field(3, 1, "planar_shrink", "SHR %", "adaptive: how much to shrink a hotspot's radius "
-                  "each time it fails the max planar-fit RMS check (only used when PLN m is set). "
-                  "scatter: repurposed as radius jitter (when Slope is off) -- each stamp's radius is "
-                  "randomized within [RAD * SHR%, RAD], so centers arrange themselves organically "
-                  "instead of a visibly uniform lattice. When Slope is on, this instead becomes the "
-                  "floor for how small a stamp can shrink to on the steepest ground. 1.0 disables "
-                  "shrinking either way (every stamp is exactly RAD).",
+        self._add_refine_field(shared_grid, 1, 0, "max_new", "MAX n", "Cap on new stamps this pass. "
+                  "Leave blank for no cap.", self.max_new_var, required=False)
+        self._add_refine_field(shared_grid, 1, 1, "spread_ratio", "SPR %", "Brush radius spread ratio: "
+                  "every brush is scored at the same base radius (a fair comparison of which brush "
+                  "shape fits best), but the winning brush is PLACED at radius scaled by "
+                  "spread_ratio ** rank (ranks 0..3 for types 8/9/10/54) -- higher-rank (smoother) "
+                  "brushes end up placed wider, forcing more overlap as the falloff gets gentler. "
+                  "1 disables it.", self.spread_ratio_var, required=True)
+        self._add_refine_field(shared_grid, 1, 2, "claim_fraction", "EAT %", "Claimed radius "
+                  "fraction: how much of the placed radius gets marked done. Below 1 lets "
+                  "neighboring stamps overlap. adaptive: 1 disables it (old behavior). scatter: "
+                  "RAD * EAT is the minimum center-to-center spacing between stamps (the actual "
+                  "Poisson-disc constraint) AND the radius within which real LIDAR points are "
+                  "averaged for each stamp's flatten target.", self.claim_fraction_var, required=True)
+        self._add_refine_field(shared_grid, 2, 0, "rad", "RAD m", "Literal target stamp radius (m) "
+                  "for this pass. adaptive: becomes max_radius (min_radius derives from the same "
+                  "fixed 0.5 ratio as before). scatter: the literal per-stamp placement radius "
+                  "before jitter. Replaces the old DEC % (radius_decay_per_pass) -- the implied "
+                  "decay vs. the last run is now shown as a computed, read-only value below instead "
+                  "of being something you type in.", self.rad_var, required=True)
+        self._add_refine_field(shared_grid, 2, 1, "planar_shrink", "SHR %", "adaptive: how much to "
+                  "shrink a hotspot's radius each time it fails the max planar-fit RMS check (only "
+                  "used when PLN m is set). scatter: repurposed as radius jitter (when Slope is "
+                  "off) -- each stamp's radius is randomized within [RAD * SHR%, RAD], so centers "
+                  "arrange themselves organically instead of a visibly uniform lattice. When Slope "
+                  "is on, this instead becomes the floor for how small a stamp can shrink to on the "
+                  "steepest ground. 1.0 disables shrinking either way (every stamp is exactly RAD).",
                   self.planar_shrink_var, required=False)
 
-        self.use_slope_radius_var = tk.BooleanVar(value=False)
-        slope_checkbox = ttk.Checkbutton(grid_frame, text="Slope", variable=self.use_slope_radius_var)
-        slope_checkbox.grid(row=3, column=2, sticky="w", padx=3, pady=2)
-        _Tooltip(slope_checkbox, "scatter only: drive each stamp's radius from real local terrain "
-                 "slope (raw gradient magnitude, computed once over the whole grid) instead of random "
-                 "jitter. Superseded by Variation below, which fixes a real blind spot this has (a "
-                 "gentle, multi-km fairway grade reads as 'steep' everywhere, even where a wide flat "
-                 "stamp would represent it fine) -- kept for back-compat/comparison. Variation wins if "
-                 "both are checked. SHR % is reused as the 'how small can it shrink' floor either way.")
+        refine_notebook = ttk.Notebook(parent)
+        refine_notebook.pack(fill="x", pady=(4, 0))
+        adaptive_tab = ttk.Frame(refine_notebook, padding=4)
+        scatter_tab = ttk.Frame(refine_notebook, padding=4)
+        refine_notebook.add(adaptive_tab, text="Adaptive")
+        refine_notebook.add(scatter_tab, text="Scatter")
 
-        self.use_variation_radius_var = tk.BooleanVar(value=False)
-        variation_checkbox = ttk.Checkbutton(
-            grid_frame, text="Variation", variable=self.use_variation_radius_var,
-        )
-        variation_checkbox.grid(row=4, column=0, sticky="w", padx=3, pady=2)
-        _Tooltip(variation_checkbox, "scatter only: drive each stamp's radius from RMS-from-local-mean "
-                 "at lag=RAD (computed once, over the whole grid) instead of random jitter -- unlike "
-                 "Slope, this scales with BOTH real curvature (bumps/greens) and macro-scale grade "
-                 "carried across the window, since a single flat stamp can't represent a tilted plane "
-                 "any better than a bumpy one. Flat/uniformly-graded ground still gets large stamps; "
-                 "genuinely detailed ground gets small ones. Wins over Slope if both are checked. SHR%% "
-                 "is the shrink floor, GAM sharpens the map toward the extremes.")
-
-        add_field(4, 1, "variation_contrast_gamma", "GAM", "Variation contrast gamma: exponent applied "
-                  "to the normalized variation field before mapping into [RAD * SHR%, RAD] -- >1 "
-                  "sharpens toward the extremes (only genuinely high-variation cells shrink much), 1.0 "
-                  "is a plain linear map. Only used when Variation is checked.",
-                  self.variation_contrast_gamma_var, required=False)
-
-        self.density_weighted_var = tk.BooleanVar(value=False)
-        density_checkbox = ttk.Checkbutton(
-            grid_frame, text="Density", variable=self.density_weighted_var,
-        )
-        density_checkbox.grid(row=4, column=2, sticky="w", padx=3, pady=2)
-        _Tooltip(density_checkbox, "scatter only: draw candidate sites from a ~1/radius^2-weighted "
-                 "density field instead of uniform-random over the whole course. Fixes what shrinking "
-                 "radius alone can't -- a smaller target radius only changes how big an accepted dart "
-                 "is, never how often darts land there, so small high-detail regions were getting "
-                 "isolated small stamps that read as random bumps instead of a tightly-packed cluster "
-                 "resolving the actual detail. Has no effect unless Slope or Variation is also checked "
-                 "-- with neither, every site wants the same radius already.")
-
-        add_field(5, 0, "subpixel_jitter_fraction", "JIT %", "Subpixel jitter fraction: fraction of a "
-                  "heightmap cell's width to jitter density-weighted draws by, off the exact cell "
-                  "center -- dither only, to avoid visibly grid-aligned stamp centers (the course "
-                  "never needs sub-cell precision on its own). Only used when Density is checked.",
-                  self.subpixel_jitter_var, required=False)
-
-        self._add_step_button(parent, "Refine Terrain", self._run_refine_terrain)
+        self._build_refine_adaptive_tab(adaptive_tab)
+        self._build_refine_scatter_tab(scatter_tab)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.registration_marks_var = tk.BooleanVar(value=False)
@@ -1011,6 +1078,16 @@ class PGAGenGUI:
                  "circle spline (cart path surface) at each of the 4 course corners -- for visually "
                  "confirming in-game that terrain and splines land exactly where expected. Shared "
                  "with the same checkbox in the Splines tab (one setting, both places).")
+        self.direct_height_shift_var = tk.BooleanVar(value=False)
+        direct_shift_checkbox = ttk.Checkbutton(
+            parent, text="Direct height shift (A/B test)", variable=self.direct_height_shift_var,
+        )
+        direct_shift_checkbox.pack(anchor="w")
+        _Tooltip(direct_shift_checkbox, "A/B test for the 'cheese grater' stamp-seam artifact: "
+                 "normalize final heights by shifting every stamp's own value directly instead of "
+                 "the default's appended course-wide raise stamp. Not a mathematically equivalent "
+                 "shift -- only use this to check whether the default method's shim stamp is causing "
+                 "the seams, not as a replacement for it.")
         write_terrain_btn = self._add_step_button(parent, "Write Terrain + Water", self._run_output_terrain)
         _Tooltip(write_terrain_btn, "Writes userLayers.json's \"height\" key (the terrain stamps) AND "
                  "its \"water\" key in one pass -- both live in the same file, so this is one step, not "
@@ -1027,6 +1104,95 @@ class PGAGenGUI:
         )
         self.refine_stats_text.pack(anchor="w", fill="x", pady=(2, 0))
         self._refresh_refine_stats()
+
+    def _run_refine_terrain_as(self, method: str) -> None:
+        self.refine_method_var.set(method)
+        self._run_refine_terrain()
+
+    def _build_refine_adaptive_tab(self, parent: ttk.Frame) -> None:
+        grid = ttk.Frame(parent)
+        grid.pack(anchor="w", fill="x")
+
+        self._add_refine_field(grid, 0, 0, "tolerance", "TOL m", "Error tolerance (m): "
+                  "|predicted - actual| above this counts as a hotspot.", self.tolerance_var,
+                  required=True)
+        self._add_refine_field(grid, 0, 1, "min_hotspot", "HOT px", "Min hotspot radius, in cells "
+                  "at the CURRENT resolution (not meters -- a cell is 2000/RES m, so this floor "
+                  "scales with resolution, not tied to a fixed real-world size). Smaller regions "
+                  "are treated as noise, not a real feature.", self.min_hotspot_radius_cells_var,
+                  required=True)
+        self._add_refine_field(grid, 1, 0, "model_rebuild_interval", "INT n", "Model rebuild "
+                  "interval: how many new stamps accumulate before the error grid gets fully "
+                  "re-rendered against everything placed so far this pass (see "
+                  "terrain/adaptive_refine.py). Higher = fewer, more expensive-per-stamp-count "
+                  "rebuilds -- the single biggest lever on how long a pass takes at high "
+                  "resolution/stamp counts, at the cost of later candidates in the same pass being "
+                  "fit against a slightly staler model (bounded by this many stamps' worth of "
+                  "staleness). Leave blank to use the default (25).",
+                  self.model_rebuild_interval_var, required=False)
+        self._add_refine_field(grid, 1, 1, "max_planar_rms", "PLN m", "Max planar-fit RMS (m): "
+                  "shrinks a hotspot's radius until the region's actual LIDAR heights fit a single "
+                  "tilted plane within this tolerance -- catches valleys/ridges/creases an "
+                  "error-sign-only region never stops growing across (e.g. a V-shaped valley "
+                  "cross-section stays one sign of error from floor to rim, so without this it "
+                  "gets averaged into one stamp that pulls the floor up and the rim down). Leave "
+                  "blank to disable (old behavior).", self.max_planar_rms_var, required=False)
+
+        self._add_step_button(parent, "Refine Terrain", lambda: self._run_refine_terrain_as("adaptive"))
+
+    def _build_refine_scatter_tab(self, parent: ttk.Frame) -> None:
+        grid = ttk.Frame(parent)
+        grid.pack(anchor="w", fill="x")
+
+        self.use_slope_radius_var = tk.BooleanVar(value=False)
+        slope_checkbox = ttk.Checkbutton(grid, text="Slope", variable=self.use_slope_radius_var)
+        slope_checkbox.grid(row=0, column=0, sticky="w", padx=3, pady=2)
+        _Tooltip(slope_checkbox, "scatter only: drive each stamp's radius from real local terrain "
+                 "slope (raw gradient magnitude, computed once over the whole grid) instead of random "
+                 "jitter. Superseded by Variation below, which fixes a real blind spot this has (a "
+                 "gentle, multi-km fairway grade reads as 'steep' everywhere, even where a wide flat "
+                 "stamp would represent it fine) -- kept for back-compat/comparison. Variation wins if "
+                 "both are checked. SHR % is reused as the 'how small can it shrink' floor either way.")
+
+        self.use_variation_radius_var = tk.BooleanVar(value=False)
+        variation_checkbox = ttk.Checkbutton(
+            grid, text="Variation", variable=self.use_variation_radius_var,
+        )
+        variation_checkbox.grid(row=0, column=1, sticky="w", padx=3, pady=2)
+        _Tooltip(variation_checkbox, "scatter only: drive each stamp's radius from RMS-from-local-mean "
+                 "at lag=RAD (computed once, over the whole grid) instead of random jitter -- unlike "
+                 "Slope, this scales with BOTH real curvature (bumps/greens) and macro-scale grade "
+                 "carried across the window, since a single flat stamp can't represent a tilted plane "
+                 "any better than a bumpy one. Flat/uniformly-graded ground still gets large stamps; "
+                 "genuinely detailed ground gets small ones. Wins over Slope if both are checked. SHR%% "
+                 "is the shrink floor, GAM sharpens the map toward the extremes.")
+
+        self._add_refine_field(grid, 1, 0, "variation_contrast_gamma", "GAM", "Variation contrast "
+                  "gamma: exponent applied to the normalized variation field before mapping into "
+                  "[RAD * SHR%, RAD] -- >1 sharpens toward the extremes (only genuinely "
+                  "high-variation cells shrink much), 1.0 is a plain linear map. Only used when "
+                  "Variation is checked.", self.variation_contrast_gamma_var, required=False)
+
+        self.density_weighted_var = tk.BooleanVar(value=False)
+        density_checkbox = ttk.Checkbutton(
+            grid, text="Density", variable=self.density_weighted_var,
+        )
+        density_checkbox.grid(row=1, column=1, sticky="w", padx=3, pady=2)
+        _Tooltip(density_checkbox, "scatter only: draw candidate sites from a ~1/radius^2-weighted "
+                 "density field instead of uniform-random over the whole course. Fixes what shrinking "
+                 "radius alone can't -- a smaller target radius only changes how big an accepted dart "
+                 "is, never how often darts land there, so small high-detail regions were getting "
+                 "isolated small stamps that read as random bumps instead of a tightly-packed cluster "
+                 "resolving the actual detail. Has no effect unless Slope or Variation is also checked "
+                 "-- with neither, every site wants the same radius already.")
+
+        self._add_refine_field(grid, 2, 0, "subpixel_jitter_fraction", "JIT %", "Subpixel jitter "
+                  "fraction: fraction of a heightmap cell's width to jitter density-weighted draws "
+                  "by, off the exact cell center -- dither only, to avoid visibly grid-aligned "
+                  "stamp centers (the course never needs sub-cell precision on its own). Only used "
+                  "when Density is checked.", self.subpixel_jitter_var, required=False)
+
+        self._add_step_button(parent, "Refine Terrain", lambda: self._run_refine_terrain_as("scatter"))
 
     def _on_brush_type_toggled(self, changed_brush: int) -> None:
         if not any(v.get() for v in self.brush_type_vars.values()):
@@ -1185,6 +1351,18 @@ class PGAGenGUI:
         ).pack(side="left", fill="x", expand=True, padx=4)
         self.mask_buffer_preview_label = ttk.Label(mask_row, text="50", width=4)
         self.mask_buffer_preview_label.pack(side="left")
+        ttk.Label(mask_row, text="Source:").pack(side="left", padx=(8, 0))
+        self.mask_source_var = tk.StringVar(value="marked")
+        mask_source_combo = ttk.Combobox(
+            mask_row, textvariable=self.mask_source_var, state="readonly", width=8,
+            values=("marked", "selected"),
+        )
+        mask_source_combo.pack(side="left", padx=(2, 0))
+        mask_source_combo.bind("<<ComboboxSelected>>", lambda e: self._show_preview())
+        _Tooltip(mask_source_combo, "What defines the mask region: 'marked' uses whatever Features "
+                 "are flagged in the Splines tab (Toggle Mask/Toggle All); 'selected' uses whichever "
+                 "spline(s) are currently selected in the Splines tab instead, regardless of their "
+                 "mask flag. Both still go through the same Buffer (px) outward buffer above.")
 
         # Live elevation-band overlay -- purely in-memory (see
         # _show_preview's compositing block below and _get_cached_
@@ -1284,12 +1462,14 @@ class PGAGenGUI:
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.splines_tree = ttk.Treeview(
-            tree_frame, columns=("kind", "mask"), show="headings", height=18, selectmode="extended",
+            tree_frame, columns=("kind", "tag", "mask"), show="headings", height=18, selectmode="extended",
         )
         self.splines_tree.heading("kind", text="Kind")
+        self.splines_tree.heading("tag", text="Tag")
         self.splines_tree.heading("mask", text="Mask")
         self.splines_tree.column("kind", width=90)
-        self.splines_tree.column("mask", width=55, anchor="center")
+        self.splines_tree.column("tag", width=90)
+        self.splines_tree.column("mask", width=24, anchor="center")
         self.splines_tree.pack(side="left", fill="both", expand=True)
         tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.splines_tree.yview)
         tree_scroll.pack(side="left", fill="y")
@@ -1423,6 +1603,19 @@ class PGAGenGUI:
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._add_step_button(parent, "Write Objects", self._run_write_objects)
 
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Building stakes (game_version=2019 only):").pack(anchor="w")
+        stake_btn = self._add_step_button(parent, "Stake Buildings", self._run_stake_buildings)
+        _Tooltip(stake_btn, "Places a subtle 0.5x-scale stake at every corner of every 'building' "
+                 "feature (features.geojson) and re-writes placedObjects2.json -- same fence-post prop "
+                 "used oversized for the cart-path debug marker. Needs Write Objects to have been run "
+                 "at least once first (object_list.json). Persists as the default for future Write "
+                 "Objects runs too -- use Clear Building Stakes to turn it back off.")
+        clear_stakes_btn = self._add_step_button(parent, "Clear Building Stakes", self._run_clear_building_stakes)
+        _Tooltip(clear_stakes_btn, "Re-writes placedObjects2.json without building stakes. Not "
+                 "destructive -- building corners are recomputed from features.geojson each time, so "
+                 "Stake Buildings can always bring them back.")
+
     def _browse_objects_asset_list(self) -> None:
         f = filedialog.askopenfilename(
             title="Select an asset list (.json)", filetypes=[(".json files", "*.json"), ("All files", "*.*")]
@@ -1465,6 +1658,33 @@ class PGAGenGUI:
         if not wd:
             return
         args = ["--step", "write-objects", "--tree-variety"]
+        theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
+        if theme_id is not None:
+            args += ["--theme", str(theme_id)]
+        self._run_step(args, wd)
+        self._refresh_objects_list()
+
+    def _run_stake_buildings(self) -> None:
+        self._run_write_objects_with_stakes(True)
+
+    def _run_clear_building_stakes(self) -> None:
+        self._run_write_objects_with_stakes(False)
+
+    def _run_write_objects_with_stakes(self, stake_buildings: bool) -> None:
+        """Shared by the Stake Buildings / Clear Building Stakes buttons --
+        both are just a Write Objects run with --stake-buildings /
+        --no-stake-buildings tacked on (see objects.py's
+        build_building_stake_objects_v2019 / PGA2k_gen.py's
+        step_write_objects), so building corners stay in lockstep with
+        whatever's currently in features.geojson rather than needing
+        separate placedObjects2.json surgery."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = [
+            "--step", "write-objects", "--tree-variety",
+            "--stake-buildings" if stake_buildings else "--no-stake-buildings",
+        ]
         theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
         if theme_id is not None:
             args += ["--theme", str(theme_id)]
@@ -1561,7 +1781,8 @@ class PGAGenGUI:
             if f.osm_id is None:
                 continue  # nothing stable to select/highlight/toggle by
             self.splines_tree.insert(
-                "", "end", iid=str(f.osm_id), values=(f.kind, "yes" if f.mask else ""),
+                "", "end", iid=str(f.osm_id),
+                values=(f.kind, _spline_tag_detail(f), "✔" if f.mask else ""),
             )
 
     def _on_spline_selected(self) -> None:
@@ -1877,6 +2098,21 @@ class PGAGenGUI:
             if hex_brush:
                 args += ["--hex-brush", hex_brush]
             args += ["--hex-tool", "1" if self.hex_tool_var.get() == "raise" else "0"]
+            raster_size = self.raster_size_var.get().strip()
+            if raster_size:
+                args += ["--raster-size", raster_size]
+            raster_spread_ratio = self.raster_spread_ratio_var.get().strip()
+            if raster_spread_ratio:
+                args += ["--raster-spread-ratio", raster_spread_ratio]
+            raster_center_bias_ratio_x = self.raster_center_bias_ratio_x_var.get().strip()
+            if raster_center_bias_ratio_x:
+                args += ["--raster-center-bias-ratio-x", raster_center_bias_ratio_x]
+            raster_center_bias_ratio_z = self.raster_center_bias_ratio_z_var.get().strip()
+            if raster_center_bias_ratio_z:
+                args += ["--raster-center-bias-ratio-z", raster_center_bias_ratio_z]
+            raster_brush = self.raster_brush_var.get().strip()
+            if raster_brush:
+                args += ["--raster-brush", raster_brush]
             band_spacing = self.band_spacing_var.get().strip()
             if band_spacing:
                 args += ["--band-spacing-m", band_spacing]
@@ -1901,12 +2137,18 @@ class PGAGenGUI:
             rect_brush = self.rect_brush_var.get().strip()
             if rect_brush:
                 args += ["--rect-brush", rect_brush]
-            rect_min_side = self.rect_min_side_var.get().strip()
-            if rect_min_side:
-                args += ["--rect-min-side-m", rect_min_side]
-            rect_size_ratio_cap = self.rect_size_ratio_cap_var.get().strip()
-            if rect_size_ratio_cap:
-                args += ["--rect-size-ratio-cap", rect_size_ratio_cap]
+            rect_tolerance = self.rect_tolerance_var.get().strip()
+            if rect_tolerance:
+                args += ["--rect-tolerance-m", rect_tolerance]
+            rect_min_length = self.rect_min_length_var.get().strip()
+            if rect_min_length:
+                args += ["--rect-min-length-m", rect_min_length]
+            rect_max_search_distance = self.rect_max_search_distance_var.get().strip()
+            if rect_max_search_distance:
+                args += ["--rect-max-search-distance-m", rect_max_search_distance]
+            rect_width_samples = self.rect_width_samples_var.get().strip()
+            if rect_width_samples:
+                args += ["--rect-width-samples", rect_width_samples]
             smoothing_brush = self.smoothing_brush_var.get().strip()
             if smoothing_brush:
                 args += ["--smoothing-brush", smoothing_brush]
@@ -2016,11 +2258,6 @@ class PGAGenGUI:
                 label.configure(foreground="red")
                 all_valid = False
         return all_valid
-
-    def _on_refine_method_changed(self) -> None:
-        """No functional effect on its own (method is only actually read when Refine Terrain
-        runs) -- just keeps the read-only stats panel's method-specific note current."""
-        self._refresh_refine_stats()
 
     def _run_refine_terrain(self) -> None:
         wd = self._require_working_dir()
@@ -2141,6 +2378,8 @@ class PGAGenGUI:
             args = ["--step", "output-terrain"]
             if self.registration_marks_var.get():
                 args.append("--registration-marks")
+            if self.direct_height_shift_var.get():
+                args.append("--direct-height-shift")
             self._run_step(args, wd)
 
     def _run_repack(self) -> None:
@@ -2669,7 +2908,18 @@ class PGAGenGUI:
 
         Returns None if there's no features.geojson yet, or it has no
         fairway/green features to mask.
+
+        Dispatches to _get_selected_mask_merged_geometry instead when
+        mask_source_var is "selected" -- every caller of this method
+        (the live preview overlay, and the snapshot-before-run blocks
+        in Generate Trees/Generate Terrain/Refine Terrain) already just
+        buffers and rasterizes/saves whatever geometry comes back, so
+        branching here is enough to make the mode switch apply
+        everywhere without touching those call sites.
         """
+        if self.mask_source_var.get() == "selected":
+            return self._get_selected_mask_merged_geometry(working_dir)
+
         features_path = working_dir / FEATURES_FILE
         mtime = features_path.stat().st_mtime if features_path.exists() else None
         cache_key = (working_dir, mtime)
@@ -2685,6 +2935,36 @@ class PGAGenGUI:
         self._cached_mask_merged_geom = merged
         self._cached_mask_geom_key = cache_key
         return merged
+
+    def _get_selected_mask_merged_geometry(self, working_dir: Path):
+        """
+        Merge the geometries of whatever spline(s) are currently
+        selected in the Splines tab into one shape -- same "filter
+        Features, then unary_union" shape as merge_height_mask_
+        features, but selecting by the live Treeview selection instead
+        of the mask flag. Not cached (unlike the "marked" path above):
+        selection changes far more often than features.geojson and the
+        union itself is cheap over a typically-small selected subset.
+
+        No buffering of bare LineStrings here (unlike the Splines-tab
+        highlight overlay's cosmetic .buffer(5.0) -- that's just to
+        make a zero-area line visible on screen): the outer
+        .buffer(buffer_px) every caller of _get_cached_mask_merged_
+        geometry already applies turns a zero-width selected line into
+        a real corridor on its own, the same way an unbuffered "hole"
+        centerline does in merge_height_mask_features.
+
+        Returns None if nothing is currently selected.
+        """
+        self._ensure_splines_features_fresh(working_dir)
+        selected_ids = {int(s) for s in self.splines_tree.selection()}
+        if not selected_ids:
+            return None
+        features = self._shift_and_crop_to_course(working_dir, self._splines_features)
+        relevant = [f.geometry for f in features if f.osm_id in selected_ids]
+        if not relevant:
+            return None
+        return unary_union(relevant)
 
     def _get_cached_heightmap(self, working_dir: Path):
         """
@@ -2777,9 +3057,12 @@ class PGAGenGUI:
         hundreds of thousands of times over. Shape-aware per stamp: a
         SHAPE_SQUARE brush (type 72, e.g. contour rect fill_mode's own
         stamps) gets the same per-axis Chebyshev rectangle test
-        terrain_model.py itself uses, not a circular approximation --
-        so a rectangular stamp reads as a rectangle here too, not a
-        bounding circle.
+        terrain_model.py itself uses (rotated into the stamp's own
+        local frame via local_square_offsets when rotation != 0, same
+        as terrain_model.py's own evaluate*/render -- rect fill_mode's
+        stamps are genuinely rotated per boundary edge, not just
+        axis-aligned), not a circular approximation -- so a rectangular
+        stamp reads as a rectangle here too, not a bounding circle.
 
         Cached and keyed on (stamps version, shape, elevation, width) --
         filtering by band means the relevant stamp subset changes with
@@ -2830,13 +3113,19 @@ class PGAGenGUI:
                 continue
             profile = BRUSH_PROFILES.get(s.brush)
             is_square = profile is not None and profile.shape == SHAPE_SQUARE
-            # Bounding box: tight per-axis (scale_x, scale_z) for a
-            # rectangle -- correct as-is, not just a safe superset, same
-            # as terrain_model.py's own render() -- since the exact
-            # per-cell test below is already an axis-aligned box for
-            # SHAPE_SQUARE brushes (type 72's rect-fill stamps included).
-            reach_x = s.scale_x
-            reach_z = s.scale_z if is_square else s.scale_x
+            # Bounding box: tight per-axis (scale_x, scale_z) for an
+            # AXIS-ALIGNED rectangle (rotation==0) -- correct as-is, not
+            # just a safe superset, same as terrain_model.py's own
+            # render(). A ROTATED square stamp (rect fill_mode's own
+            # stamps) needs the same loose-but-safe hypot(scale_x,
+            # scale_z) widening terrain_model.py's render() uses, since
+            # its true axis-aligned reach is otherwise tighter than a
+            # plain per-axis box would assume.
+            if is_square and s.rotation != 0.0:
+                reach_x = reach_z = (s.scale_x ** 2 + s.scale_z ** 2) ** 0.5
+            else:
+                reach_x = s.scale_x
+                reach_z = s.scale_z if is_square else s.scale_x
             col_min = max(0, int((s.x - reach_x) / cell_x))
             col_max = min(n_cols, int((s.x + reach_x) / cell_x) + 1)
             row_min = max(0, int((s.z - reach_z) / cell_z))
@@ -2849,9 +3138,12 @@ class PGAGenGUI:
             # Same per-axis normalized distance terrain_model.py's own
             # evaluate_many()/render() use: Chebyshev-per-axis (a true
             # rectangle test, not a bounding circle) for SHAPE_SQUARE
-            # brushes, plain Euclidean/scale_x for circular ones.
+            # brushes -- rotated into the stamp's own local frame first
+            # (identity when rotation==0) -- plain Euclidean/scale_x for
+            # circular ones.
             if is_square:
-                r_full = np.maximum(np.abs(xx - s.x) / s.scale_x, np.abs(zz - s.z) / s.scale_z)
+                ax, az = local_square_offsets(s, xx - s.x, zz - s.z)
+                r_full = np.maximum(np.abs(ax) / s.scale_x, np.abs(az) / s.scale_z)
             else:
                 r_full = np.hypot(xx - s.x, zz - s.z) / s.scale_x
             within = r_full <= 1.0

@@ -36,14 +36,15 @@ identical either way):
     only fill mode before "rect" was added, and is still what every
     section below this point describes unless a section says otherwise.
 
-    "rect" -- fills each band's mask with AXIS-ALIGNED RECTANGLES of
-    hard, zero-falloff type-72 stamps instead (see _rect_pack_band and
-    its own docstring for the full design: greedy largest-rectangle
-    covering, pitched by type 72's real measured plateau fraction so
-    adjacent plateaus butt exactly edge-to-edge). Both modes hand
-    whatever they can't place at a reasonable size off to the exact
-    same pass 2 (_scatter_fill_remaining, smoothing_brush) for final
-    crumb cleanup -- only the main covering pass differs.
+    "rect" -- fills each band's mask with hard, zero-falloff type-72
+    stamps instead, one per boundary edge of the band's own real (traced,
+    not axis-aligned) shape (see _fallline_pack_band and its own
+    docstring for the full design: boundary-trace-then-shoot-per-edge,
+    pitched by type 72's real measured plateau fraction so each stamp's
+    plateau exactly matches its own edge's width/length). Both modes hand
+    whatever they can't place off to the exact same pass 2
+    (_scatter_fill_remaining, smoothing_brush) for final crumb cleanup --
+    only the main covering pass differs.
 
 TIERED MULTI-SCALE FILL ("poisson" mode's actual placement algorithm):
 scan stamp radius from max_radius down to min_radius in geometric steps (see
@@ -140,9 +141,10 @@ catch-all pass afterward. This "every pixel belongs to exactly one
 band" guarantee is what "poisson" and "rect" both build on -- only
 what happens WITHIN one band's own mask differs between the two modes.
 
-RECT FILL MODE (fill_mode="rect", see _rect_pack_band): fills a band's
-mask with axis-aligned rectangles of type-72 ("hard square") stamps
-instead of circles. Type 72's real measured profile (see
+RECT FILL MODE (fill_mode="rect", see _fallline_pack_band): fills a
+band's mask with type-72 ("hard square") stamps, one per boundary edge
+of the mask's own real shape, instead of circles or an axis-aligned
+rectangle pack. Type 72's real measured profile (see
 terrain/brush_profiles.py's BRUSH_PROFILES[72], confirmed directly
 against the game's own 512x512 PNG asset) is NOT a falloff curve at
 all in the usual sense: weight is exactly 1.0 (a flat plateau) out to
@@ -158,58 +160,38 @@ Because the plateau is EXACTLY flat and the drop to zero is EXACTLY
 instant, a stamp's scale can be picked so its plateau -- not its full
 nominal footprint -- comes out to exactly some target world-space
 rectangle: scale_x = target_width_m / (2 * TYPE72_PLATEAU_FRACTION),
-scale_z = target_height_m / (2 * TYPE72_PLATEAU_FRACTION). Two
-stamps sized this way for two rectangles that share an edge have
-plateaus that butt together with zero gap and zero overlap -- and the
-sliver of each stamp's own footprint BEYOND its plateau (nominal scale
-minus plateau, ~2.3% of scale) contributes exactly zero weight, so
-those slivers freely overlapping a neighbor's territory is harmless.
-This is what makes rectangle packing viable here at all: no falloff-
-ring accounting is needed the way pass 1's plateau/radius claiming
-(see PLATEAU-RADIUS FIT TOLERANCE above) needs for circular brushes.
+scale_z = target_height_m / (2 * TYPE72_PLATEAU_FRACTION).
 
-Covering algorithm: greedy largest-rectangle-in-mask, repeated on
-whatever's left after each placement (see _largest_rectangle_in_mask
--- the standard per-row histogram + monotonic-stack scan for the
-single largest all-True axis-aligned rectangle in a boolean matrix,
-O(rows*cols) per call). Not globally optimal (that's a much harder
-problem and explicitly not the goal here -- "as few rectangles as
-reasonably achievable," not minimum-count), but greedy-largest-first
-converges fast and produces few rectangles over any reasonably
-contiguous band footprint. Stops once the best remaining rectangle
-drops below rect_min_side_m on its shorter side; whatever's left at
-that point is genuine leftover crumbs, handed to the exact same
-_scatter_fill_remaining (smoothing_brush) pass 2 already used for
-"poisson" mode's crumbs -- same role, same mechanism, no new crumb
-code needed. This also means a softer, falloff-bearing brush ends up
-covering the band's own ragged true boundary either way, while type
-72's hard edges only ever appear on genuine INTERIOR seams between two
-rectangles, never at the band's outer edge.
+Covering algorithm (lifted from the standalone fallline_fill_viz.py /
+boundary_trace_viz.py prototypes, validated there first): trace the
+band mask's own boundary into real vector polygons -- one exterior
+ring plus a ring for each fully-enclosed hole, straight-line-segment
+simplified via shapely's Douglas-Peucker `simplify` (see
+_trace_mask_boundaries) -- then, for every edge of every ring (all
+rings walked as closed loops), place exactly one type-72 stamp: width
+= |p1 - p0|, oriented along that edge's own direction (arbitrary
+rotation, not constrained to the raster grid's axes), shot from the
+edge into the ring's interior until it hits whatever wall is opposite
+(a ray-cast against every other edge in the region, sampled across
+several points along the edge's own width -- not just its center point
+-- so an angled nearby wall can't sneak closer to the stamp's real
+corner than a single centerline ray would catch), floored at
+rect_min_length_m if no wall is found within rect_max_search_distance_m.
+See _fallline_edge_stamps for the exact placement math (identical to
+fallline_fill_viz.py's build_interior_fill_stamps) and
+terrain/stamp.py's local_square_offsets for the shared rotation
+convention every consumer of a rotated stamp (TerrainModel, the
+preview renderers) uses.
 
-SEAM HANDLING: unlike circular brushes' overlapping falloff (which
-blends two neighboring stamps' values smoothly), type 72's zero
-falloff means two adjacent rectangles' independently-fit values meet
-at a hard, visible step if they disagree. rect_size_ratio_cap
-implements the simpler of the two mitigations called out for this (in
-the terms it was posed: "(a) cap adjacent-rectangle size ratio to
-bound worst-case step size" over "(b) constrain each rectangle's
-fitted value to match its already-placed neighbors along shared
-edges"): before a candidate rectangle is accepted, its own longer side
-is checked against every already-placed, directly-touching neighbor's
-longer side (tracked in a per-cell "claimed size" grid), in BOTH
-directions -- too big relative to a small neighbor gets clipped down
-(anchored at its own top-left corner, so it stays a valid subset of
-the same all-True region, and never below rect_min_side_m); too small
-relative to a big neighbor can't be grown (the mask genuinely has no
-more contiguous area there), so it's declined outright and deferred to
-pass 2's soft-falloff crumb scatter instead of placing a small hard-
-edged stamp directly against a much larger one. Two same-generation
-interior rectangles (nothing claimed near either yet) are never capped
-against each other this way -- the cap only ever fires where a new
-rectangle would land directly against an already-placed, much
-differently-sized one, which is exactly where the worst steps actually
-happen. (b) is NOT implemented -- left as a clear next step if (a)
-proves visually insufficient once seen in-game via composite_render.py.
+EVERY boundary edge gets a stamp -- no size floor that defers a
+candidate to crumb scatter the way the old axis-aligned rect pack did.
+What pass 2 (_scatter_fill_remaining, smoothing_brush) still cleans up
+here is genuine leftover: area the per-edge stamps' own footprints
+don't reach, rasterized directly (see _fallline_pack_band) rather than
+inferred from a "candidate rejected" bookkeeping the way the old
+seam-ratio-cap approach needed -- there's no rectangle-vs-rectangle
+seam competition here at all, since each stamp is anchored to its own
+boundary edge rather than competing for area with its neighbors.
 """
 
 from __future__ import annotations
@@ -222,10 +204,11 @@ from typing import Callable, Optional
 
 import numpy as np
 from scipy import ndimage
+from shapely.geometry import Point, Polygon
 
 from ingest.heightmap import downsample_heightmap  # noqa: F401 (kept for API stability; unused directly)
 from terrain.bounding_box import BoundingBox
-from terrain.stamp import TOOL_FLATTEN, Stamp
+from terrain.stamp import TOOL_FLATTEN, Stamp, local_square_offsets
 
 try:
     # The real thing, not a duplicated/re-derived copy: terrain/
@@ -247,7 +230,7 @@ try:
     # just duplicated a file (and now a whole loader module) that
     # already exists in the repo. Importing BRUSH_PROFILES directly
     # fixes both problems at once.
-    from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE
+    from terrain.brush_profiles import BRUSH_PROFILES, SHAPE_SQUARE, apply_brush_adjustment
     _HAVE_BRUSH_PROFILES = True
 except ImportError:
     _HAVE_BRUSH_PROFILES = False
@@ -313,8 +296,9 @@ DEFAULT_MAX_TIER_ITERATIONS = 2_000_000  # true last-resort backstop against a g
                                           # getting smaller far too quickly and leaving real gaps a
                                           # larger stamp could still have filled.
 
-DEFAULT_FILL_MODE = "poisson"  # "poisson" (circles, the original algorithm) or "rect" (axis-aligned
-                                 # type-72 rectangles) -- see module docstring's FILL MODE section
+DEFAULT_FILL_MODE = "poisson"  # "poisson" (circles, the original algorithm) or "rect" (one type-72
+                                 # stamp per boundary edge, vector/boundary-traced) -- see module
+                                 # docstring's FILL MODE section
 DEFAULT_RECT_BRUSH = 72  # must be a SHAPE_SQUARE brush (see terrain/brush_profiles.py) -- only type 72
                            # qualifies today; TYPE72_PLATEAU_FRACTION below is specific to it
 TYPE72_PLATEAU_FRACTION = 500.0 / 512.0  # real measured plateau fraction (not re-derived through the
@@ -325,12 +309,21 @@ TYPE72_PLATEAU_FRACTION = 500.0 / 512.0  # real measured plateau fraction (not r
                                            # through r=250/256 (500/512 in full-width terms), then
                                            # exactly 0.0 the very next sample -- a hard 6px-border step,
                                            # not a soft edge
-DEFAULT_RECT_MIN_SIDE_M = 4.0  # shorter side below which a candidate rectangle is genuine leftover,
-                                 # handed to the same smoothing_brush crumb-scatter pass 2 already used
-                                 # for "poisson" mode's own crumbs
-DEFAULT_RECT_SIZE_RATIO_CAP = 2.0  # seam handling approach (a) -- see module docstring's SEAM HANDLING
-                                     # section: no rectangle's own longer side may exceed this multiple
-                                     # of an already-placed, directly-touching neighbor's longer side
+DEFAULT_RECT_TOLERANCE_M = 1.5  # Douglas-Peucker boundary-simplify tolerance, in world meters --
+                                  # converted to pixels via cell_x before tracing (assumes near-square
+                                  # cells, same class of scalar approximation TYPE72_PLATEAU_FRACTION
+                                  # already makes). Matches boundary_trace_viz.py's own DEFAULT_TOLERANCE.
+DEFAULT_RECT_MIN_LENGTH_M = 1.0  # floor length for a per-edge stamp when no opposite wall is found
+                                   # within rect_max_search_distance_m -- matches fallline_fill_viz.py's
+                                   # own DEFAULT_MIN_LENGTH
+DEFAULT_RECT_MAX_SEARCH_DISTANCE_M = 400.0  # ray-cast cap when shooting a per-edge stamp toward the
+                                              # opposite wall -- matches fallline_fill_viz.py's own
+                                              # DEFAULT_MAX_SEARCH_DISTANCE (tuned on that tool's own
+                                              # small test images; worth sanity-checking against real
+                                              # course band sizes)
+DEFAULT_RECT_WIDTH_SAMPLES = 5  # points sampled across each edge's own width when ray-casting for the
+                                  # opposite wall, not just the edge's center point -- matches
+                                  # fallline_fill_viz.py's own DEFAULT_WIDTH_SAMPLES
 
 
 _plateau_fraction_cache: dict[int, float] = {}
@@ -731,243 +724,422 @@ def _poisson_pack_band(
     return stamps, crumbs
 
 
-def _largest_rectangle_in_mask(mask: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+def _first_pixel(mask: np.ndarray) -> Optional[tuple[int, int]]:
+    """First True pixel in raster-scan (row-major) order, or None."""
+    ys, xs = np.nonzero(mask)
+    if len(ys) == 0:
+        return None
+    i = np.lexsort((xs, ys))[0]
+    return (int(ys[i]), int(xs[i]))
+
+
+_MOORE_DIRECTIONS = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+
+
+def _moore_boundary_trace(mask: np.ndarray, start: tuple[int, int]) -> list[tuple[int, int]]:
     """
-    Single largest-area all-True axis-aligned rectangle in a 2D boolean
-    array -- the standard per-row histogram + monotonic-stack scan:
-    for each row, `heights[c]` is the number of consecutive True cells
-    ending at (row, c) reading upward (0 if this cell is False), and
-    the largest rectangle whose BOTTOM edge is this row is exactly the
-    largest rectangle in that row's own height histogram, solvable in
-    O(cols) amortized via a monotonic stack (classic "largest rectangle
-    in a histogram"). Scanning every row this way and keeping the best
-    seen is O(rows*cols) total for one full call, same complexity class
-    as this module's own EDT-per-tier/per-call passes elsewhere (see
-    e.g. _scatter_fill_remaining's live EDT recompute every iteration)
-    -- consistent with this module's existing "recompute the full array
-    each placement, don't try to update incrementally" style, not a new
-    performance tradeoff introduced here.
-
-    Returns (row_min, row_max, col_min, col_max) -- row_max/col_max
-    EXCLUSIVE, matching numpy slicing -- or None if `mask` is entirely
-    False.
+    Classic Moore-neighbor boundary trace -- lifted verbatim from
+    boundary_trace_viz.py (validated there first as a standalone
+    prototype). `start` MUST be a raster-scan-first pixel of the region
+    being traced (guarantees the pixel immediately to its West is not
+    part of the region, fixing the initial backtrack direction). Returns
+    an ordered, non-repeating list of (row, col) boundary pixels forming
+    one closed loop.
     """
-    n_rows, n_cols = mask.shape
-    heights = [0] * n_cols
-    best_area = 0
-    best: Optional[tuple[int, int, int, int]] = None
+    r0, c0 = start
+    boundary = [(r0, c0)]
+    b_dir = _MOORE_DIRECTIONS.index((0, -1))  # came from the West
+    current = (r0, c0)
+    rows, cols = mask.shape
 
-    for row in range(n_rows):
-        row_mask = mask[row]
-        for c in range(n_cols):
-            heights[c] = heights[c] + 1 if row_mask[c] else 0
+    for _ in range(mask.size * 4):  # safety cap, not expected to be hit
+        found = False
+        for i in range(1, 9):
+            idx = (b_dir + i) % 8
+            dr, dc = _MOORE_DIRECTIONS[idx]
+            nr, nc = current[0] + dr, current[1] + dc
+            if 0 <= nr < rows and 0 <= nc < cols and mask[nr, nc]:
+                b_dir = (idx + 4) % 8  # opposite direction -- new backtrack
+                current = (nr, nc)
+                found = True
+                break
+        if not found:
+            break  # isolated single pixel, no neighbors
+        if current == (r0, c0):
+            break
+        boundary.append(current)
 
-        stack = [-1]  # column indices with strictly increasing heights; -1 is a left sentinel
-        for i in range(n_cols + 1):
-            cur = heights[i] if i < n_cols else 0
-            while stack[-1] != -1 and heights[stack[-1]] >= cur:
-                h = heights[stack[-1]]
-                stack.pop()
-                left = stack[-1] + 1
-                width = i - left
-                area = h * width
-                if area > best_area:
-                    best_area = area
-                    best = (row - h + 1, row + 1, left, i)
-            stack.append(i)
-
-    return best
+    return boundary
 
 
-def _rect_area_value(
-    heights: np.ndarray, row_min: int, row_max: int, col_min: int, col_max: int,
-    fallback_row: int, fallback_col: int,
+def _trace_mask_boundaries(mask: np.ndarray, tolerance_px: float) -> list[dict]:
+    """
+    Trace every connected foreground region in `mask`, plus any
+    fully-enclosed hole within each, then simplify each ring with
+    shapely's Douglas-Peucker `simplify` -- lifted from
+    boundary_trace_viz.py's trace_and_simplify (validated there first;
+    see that file for the two-stage raw-trace-then-simplify design
+    rationale). Drops the *_raw fields that tool's own UI needed for
+    display -- production only needs the simplified rings.
+
+    Returns a list of dicts, one per foreground region:
+        {"exterior": [(x, z), ...], "holes": [[(x, z), ...], ...]}
+    Coordinates are (x, z) = (col, row), PIXEL space -- the caller maps
+    these into world space (see _fallline_pack_band).
+    """
+    fg_labels, n_fg = ndimage.label(mask)
+
+    bg_mask = ~mask
+    bg_labels, n_bg = ndimage.label(bg_mask)
+    border_labels = (
+        set(np.unique(bg_labels[0, :])) | set(np.unique(bg_labels[-1, :])) |
+        set(np.unique(bg_labels[:, 0])) | set(np.unique(bg_labels[:, -1]))
+    )
+    border_labels.discard(0)
+    hole_label_ids = [l for l in range(1, n_bg + 1) if l not in border_labels]
+
+    regions = []
+    for fg_id in range(1, n_fg + 1):
+        region_mask = fg_labels == fg_id
+        start = _first_pixel(region_mask)
+        if start is None:
+            continue
+        exterior_raw = _moore_boundary_trace(region_mask, start)
+        exterior_xy = [(c, r) for r, c in exterior_raw]
+        if len(exterior_xy) < 3:
+            continue  # degenerate (single/double pixel) -- not a real polygon
+
+        # Which holes actually belong to THIS foreground region -- test
+        # containment of each hole's own start pixel against this
+        # region's raw exterior polygon.
+        exterior_poly_raw = Polygon(exterior_xy)
+        holes_raw = []
+        for hole_id in hole_label_ids:
+            hole_mask = bg_labels == hole_id
+            hole_start = _first_pixel(hole_mask)
+            if hole_start is None:
+                continue
+            if not exterior_poly_raw.contains(Point(hole_start[1], hole_start[0])):
+                continue
+            hole_trace = _moore_boundary_trace(hole_mask, hole_start)
+            hole_xy = [(c, r) for r, c in hole_trace]
+            if len(hole_xy) >= 3:
+                holes_raw.append(hole_xy)
+
+        full_poly = Polygon(exterior_xy, holes_raw)
+        simplified = full_poly.simplify(tolerance_px, preserve_topology=True)
+
+        # simplify() on a Polygon-with-holes can in rare degenerate
+        # cases (tolerance wiping out a hole entirely) return a bare
+        # Polygon with no interiors -- .interiors is just empty then,
+        # not an error.
+        ext_simplified = list(simplified.exterior.coords)[:-1]
+        holes_simplified = [list(ring.coords)[:-1] for ring in simplified.interiors]
+
+        regions.append({"exterior": ext_simplified, "holes": holes_simplified})
+
+    return regions
+
+
+def _fl_sub(a, b):
+    return (a[0] - b[0], a[1] - b[1])
+
+
+def _fl_add(a, b):
+    return (a[0] + b[0], a[1] + b[1])
+
+
+def _fl_scale(a, s):
+    return (a[0] * s, a[1] * s)
+
+
+def _fl_length(a):
+    return math.hypot(a[0], a[1])
+
+
+def _fl_normalize(a):
+    ln = _fl_length(a)
+    if ln < 1e-9:
+        return (0.0, 0.0)
+    return (a[0] / ln, a[1] / ln)
+
+
+def _fl_rotate90(a, sign):
+    return (-sign * a[1], sign * a[0])
+
+
+def _fl_ring_edges(ring: list[tuple[float, float]]) -> list[tuple[tuple, tuple]]:
+    n = len(ring)
+    return [(ring[i], ring[(i + 1) % n]) for i in range(n)]
+
+
+def _fl_ray_edges_intersection(origin, direction, edges, max_distance):
+    """
+    Nearest intersection of the ray (origin + t*direction, t > 0) with
+    any segment in `edges` (a flat list of (p0, p1) pairs -- may span
+    multiple rings), within max_distance. Returns t or None. Lifted
+    verbatim from fallline_fill_viz.py's _ray_edges_intersection.
+    """
+    best_t = None
+    ox, oz = origin
+    dx, dz = direction
+
+    for p0, p1 in edges:
+        ex, ez = p1[0] - p0[0], p1[1] - p0[1]
+
+        denom = dx * ez - dz * ex
+        if abs(denom) < 1e-9:
+            continue
+
+        qx, qz = p0[0] - ox, p0[1] - oz
+        t = (qx * ez - qz * ex) / denom
+        u = (qx * dz - qz * dx) / denom
+        if t > 1e-6 and 0.0 <= u <= 1.0 and t <= max_distance:
+            if best_t is None or t < best_t:
+                best_t = t
+
+    return best_t
+
+
+def _fallline_edge_stamps(
+    rings: list[list[tuple[float, float]]], brush: int,
+    max_search_distance: float, width_samples: int, min_length: float,
+) -> list[Stamp]:
+    """
+    One type-72 Stamp per boundary edge of every ring in `rings` (ring 0
+    = exterior, the rest = holes), all rings walked as closed loops --
+    lifted from fallline_fill_viz.py's build_interior_fill_stamps
+    (validated there first as a standalone prototype; see that file's
+    module docstring for the full per-edge placement rule, including
+    why interior direction is a FIXED sign per ring -- +1 exterior, -1
+    every hole -- rather than a per-segment raster probe). EVERY real
+    edge gets a stamp: width is exactly |p1 - p0|, length extends toward
+    the opposite wall where possible, floored at `min_length` where it
+    can't. The only edge that gets skipped is a genuinely degenerate
+    (duplicate-point) zero-width segment.
+
+    `rings` must already be in WORLD-space coordinates -- max_search_distance
+    and min_length are both interpreted directly in the same units.
+    `value` is left as a placeholder (0.0); the caller fills in the real
+    local heightmap value once heights are in scope (see
+    _fallline_pack_band / _rotated_rect_area_value). scale_x/scale_z are
+    sized so the stamp's PLATEAU -- not its full nominal footprint --
+    comes out to exactly (width, length), same TYPE72_PLATEAU_FRACTION
+    convention the old axis-aligned rect pack used.
+    """
+    all_edges = [e for ring in rings for e in _fl_ring_edges(ring)]
+    stamps: list[Stamp] = []
+
+    for ring_index, ring in enumerate(rings):
+        winding_sign = 1 if ring_index == 0 else -1  # 0 = exterior, rest = holes
+
+        for p0, p1 in _fl_ring_edges(ring):
+            seg = _fl_sub(p1, p0)
+            width = _fl_length(seg)
+            if width < 1e-9:
+                continue  # degenerate zero-width segment -- numerically meaningless
+
+            direction = _fl_normalize(seg)
+            midpoint = _fl_scale(_fl_add(p0, p1), 0.5)
+            interior_perp = _fl_rotate90(direction, winding_sign)
+
+            sample_ts = np.linspace(0.05, 0.95, width_samples)
+            sample_distances = []
+            for t in sample_ts:
+                sample_origin = _fl_add(p0, _fl_scale(seg, float(t)))
+                d = _fl_ray_edges_intersection(sample_origin, interior_perp, all_edges, max_search_distance)
+                if d is not None:
+                    sample_distances.append(d)
+
+            length = max(min_length, min(sample_distances)) if sample_distances else min_length
+            center = _fl_add(midpoint, _fl_scale(interior_perp, length / 2.0))
+
+            # Same formula/axis convention terrain/stamp.py's
+            # local_square_offsets shares with every other consumer of
+            # a rotated stamp.
+            rotation_deg = math.degrees(math.atan2(interior_perp[0], interior_perp[1]))
+            scale_x = (width / 2.0) / TYPE72_PLATEAU_FRACTION
+            scale_z = (length / 2.0) / TYPE72_PLATEAU_FRACTION
+            if _HAVE_BRUSH_PROFILES:
+                rotation_deg, scale_x, scale_z = apply_brush_adjustment(rotation_deg, scale_x, scale_z, brush)
+
+            stamps.append(Stamp(
+                x=center[0], z=center[1],
+                scale_x=scale_x, scale_z=scale_z,
+                value=0.0, brush=brush, rotation=rotation_deg, tool=TOOL_FLATTEN,
+            ))
+
+    return stamps
+
+
+def _fallline_stamp_footprint(
+    stamp: Stamp, bounds: BoundingBox, cell_x: float, cell_z: float, n_rows: int, n_cols: int,
+) -> tuple[int, int, int, int, np.ndarray]:
+    """
+    Tight axis-aligned pixel bounding box + boolean inside-test for one
+    rotated type-72 stamp's own PLATEAU footprint -- computed from the
+    stamp's own 4 real corners (perp/across trig, same convention as
+    terrain/stamp.py's local_square_offsets), not a loose
+    hypot(scale_x, scale_z) superset, since this runs per-placed-stamp
+    at fill time and a tight box keeps both the value-sampling mean
+    (_rotated_rect_area_value) and the crumb-coverage rasterization
+    (_fallline_pack_band) precise rather than over-counting.
+
+    Returns (row_min, row_max, col_min, col_max, inside) -- row_max/
+    col_max EXCLUSIVE (numpy slicing), `inside` shaped
+    (row_max - row_min, col_max - col_min) -- possibly a (0, 0) array
+    if the stamp falls entirely off-grid.
+    """
+    theta = math.radians(stamp.rotation)
+    perp = (math.sin(theta), math.cos(theta))
+    across = (math.cos(theta), -math.sin(theta))
+
+    corners_x = [
+        stamp.x + s1 * perp[0] * stamp.scale_z + s2 * across[0] * stamp.scale_x
+        for s1 in (-1.0, 1.0) for s2 in (-1.0, 1.0)
+    ]
+    corners_z = [
+        stamp.z + s1 * perp[1] * stamp.scale_z + s2 * across[1] * stamp.scale_x
+        for s1 in (-1.0, 1.0) for s2 in (-1.0, 1.0)
+    ]
+
+    col_min = max(0, int((min(corners_x) - bounds.min_x) / cell_x))
+    col_max = min(n_cols, int((max(corners_x) - bounds.min_x) / cell_x) + 1)
+    row_min = max(0, int((min(corners_z) - bounds.min_z) / cell_z))
+    row_max = min(n_rows, int((max(corners_z) - bounds.min_z) / cell_z) + 1)
+    if col_min >= col_max or row_min >= row_max:
+        return row_min, row_max, col_min, col_max, np.zeros((0, 0), dtype=bool)
+
+    x_centers = bounds.min_x + (np.arange(col_min, col_max) + 0.5) * cell_x
+    z_centers = bounds.min_z + (np.arange(row_min, row_max) + 0.5) * cell_z
+    xx, zz = np.meshgrid(x_centers, z_centers)
+    ax, az = local_square_offsets(stamp, xx - stamp.x, zz - stamp.z)
+    inside = (np.abs(ax) <= stamp.scale_x) & (np.abs(az) <= stamp.scale_z)
+
+    return row_min, row_max, col_min, col_max, inside
+
+
+def _rotated_rect_area_value(
+    heights: np.ndarray, bounds: BoundingBox, cell_x: float, cell_z: float,
+    stamp: Stamp, fallback_row: int, fallback_col: int,
 ) -> float:
     """
-    Real local heightmap mean over a rectangle's OWN footprint -- unlike
-    the circular passes' _nearest_point_value (a single point sample,
-    needed there specifically because a circular stamp's full nominal
-    radius extends past its plateau into neighboring territory -- see
-    that function's own docstring), a rect-mode stamp's plateau IS
-    exactly this rectangle, by construction (see module docstring's
-    RECT FILL MODE section on TYPE72_PLATEAU_FRACTION sizing). There is
-    no falloff ring to blur into here, so an area average over exactly
-    this footprint is the precise, not approximate, right measure.
+    Real local heightmap mean over a (possibly rotated) type-72 stamp's
+    own plateau footprint -- the rotated counterpart of the old
+    _rect_area_value's "no falloff ring, so an exact area mean over the
+    plateau IS the precise measure" reasoning; see
+    _fallline_stamp_footprint for the footprint test itself.
 
     Falls back to the single nearest finite cell (same convention as
-    _nearest_point_value) if this rectangle happens to contain no
-    finite heightmap data at all.
+    _nearest_point_value) if the footprint contains no finite heightmap
+    data at all.
     """
-    sub = heights[row_min:row_max, col_min:col_max]
-    valid = np.isfinite(sub)
-    if valid.any():
-        return float(np.mean(sub[valid]))
+    n_rows, n_cols = heights.shape
+    row_min, row_max, col_min, col_max, inside = _fallline_stamp_footprint(
+        stamp, bounds, cell_x, cell_z, n_rows, n_cols,
+    )
+    if inside.size:
+        sub = heights[row_min:row_max, col_min:col_max]
+        valid = inside & np.isfinite(sub)
+        if valid.any():
+            return float(np.mean(sub[valid]))
     return _nearest_point_value(heights, fallback_row, fallback_col)
 
 
-def _rect_pack_band(
+def _fallline_pack_band(
     mask: np.ndarray, heights: np.ndarray, bounds: BoundingBox,
-    brush: int, min_side_m: float, size_ratio_cap: float,
-    max_stamps: Optional[int] = None,
+    brush: int, tolerance_m: float, min_length_m: float, max_search_distance_m: float,
+    width_samples: int, max_stamps: Optional[int] = None,
 ) -> tuple[list[Stamp], np.ndarray]:
     """
-    "rect" fill mode's main covering pass -- see module docstring's
-    RECT FILL MODE and SEAM HANDLING sections for the full design.
-    `brush` must be a SHAPE_SQUARE brush (checked via BRUSH_PROFILES);
-    TYPE72_PLATEAU_FRACTION is specific to type 72's own real measured
-    geometry, so this is only meaningful for brush=72 today.
+    "rect" fill mode's main covering pass -- see module docstring's RECT
+    FILL MODE section for the full design. `brush` must be a
+    SHAPE_SQUARE brush (checked via BRUSH_PROFILES); TYPE72_PLATEAU_FRACTION
+    is specific to type 72's own real measured geometry, so this is only
+    meaningful for brush=72 today, same as the axis-aligned rect pack
+    this replaces.
 
-    Greedily takes the single largest all-True rectangle remaining in
-    `mask` (_largest_rectangle_in_mask) and checks it against
-    size_ratio_cap for any already-placed, directly-touching neighbor
-    (tracked in `claimed_size`, a per-cell "longer side, in meters, of
-    whichever rectangle claimed this cell" grid) both ways: if the
-    candidate is disproportionately BIGGER than a small neighbor, it's
-    clipped down (anchored at its own top-left corner, so it stays a
-    valid subset of the same all-True region); if it's disproportionately
-    SMALLER than a big neighbor, it's declined outright (there's no
-    valid way to grow it -- the mask genuinely has no more contiguous
-    area there) and deferred to pass 2's soft-falloff crumb scatter
-    instead of placing a small hard-edged stamp against a much larger
-    one. Otherwise places a type-72 stamp sized so its PLATEAU exactly
-    fills the (possibly clipped) rectangle, and marks it fully claimed
-    -- zero partial-claim bookkeeping needed, unlike the circular
-    passes, because the plateau IS the rectangle exactly (no falloff
-    ring to account for). Repeats until the best remaining rectangle
-    drops below min_side_m on its shorter side.
+    Traces `mask`'s own boundary into vector polygons
+    (_trace_mask_boundaries, lifted from boundary_trace_viz.py) and
+    places one type-72 stamp per boundary edge, shot toward whichever
+    wall is opposite (_fallline_edge_stamps, lifted from
+    fallline_fill_viz.py's build_interior_fill_stamps) -- unlike the old
+    axis-aligned pack, EVERY edge always gets a stamp (floored at
+    min_length_m), so there's no candidate-rejection bookkeeping;
+    whatever area the placed footprints don't reach is rasterized
+    directly into `crumbs` (_fallline_stamp_footprint).
 
-    Returns (stamps, crumbs) -- `crumbs` is just whatever's left in the
-    working mask once the loop stops, mirroring _poisson_pack_band's
-    return contract so both fill modes can share the exact same pass-2
-    crumb handling (_scatter_fill_remaining) at the call site.
+    Returns (stamps, crumbs) -- same contract _poisson_pack_band/the old
+    _rect_pack_band already used, so pass 2 (_scatter_fill_remaining) at
+    the call site needs no changes.
     """
     n_rows, n_cols = heights.shape
     cell_x = (bounds.max_x - bounds.min_x) / n_cols
     cell_z = (bounds.max_z - bounds.min_z) / n_rows
 
     stamps: list[Stamp] = []
-    if not mask.any() or min_side_m <= 0 or (max_stamps is not None and max_stamps <= 0):
+    if not mask.any() or (max_stamps is not None and max_stamps <= 0):
         return stamps, mask.copy()
 
     profile = BRUSH_PROFILES.get(brush) if _HAVE_BRUSH_PROFILES else None
     if profile is None or profile.shape != SHAPE_SQUARE:
-        # Not a square/rectangular brush -- rectangle packing has
-        # nothing to claim; refuse outright rather than silently
-        # placing circular-shaped stamps mislabeled as a rect fill (same
-        # "refuse outright" convention _poisson_pack_band uses for a
-        # brush with no usable plateau).
+        # Not a square/rectangular brush -- fallline placement has
+        # nothing to anchor a rotated rectangle to; refuse outright,
+        # same convention _poisson_pack_band uses for a brush with no
+        # usable plateau.
         return stamps, mask.copy()
 
-    # Crop to the mask's own tight bounding box -- no margin needed
-    # (unlike the circular passes): a rect-mode stamp's plateau is
-    # exactly the rectangle found inside this crop, and the sliver of
-    # footprint beyond the plateau contributes exactly zero weight (see
-    # module docstring), so there's no falloff ring that could ever
-    # reach outside the crop and matter.
+    # Crop to the mask's own tight bounding box before tracing -- same
+    # optimization the old rect pack used, and keeps the boundary trace
+    # off the full heightmap-sized array.
     rows_nz, cols_nz = np.nonzero(mask)
     row0, row1 = int(rows_nz.min()), int(rows_nz.max()) + 1
     col0, col1 = int(cols_nz.min()), int(cols_nz.max()) + 1
-    remaining = mask[row0:row1, col0:col1].copy()
-    crop_rows, crop_cols = remaining.shape
+    cropped = mask[row0:row1, col0:col1]
 
-    claimed_size = np.zeros((crop_rows, crop_cols), dtype=np.float64)  # 0 == unclaimed
-    # Cells declined below (a small candidate forced up against an
-    # already-placed, much larger neighbor -- see the neighbor_max
-    # check) are pulled out of `remaining` so the main loop makes
-    # progress instead of re-finding them forever, but they still need
-    # to end up in `crumbs`, not vanish -- tracked here and folded back
-    # in once the main loop stops.
-    forced_crumbs = np.zeros((crop_rows, crop_cols), dtype=bool)
+    # tolerance_m is specified in world meters (consistent with every
+    # other *_m param this module takes); the trace itself operates on
+    # the pixel grid, so convert via cell_x -- assumes near-square
+    # cells, the same class of scalar approximation TYPE72_PLATEAU_FRACTION
+    # already makes elsewhere in this module.
+    tolerance_px = tolerance_m / cell_x
+    regions = _trace_mask_boundaries(cropped, tolerance_px)
 
-    while remaining.any():
-        if max_stamps is not None and len(stamps) >= max_stamps:
-            break
+    covered = np.zeros_like(mask)
 
-        found = _largest_rectangle_in_mask(remaining)
-        if found is None:
-            break
-        r_min, r_max, c_min, c_max = found
-
-        width_m = (c_max - c_min) * cell_x
-        height_m = (r_max - r_min) * cell_z
-        if min(width_m, height_m) < min_side_m:
-            break  # best remaining candidate is already below the floor -- everything left is crumbs
-
-        # Seam handling approach (a): clip against any already-placed,
-        # directly-touching neighbor's own longer side (module
-        # docstring's SEAM HANDLING). Anchored at (r_min, c_min) so the
-        # clipped rectangle stays a subset of the same all-True region
-        # -- always valid without re-checking.
-        border_sizes = []
-        if r_min > 0:
-            border_sizes.append(claimed_size[r_min - 1, c_min:c_max])
-        if r_max < crop_rows:
-            border_sizes.append(claimed_size[r_max, c_min:c_max])
-        if c_min > 0:
-            border_sizes.append(claimed_size[r_min:r_max, c_min - 1])
-        if c_max < crop_cols:
-            border_sizes.append(claimed_size[r_min:r_max, c_max])
-        neighbor_sizes = np.concatenate(border_sizes) if border_sizes else np.empty(0)
-        neighbor_sizes = neighbor_sizes[neighbor_sizes > 0]
-
-        if neighbor_sizes.size:
-            neighbor_min = float(neighbor_sizes.min())
-            neighbor_max = float(neighbor_sizes.max())
-            candidate_long = max(width_m, height_m)
-
-            if neighbor_max > size_ratio_cap * candidate_long:
-                # The candidate itself is disproportionately SMALL next
-                # to an already-placed neighbor -- unlike the "too big"
-                # case below, there's no valid way to grow it (the mask
-                # genuinely has no more contiguous True area here), and
-                # placing a small hard-edged type-72 rectangle directly
-                # against a much larger one is exactly the visible-step
-                # case size_ratio_cap exists to avoid. Decline this
-                # placement and let it fall through to pass 2's soft-
-                # falloff crumb scatter instead, which blends across a
-                # boundary like this far better than a hard plateau edge.
-                remaining[r_min:r_max, c_min:c_max] = False
-                forced_crumbs[r_min:r_max, c_min:c_max] = True
+    for region in regions:
+        rings_world = []
+        for ring_px in (region["exterior"], *region["holes"]):
+            if len(ring_px) < 3:
                 continue
+            rings_world.append([
+                (bounds.min_x + (c + col0 + 0.5) * cell_x, bounds.min_z + (r + row0 + 0.5) * cell_z)
+                for c, r in ring_px
+            ])
+        if not rings_world:
+            continue
 
-            # Never cap below min_side_m -- the candidate is already
-            # known >= min_side_m on both sides at this point, so
-            # capping strictly at the ratio could otherwise shrink it
-            # below the crumb floor, which would either need to discard
-            # real area (a coverage bug -- those cells would vanish from
-            # both the main pass AND crumbs) or loop forever re-finding
-            # the same too-small candidate. Preferring the floor over
-            # strict ratio enforcement in this rare conflict is a
-            # deliberate, documented trade-off, not an oversight.
-            cap_m = max(size_ratio_cap * neighbor_min, min_side_m)
-            if candidate_long > cap_m:
-                max_width_cells = max(1, int(math.ceil(cap_m / cell_x)))
-                max_height_cells = max(1, int(math.ceil(cap_m / cell_z)))
-                c_max = min(c_max, c_min + max_width_cells)
-                r_max = min(r_max, r_min + max_height_cells)
-                width_m = (c_max - c_min) * cell_x
-                height_m = (r_max - r_min) * cell_z
+        for stamp in _fallline_edge_stamps(
+            rings_world, brush, max_search_distance_m, width_samples, min_length_m,
+        ):
+            if max_stamps is not None and len(stamps) >= max_stamps:
+                return stamps, mask & ~covered
 
-        row_min, row_max = row0 + r_min, row0 + r_max
-        col_min, col_max = col0 + c_min, col0 + c_max
-        cx = bounds.min_x + (col_min + (col_max - col_min) / 2.0) * cell_x
-        cz = bounds.min_z + (row_min + (row_max - row_min) / 2.0) * cell_z
-        scale_x = width_m / (2.0 * TYPE72_PLATEAU_FRACTION)
-        scale_z = height_m / (2.0 * TYPE72_PLATEAU_FRACTION)
+            fallback_row = min(n_rows - 1, max(0, int((stamp.z - bounds.min_z) / cell_z)))
+            fallback_col = min(n_cols - 1, max(0, int((stamp.x - bounds.min_x) / cell_x)))
+            stamp.value = _rotated_rect_area_value(
+                heights, bounds, cell_x, cell_z, stamp, fallback_row, fallback_col,
+            )
 
-        fallback_row = row_min + (row_max - row_min) // 2
-        fallback_col = col_min + (col_max - col_min) // 2
-        value = _rect_area_value(heights, row_min, row_max, col_min, col_max, fallback_row, fallback_col)
+            s_row_min, s_row_max, s_col_min, s_col_max, inside = _fallline_stamp_footprint(
+                stamp, bounds, cell_x, cell_z, n_rows, n_cols,
+            )
+            if inside.size:
+                covered[s_row_min:s_row_max, s_col_min:s_col_max] |= inside
 
-        stamps.append(Stamp(
-            x=cx, z=cz, scale_x=scale_x, scale_z=scale_z, value=value, brush=brush, tool=TOOL_FLATTEN,
-        ))
+            stamps.append(stamp)
 
-        remaining[r_min:r_max, c_min:c_max] = False
-        claimed_size[r_min:r_max, c_min:c_max] = max(width_m, height_m)
-
-    crumbs = mask.copy()
-    crumbs[row0:row1, col0:col1] = remaining | forced_crumbs
+    crumbs = mask & ~covered
     return stamps, crumbs
 
 
@@ -1441,7 +1613,8 @@ def _fill_one_band(
     fill_mode: str,
     fill_brush: int, min_radius: float, max_radius: float, radius_step_ratio: float,
     edge_distance_m: float, candidates_per_radius: int, rng: np.random.Generator,
-    rect_brush: int, rect_min_side_m: float, rect_size_ratio_cap: float,
+    rect_brush: int, rect_tolerance_m: float, rect_min_length_m: float,
+    rect_max_search_distance_m: float, rect_width_samples: int,
     smoothing_brush: int, crumb_radius: float, smooth_claim_fraction: float,
     max_stamps: Optional[int] = None,
     enable_secondary_fill: bool = True,
@@ -1452,8 +1625,8 @@ def _fill_one_band(
     sequential loop in generate_contour_layers and _process_one_band's
     parallel-worker path, so the two can never drift out of sync with
     each other. Only the main pass differs between "poisson" (circular,
-    _poisson_pack_band) and "rect" (axis-aligned type-72 rectangles,
-    _rect_pack_band, see module docstring's RECT FILL MODE section);
+    _poisson_pack_band) and "rect" (one type-72 stamp per boundary edge,
+    _fallline_pack_band, see module docstring's RECT FILL MODE section);
     pass 2 (_scatter_fill_remaining, smoothing_brush) is identical
     either way, since both main passes return a `crumbs` mask in the
     exact same contract.
@@ -1463,8 +1636,9 @@ def _fill_one_band(
     speed (e.g. a quick preview of pass 1's own plateau shape).
     """
     if fill_mode == "rect":
-        main_stamps, crumbs = _rect_pack_band(
-            mask, heights, bounds, rect_brush, rect_min_side_m, rect_size_ratio_cap,
+        main_stamps, crumbs = _fallline_pack_band(
+            mask, heights, bounds, rect_brush, rect_tolerance_m, rect_min_length_m,
+            rect_max_search_distance_m, rect_width_samples,
             max_stamps=max_stamps,
         )
     else:
@@ -1525,7 +1699,7 @@ def _process_one_band(args: tuple) -> list[Stamp]:
     """
     (band_index, lo, hi, fill_mode, fill_brush, min_radius, max_radius, radius_step_ratio,
      edge_distance_m, denoise_px, random_seed, candidates_per_radius,
-     rect_brush, rect_min_side_m, rect_size_ratio_cap,
+     rect_brush, rect_tolerance_m, rect_min_length_m, rect_max_search_distance_m, rect_width_samples,
      smoothing_brush, crumb_radius, smooth_claim_fraction, enable_secondary_fill) = args
 
     heights = _worker_heights
@@ -1546,7 +1720,7 @@ def _process_one_band(args: tuple) -> list[Stamp]:
         mask, heights, bounds, fill_mode,
         fill_brush, min_radius, max_radius, radius_step_ratio, edge_distance_m,
         candidates_per_radius, rng,
-        rect_brush, rect_min_side_m, rect_size_ratio_cap,
+        rect_brush, rect_tolerance_m, rect_min_length_m, rect_max_search_distance_m, rect_width_samples,
         smoothing_brush, crumb_radius, smooth_claim_fraction,
         enable_secondary_fill=enable_secondary_fill,
     )
@@ -1563,8 +1737,10 @@ def generate_contour_layers(
     radius_step_ratio: float = DEFAULT_RADIUS_STEP_RATIO,
     edge_distance_m: float = DEFAULT_EDGE_DISTANCE_M,
     rect_brush: int = DEFAULT_RECT_BRUSH,
-    rect_min_side_m: float = DEFAULT_RECT_MIN_SIDE_M,
-    rect_size_ratio_cap: float = DEFAULT_RECT_SIZE_RATIO_CAP,
+    rect_tolerance_m: float = DEFAULT_RECT_TOLERANCE_M,
+    rect_min_length_m: float = DEFAULT_RECT_MIN_LENGTH_M,
+    rect_max_search_distance_m: float = DEFAULT_RECT_MAX_SEARCH_DISTANCE_M,
+    rect_width_samples: int = DEFAULT_RECT_WIDTH_SAMPLES,
     smoothing_brush: int = DEFAULT_SMOOTHING_BRUSH,
     smoothing_min_radius: float = DEFAULT_SMOOTHING_MIN_RADIUS_M,
     smooth_ratio: float = DEFAULT_CRUMB_SCATTER_MULTIPLIER,
@@ -1604,15 +1780,17 @@ def generate_contour_layers(
     to exactly one band.
 
     fill_mode selects the main covering pass's shape -- "poisson"
-    (default, circles -- see PASS 1 below) or "rect" (axis-aligned
-    type-72 rectangles -- see module docstring's RECT FILL MODE
-    section, and rect_brush/rect_min_side_m/rect_size_ratio_cap below).
-    Everything else -- band partitioning, denoise, pass 2 crumb
+    (default, circles -- see PASS 1 below) or "rect" (one type-72 stamp
+    per boundary edge, vector/boundary-traced -- see module docstring's
+    RECT FILL MODE section, and rect_brush/rect_tolerance_m/
+    rect_min_length_m/rect_max_search_distance_m/rect_width_samples
+    below). Everything else -- band partitioning, denoise, pass 2 crumb
     cleanup, the ProcessPoolExecutor per-band loop -- is identical
     either way; only the main pass differs. fill_brush/min_radius/
     max_radius/radius_step_ratio/edge_distance_m/candidates_per_radius
     and the sweet_spot_* auto-tuning knobs apply to "poisson" only;
-    rect_brush/rect_min_side_m/rect_size_ratio_cap apply to "rect"
+    rect_brush/rect_tolerance_m/rect_min_length_m/
+    rect_max_search_distance_m/rect_width_samples apply to "rect"
     only -- each set is silently unused (not validated away) under the
     other mode, same convention hex/contour method selection already
     uses in PGA2k_gen.py.
@@ -1622,25 +1800,27 @@ def generate_contour_layers(
     fast random-candidate poisson pack with fill_brush (see
     _poisson_pack_band), a hard, high-plateau brush (type 8/73) doing
     the bulk of the work quickly, trading a per-call completeness
-    guarantee for speed; for "rect", greedy largest-rectangle covering
-    with rect_brush (see _rect_pack_band) -- (3) PASS 2: whatever pass
-    1 leaves as genuine crumbs gets an oversized, heavily-overlapping
-    scatter fill with smoothing_brush (see _scatter_fill_remaining),
-    which IS exhaustive -- so overall coverage is still complete by
-    construction, just split across a fast bulk pass and a smaller,
-    guaranteed-complete cleanup pass instead of one mechanism doing
-    both jobs. No ring tracing, no cross-band value blending, no
-    separate hilltop/pit/residual special-casing -- every band gets
-    identical treatment regardless of its own shape or connectivity.
+    guarantee for speed; for "rect", one type-72 stamp per boundary
+    edge of the band's own traced shape (see _fallline_pack_band) --
+    (3) PASS 2: whatever pass 1 leaves as genuine crumbs gets an
+    oversized, heavily-overlapping scatter fill with smoothing_brush
+    (see _scatter_fill_remaining), which IS exhaustive -- so overall
+    coverage is still complete by construction, just split across a
+    fast bulk pass and a smaller, guaranteed-complete cleanup pass
+    instead of one mechanism doing both jobs. No cross-band value
+    blending, no separate hilltop/pit/residual special-casing -- every
+    band gets identical treatment regardless of its own shape or
+    connectivity.
 
     rect_brush must be a SHAPE_SQUARE brush (only type 72 today);
-    rect_min_side_m is the shorter-side floor below which a candidate
-    rectangle is treated as a genuine crumb and handed to pass 2
-    instead; rect_size_ratio_cap bounds how much larger a rectangle's
-    own longer side may be than an already-placed, directly-touching
-    neighbor's (seam-step mitigation -- see module docstring's SEAM
-    HANDLING section). candidates_per_radius auto-tuning (below) is
-    skipped entirely in "rect" mode -- it's a "poisson"-only concept.
+    rect_tolerance_m is the Douglas-Peucker boundary-simplify tolerance
+    (world meters); rect_min_length_m floors a per-edge stamp's length
+    when no opposite wall is found within rect_max_search_distance_m;
+    rect_width_samples is how many points along each edge's own width
+    get ray-cast when searching for that opposite wall (see module
+    docstring's RECT FILL MODE section). candidates_per_radius
+    auto-tuning (below) is skipped entirely in "rect" mode -- it's a
+    "poisson"-only concept.
 
     edge_distance_m (pass 1 only -- pass 2 always ignores it) buffers
     every candidate's plateau an extra edge_distance_m past the band's
@@ -1807,7 +1987,7 @@ def generate_contour_layers(
                     mask, heights, bounds, fill_mode,
                     fill_brush, min_radius, max_radius, radius_step_ratio, edge_distance_m,
                     candidates_per_radius, rng,
-                    rect_brush, rect_min_side_m, rect_size_ratio_cap,
+                    rect_brush, rect_tolerance_m, rect_min_length_m, rect_max_search_distance_m, rect_width_samples,
                     smoothing_brush, crumb_radius, smooth_claim_fraction,
                     max_stamps=tier_budget,
                     enable_secondary_fill=enable_secondary_fill,
@@ -1823,7 +2003,7 @@ def generate_contour_layers(
         tasks = [
             (i, lo, hi, fill_mode, fill_brush, min_radius, max_radius, radius_step_ratio, edge_distance_m,
              denoise_px, random_seed, candidates_per_radius,
-             rect_brush, rect_min_side_m, rect_size_ratio_cap,
+             rect_brush, rect_tolerance_m, rect_min_length_m, rect_max_search_distance_m, rect_width_samples,
              smoothing_brush, crumb_radius, smooth_claim_fraction, enable_secondary_fill)
             for i, (lo, hi) in enumerate(boundaries)
         ]
