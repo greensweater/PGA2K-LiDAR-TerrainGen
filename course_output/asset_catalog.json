@@ -1,0 +1,1809 @@
+{
+  "source_theme": "rustic (theme id 11)",
+  "note": "category/type -> v2021+ asset path mapping, derived by matching item positions between a hand-placed v2019 placedObjects2.json and the same file re-saved from v2021 (placedObjects3.json). spacing (meters, center-to-center) is back-calculated per asset from a maxed-out cluster (spacing = radius / sqrt(count/pi)), taking the largest-radius sample seen across all maxed-cluster passes provided for that asset. Category 1 (rocks) types 1-6 borrow type 0's spacing and types 8-9 borrow type 7's spacing (not independently measured -- assigned per instruction). spacing is null where no maxed-cluster sample exists and no borrowed value was assigned. cluster_radius on each category is the largest cluster radius observed for any measured asset in that category (the apparent engine-side max radius cap); null for categories with no cluster samples at all.",
+  "missing_spacing_data": [],
+  "categories": [
+    {
+      "id": 0,
+      "description": "trees and bushes",
+      "cluster_radius": 45.0
+    },
+    {
+      "id": 1,
+      "description": "rocks",
+      "cluster_radius": 11.25
+    },
+    {
+      "id": 2,
+      "description": "grass",
+      "cluster_radius": 11.25
+    },
+    {
+      "id": 3,
+      "description": "ground-cover plants",
+      "cluster_radius": 15.0
+    },
+    {
+      "id": 5,
+      "description": "buildings",
+      "cluster_radius": null
+    },
+    {
+      "id": 7,
+      "description": "signs/markers",
+      "cluster_radius": null
+    },
+    {
+      "id": 8,
+      "description": "bridges",
+      "cluster_radius": null
+    },
+    {
+      "id": 10,
+      "description": "vehicles",
+      "cluster_radius": null
+    },
+    {
+      "id": 12,
+      "description": "detail plants",
+      "cluster_radius": 11.25
+    },
+    {
+      "id": 13,
+      "description": "walls/fences/steps",
+      "cluster_radius": null
+    }
+  ],
+  "entries": [
+    {
+      "category": 0,
+      "type": 0,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Lombardy_Poplar/Prefabs/Lombardy_Popular_Desktop01",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 1,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Lombardy_Poplar/Prefabs/Lombardy_Popular_Desktop02",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 2,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/European_White_Birch/Prefabs/European_White_Birch_Desktop04",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 4,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Green_Ash/Prefabs/Green_Ash_Desktop_101",
+      "spacing": 11.3943
+    },
+    {
+      "category": 0,
+      "type": 5,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Green_Ash/Prefabs/Green_Ash_Desktop_102",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 6,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/American_Elm/Prefabs/American_Elm_Desktop02",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 7,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/American_Elm/Prefabs/American_Elm_Desktop03",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 8,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Red_Maple/Prefabs/Red_Maple_Desktop01",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 9,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/American_Sycamore/Prefabs/American_Sycamore_Desktop02",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 10,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/White_Oak/Prefabs/White_Oak_Desktop01",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 11,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/White_Oak/Prefabs/White_Oak_Desktop02",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 12,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/White_Oak/Prefabs/White_Oak_Desktop03",
+      "spacing": 11.3943
+    },
+    {
+      "category": 0,
+      "type": 13,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Douglas_Fir/Prefabs/DouglasFir_Desktop02",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 14,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Alaska_Cedar/Prefabs/AlaskaCedar_Desktop02",
+      "spacing": 15.9521
+    },
+    {
+      "category": 0,
+      "type": 15,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Generic_Conifer/Prefabs/Generic_Conifer_Desktop02",
+      "spacing": 11.3943
+    },
+    {
+      "category": 0,
+      "type": 16,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Trees/Eastern_White_Pine/Prefabs/Eastern_White_Pine_Desktop02",
+      "spacing": 11.3943
+    },
+    {
+      "category": 0,
+      "type": 17,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/AutumnBushes/Prefabs/AutumnBush5A",
+      "spacing": 8.8623
+    },
+    {
+      "category": 0,
+      "type": 18,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/AutumnBushes/Prefabs/AutumnBush5B",
+      "spacing": 8.8623
+    },
+    {
+      "category": 0,
+      "type": 19,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/AutumnBushes/Prefabs/AutumnBush5C",
+      "spacing": 9.9701
+    },
+    {
+      "category": 0,
+      "type": 20,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/AutumnBushes/Prefabs/AutumnBush6A",
+      "spacing": 8.8623
+    },
+    {
+      "category": 0,
+      "type": 21,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/TropicalBushes/Prefabs/TropicalBush1A",
+      "spacing": 8.8623
+    },
+    {
+      "category": 0,
+      "type": 22,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/TropicalBushes/Prefabs/TropicalBush2A",
+      "spacing": 8.8623
+    },
+    {
+      "category": 0,
+      "type": 23,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/TropicalBushes/Prefabs/TropicalBush2B",
+      "spacing": 9.9701
+    },
+    {
+      "category": 0,
+      "type": 24,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/TropicalBushes/Prefabs/TropicalBush4B",
+      "spacing": 8.8623
+    },
+    {
+      "category": 1,
+      "type": 0,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Rock1AAlpinePrefab",
+      "spacing": 0.6042
+    },
+    {
+      "category": 1,
+      "type": 1,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Rock1BAlpinePrefab",
+      "spacing": 0.6042
+    },
+    {
+      "category": 1,
+      "type": 2,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Rock2AAlpinePrefab",
+      "spacing": 0.6042
+    },
+    {
+      "category": 1,
+      "type": 3,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Rock3AAlpinePrefab",
+      "spacing": 0.6042
+    },
+    {
+      "category": 1,
+      "type": 4,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Rock3BAlpinePrefab",
+      "spacing": 0.6042
+    },
+    {
+      "category": 1,
+      "type": 5,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Rock3CAlpinePrefab",
+      "spacing": 0.6042
+    },
+    {
+      "category": 1,
+      "type": 6,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Rock3DAlpinePrefab",
+      "spacing": 0.6042
+    },
+    {
+      "category": 1,
+      "type": 7,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Stone01AutumnPrefab",
+      "spacing": 0.5882
+    },
+    {
+      "category": 1,
+      "type": 8,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Stone02AutumnPrefab",
+      "spacing": 0.5882
+    },
+    {
+      "category": 1,
+      "type": 9,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Rocks/Stone03AutumnPrefab",
+      "spacing": 0.5882
+    },
+    {
+      "category": 2,
+      "type": 0,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassA",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 1,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassB",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 2,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassC",
+      "spacing": 0.9084
+    },
+    {
+      "category": 2,
+      "type": 3,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/DetailGrassNPrefab",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 4,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassD",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 5,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassE",
+      "spacing": 0.9084
+    },
+    {
+      "category": 2,
+      "type": 6,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassCA",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 7,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassN",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 8,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassO",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 11,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassK",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 12,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassL",
+      "spacing": 0.9064
+    },
+    {
+      "category": 2,
+      "type": 13,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Grass/TallGrassM",
+      "spacing": 0.997
+    },
+    {
+      "category": 3,
+      "type": 0,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Bushes/GroundCoverA1Prefab",
+      "spacing": 2.6587
+    },
+    {
+      "category": 3,
+      "type": 1,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Plants/Lilies2APrefab",
+      "spacing": 1.7725
+    },
+    {
+      "category": 3,
+      "type": 2,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Bushes/GroundCoverB1Prefab",
+      "spacing": 2.6587
+    },
+    {
+      "category": 3,
+      "type": 3,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Bushes/GroundCoverC1Prefab",
+      "spacing": 2.6587
+    },
+    {
+      "category": 3,
+      "type": 4,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Plants/PlantA09Prefab",
+      "spacing": 1.7725
+    },
+    {
+      "category": 3,
+      "type": 5,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Plants/PlantA08Prefab",
+      "spacing": 2.0451
+    },
+    {
+      "category": 3,
+      "type": 6,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Bushes/GroundCoverA2Prefab",
+      "spacing": 2.6587
+    },
+    {
+      "category": 3,
+      "type": 7,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Bushes/GroundCoverB2Prefab",
+      "spacing": 2.6587
+    },
+    {
+      "category": 3,
+      "type": 8,
+      "theme": true,
+      "path": "Assets/CourseGen/Detail/Bushes/GroundCoverC2Prefab",
+      "spacing": 2.6587
+    },
+    {
+      "category": 5,
+      "type": 32,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse01APrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 33,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse01BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 34,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse01CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 35,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse01DPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 36,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse01EPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 37,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse02APrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 38,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse02BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 39,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse02CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 40,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse02DPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 41,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse02EPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 42,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse03APrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 43,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse03BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 44,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse03CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 45,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse03DPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 46,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse03EPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 47,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse04APrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 48,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse04BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 49,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse04CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 50,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse04DPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 51,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse04EPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 124,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse05APrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 125,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse05BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 126,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse05CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 127,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse05DPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 128,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse05EPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 129,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse02FPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 130,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse02GPrefab",
+      "spacing": null
+    },
+    {
+      "category": 5,
+      "type": 131,
+      "theme": false,
+      "path": "Assets/CourseProps/Buildings/TownHouses/TownHouse02HPrefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 52,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/DistanceMarkerA100Prefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 53,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/DistanceMarkerA150Prefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 54,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/DistanceMarkerA200Prefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 55,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/DistanceMarkerB100Prefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 56,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/DistanceMarkerB150Prefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 57,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/DistanceMarkerB200Prefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 68,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/BlindSpotMarkerAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 69,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/BlindSpotMarkerBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 77,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/OBMarkerAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 78,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/OBMarkerBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 79,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/OBMarkerCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 7,
+      "type": 80,
+      "theme": false,
+      "path": "Assets/CourseProps/Signs/OBMarkerDPrefab",
+      "spacing": null
+    },
+    {
+      "category": 8,
+      "type": 10,
+      "theme": false,
+      "path": "Assets/CourseProps/Bridges/Bridge07BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 7,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car16Prefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 8,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car25Prefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 9,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car30Prefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 10,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car32Prefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 11,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car35Prefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 12,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car51Prefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 13,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car56Prefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 33,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car16BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 34,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car25PrefabB",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 35,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car30PrefabB",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 36,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car32PrefabB",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 37,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car35PrefabB",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 38,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car51PrefabB",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 39,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car56PrefabB",
+      "spacing": null
+    },
+    {
+      "category": 10,
+      "type": 40,
+      "theme": false,
+      "path": "Assets/CourseProps/Vehicles/Land/Car16CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 12,
+      "type": 0,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantDPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 1,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantEPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 2,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantFPrefab",
+      "spacing": 0.9084
+    },
+    {
+      "category": 12,
+      "type": 3,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantGPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 4,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantHPrefabGlobal",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 5,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantKPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 6,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantLPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 7,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantMPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 8,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantNPrefab",
+      "spacing": 1.8168
+    },
+    {
+      "category": 12,
+      "type": 9,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantOPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 10,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantPPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 11,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantQPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 12,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantRPrefab",
+      "spacing": 1.8168
+    },
+    {
+      "category": 12,
+      "type": 13,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantSPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 14,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantTPrefab",
+      "spacing": 1.8168
+    },
+    {
+      "category": 12,
+      "type": 15,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantUPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 16,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantVPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 17,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlantWPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 18,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailWeedAPrefabGlobal",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 19,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailWeedBPrefabGlobal",
+      "spacing": 1.994
+    },
+    {
+      "category": 12,
+      "type": 20,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailWeedCPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 21,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailWeedDPrefabGlobal",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 22,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/Lilies2APrefabGlobal",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 23,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/Lilies2BPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 24,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/Lilies2CPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 25,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2CPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 26,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2DPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 27,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2EPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 28,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2FPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 29,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2GPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 30,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2HPrefabGlobal",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 31,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2IPrefabGlobal",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 32,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2JPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 33,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2KPrefabGlobal",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 34,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailPlant2LPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 35,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailWeedFPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 36,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailWeedGPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 37,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailWeedHPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 12,
+      "type": 38,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Plants/DetailWeedIPrefab",
+      "spacing": 1.8127
+    },
+    {
+      "category": 13,
+      "type": 0,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/RetainWallAPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 1,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/RetainWallAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 2,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/RetainWallABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 3,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/RetainWallACPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 4,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/RetainWallADPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 5,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 6,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAPostBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 7,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAPostC",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 8,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 9,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 10,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAC",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 11,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighRailsAPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 12,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighRailsAPostBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 13,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighRailsAPostCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 14,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighRailsAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 15,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighRailsABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 16,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighRailsACPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 17,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowAPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 18,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowAPostBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 19,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowAPostCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 20,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 21,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 22,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowACPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 23,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 24,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 25,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsACPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 26,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesAPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 27,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesAPostBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 28,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesAPostCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 29,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesAPostDPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 30,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 31,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 32,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesACPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 33,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesADPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 34,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesBPostCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 35,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesBPostBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 36,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesBPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 37,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesBAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 38,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesBBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 39,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WoodFencesBCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 40,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WireFenceAPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 41,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WireFenceAPostBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 42,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WireFenceAPostCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 43,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WireFenceAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 44,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WireFenceABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 45,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WireFenceACPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 46,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/WireFenceADPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 47,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/RetainWallAEPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 48,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/RetainWallAFPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 49,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 50,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 51,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsACPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 52,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsADPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 53,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsBAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 54,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsBBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 55,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsBCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 56,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsBDPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 57,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsCAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 58,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsCBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 59,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsCCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 60,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StepsCDPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 61,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsAPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 62,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsAPostBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 63,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsAPostCPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 64,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAD",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 65,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAE",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 66,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAF",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 67,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsADPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 68,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsAEPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 69,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsAFPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 70,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsAGPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 71,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowADPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 72,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowAEPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 73,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowAFPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 74,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowAGPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 75,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/PicketFence01APrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 76,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/PicketFence01BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 77,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/PicketFencePost01APrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 78,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/PicketFencePost01BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 79,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/PicketFencePost01CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 80,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence01APrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 81,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence01BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 82,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence01Post01APrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 83,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence01Post01BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 84,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence01Post01CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 85,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence02APrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 86,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence02BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 87,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence02Post01APrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 88,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence02Post01BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 89,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/TriFence02Post01CPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 90,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/UniFence01APrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 91,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/UniFence01BPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 92,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/UniFencePostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 93,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/HedgeHighAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 94,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/HedgeHighBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 95,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StoneWallAAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 96,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StoneWallABPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 97,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StoneWallAPostAPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 98,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StoneWallAPostBPrefab",
+      "spacing": null
+    },
+    {
+      "category": 13,
+      "type": 99,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/StoneWallAPostCPrefab",
+      "spacing": null
+    }
+  ]
+}

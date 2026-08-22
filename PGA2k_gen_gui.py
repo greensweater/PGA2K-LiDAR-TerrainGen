@@ -25,6 +25,7 @@ import json
 import os
 import platform
 import queue
+import random
 import re
 import shutil
 import signal
@@ -39,7 +40,7 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
     _HAVE_PIL = True
 except ImportError:
     _HAVE_PIL = False
@@ -57,13 +58,18 @@ from constants import (  # noqa: E402
 )
 from PGA2k_gen import (  # noqa: E402
     DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M, FEATURES_FILE, HEIGHT_MASK_FILE,
-    HEIGHTMAP_FILE, OBJECT_LIST_FILE, load_all_stamps, load_project, save_project,
+    HEIGHTMAP_FILE, OBJECT_LIST_FILE, PLACED_OBJECTS_FILE, load_all_stamps, load_project, save_project,
 )
 from ingest.heightmap import load_heightmap  # noqa: E402
 from course_output.objects import (  # noqa: E402
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_HEIGHT_TAG,
-    TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, save_object_list,
+    TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, load_placed_objects, save_object_list,
 )
+from course_output.asset_catalog import (  # noqa: E402
+    ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS,
+)
+from course_output.object_clusters import DEFAULT_RASTER_RATIO, PGA_CLUSTER_FILLS_TAG  # noqa: E402
+from course_output.userLayers import GRID_ORIGIN_OFFSET  # noqa: E402
 from ingest.osm import (  # noqa: E402
     DEFAULT_HOLE_CORRIDOR_BUFFER_PX, Feature, build_height_mask, crop_features,
     merge_height_mask_features, load_features,
@@ -147,6 +153,58 @@ def _spline_tag_detail(f: Feature) -> str:
     return f.tags.get("natural", "")
 
 
+_ASSET_LABEL_BY_KEY = {(e.category, e.type): e.label for e in ASSET_ENTRIES}
+
+# v2021+ placedObjects2 groups are keyed by {"path": ...} rather than
+# v2019's {"category", "type", "theme"} (see course_output/objects.py's
+# module docstring) -- this resolves a group's asset path back to its
+# asset_catalog.json category, so the "Show objects" preview overlay
+# (below) can color either schema's groups the same way.
+_ASSET_CATEGORY_BY_PATH = {e.path: e.category for e in ASSET_ENTRIES}
+
+# Category id -> (legend label, RGB) for the Objects tab's "Show objects"
+# preview overlay. Only the "nature"/scatterable categories (course_output.
+# asset_catalog.NATURE_CATEGORY_IDS) get a color -- building stakes,
+# cart-path debug markers, walls/signs/bridges/vehicles etc. have no
+# useful preview color and are silently skipped (see
+# _get_cached_object_preview_layer). Deliberately dark, desaturated
+# tones -- bright colors would be hard to pick out against the OSM
+# overlay/heightmap this draws on top of.
+_OBJECT_LAYER_STYLE = {
+    0: ("Trees", (8, 36, 8)),
+    3: ("Ground cover", (30, 74, 30)),
+    2: ("Grass", (94, 90, 45)),
+    12: ("Display plants", (110, 24, 24)),
+    1: ("Rocks", (68, 68, 68)),
+}
+
+# Draw order for the "Show objects" overlay -- LOW to HIGH, i.e. this
+# index is the position in the stack (later entries drawn on top of
+# earlier ones), not visual/z-height. Modeled on real-world stacking by
+# how tall each category typically stands off the ground: low ground
+# cover/rocks/grass first, trees (by far the tallest) drawn dead last so
+# a tree marker is never buried under a shorter category's circle.
+# Buildings (category 5) aren't in _OBJECT_LAYER_STYLE yet -- no building
+# placement data currently feeds this overlay -- but would slot in just
+# before trees (second-to-last) if that ever changes.
+_OBJECT_LAYER_DRAW_ORDER = (1, 2, 3, 12, 0)  # rocks, grass, ground cover, display plants, trees
+
+
+def _spline_cluster_detail(f: Feature) -> str:
+    """
+    Comma-joined asset labels for whatever's currently in
+    f.tags[PGA_CLUSTER_FILLS_TAG] (see course_output/object_clusters.py),
+    shown in the Splines tab's "Clusters" column -- "" if untagged. A
+    spec that no longer resolves (stale tag after asset_catalog.json
+    changed) shows as "?" rather than being silently dropped, so it's
+    still visible that *something* is tagged there.
+    """
+    specs = f.tags.get(PGA_CLUSTER_FILLS_TAG)
+    if not specs:
+        return ""
+    return ", ".join(_ASSET_LABEL_BY_KEY.get((s.get("category"), s.get("type")), "?") for s in specs)
+
+
 class _Tooltip:
     """Minimal hover tooltip: shows `text` near the widget on mouse-enter."""
 
@@ -199,12 +257,14 @@ class PGAGenGUI:
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
+        self._cluster_fill_rows = []  # (spline_osm_ids_str, asset_label, ratio) -- see _build_cluster_fill_rows
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._selection_preview_job = None  # see _on_spline_selected's debounce
         self._splines_selection_memory: set[str] = set()  # see _splines_memory_store/_recall
         self._suppress_course_name_save = False
         self._suppress_repack_filename_save = False
         self._suppress_game_version_save = False
+        self._suppress_objects_theme_save = False
 
         self._build_layout()
         self._poll_log_queue()
@@ -212,6 +272,7 @@ class PGAGenGUI:
         self.working_dir.trace_add("write", lambda *a: self._on_working_dir_changed())
         self.course_name.trace_add("write", lambda *a: self._on_course_name_changed())
         self.game_version.trace_add("write", lambda *a: self._on_game_version_changed())
+        self.objects_theme_var.trace_add("write", lambda *a: self._on_objects_theme_changed())
 
     # ------------------------------------------------------------------
     # Layout
@@ -242,10 +303,12 @@ class PGAGenGUI:
         terrain_tab = ttk.Frame(left, padding=4)
         splines_tab = ttk.Frame(left, padding=4)
         objects_tab = ttk.Frame(left, padding=4)
+        options_tab = ttk.Frame(left, padding=4)
         left.add(file_tab, text="File")
         left.add(terrain_tab, text="Terrain")
         left.add(splines_tab, text="Splines")
         left.add(objects_tab, text="Objects")
+        left.add(options_tab, text="Options")
 
         # Horizontal split: preview (more room, per request) on the left,
         # log on the right; the sash between them resizes width, not height.
@@ -258,6 +321,7 @@ class PGAGenGUI:
         self._build_terrain_tab(self._make_scrollable_tab(terrain_tab))
         self._build_splines_tab(self._make_scrollable_tab(splines_tab))
         self._build_objects_tab(self._make_scrollable_tab(objects_tab))
+        self._build_options_tab(self._make_scrollable_tab(options_tab))
         self._build_preview_panel(right)
         self._build_log_panel(right)
 
@@ -363,8 +427,10 @@ class PGAGenGUI:
         ttk.Checkbutton(
             parent, text="\U0001F514 Sound when done", variable=self.play_sound_var,
         ).pack(side="left", padx=(12, 0))
+        self.restart_button = ttk.Button(parent, text="Restart", command=self._restart_app)
+        self.restart_button.pack(side="right")
         self.stop_button = ttk.Button(parent, text="Stop", command=self._stop_current_step, state="disabled")
-        self.stop_button.pack(side="right")
+        self.stop_button.pack(side="right", padx=(0, 4))
 
     def _build_file_tab(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Working directory:").pack(anchor="w")
@@ -382,7 +448,7 @@ class PGAGenGUI:
                  f"only {IMPLEMENTED_GAME_VERSIONS} are actually implemented (see objects.py's "
                  "module docstring); the others can be selected and saved, but write/repack steps "
                  "will raise a clear error until their schema is confirmed. Project-level, saved "
-                 "immediately, used by write-objects and (eventually) write-splines/output-terrain/"
+                 "immediately, used by write-objects and (eventually) write-splines/write-terrain/"
                  "repack.")
 
         ttk.Label(parent, text="Course name:").pack(anchor="w")
@@ -428,7 +494,7 @@ class PGAGenGUI:
         buffer_entry.pack(anchor="w")
         _Tooltip(buffer_entry, "Inward (negative) buffer applied to each water polygon before "
                  "determining which cells to lower -- lets the water plane object (sized from the "
-                 "ORIGINAL un-buffered polygon; see Write Terrain + Water) clip slightly into the "
+                 "ORIGINAL un-buffered polygon; see Write Water) clip slightly into the "
                  "surrounding terrain at the edges, instead of floating exactly at the rim of a "
                  "perfectly-matching recess with a visible seam.")
 
@@ -483,7 +549,74 @@ class PGAGenGUI:
         self._build_refine_section(parent)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self._build_cart_paths_section(parent)
+        self._build_terrain_preview_overlays(parent)
+
+    # ------------------------------------------------------------------
+    # Live preview overlays -- elevation contour / stamp influence. Read
+    # heightmap.npz / stamps directly and composite purely in-memory (see
+    # _show_preview's compositing block), so they live here next to the
+    # Generate/Refine settings they're meant to be eyeballed against.
+    # ------------------------------------------------------------------
+
+    def _build_terrain_preview_overlays(self, parent: ttk.Frame) -> None:
+        # Live elevation-band overlay -- purely in-memory (see
+        # _show_preview's compositing block below and _get_cached_
+        # heightmap): reads heightmap.npz directly, thresholds it into
+        # a 1-bit [elevation, elevation+width) band, and composites
+        # that on top of whatever preview is currently showing. Never
+        # writes anything to disk. Useful for eyeballing real channel
+        # width against generate-terrain's BAND m / MAX RING m settings
+        # (Terrain tab) before committing to a run.
+        elev_row = ttk.Frame(parent)
+        elev_row.pack(fill="x", pady=(4, 0))
+        self.show_elevation_contour_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            elev_row, text="Elevation contour", variable=self.show_elevation_contour_var,
+            command=self._on_elevation_contour_toggle,
+        ).pack(side="left")
+        ttk.Label(elev_row, text="Elev (m):").pack(side="left", padx=(8, 0))
+        self.elevation_contour_var = tk.DoubleVar(value=0.0)
+        self.elevation_contour_scale = ttk.Scale(
+            elev_row, from_=0.0, to=1.0, orient="horizontal",
+            variable=self.elevation_contour_var, command=self._on_elevation_slider_drag,
+        )
+        self.elevation_contour_scale.pack(side="left", fill="x", expand=True, padx=4)
+        self.elevation_contour_label = ttk.Label(elev_row, text="0.0", width=8)
+        self.elevation_contour_label.pack(side="left")
+        ttk.Label(elev_row, text="Width (m):").pack(side="left", padx=(8, 0))
+        self.elevation_contour_width_var = tk.StringVar(value="1.0")
+        width_entry = ttk.Entry(elev_row, textvariable=self.elevation_contour_width_var, width=6)
+        width_entry.pack(side="left", padx=(2, 0))
+        width_entry.bind("<Return>", lambda e: self._on_elevation_width_changed())
+        width_entry.bind("<FocusOut>", lambda e: self._on_elevation_width_changed())
+        _Tooltip(width_entry, "Band thickness (m): shows heights in [Elev, Elev+Width) as solid "
+                 "white, everything else transparent -- 1-bit, no antialiasing, purely an in-"
+                 "memory visual (nothing written to disk). Narrow this toward your BAND m setting "
+                 "to see one traced level at a time; widen it to see a whole channel at once. The "
+                 "slider snaps to multiples of this value, matching the same band boundaries a real "
+                 "generate-terrain run at that BAND m would actually produce.")
+
+        stamp_cov_row = ttk.Frame(parent)
+        stamp_cov_row.pack(fill="x", pady=(4, 0))
+        self.show_stamp_coverage_var = tk.BooleanVar(value=False)
+        stamp_cov_checkbox = ttk.Checkbutton(
+            stamp_cov_row, text="Show stamp influence (Elevation contour)",
+            variable=self.show_stamp_coverage_var, command=self._show_preview,
+        )
+        stamp_cov_checkbox.pack(side="left")
+        _Tooltip(stamp_cov_checkbox, "Only has an effect while Elevation contour is also checked. "
+                 "Filters the real current stamp list (every stamps_N.json layer under stamps/) "
+                 "to only stamps whose own VALUE falls within the current [Elev, Elev+Width) band -- "
+                 "not the whole course -- then evaluates the REAL kernel weight (via terrain."
+                 "terrain_kernel.TerrainKernel -- the same kernel adaptive_refine.py scores candidates "
+                 "with) from whichever of THOSE stamps pulls hardest at each cell, not just whether "
+                 "some stamp's nominal radius geometrically reaches it. Pure RED = untouched by this "
+                 "band's own stamps (not just 'touched by a neighboring band's stamp instead' -- those "
+                 "are excluded), pure GREEN = strongly pulled, anything in between (orange/yellow) is "
+                 "geometrically 'covered' but only weakly influenced. If a region reads solid green "
+                 "under the old binary check but still looks unfilled visually, this is what actually "
+                 "explains it. Recomputed per elevation (filtering changes which stamps are relevant), "
+                 "but only over that band's own stamp subset, so it stays fast in practice.")
 
     # ------------------------------------------------------------------
     # Generate -- hex / contour / raster each live in their own tab with
@@ -511,7 +644,7 @@ class PGAGenGUI:
                  "mode never places a lattice stamp outside it, so a small masked region does "
                  "proportionally less work, not full-course work followed by discarding most of it "
                  "(the course-wide baseline-flatten stamp is never masked). Uses the same "
-                 "Buffer (px) slider as Refine's Mask option, in the Preview panel.")
+                 "Buffer (px) slider as Refine's Mask option, in the Splines tab.")
 
         gen_notebook = ttk.Notebook(parent)
         gen_notebook.pack(fill="x", pady=(0, 4))
@@ -526,364 +659,374 @@ class PGAGenGUI:
         self._build_generate_contour_tab(contour_tab)
         self._build_generate_raster_tab(raster_tab)
 
+        gen_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._autosize_notebook(gen_notebook))
+        self._autosize_notebook(gen_notebook)
+
     def _run_generate_terrain_as(self, method: str) -> None:
         self.generate_terrain_method_var.set(method)
         self._run_generate_terrain()
 
-    def _build_generate_hex_tab(self, parent: ttk.Frame) -> None:
-        pitch_row = ttk.Frame(parent)
-        pitch_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(pitch_row, text="Pitch (m):").pack(side="left")
-        self.pitch_var = tk.StringVar(value=str(HEX_LATTICE_PITCH_M))
-        pitch_entry = ttk.Entry(pitch_row, textvariable=self.pitch_var, width=8)
-        pitch_entry.pack(side="left", padx=4)
-        _Tooltip(pitch_entry, "hex method only: spacing (m) of the initial coarse hex-grid stamp "
-                 "lattice CENTERS (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch means "
-                 "more, more tightly-packed lattice points. Edge bleed derives from this "
-                 "automatically (bleed=pitch); stamp radius instead comes from the Spread field.")
+    def _autosize_notebook(self, notebook: ttk.Notebook) -> None:
+        """Resize a nested Notebook's pane to fit only its currently
+        selected tab, instead of ttk's default of sizing to the tallest
+        tab and never shrinking for shorter ones."""
+        notebook.update_idletasks()
+        tab_id = notebook.select()
+        if not tab_id:
+            return
+        child = notebook.nametowidget(tab_id)
+        notebook.configure(height=child.winfo_reqheight())
 
-        ttk.Label(pitch_row, text="Spread:").pack(side="left", padx=(10, 0))
+    def _add_grid_field(self, target, row, col, var, label, tooltip,
+                         combobox_values: Optional[list[str]] = None, width: int = 8) -> ttk.Widget:
+        """Shared field builder for the 3-col-max Generate grids -- label above widget,
+        so BAND m/BRUSH/SIZE/etc. all line up the same way regardless of tab."""
+        cell = ttk.Frame(target)
+        cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+        lbl = ttk.Label(cell, text=label)
+        lbl.pack(anchor="w")
+        if combobox_values is not None:
+            entry: ttk.Widget = ttk.Combobox(
+                cell, textvariable=var, state="readonly", width=width, values=combobox_values,
+            )
+        else:
+            entry = ttk.Entry(cell, textvariable=var, width=width)
+        entry.pack(anchor="w")
+        _Tooltip(lbl, tooltip)
+        _Tooltip(entry, tooltip)
+        return entry
+
+    def _add_brush_field(self, target, row, col, var, tooltip, choices=None, labels=None) -> ttk.Widget:
+        """Single-select BRUSH field, styled like Refine's Brush Type selector (label
+        above, dropdown menu of 'id: name') but bound directly to one StringVar holding
+        just the numeric brush id -- CLI args read that var's raw value unchanged."""
+        choices = choices if choices is not None else self.BRUSH_TYPE_ORDER
+        labels = labels if labels is not None else self.BRUSH_TYPE_LABELS
+        cell = ttk.Frame(target)
+        cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+        lbl = ttk.Label(cell, text="BRUSH")
+        lbl.pack(anchor="w")
+        menubutton = ttk.Menubutton(cell, textvariable=var, direction="below", width=6)
+        menu = tk.Menu(menubutton, tearoff=False)
+        for b in choices:
+            menu.add_radiobutton(label=f"{b}: {labels.get(b, b)}", variable=var, value=str(b))
+        menubutton["menu"] = menu
+        menubutton.pack(anchor="w")
+        _Tooltip(lbl, tooltip)
+        _Tooltip(menubutton, tooltip)
+        return menubutton
+
+    def _build_generate_hex_tab(self, parent: ttk.Frame) -> None:
+        grid = ttk.Frame(parent)
+        grid.pack(fill="x", pady=(0, 4))
+
+        self.pitch_var = tk.StringVar(value=str(HEX_LATTICE_PITCH_M))
+        self._add_grid_field(grid, 0, 0, self.pitch_var, "SIZE",
+                 "hex method only: spacing (m) of the initial coarse hex-grid stamp lattice "
+                 "CENTERS (terrain/hexgrid.py's HEX_LATTICE_PITCH_M) -- smaller pitch means "
+                 "more, more tightly-packed lattice points. Edge bleed derives from this "
+                 "automatically (bleed=pitch); stamp radius instead comes from SPR%.")
+
         self.hex_spread_ratio_var = tk.StringVar(value=str(HEX_DEFAULT_SPREAD_RATIO))
-        hex_spread_entry = ttk.Entry(pitch_row, textvariable=self.hex_spread_ratio_var, width=5)
-        hex_spread_entry.pack(side="left", padx=4)
-        _Tooltip(hex_spread_entry, "hex method only: scales stamp radius independently of pitch -- "
-                 "stamp_radius = 2*pitch*spread. 1 (default) reproduces the original fixed radius = "
+        self._add_grid_field(grid, 0, 1, self.hex_spread_ratio_var, "SPR%",
+                 "hex method only: scales stamp radius independently of pitch -- "
+                 "stamp_radius = 2*pitch*SPR%. 1 (default) reproduces the original fixed radius = "
                  "2*pitch (each stamp reaches exactly to its nearest neighbors' centers); >1 grows "
                  "stamps past their neighbors for more overlap/blending, <1 shrinks them, "
                  "potentially opening coverage gaps between lattice centers. Does NOT move any "
                  "lattice center or affect edge bleed (bleed always = pitch).")
 
-        ttk.Label(pitch_row, text="Brush:").pack(side="left", padx=(10, 0))
         self.hex_brush_var = tk.StringVar(value=str(HEX_DEFAULT_BRUSH))
-        hex_brush_entry = ttk.Entry(pitch_row, textvariable=self.hex_brush_var, width=4)
-        hex_brush_entry.pack(side="left", padx=4)
-        _Tooltip(hex_brush_entry, "hex method only: brush every lattice stamp uses. Default: "
+        self._add_brush_field(grid, 0, 2, self.hex_brush_var,
+                 "hex method only: brush every lattice stamp uses. Default: "
                  f"{HEX_DEFAULT_BRUSH} (terrain/hexgrid.py's DEFAULT_BRUSH).")
 
-        ttk.Label(pitch_row, text="Tool:").pack(side="left", padx=(10, 0))
         self.hex_tool_var = tk.StringVar(value="flatten")
-        hex_tool_box = ttk.Combobox(
-            pitch_row, textvariable=self.hex_tool_var, state="readonly", width=8,
-            values=["flatten", "raise"],
-        )
-        hex_tool_box.pack(side="left", padx=4)
-        _Tooltip(hex_tool_box, "hex method only: tool every lattice stamp uses -- flatten (0) pulls "
+        self._add_grid_field(grid, 1, 0, self.hex_tool_var, "TOOL",
+                 "hex method only: tool every lattice stamp uses -- flatten (0) pulls "
                  "terrain toward an absolute target height; raise (1) adds a delta instead, "
                  "preserving whatever relief already exists (see terrain/stamp.py). Most useful "
-                 "for a masked pass that should build up an area without flattening it.")
+                 "for a masked pass that should build up an area without flattening it.",
+                 combobox_values=["flatten", "raise"])
 
         self._add_step_button(parent, "Generate Terrain", lambda: self._run_generate_terrain_as("hex"))
 
     def _build_generate_raster_tab(self, parent: ttk.Frame) -> None:
-        def _field(column: ttk.Frame, label: str, var: tk.Variable, width: int,
-                    tooltip: str, combo_values: Optional[list[str]] = None) -> ttk.Widget:
-            row = ttk.Frame(column)
-            row.pack(fill="x", pady=2)
-            ttk.Label(row, text=label, width=14, anchor="w").pack(side="left")
-            if combo_values is not None:
-                widget: ttk.Widget = ttk.Combobox(
-                    row, textvariable=var, state="readonly", width=width, values=combo_values,
-                )
-            else:
-                widget = ttk.Entry(row, textvariable=var, width=width)
-            widget.pack(side="left", padx=4)
-            _Tooltip(widget, tooltip)
-            return widget
-
-        columns = ttk.Frame(parent)
-        columns.pack(fill="x", pady=(0, 4))
-        left_col = ttk.Frame(columns)
-        left_col.pack(side="left", fill="y", padx=(0, 24))
-        right_col = ttk.Frame(columns)
-        right_col.pack(side="left", fill="y")
+        grid = ttk.Frame(parent)
+        grid.pack(fill="x", pady=(0, 4))
 
         self.raster_size_var = tk.StringVar(value=str(DEFAULT_RASTER_SIZE))
-        _field(left_col, "Raster size (m):", self.raster_size_var, 5,
-               "raster method only: center-to-center spacing (m) of the flat square-stamp grid "
-               "(terrain/rastergrid.py's RASTER_SIZES). Each run places ONE flat grid at this size -- "
-               "layer coarse-to-fine yourself by re-running Generate Terrain at each size in turn, "
-               "largest first.", combo_values=[str(s) for s in RASTER_SIZES])
+        self._add_grid_field(grid, 0, 0, self.raster_size_var, "SIZE",
+                 "raster method only: center-to-center spacing (m) of the flat square-stamp grid "
+                 "(terrain/rastergrid.py's RASTER_SIZES). Each run places ONE flat grid at this size -- "
+                 "layer coarse-to-fine yourself by re-running Generate Terrain at each size in turn, "
+                 "largest first.", combobox_values=[str(s) for s in RASTER_SIZES])
 
         self.raster_spread_ratio_var = tk.StringVar(value=str(DEFAULT_RASTER_SPREAD_RATIO))
-        _field(left_col, "Raster spread:", self.raster_spread_ratio_var, 5,
-               "raster method only: scales stamp radius (x/z scale) independently of raster size -- "
-               "lattice centers are unaffected. 1 (default) reproduces the exact edge-to-edge tiling "
-               "radius; >1 grows stamps past their own cell for more overlap/blending, <1 shrinks "
-               "them, opening a gap between cells. Does NOT move any lattice center, only how big "
-               "each stamp is.")
+        self._add_grid_field(grid, 0, 1, self.raster_spread_ratio_var, "SPR%",
+                 "raster method only: scales stamp radius (x/z scale) independently of raster size -- "
+                 "lattice centers are unaffected. 1 (default) reproduces the exact edge-to-edge tiling "
+                 "radius; >1 grows stamps past their own cell for more overlap/blending, <1 shrinks "
+                 "them, opening a gap between cells. Does NOT move any lattice center, only how big "
+                 "each stamp is.")
 
         self.raster_brush_var = tk.StringVar(value=str(DEFAULT_RASTER_BRUSH))
-        _field(left_col, "Brush:", self.raster_brush_var, 4,
-               "raster method only: brush every lattice stamp uses. Default: "
-               f"{DEFAULT_RASTER_BRUSH} (terrain/rastergrid.py's RASTER_BRUSH, the square 'hard "
-               "square' brush) -- the grid's own center-to-center spacing is derived specifically "
-               f"from type {DEFAULT_RASTER_BRUSH}'s measured flat-plateau/instant-edge profile, so "
-               "it tiles edge-to-edge with no gap or overlap. Picking any other (circular) brush "
-               "keeps that same radius but no longer tiles exactly -- a circle inscribed in each "
-               "square cell leaves the corners uncovered -- so treat this as a cosmetic/blending "
-               "choice (pair with a wider Raster spread to close the resulting gaps), not a "
-               "like-for-like swap.")
+        self._add_brush_field(
+            grid, 0, 2, self.raster_brush_var,
+            "raster method only: brush every lattice stamp uses. Default: "
+            f"{DEFAULT_RASTER_BRUSH} (terrain/rastergrid.py's RASTER_BRUSH, the square 'hard "
+            "square' brush) -- the grid's own center-to-center spacing is derived specifically "
+            f"from type {DEFAULT_RASTER_BRUSH}'s measured flat-plateau/instant-edge profile, so "
+            "it tiles edge-to-edge with no gap or overlap. Picking any other (circular) brush "
+            "keeps that same radius but no longer tiles exactly -- a circle inscribed in each "
+            "square cell leaves the corners uncovered -- so treat this as a cosmetic/blending "
+            "choice (pair with a wider SPR% to close the resulting gaps), not a like-for-like swap.",
+            choices=(DEFAULT_RASTER_BRUSH,) + self.BRUSH_TYPE_ORDER,
+            labels={DEFAULT_RASTER_BRUSH: "square", **self.BRUSH_TYPE_LABELS},
+        )
 
         center_bias_tooltip = (
             "raster method only: shifts each stamp's placement (not its sampled value) along this "
             "axis by raster size * this ratio. Compensates for a resolution-dependent 'drop shadow' "
             "at mask edges, caused by TerrainModel always favoring the +x/+z neighbor when stamps "
             "overlap (see terrain/rastergrid.py's CENTER BIAS section). 0 (default) is off -- no "
-            "derived 'correct' value, dial in independently per axis, empirically, same as Raster "
-            "spread."
+            "derived 'correct' value, dial in independently per axis, empirically, same as SPR%."
         )
         self.raster_center_bias_ratio_x_var = tk.StringVar(value=str(DEFAULT_RASTER_CENTER_BIAS_RATIO))
-        _field(right_col, "Center bias X:", self.raster_center_bias_ratio_x_var, 5, center_bias_tooltip)
+        self._add_grid_field(grid, 1, 0, self.raster_center_bias_ratio_x_var, "BIAS x", center_bias_tooltip)
 
         self.raster_center_bias_ratio_z_var = tk.StringVar(value=str(DEFAULT_RASTER_CENTER_BIAS_RATIO))
-        _field(right_col, "Center bias Z:", self.raster_center_bias_ratio_z_var, 5, center_bias_tooltip)
+        self._add_grid_field(grid, 1, 1, self.raster_center_bias_ratio_z_var, "BIAS z", center_bias_tooltip)
 
         self._add_step_button(parent, "Generate Terrain", lambda: self._run_generate_terrain_as("raster"))
 
+    # ------------------------------------------------------------------
+    # Contour -- universal band/edge/cutoff settings up top, then Primary
+    # Fill (Poisson / Fall Line, each its own tab and its own Generate
+    # Terrain button that also pins fill_mode_var), then a shared
+    # Secondary Fill section (the crumb-scatter cleanup pass, which runs
+    # after either Primary Fill mode). Poisson's auto-tune calibration
+    # knobs live behind their own popup instead of cluttering the grid.
+    # ------------------------------------------------------------------
+
     def _build_generate_contour_tab(self, parent: ttk.Frame) -> None:
-        fill_mode_row = ttk.Frame(parent)
-        fill_mode_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(fill_mode_row, text="Fill mode:").pack(side="left")
+        self.band_spacing_var = tk.StringVar(value="5")
+        self.edge_distance_var = tk.StringVar(value="0")
+        self.max_stamps_var = tk.StringVar(value="")
+
+        universal_grid = ttk.Frame(parent)
+        universal_grid.pack(anchor="w", fill="x", pady=(0, 6))
+        self._add_grid_field(universal_grid, 0, 0, self.band_spacing_var, "BAND m",
+                 "contour method only: elevation spacing (m) defining each band -- smaller "
+                 "means more, narrower bands. Tweak and re-run to see how it behaves.")
+        self._add_grid_field(universal_grid, 0, 1, self.edge_distance_var, "EDGE m",
+                 "contour method only, Poisson fill only: buffer (m) past the true band "
+                 "boundary that every candidate's plateau must additionally clear, on top of "
+                 "just fitting within it. Leaves a strip along every band edge for Secondary "
+                 "Fill's finer crumb fill to handle instead of Primary Fill's large hard "
+                 "stamps. Ignored in Fall Line mode. 0 disables.")
+        self._add_grid_field(universal_grid, 0, 2, self.max_stamps_var, "MAX stamps",
+                 "contour method only: stop once this many stamps have been placed in total -- "
+                 "a quick way to sanity-check a parameter combination before committing to the "
+                 "full run. Bands fill ascending by elevation, so the cutoff always lands on "
+                 "the low-elevation end and most of the course will be genuinely unfilled, not "
+                 "just coarser -- this is a partial-preview tool, not a real generation mode. "
+                 "Leave blank for a real run. Not saved to project.json -- set explicitly each "
+                 "time.")
+
+        ttk.Label(parent, text="Primary Fill", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
         self.fill_mode_var = tk.StringVar(value="poisson")
-        fill_mode_box = ttk.Combobox(
-            fill_mode_row, textvariable=self.fill_mode_var, state="readonly", width=10,
-            values=["poisson", "rect"],
-        )
-        fill_mode_box.pack(side="left", padx=4)
-        _Tooltip(fill_mode_box, "contour method only: per-band fill algorithm. poisson (default) is "
-                 "the two-pass circle fill below (PASS 1 tiered pack + PASS 2 crumb scatter). rect "
-                 "instead traces each band's own real boundary and places one type-72 stamp per "
-                 "boundary edge (RECT BR/RECT tol m/RECT min len m/RECT max search m/RECT width "
-                 "samples below), falling through to the same PASS 2 SMOOTH crumb scatter for "
-                 "whatever it can't reach -- see terrain/contour_layers.py's RECT FILL MODE "
-                 "docstring section. FILL BR/MIN m/MAX m/STEP ratio/EDGE dist m and the CANDID/tier "
-                 "auto-tune knobs apply to poisson only.")
+        self.fill_notebook = ttk.Notebook(parent)
+        self.fill_notebook.pack(fill="x", pady=(0, 4))
+        poisson_tab = ttk.Frame(self.fill_notebook, padding=4)
+        fall_line_tab = ttk.Frame(self.fill_notebook, padding=4)
+        self.fill_notebook.add(poisson_tab, text="Poisson")
+        self.fill_notebook.add(fall_line_tab, text="Fall Line")
+        self._build_contour_poisson_tab(poisson_tab)
+        self._build_contour_fall_line_tab(fall_line_tab)
+        self._autosize_notebook(self.fill_notebook)
 
-        rect_frame = ttk.Frame(parent)
-        rect_frame.pack(anchor="w", fill="x", pady=(0, 4))
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._build_contour_secondary_fill(parent)
 
-        def add_rect_field(row, col, var, label, tooltip):
-            cell = ttk.Frame(rect_frame)
-            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
-            lbl = ttk.Label(cell, text=label)
-            lbl.pack(anchor="w")
-            entry = ttk.Entry(cell, textvariable=var, width=8)
-            entry.pack(anchor="w")
-            _Tooltip(lbl, tooltip)
-            _Tooltip(entry, tooltip)
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        # One button for both Primary Fill modes -- its label/command morph
+        # to match whichever of Poisson/Fall Line is the active tab, rather
+        # than keeping two separate near-identical buttons in sync by hand.
+        self.contour_generate_btn_text_var = tk.StringVar(value="Generate Terrain (Poisson)")
+        ttk.Button(
+            parent, textvariable=self.contour_generate_btn_text_var, width=24,
+            command=self._run_generate_contour,
+        ).pack(anchor="w", pady=2)
+        self.fill_notebook.bind("<<NotebookTabChanged>>", self._on_fill_mode_tab_changed)
 
-        self.rect_brush_var = tk.StringVar(value="72")
-        self.rect_tolerance_var = tk.StringVar(value="1.5")
-        self.rect_min_length_var = tk.StringVar(value="1")
-        self.rect_max_search_distance_var = tk.StringVar(value="400")
-        self.rect_width_samples_var = tk.StringVar(value="5")
+    def _on_fill_mode_tab_changed(self, _event=None) -> None:
+        idx = self.fill_notebook.index(self.fill_notebook.select())
+        label = self.fill_notebook.tab(idx, "text")
+        self.fill_mode_var.set("rect" if idx == 1 else "poisson")
+        self.contour_generate_btn_text_var.set(f"Generate Terrain ({label})")
+        self._autosize_notebook(self.fill_notebook)
 
-        add_rect_field(0, 0, self.rect_brush_var, "RECT BR",
-                       "rect fill_mode only: brush for the main per-boundary-edge pass -- must be a "
-                       "square-shaped brush (type 72 is the only one today).")
-        add_rect_field(0, 1, self.rect_tolerance_var, "RECT tol m",
-                       "rect fill_mode only: Douglas-Peucker boundary-simplify tolerance (m) when "
-                       "tracing each band's own shape into vector polygons before placing per-edge "
-                       "stamps.")
-        add_rect_field(0, 2, self.rect_min_length_var, "RECT min len m",
-                       "rect fill_mode only: floor length (m) for a per-edge stamp when no opposite "
-                       "wall is found within RECT max search m.")
-        add_rect_field(0, 3, self.rect_max_search_distance_var, "RECT max search m",
-                       "rect fill_mode only: cap (m) on the ray-cast search for the wall opposite each "
-                       "boundary edge.")
-        add_rect_field(0, 4, self.rect_width_samples_var, "RECT width samples",
-                       "rect fill_mode only: points sampled across each boundary edge's own width "
-                       "(not just its center) when ray-casting for the opposite wall.")
+    def _run_generate_contour(self) -> None:
+        idx = self.fill_notebook.index(self.fill_notebook.select())
+        self._run_generate_contour_as("rect" if idx == 1 else "poisson")
 
-        contour_frame = ttk.Frame(parent)
-        contour_frame.pack(anchor="w", fill="x", pady=(0, 4))
+    def _run_generate_contour_as(self, fill_mode: str) -> None:
+        self.fill_mode_var.set(fill_mode)
+        self._run_generate_terrain_as("contour")
 
-        def add_contour_field(row, col, var, label, tooltip):
-            cell = ttk.Frame(contour_frame)
-            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
-            lbl = ttk.Label(cell, text=label)
-            lbl.pack(anchor="w")
-            entry = ttk.Entry(cell, textvariable=var, width=8)
-            entry.pack(anchor="w")
-            _Tooltip(lbl, tooltip)
-            _Tooltip(entry, tooltip)
-
+    def _build_contour_poisson_tab(self, parent: ttk.Frame) -> None:
         # Consolidated down from the earlier ring/rough/interior/residual
         # design's 16 separate fields -- that split no longer exists:
-        # every elevation band gets identical two-pass treatment now
-        # (pass 1: fast poisson pack, pass 2: crumb scatter), regardless
-        # of shape or connectivity. The fit-tolerance knob (an earlier
-        # version's EDGE SOFT) is gone too -- derived directly from each
-        # brush's own real measured plateau, not a separately-guessed
-        # ratio (see terrain/brush_profiles.py).
-        self.band_spacing_var = tk.StringVar(value="5")
+        # every elevation band gets identical two-pass treatment now,
+        # regardless of shape or connectivity. The fit-tolerance knob (an
+        # earlier version's EDGE SOFT) is gone too -- derived directly
+        # from each brush's own real measured plateau, not a
+        # separately-guessed ratio (see terrain/brush_profiles.py).
+        grid = ttk.Frame(parent)
+        grid.pack(anchor="w", fill="x")
+
         self.fill_brush_var = tk.StringVar(value="8")
+        self._add_brush_field(grid, 0, 0, self.fill_brush_var,
+                 "Poisson fill only: the fast poisson pack that does the bulk of the work. Type "
+                 "8 (wide flat plateau) recommended: best real measured plateau fraction of the "
+                 "four brush types, so it packs most efficiently. A brush with no real plateau "
+                 "(10/54) can't do this job at all and is refused outright.")
         self.min_radius_var = tk.StringVar(value="10")
+        self._add_grid_field(grid, 0, 1, self.min_radius_var, "MIN m",
+                 "Poisson fill only: smallest tier (m).")
         self.max_radius_var = tk.StringVar(value="50")
+        self._add_grid_field(grid, 0, 2, self.max_radius_var, "MAX m",
+                 "Poisson fill only: largest tier (m) -- the main level-of-detail knob: how big "
+                 "the biggest stamps in a band are allowed to be.")
         self.radius_step_var = tk.StringVar(value="0.85")
-        self.edge_distance_var = tk.StringVar(value="0")
-        self.smoothing_brush_var = tk.StringVar(value="10")
-        self.smoothing_min_radius_var = tk.StringVar(value="4")
-        self.smooth_ratio_var = tk.StringVar(value="4")
-        self.smooth_claim_fraction_var = tk.StringVar(value="0.25")
+        self._add_grid_field(grid, 1, 0, self.radius_step_var, "STEP ratio",
+                 "Poisson fill only: geometric (multiplicative) step between tiers, scanning "
+                 "from MAX m down to MIN m -- each tier's radius is the previous tier's radius "
+                 "times this ratio (0-1, NOT a fixed meters step). Scales automatically with "
+                 "whatever MIN m/MAX m range you pick.")
         self.candidates_per_radius_var = tk.StringVar(value="")  # blank = auto-tune
+        self._add_grid_field(grid, 1, 1, self.candidates_per_radius_var, "CAP",
+                 "Poisson fill only: random-candidate cap per tier. Left blank, this is "
+                 "AUTO-TUNED once at the start of the run (see Auto-tune... below) by searching "
+                 "a handful of sample bands for the point of diminishing returns. Set this "
+                 "explicitly, once you've seen a good auto-tuned value, to skip re-running that "
+                 "search on every subsequent run -- it is NOT auto-persisted from an auto-tuned "
+                 "run.")
         self.denoise_px_var = tk.StringVar(value="1")
+        self._add_grid_field(grid, 1, 2, self.denoise_px_var, "DENOISE",
+                 "contour method only (applies to both Primary Fill modes): morphological "
+                 "open+close radius (heightmap pixels) applied to each band's mask before "
+                 "filling -- trims isolated few-pixel bumps and fills isolated few-pixel gaps, "
+                 "simplifying the boundary before it fragments the fill into unnecessary tiny "
+                 "stamps. 0 disables.")
 
-        add_contour_field(0, 0, self.band_spacing_var, "BAND m",
-                           "contour method only: elevation spacing (m) defining each band -- smaller "
-                           "means more, narrower bands. Tweak and re-run to see how it behaves.")
-        add_contour_field(0, 1, self.fill_brush_var, "FILL BR",
-                           "contour method only: PASS 1's brush -- the fast poisson pack that does "
-                           "the bulk of the work. Type 8 (wide flat plateau) recommended: best real "
-                           "measured plateau fraction of the four brush types, so it packs most "
-                           "efficiently. A brush with no real plateau (10/54) can't do this job at "
-                           "all and is refused outright.")
-        add_contour_field(0, 2, self.min_radius_var, "MIN m",
-                           "contour method only: PASS 1's smallest tier (m).")
-        add_contour_field(1, 0, self.max_radius_var, "MAX m",
-                           "contour method only: PASS 1's largest tier (m) -- the main level-of-"
-                           "detail knob: how big the biggest stamps in a band are allowed to be.")
-        add_contour_field(1, 1, self.radius_step_var, "STEP ratio",
-                           "contour method only: PASS 1's geometric (multiplicative) step between "
-                           "tiers, scanning from MAX m down to MIN m -- each tier's radius is the "
-                           "previous tier's radius times this ratio (0-1, NOT a fixed meters step). "
-                           "Scales automatically with whatever MIN m/MAX m range you pick.")
-        add_contour_field(1, 2, self.edge_distance_var, "EDGE dist m",
-                           "contour method only: PASS 1 ONLY -- buffer (m) past the true band "
-                           "boundary that every candidate's plateau must additionally clear, on top "
-                           "of just fitting within it. Leaves a strip along every band edge for "
-                           "PASS 2's finer crumb fill to handle instead of pass 1's large hard "
-                           "stamps. Pass 2 always ignores this. 0 disables.")
-        add_contour_field(2, 0, self.smoothing_brush_var, "SMOOTH BR",
-                           "contour method only: PASS 2's brush -- the crumb-scatter fill over "
-                           "whatever pass 1 leaves as genuine crumbs. A softer brush (type 10 "
-                           "default) so small scattered crumbs blend rather than showing a hard-"
-                           "edged patch.")
-        add_contour_field(2, 1, self.smoothing_min_radius_var, "SMOOTH MIN m",
-                           "contour method only: PASS 2's OWN radius floor, independent of MIN m "
-                           "(pass 1's) -- the crumb stage's scale is a property of how it does its "
-                           "own job, not of how finely pass 1 happened to be tiered.")
-        add_contour_field(2, 2, self.smooth_ratio_var, "SMOOTH ratio",
-                           "contour method only: PASS 2's scatter radius as a multiple of SMOOTH "
-                           "MIN m (default 4 -- a 16m scatter radius at the 4m default floor). "
-                           "Deliberately a ratio: the crumb stage's scale should track its own floor "
-                           "directly rather than needing separate re-tuning.")
-        add_contour_field(3, 0, self.smooth_claim_fraction_var, "SMOOTH eat",
-                           "contour method only: PASS 2's \"eat\" -- how much of each crumb-scatter "
-                           "stamp's placed radius gets claimed. Deliberately much heavier overlap "
-                           "(claim less) than pass 1's real-plateau-derived claim, since pass 2's "
-                           "whole job is blanket-covering whatever pass 1 couldn't reach, not "
-                           "precise packing.")
-        add_contour_field(3, 1, self.candidates_per_radius_var, "CANDID/tier",
-                           "contour method only: PASS 1's random-candidate cap per tier. Left blank, "
-                           "this is AUTO-TUNED once at the start of the run (see the auto-tune row "
-                           "below) by searching a handful of sample bands for the point of "
-                           "diminishing returns. Set this explicitly, once you've seen a good auto-"
-                           "tuned value, to skip re-running that search on every subsequent run -- "
-                           "it is NOT auto-persisted from an auto-tuned run.")
-        add_contour_field(3, 2, self.denoise_px_var, "DENOISE px",
-                           "contour method only: morphological open+close radius (heightmap pixels) "
-                           "applied to each band's mask before filling -- trims isolated few-pixel "
-                           "bumps and fills isolated few-pixel gaps, simplifying the boundary before "
-                           "it fragments the fill into unnecessary tiny stamps. 0 disables.")
-
-        self.enable_secondary_fill_var = tk.BooleanVar(value=True)
-        secondary_fill_checkbox = ttk.Checkbutton(
-            parent, text="Enable secondary fill (PASS 2 crumb scatter)",
-            variable=self.enable_secondary_fill_var,
-        )
-        secondary_fill_checkbox.pack(anchor="w", pady=(0, 4))
-        _Tooltip(secondary_fill_checkbox, "contour method only: whether PASS 2's crumb-scatter cleanup "
-                 "runs after PASS 1. Unchecked skips it entirely -- whatever PASS 1 leaves as crumbs "
-                 "stays unfilled, so coverage is no longer complete. Trades that guarantee for speed, "
-                 "e.g. for a quick look at PASS 1's own plateau shape.")
-
-        # Auto-tune calibration parameters -- only matter when CANDID/tier
-        # above is left blank. Deliberately visually separated from the
-        # main grid: these tune HOW the auto-tune search itself runs, not
-        # the actual fill, so most runs shouldn't need to touch them.
-        auto_tune_label = ttk.Label(parent, text="Auto-tune calibration (only used if CANDID/tier is blank):")
-        auto_tune_label.pack(anchor="w", pady=(6, 2))
-        auto_tune_frame = ttk.Frame(parent)
-        auto_tune_frame.pack(anchor="w", fill="x", pady=(0, 4))
-
-        def add_auto_tune_field(row, col, var, label, tooltip):
-            cell = ttk.Frame(auto_tune_frame)
-            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
-            lbl = ttk.Label(cell, text=label)
-            lbl.pack(anchor="w")
-            entry = ttk.Entry(cell, textvariable=var, width=8)
-            entry.pack(anchor="w")
-            _Tooltip(lbl, tooltip)
-            _Tooltip(entry, tooltip)
-
+        # Auto-tune calibration -- only matters when CAP above is left
+        # blank. Tucked behind a popup instead of its own grid: these tune
+        # HOW the auto-tune search itself runs, not the actual fill, so
+        # most runs shouldn't need to touch them.
         self.sweet_spot_ratio_var = tk.StringVar(value="0.10")
         self.sweet_spot_sample_bands_var = tk.StringVar(value="3")
         self.sweet_spot_seeds_var = tk.StringVar(value="2")
-        self.sweet_spot_max_candidates_var = tk.StringVar(value="50000")
-        self.sweet_spot_time_budget_var = tk.StringVar(value="60")
-        self.random_seed_var = tk.StringVar(value="1")
 
-        add_auto_tune_field(0, 0, self.sweet_spot_ratio_var, "RATIO",
-                             "keep doubling candidates-per-tier as long as each doubling reduces a "
-                             "sample band's own uncovered-area fraction by at least this much, "
-                             "RELATIVE to the previous doubling's own fraction (0.10 = stop once "
-                             "another doubling buys less than a 10% relative improvement). NOT an "
-                             "absolute area target -- pass 1 has a genuine structural floor (real "
-                             "area smaller than MIN m, which no candidate count can ever close), so "
-                             "a fixed target can be unreachable regardless of true coverage quality.")
-        add_auto_tune_field(0, 1, self.sweet_spot_sample_bands_var, "SAMPLE bands",
-                             "how many regularly-spaced bands to calibrate against, not every band "
-                             "-- bands are similar enough that per-band tuning would mostly repeat "
-                             "the same search for no benefit.")
-        add_auto_tune_field(0, 2, self.sweet_spot_seeds_var, "SEEDS",
-                             "random seeds per sampled band, so one lucky/unlucky seed doesn't skew "
-                             "the calibration -- the MAX candidate count found across every band/"
-                             "seed combination is what actually gets used.")
-        add_auto_tune_field(1, 0, self.sweet_spot_max_candidates_var, "MAX candid",
-                             "safety cap on the calibration search itself.")
-        add_auto_tune_field(1, 1, self.sweet_spot_time_budget_var, "TIME budget s",
-                             "hard wall-clock ceiling (seconds) on the whole calibration search -- "
-                             "once exceeded, whatever's best so far gets used, rather than "
-                             "calibration dominating total run time unpredictably.")
-        add_auto_tune_field(1, 2, self.random_seed_var, "SEED",
-                             "seeds pass 1's own randomness -- each band gets this + its own index, "
-                             "so the whole run is reproducible given the same inputs, while still "
-                             "varying naturally band to band.")
+        ttk.Button(
+            parent, text="Auto-tune...", command=self._open_auto_tune_dialog,
+        ).pack(anchor="w", pady=(6, 0))
 
-        n_workers_row = ttk.Frame(parent)
-        n_workers_row.pack(anchor="w", fill="x", pady=(4, 0))
-        ttk.Label(n_workers_row, text="Workers:").pack(side="left")
-        self.n_workers_var = tk.StringVar(value="")
-        n_workers_entry = ttk.Entry(n_workers_row, textvariable=self.n_workers_var, width=6)
-        n_workers_entry.pack(side="left", padx=4)
-        _Tooltip(n_workers_entry, "contour method only: parallelize the main per-band loop across "
-                 "this many OS processes. Bands never spatially overlap, so this is embarrassingly "
-                 "parallel -- output is byte-for-byte identical to a sequential run at the same "
-                 "SEED, confirmed directly, only faster. Blank = auto-detect via CPU count. 1 forces "
-                 "sequential (e.g. for debugging). Forced to 1 regardless of this setting whenever "
-                 "max_stamps is set (that flag needs a running total checked band-by-band, which is "
-                 "fundamentally sequential).")
+    def _open_auto_tune_dialog(self) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Poisson auto-tune calibration")
+        win.transient(self.root)
+        win.resizable(False, False)
+        ttk.Label(
+            win, text="Only used when CAP (above) is left blank.", padding=(8, 8, 8, 0),
+        ).pack(anchor="w")
+        grid = ttk.Frame(win, padding=8)
+        grid.pack(fill="both", expand=True)
+        self._add_grid_field(grid, 0, 0, self.sweet_spot_ratio_var, "RATIO",
+                 "Keep doubling candidates-per-tier as long as each doubling reduces a sample "
+                 "band's own uncovered-area fraction by at least this much, RELATIVE to the "
+                 "previous doubling's own fraction (0.10 = stop once another doubling buys less "
+                 "than a 10% relative improvement). NOT an absolute area target -- Poisson fill "
+                 "has a genuine structural floor (real area smaller than MIN m, which no "
+                 "candidate count can ever close), so a fixed target can be unreachable "
+                 "regardless of true coverage quality.")
+        self._add_grid_field(grid, 0, 1, self.sweet_spot_sample_bands_var, "SAMPLE",
+                 "How many regularly-spaced bands to calibrate against, not every band -- bands "
+                 "are similar enough that per-band tuning would mostly repeat the same search "
+                 "for no benefit.")
+        self._add_grid_field(grid, 0, 2, self.sweet_spot_seeds_var, "SEEDS",
+                 "Random seeds per sampled band, so one lucky/unlucky seed doesn't skew the "
+                 "calibration -- the MAX candidate count found across every band/seed "
+                 "combination is what actually gets used. MAX candidates and the calibration "
+                 "time budget are no longer separately tunable -- fixed at 50000 / 60s.")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 8))
 
-        # Deliberately separate from the settings grid above, not another
-        # field in it -- this is a quick-preview control, not a real
-        # generation setting (not saved to project.json, meant to be set
-        # explicitly each time), and mixing it into the persistent-feeling
-        # grid would undercut the point of having just decluttered it.
-        max_stamps_row = ttk.Frame(parent)
-        max_stamps_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(max_stamps_row, text="Max stamps (preview only):").pack(side="left")
-        self.max_stamps_var = tk.StringVar(value="")
-        max_stamps_entry = ttk.Entry(max_stamps_row, textvariable=self.max_stamps_var, width=8)
-        max_stamps_entry.pack(side="left", padx=4)
-        _Tooltip(max_stamps_entry, "contour method only: stop once this many stamps have been placed "
-                 "in total -- a quick way to sanity-check a parameter combination before committing "
-                 "to the full run. Bands fill ascending by elevation, so the cutoff always lands on "
-                 "the low-elevation end and most of the course will be genuinely unfilled, not just "
-                 "coarser -- this is a partial-preview tool, not a real generation mode. Leave blank "
-                 "for a real run. Not saved to project.json -- set explicitly each time.")
+    def _build_contour_fall_line_tab(self, parent: ttk.Frame) -> None:
+        grid = ttk.Frame(parent)
+        grid.pack(anchor="w", fill="x")
 
-        self._add_step_button(parent, "Generate Terrain", lambda: self._run_generate_terrain_as("contour"))
+        self.rect_brush_var = tk.StringVar(value="72")
+        self._add_brush_field(grid, 0, 0, self.rect_brush_var,
+                 "Fall Line fill only: brush for the main per-boundary-edge pass -- must be a "
+                 "square-shaped brush (type 72 is the only one today).",
+                 choices=(72,), labels={72: "square"})
+        self.rect_tolerance_var = tk.StringVar(value="1.5")
+        self._add_grid_field(grid, 0, 1, self.rect_tolerance_var, "TOL m",
+                 "Fall Line fill only: Douglas-Peucker boundary-simplify tolerance (m) when "
+                 "tracing each band's own shape into vector polygons before placing per-edge "
+                 "stamps.")
+        self.rect_min_length_var = tk.StringVar(value="1")
+        self._add_grid_field(grid, 0, 2, self.rect_min_length_var, "MIN m",
+                 "Fall Line fill only: floor length (m) for a per-edge stamp when no opposite "
+                 "wall is found within MAX search m.")
+        self.rect_max_search_distance_var = tk.StringVar(value="400")
+        self._add_grid_field(grid, 1, 0, self.rect_max_search_distance_var, "ROLL m",
+                 "Fall Line fill only: cap (m) on the ray-cast search for the wall opposite each "
+                 "boundary edge.")
+        self.rect_width_samples_var = tk.StringVar(value="5")
+        self._add_grid_field(grid, 1, 1, self.rect_width_samples_var, "SAMP",
+                 "Fall Line fill only: points sampled across each boundary edge's own width (not "
+                 "just its center) when ray-casting for the opposite wall.")
+
+    def _build_contour_secondary_fill(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Secondary Fill", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        self.enable_secondary_fill_var = tk.BooleanVar(value=True)
+        secondary_fill_checkbox = ttk.Checkbutton(
+            parent, text="Enable", variable=self.enable_secondary_fill_var,
+        )
+        secondary_fill_checkbox.pack(anchor="w", pady=(0, 4))
+        _Tooltip(secondary_fill_checkbox, "contour method only: whether the crumb-scatter cleanup "
+                 "pass runs after Primary Fill. Unchecked skips it entirely -- whatever Primary "
+                 "Fill leaves as crumbs stays unfilled, so coverage is no longer complete. Trades "
+                 "that guarantee for speed, e.g. for a quick look at Primary Fill's own plateau "
+                 "shape.")
+
+        grid = ttk.Frame(parent)
+        grid.pack(anchor="w", fill="x")
+
+        self.smoothing_brush_var = tk.StringVar(value="10")
+        self._add_brush_field(grid, 0, 0, self.smoothing_brush_var,
+                 "Secondary Fill only: the crumb-scatter fill over whatever Primary Fill leaves "
+                 "as genuine crumbs. A softer brush (type 10 default) so small scattered crumbs "
+                 "blend rather than showing a hard-edged patch.")
+        self.smoothing_min_radius_var = tk.StringVar(value="4")
+        self._add_grid_field(grid, 0, 1, self.smoothing_min_radius_var, "MIN m",
+                 "Secondary Fill only: its OWN radius floor, independent of Primary Fill's MIN m "
+                 "-- the crumb stage's scale is a property of how it does its own job, not of "
+                 "how finely Primary Fill happened to be tiered.")
+        self.smooth_ratio_var = tk.StringVar(value="4")
+        self._add_grid_field(grid, 0, 2, self.smooth_ratio_var, "RATIO",
+                 "Secondary Fill only: scatter radius as a multiple of its own MIN m (default 4 "
+                 "-- a 16m scatter radius at the 4m default floor). Deliberately a ratio: the "
+                 "crumb stage's scale should track its own floor directly rather than needing "
+                 "separate re-tuning.")
+        self.smooth_claim_fraction_var = tk.StringVar(value="0.25")
+        self._add_grid_field(grid, 1, 0, self.smooth_claim_fraction_var, "EAT",
+                 "Secondary Fill only: \"eat\" -- how much of each crumb-scatter stamp's placed "
+                 "radius gets claimed. Deliberately much heavier overlap (claim less) than "
+                 "Primary Fill's real-plateau-derived claim, since Secondary Fill's whole job is "
+                 "blanket-covering whatever Primary Fill couldn't reach, not precise packing.")
 
     # ------------------------------------------------------------------
     # Cart Paths
@@ -1068,6 +1211,9 @@ class PGAGenGUI:
         self._build_refine_adaptive_tab(adaptive_tab)
         self._build_refine_scatter_tab(scatter_tab)
 
+        refine_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._autosize_notebook(refine_notebook))
+        self._autosize_notebook(refine_notebook)
+
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.registration_marks_var = tk.BooleanVar(value=False)
         reg_marks_checkbox = ttk.Checkbutton(
@@ -1078,23 +1224,28 @@ class PGAGenGUI:
                  "circle spline (cart path surface) at each of the 4 course corners -- for visually "
                  "confirming in-game that terrain and splines land exactly where expected. Shared "
                  "with the same checkbox in the Splines tab (one setting, both places).")
-        self.direct_height_shift_var = tk.BooleanVar(value=False)
-        direct_shift_checkbox = ttk.Checkbutton(
-            parent, text="Direct height shift (A/B test)", variable=self.direct_height_shift_var,
+        self.prune_overlapped_stamps_var = tk.BooleanVar(value=True)
+        prune_checkbox = ttk.Checkbutton(
+            parent, text="Delete overlapped stamps", variable=self.prune_overlapped_stamps_var,
         )
-        direct_shift_checkbox.pack(anchor="w")
-        _Tooltip(direct_shift_checkbox, "A/B test for the 'cheese grater' stamp-seam artifact: "
-                 "normalize final heights by shifting every stamp's own value directly instead of "
-                 "the default's appended course-wide raise stamp. Not a mathematically equivalent "
-                 "shift -- only use this to check whether the default method's shim stamp is causing "
-                 "the seams, not as a replacement for it.")
-        write_terrain_btn = self._add_step_button(parent, "Write Terrain + Water", self._run_output_terrain)
-        _Tooltip(write_terrain_btn, "Writes userLayers.json's \"height\" key (the terrain stamps) AND "
-                 "its \"water\" key in one pass -- both live in the same file, so this is one step, not "
-                 "two (see course_output/water.py). Water objects are built from features.geojson's "
-                 "water polygons (natural=water, golf=water_hazard, waterway=* areas -- run Ingest OSM "
-                 "first if none show up) fitted to the CURRENT stamp list's low points, so water always "
-                 "reflects whatever terrain was most recently written here, not a stale prior run.")
+        prune_checkbox.pack(anchor="w")
+        _Tooltip(prune_checkbox, "Drop stamps fully overwritten by later stamps before writing/fitting "
+                 "water (terrain/stamp_pruning.py) -- pure cleanup with no effect on the resolved "
+                 "terrain, just fewer stamps in the output. On by default; uncheck to keep every stamp "
+                 "as-is (e.g. while debugging pruning itself).")
+        write_terrain_btn = self._add_step_button(parent, "Write Terrain", self._run_write_terrain)
+        _Tooltip(write_terrain_btn, "Writes userLayers.json's \"height\" key (the terrain stamps) -- "
+                 "leaves \"water\" exactly as it was found (see the separate Write Water button below, "
+                 "which is slower and only needs re-running when water levels should track a terrain "
+                 "change).")
+        write_water_btn = self._add_step_button(parent, "Write Water", self._run_write_water)
+        _Tooltip(write_water_btn, "Writes userLayers.json's \"water\" key -- leaves \"height\" exactly "
+                 "as it was found (see course_output/water.py). Water objects are built from "
+                 "features.geojson's water polygons (natural=water, golf=water_hazard, waterway=* "
+                 "areas -- run Ingest OSM first if none show up) fitted to the CURRENT stamp list's "
+                 "low points (re-loaded/pruned/normalized the same way as Write Terrain, using the "
+                 "same checkboxes above), so this can be slow -- only run it when water levels need "
+                 "to catch up with a terrain change, not after every terrain iteration.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(parent, text="Refinement values:").pack(anchor="w")
@@ -1317,7 +1468,43 @@ class PGAGenGUI:
         self.preview_canvas.bind("<B2-Motion>", lambda e: self.preview_canvas.scan_dragto(e.x, e.y, gain=1))
         self.preview_canvas.bind("<Configure>", self._center_preview_image)
 
-        overlay_row = ttk.Frame(frame)
+    _SPLINE_KIND_FILTERS = (
+        "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
+        "water", "cartpath", "service_road", "roadway", "driveway", "path",
+        "building", "wood", "pavement", "mulch", "hole",
+    )
+
+    BRUSH_TYPE_ORDER = (8, 9, 10, 54)
+    BRUSH_TYPE_LABELS = {8: "hard", 9: "med", 10: "soft", 54: "smooth"}
+
+    _OBJECT_SOURCE_FILTERS = ("All", "OSM", "LIDAR", "Manual")
+
+    def _build_splines_tab(self, parent: ttk.Frame) -> None:
+        filter_row = ttk.Frame(parent)
+        filter_row.pack(fill="x")
+        ttk.Label(filter_row, text="Filter:").pack(side="left")
+        self.splines_kind_filter_var = tk.StringVar(value="All")
+        filter_box = ttk.Combobox(
+            filter_row, textvariable=self.splines_kind_filter_var, state="readonly", width=12,
+            values=self._SPLINE_KIND_FILTERS,
+        )
+        filter_box.pack(side="left", padx=4)
+        filter_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_splines_list())
+        ttk.Button(filter_row, text="Refresh", command=self._refresh_splines_list).pack(side="left")
+
+        hole_width_row = ttk.Frame(parent)
+        hole_width_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(hole_width_row, text="Hole width (m):").pack(side="left")
+        self.hole_corridor_buffer_var = tk.StringVar(value=str(DEFAULT_HOLE_CORRIDOR_BUFFER_PX))
+        hole_width_entry = ttk.Entry(hole_width_row, textvariable=self.hole_corridor_buffer_var, width=6)
+        hole_width_entry.pack(side="left", padx=4)
+        _Tooltip(hole_width_entry, "Buffer applied to each hole routing centerline (tee-to-green line) "
+                 "before it contributes to the height mask -- an unbuffered centerline alone would leave "
+                 "most of the actual playing corridor outside the mask. This is a BUFFER distance, "
+                 "roughly HALF the resulting corridor width, not the total width. Takes effect the next "
+                 "time Ingest OSM runs (File tab).")
+
+        overlay_row = ttk.Frame(parent)
         overlay_row.pack(fill="x", pady=(4, 0))
         self.overlay_osm_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -1336,7 +1523,7 @@ class PGAGenGUI:
         # dragging the slider shows exactly how far the buffer currently
         # reaches without needing to re-run ingest-osm each time (see
         # _get_cached_mask_merged_geometry / ingest.osm.rasterize_mask_rgba).
-        mask_row = ttk.Frame(frame)
+        mask_row = ttk.Frame(parent)
         mask_row.pack(fill="x", pady=(4, 0))
         self.show_mask_buffer_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -1364,112 +1551,20 @@ class PGAGenGUI:
                  "spline(s) are currently selected in the Splines tab instead, regardless of their "
                  "mask flag. Both still go through the same Buffer (px) outward buffer above.")
 
-        # Live elevation-band overlay -- purely in-memory (see
-        # _show_preview's compositing block below and _get_cached_
-        # heightmap): reads heightmap.npz directly, thresholds it into
-        # a 1-bit [elevation, elevation+width) band, and composites
-        # that on top of whatever preview is currently showing. Never
-        # writes anything to disk. Useful for eyeballing real channel
-        # width against generate-terrain's BAND m / MAX RING m settings
-        # (Terrain tab) before committing to a run.
-        elev_row = ttk.Frame(frame)
-        elev_row.pack(fill="x", pady=(4, 0))
-        self.show_elevation_contour_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            elev_row, text="Elevation contour", variable=self.show_elevation_contour_var,
-            command=self._on_elevation_contour_toggle,
-        ).pack(side="left")
-        ttk.Label(elev_row, text="Elev (m):").pack(side="left", padx=(8, 0))
-        self.elevation_contour_var = tk.DoubleVar(value=0.0)
-        self.elevation_contour_scale = ttk.Scale(
-            elev_row, from_=0.0, to=1.0, orient="horizontal",
-            variable=self.elevation_contour_var, command=self._on_elevation_slider_drag,
-        )
-        self.elevation_contour_scale.pack(side="left", fill="x", expand=True, padx=4)
-        self.elevation_contour_label = ttk.Label(elev_row, text="0.0", width=8)
-        self.elevation_contour_label.pack(side="left")
-        ttk.Label(elev_row, text="Width (m):").pack(side="left", padx=(8, 0))
-        self.elevation_contour_width_var = tk.StringVar(value="1.0")
-        width_entry = ttk.Entry(elev_row, textvariable=self.elevation_contour_width_var, width=6)
-        width_entry.pack(side="left", padx=(2, 0))
-        width_entry.bind("<Return>", lambda e: self._on_elevation_width_changed())
-        width_entry.bind("<FocusOut>", lambda e: self._on_elevation_width_changed())
-        _Tooltip(width_entry, "Band thickness (m): shows heights in [Elev, Elev+Width) as solid "
-                 "white, everything else transparent -- 1-bit, no antialiasing, purely an in-"
-                 "memory visual (nothing written to disk). Narrow this toward your BAND m setting "
-                 "to see one traced level at a time; widen it to see a whole channel at once. The "
-                 "slider snaps to multiples of this value, matching the same band boundaries a real "
-                 "generate-terrain run at that BAND m would actually produce.")
-
-        stamp_cov_row = ttk.Frame(frame)
-        stamp_cov_row.pack(fill="x", pady=(4, 0))
-        self.show_stamp_coverage_var = tk.BooleanVar(value=False)
-        stamp_cov_checkbox = ttk.Checkbutton(
-            stamp_cov_row, text="Show stamp influence (Elevation contour)",
-            variable=self.show_stamp_coverage_var, command=self._show_preview,
-        )
-        stamp_cov_checkbox.pack(side="left")
-        _Tooltip(stamp_cov_checkbox, "Only has an effect while Elevation contour is also checked. "
-                 "Filters the real current stamp list (every stamps_N.json layer under stamps/) "
-                 "to only stamps whose own VALUE falls within the current [Elev, Elev+Width) band -- "
-                 "not the whole course -- then evaluates the REAL kernel weight (via terrain."
-                 "terrain_kernel.TerrainKernel -- the same kernel adaptive_refine.py scores candidates "
-                 "with) from whichever of THOSE stamps pulls hardest at each cell, not just whether "
-                 "some stamp's nominal radius geometrically reaches it. Pure RED = untouched by this "
-                 "band's own stamps (not just 'touched by a neighboring band's stamp instead' -- those "
-                 "are excluded), pure GREEN = strongly pulled, anything in between (orange/yellow) is "
-                 "geometrically 'covered' but only weakly influenced. If a region reads solid green "
-                 "under the old binary check but still looks unfilled visually, this is what actually "
-                 "explains it. Recomputed per elevation (filtering changes which stamps are relevant), "
-                 "but only over that band's own stamp subset, so it stays fast in practice.")
-
-    _SPLINE_KIND_FILTERS = (
-        "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
-        "water", "cartpath", "service_road", "roadway", "driveway", "path",
-        "building", "wood", "pavement", "mulch", "hole",
-    )
-
-    BRUSH_TYPE_ORDER = (8, 9, 10, 54)
-    BRUSH_TYPE_LABELS = {8: "hard", 9: "med", 10: "soft", 54: "smooth"}
-
-    _OBJECT_SOURCE_FILTERS = ("All", "OSM", "LIDAR")
-
-    def _build_splines_tab(self, parent: ttk.Frame) -> None:
-        filter_row = ttk.Frame(parent)
-        filter_row.pack(fill="x")
-        ttk.Label(filter_row, text="Filter:").pack(side="left")
-        self.splines_kind_filter_var = tk.StringVar(value="All")
-        filter_box = ttk.Combobox(
-            filter_row, textvariable=self.splines_kind_filter_var, state="readonly", width=12,
-            values=self._SPLINE_KIND_FILTERS,
-        )
-        filter_box.pack(side="left", padx=4)
-        filter_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_splines_list())
-        ttk.Button(filter_row, text="Refresh", command=self._refresh_splines_list).pack(side="left")
-
-        hole_width_row = ttk.Frame(parent)
-        hole_width_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(hole_width_row, text="Hole width (m):").pack(side="left")
-        self.hole_corridor_buffer_var = tk.StringVar(value=str(DEFAULT_HOLE_CORRIDOR_BUFFER_PX))
-        hole_width_entry = ttk.Entry(hole_width_row, textvariable=self.hole_corridor_buffer_var, width=6)
-        hole_width_entry.pack(side="left", padx=4)
-        _Tooltip(hole_width_entry, "Buffer applied to each hole routing centerline (tee-to-green line) "
-                 "before it contributes to the height mask -- an unbuffered centerline alone would leave "
-                 "most of the actual playing corridor outside the mask. This is a BUFFER distance, "
-                 "roughly HALF the resulting corridor width, not the total width. Takes effect the next "
-                 "time Ingest OSM runs (File tab).")
-
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.splines_tree = ttk.Treeview(
-            tree_frame, columns=("kind", "tag", "mask"), show="headings", height=18, selectmode="extended",
+            tree_frame, columns=("kind", "tag", "mask", "clusters"), show="headings", height=18,
+            selectmode="extended",
         )
         self.splines_tree.heading("kind", text="Kind")
         self.splines_tree.heading("tag", text="Tag")
         self.splines_tree.heading("mask", text="Mask")
+        self.splines_tree.heading("clusters", text="Clusters")
         self.splines_tree.column("kind", width=90)
         self.splines_tree.column("tag", width=90)
         self.splines_tree.column("mask", width=24, anchor="center")
+        self.splines_tree.column("clusters", width=140)
         self.splines_tree.pack(side="left", fill="both", expand=True)
         tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.splines_tree.yview)
         tree_scroll.pack(side="left", fill="y")
@@ -1478,8 +1573,8 @@ class PGAGenGUI:
 
         button_row = ttk.Frame(parent)
         button_row.pack(fill="x", pady=(6, 0))
-        ttk.Button(button_row, text="Toggle Mask", command=self._toggle_selected_mask).pack(side="left")
-        toggle_all_btn = ttk.Button(button_row, text="Toggle All", command=self._toggle_all_mask)
+        ttk.Button(button_row, text="Mask", command=self._toggle_selected_mask).pack(side="left")
+        toggle_all_btn = ttk.Button(button_row, text="Mask All", command=self._toggle_all_mask)
         toggle_all_btn.pack(side="left", padx=(4, 0))
         _Tooltip(toggle_all_btn, "Toggle mask for every feature currently visible (i.e. matching the "
                  "active Filter) -- any kind, not just golf objects. If any are currently unmasked, "
@@ -1496,6 +1591,26 @@ class PGAGenGUI:
                  "'All' first to recall a selection that spans multiple kinds.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Object Clusters", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        cluster_grid = ttk.Frame(parent)
+        cluster_grid.pack(anchor="w", fill="x")
+        fill_clusters_btn = ttk.Button(
+            cluster_grid, text="Fill", command=self._open_cluster_fill_dialog,
+        )
+        fill_clusters_btn.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
+        _Tooltip(fill_clusters_btn, "Fill the selected spline(s) with object clusters -- pick "
+                 "one or more nature assets (trees/bushes, rocks, grass, ground-cover/detail plants) "
+                 "from asset_catalog.json and pack circular stamps across each selected area (largest "
+                 "first, then progressively smaller passes fill in what's left, sized from that asset's "
+                 "own measured planting density). Only Polygon/MultiPolygon splines can be filled.")
+        clear_clusters_btn = ttk.Button(
+            cluster_grid, text="Clear", command=self._clear_selected_cluster_fills,
+        )
+        clear_clusters_btn.grid(row=0, column=1, sticky="w", padx=(4, 0), pady=2)
+        _Tooltip(clear_clusters_btn, "Remove every cluster-fill asset from the selected spline(s), "
+                 "so Write Objects stops generating clusters for them.")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         reg_marks_checkbox2 = ttk.Checkbutton(
             parent, text="Registration marks", variable=self.registration_marks_var,
         )
@@ -1506,6 +1621,9 @@ class PGAGenGUI:
                  "with the same checkbox in the Terrain tab (one setting, both places).")
         self._add_step_button(parent, "Write Splines", self._run_write_splines)
         self._add_step_button(parent, "Write Holes", self._run_write_holes)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._build_cart_paths_section(parent)
 
     def _run_write_splines(self) -> None:
         wd = self._require_working_dir()
@@ -1535,6 +1653,8 @@ class PGAGenGUI:
                  "available, same set for every game version. Leave as '(not set)' to use a single "
                  "generic tree type.")
 
+        """
+        Commenting this out for now.
         ttk.Label(parent, text="Asset List (.json):").pack(anchor="w")
         self.objects_asset_list_var = tk.StringVar(value="")
         asset_list_row = ttk.Frame(parent)
@@ -1545,19 +1665,23 @@ class PGAGenGUI:
         _Tooltip(asset_list_entry, "Not wired up yet -- placeholder for a future 2021+ asset-path "
                  "list (will also cover building stakes; replaces hand-typing individual asset "
                  "paths one at a time).")
+        """
 
-        self.detect_lidar_trees_var = tk.BooleanVar(value=True)
-        lidar_trees_checkbox = ttk.Checkbutton(
-            parent, text="Detect trees from LIDAR canopy", variable=self.detect_lidar_trees_var,
+        show_objects_row = ttk.Frame(parent)
+        show_objects_row.pack(fill="x")
+        self.show_objects_var = tk.BooleanVar(value=False)
+        show_objects_checkbox = ttk.Checkbutton(
+            show_objects_row, text="Show objects", variable=self.show_objects_var,
+            command=self._show_preview,
         )
-        lidar_trees_checkbox.pack(anchor="w", pady=(0, 4))
-        _Tooltip(lidar_trees_checkbox, "Also detect individual trees directly from LIDAR canopy "
-                 "points (ingest/tree_detection.py), on top of any OSM natural=tree nodes. Confined "
-                 "to height_mask.geojson's core-play-area polygon if one exists -- the game's own "
-                 "procedural vegetation fill is expected to handle everywhere else. Needs "
-                 "heightmap.npz and pointcloud.npz (Ingest LAZ). On by default: OSM alone typically "
-                 "finds few or no individually-tagged trees on a real course.")
-        self._add_step_button(parent, "Generate Trees", self._run_generate_trees)
+        show_objects_checkbox.pack(side="left")
+        _Tooltip(show_objects_checkbox, "Overlay placed objects on the preview, similar to Overlay OSM "
+                 "(Preview tab) -- individually placed trees (object_list.json, after Generate Trees) "
+                 "as a 2px dot, or a circle sized to its measured LIDAR canopy radius if it has one; "
+                 "rock/grass/ground-cover/display-plant cluster-fill stamps (placedObjects2.json, after "
+                 "Write Objects) as a circle at that stamp's own packed radius. Colored by category, "
+                 "fully opaque -- see the key drawn on the preview. Categories with no placed objects "
+                 "yet just don't appear.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         obj_filter_row = ttk.Frame(parent)
@@ -1598,23 +1722,72 @@ class PGAGenGUI:
         _Tooltip(clear_all_btn, "Delete every tree currently shown (i.e. matching the active Filter) "
                  "from object_list.json permanently, then re-run Write Objects to pick up the change. "
                  "Set Filter to 'LIDAR' first to dump only auto-detected trees, keeping any hand-tagged "
-                 "OSM ones -- useful for clearing out a bad detection run without losing curated data.")
+                 "OSM ones -- useful for clearing out a bad detection run without losing curated data. "
+                 "'Manual' (cluster fill) rows are never affected -- use Clear Cluster Fills in the "
+                 "Splines tab for those.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self._add_step_button(parent, "Write Objects", self._run_write_objects)
+        ttk.Label(parent, text="Generate Trees", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        self.detect_lidar_trees_var = tk.BooleanVar(value=True)
+        lidar_trees_checkbox = ttk.Checkbutton(
+            parent, text="Detect trees from LIDAR canopy", variable=self.detect_lidar_trees_var,
+        )
+        lidar_trees_checkbox.pack(anchor="w", pady=(0, 4))
+        _Tooltip(lidar_trees_checkbox, "Also detect individual trees directly from LIDAR canopy "
+                 "points (ingest/tree_detection.py), on top of any OSM natural=tree nodes. Confined "
+                 "to height_mask.geojson's core-play-area polygon if one exists -- the game's own "
+                 "procedural vegetation fill is expected to handle everywhere else. Needs "
+                 "heightmap.npz and pointcloud.npz (Ingest LAZ). On by default: OSM alone typically "
+                 "finds few or no individually-tagged trees on a real course.")
+        self._add_step_button(parent, "Generate Trees", self._run_generate_trees)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Label(parent, text="Building stakes (game_version=2019 only):").pack(anchor="w")
-        stake_btn = self._add_step_button(parent, "Stake Buildings", self._run_stake_buildings)
+        ttk.Label(parent, text="Stake Buildings", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        stake_grid = ttk.Frame(parent)
+        stake_grid.pack(anchor="w", fill="x")
+        stake_btn = ttk.Button(stake_grid, text="Place", command=self._run_stake_buildings)
+        stake_btn.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
         _Tooltip(stake_btn, "Places a subtle 0.5x-scale stake at every corner of every 'building' "
                  "feature (features.geojson) and re-writes placedObjects2.json -- same fence-post prop "
                  "used oversized for the cart-path debug marker. Needs Write Objects to have been run "
                  "at least once first (object_list.json). Persists as the default for future Write "
                  "Objects runs too -- use Clear Building Stakes to turn it back off.")
-        clear_stakes_btn = self._add_step_button(parent, "Clear Building Stakes", self._run_clear_building_stakes)
+        clear_stakes_btn = ttk.Button(stake_grid, text="Clear", command=self._run_clear_building_stakes)
+        clear_stakes_btn.grid(row=0, column=1, sticky="w", padx=(4, 0), pady=2)
         _Tooltip(clear_stakes_btn, "Re-writes placedObjects2.json without building stakes. Not "
                  "destructive -- building corners are recomputed from features.geojson each time, so "
                  "Stake Buildings can always bring them back.")
+        
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._add_step_button(parent, "Write Objects", self._run_write_objects)
+
+    def _build_options_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Options", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+
+        n_workers_row = ttk.Frame(parent)
+        n_workers_row.pack(anchor="w", fill="x", pady=(4, 0))
+        ttk.Label(n_workers_row, text="Workers:").pack(side="left")
+        self.n_workers_var = tk.StringVar(value="")
+        n_workers_entry = ttk.Entry(n_workers_row, textvariable=self.n_workers_var, width=6)
+        n_workers_entry.pack(side="left", padx=4)
+        _Tooltip(n_workers_entry, "contour method only (Terrain tab): parallelize the main "
+                 "per-band loop across this many OS processes. Bands never spatially overlap, so "
+                 "this is embarrassingly parallel -- output is byte-for-byte identical to a "
+                 "sequential run given the same random seed, confirmed directly, only faster. "
+                 "Blank = auto-detect via CPU count. 1 forces sequential (e.g. for debugging). "
+                 "Forced to 1 regardless of this setting whenever max_stamps is set (that flag "
+                 "needs a running total checked band-by-band, which is fundamentally sequential).")
+
+        self.direct_height_shift_var = tk.BooleanVar(value=True)
+        direct_shift_checkbox = ttk.Checkbutton(
+            parent, text="Direct height shift", variable=self.direct_height_shift_var,
+        )
+        direct_shift_checkbox.pack(anchor="w", pady=(8, 0))
+        _Tooltip(direct_shift_checkbox, "Write Terrain / Write Water (Refine tab): normalize final "
+                 "heights by shifting every stamp's own value directly instead of appending a "
+                 "course-wide shim stamp. Not a mathematically equivalent shift -- fixes the 'cheese "
+                 "grater' stamp-seam artifact the shim-stamp method can produce. On by default; "
+                 "uncheck to fall back to the shim-stamp method.")
 
     def _browse_objects_asset_list(self) -> None:
         f = filedialog.askopenfilename(
@@ -1712,19 +1885,62 @@ class PGAGenGUI:
             parts.append(f"r={float(radius):.1f}m")
         return " ".join(parts)
 
+    @staticmethod
+    def _build_cluster_fill_rows(features: list) -> list[tuple[str, str, float]]:
+        """
+        (spline_osm_ids, asset_label, ratio) -- one row per distinct
+        {"category","type","ratio"} fill spec seen across `features`
+        (see course_output/object_clusters.py's PGA_CLUSTER_FILLS_TAG),
+        with every contributing spline's osm_id collected together --
+        so a single Fill action (which can target many splines and
+        several assets at once) shows as one row per asset/ratio
+        combo, not one row per spline.
+        """
+        groups: dict[tuple, list[int]] = {}
+        for f in features:
+            if f.osm_id is None:
+                continue
+            for spec in f.tags.get(PGA_CLUSTER_FILLS_TAG) or []:
+                key = (spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO))
+                groups.setdefault(key, []).append(f.osm_id)
+
+        rows = []
+        for (category, type_, ratio), osm_ids in groups.items():
+            label = _ASSET_LABEL_BY_KEY.get((category, type_), f"category={category}/type={type_}")
+            ids_str = ",".join(str(i) for i in sorted(set(osm_ids)))
+            rows.append((ids_str, label, ratio))
+        return rows
+
     def _refresh_objects_list(self) -> None:
+        """
+        Populates the Objects tab list from two independent sources:
+        object_list.json (individually placed trees -- iid is a plain
+        int index into self._objects_tree_list, source OSM/LIDAR) and
+        features.geojson's cluster-fill tags (area fills -- iid is
+        "c"+index into self._cluster_fill_rows, source "manual"). Kept
+        as two disjoint iid namespaces so _clear_filtered_objects (tree-
+        only) can never mistake one for the other.
+        """
         wd = self.working_dir.get().strip()
         self.objects_tree.delete(*self.objects_tree.get_children())
         self._objects_tree_list = []
+        self._cluster_fill_rows = []
         if not wd or not Path(wd).is_dir():
             return
+
         object_list_path = Path(wd) / OBJECT_LIST_FILE
-        if not object_list_path.exists():
-            return
-        try:
-            self._objects_tree_list = load_object_list(object_list_path)
-        except (json.JSONDecodeError, OSError, KeyError):
-            return
+        if object_list_path.exists():
+            try:
+                self._objects_tree_list = load_object_list(object_list_path)
+            except (json.JSONDecodeError, OSError, KeyError):
+                self._objects_tree_list = []
+
+        features_path = Path(wd) / FEATURES_FILE
+        if features_path.exists():
+            try:
+                self._cluster_fill_rows = self._build_cluster_fill_rows(load_features(features_path))
+            except (json.JSONDecodeError, OSError, KeyError):
+                self._cluster_fill_rows = []
 
         filter_val = self.objects_filter_var.get()
         for i, (x, z, tags) in enumerate(self._objects_tree_list):
@@ -1735,13 +1951,27 @@ class PGAGenGUI:
                 "", "end", iid=str(i), values=(f"{x:.1f}", f"{z:.1f}", source, self._object_detail(tags)),
             )
 
+        if filter_val in ("All", "Manual"):
+            for j, (spline_ids, asset_label, ratio) in enumerate(self._cluster_fill_rows):
+                detail = f"splines={spline_ids} fill={asset_label} ratio={ratio:g}"
+                self.objects_tree.insert("", "end", iid=f"c{j}", values=("", "", "manual", detail))
+
     def _clear_filtered_objects(self) -> None:
+        """
+        Deletes trees only -- manual cluster fills (source "manual",
+        iid prefixed "c") are managed from the Splines tab's Clear
+        Cluster Fills instead, since they live in features.geojson's
+        tags, not object_list.json.
+        """
         wd = self._require_working_dir()
         if not wd:
             return
-        visible_iids = self.objects_tree.get_children()
+        visible_iids = [iid for iid in self.objects_tree.get_children() if iid.isdigit()]
         if not visible_iids:
-            messagebox.showinfo("Nothing to clear", "No trees are currently shown for the active filter.")
+            messagebox.showinfo(
+                "Nothing to clear", "No trees are currently shown for the active filter. (Manual cluster "
+                "fills aren't cleared here -- use Clear Cluster Fills in the Splines tab.)",
+            )
             return
         if not messagebox.askyesno(
             "Clear filtered trees",
@@ -1782,7 +2012,7 @@ class PGAGenGUI:
                 continue  # nothing stable to select/highlight/toggle by
             self.splines_tree.insert(
                 "", "end", iid=str(f.osm_id),
-                values=(f.kind, _spline_tag_detail(f), "✔" if f.mask else ""),
+                values=(f.kind, _spline_tag_detail(f), "✔" if f.mask else "", _spline_cluster_detail(f)),
             )
 
     def _on_spline_selected(self) -> None:
@@ -1893,6 +2123,151 @@ class PGAGenGUI:
         self._refresh_splines_list()
         self._show_preview()
 
+    def _clear_selected_cluster_fills(self) -> None:
+        """Remove PGA_CLUSTER_FILLS_TAG entirely from every currently-selected row (multi-select)."""
+        wd = self.working_dir.get().strip()
+        selected_ids = {int(s) for s in self.splines_tree.selection()}
+        if not wd or not selected_ids:
+            return
+        targets = [f for f in self._splines_features if f.osm_id in selected_ids]
+        if not targets:
+            return
+        changed = False
+        for f in targets:
+            if f.tags.pop(PGA_CLUSTER_FILLS_TAG, None) is not None:
+                changed = True
+        if not changed:
+            return
+        save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+        self._refresh_splines_list()
+        restorable_ids = [str(i) for i in selected_ids if self.splines_tree.exists(str(i))]
+        if restorable_ids:
+            self.splines_tree.selection_set(restorable_ids)
+
+    def _open_cluster_fill_dialog(self) -> None:
+        """
+        "Fill with Clusters...": pick one or more nature assets (see
+        course_output/asset_catalog.py) and a raster ratio, then append
+        a {"category","type","ratio"} spec per chosen asset to
+        PGA_CLUSTER_FILLS_TAG on every currently-selected spline (see
+        course_output/object_clusters.py for what actually consumes
+        that tag at write-objects time). Splines are captured up front,
+        before the dialog steals focus -- the dialog's own asset
+        Treeview otherwise makes it easy to lose track of which rows
+        were selected in the main list.
+        """
+        wd = self.working_dir.get().strip()
+        if not wd:
+            messagebox.showwarning("No working directory", "Set a working directory first.")
+            return
+        selected_ids = {int(s) for s in self.splines_tree.selection()}
+        if not selected_ids:
+            messagebox.showwarning("No splines selected", "Select one or more splines in the list first.")
+            return
+        targets = [f for f in self._splines_features if f.osm_id in selected_ids]
+        area_targets = [f for f in targets if f.geometry.geom_type in ("Polygon", "MultiPolygon")]
+        if not area_targets:
+            messagebox.showwarning(
+                "No fillable splines", "None of the selected splines have polygon area to fill "
+                "(cluster fill needs a Polygon/MultiPolygon spline, not a bare line).",
+            )
+            return
+        if not CLUSTERABLE_ENTRIES:
+            messagebox.showinfo(
+                "No clusterable assets", "course_output/asset_catalog.json has no entries with both "
+                "a category cluster_radius and a measured spacing yet -- nothing to fill with.",
+            )
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Fill with Clusters")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        filter_row = ttk.Frame(dialog)
+        filter_row.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(filter_row, text="Category:").pack(side="left")
+        category_names = ["All"] + [ASSET_CATEGORIES[cid].description for cid in sorted(NATURE_CATEGORY_IDS)]
+        category_var = tk.StringVar(value="All")
+        category_box = ttk.Combobox(
+            filter_row, textvariable=category_var, state="readonly", width=20, values=category_names,
+        )
+        category_box.pack(side="left", padx=4)
+
+        tree_frame = ttk.Frame(dialog)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        asset_tree = ttk.Treeview(
+            tree_frame, columns=("category", "asset"), show="headings", height=14, selectmode="extended",
+        )
+        asset_tree.heading("category", text="Category")
+        asset_tree.heading("asset", text="Asset")
+        asset_tree.column("category", width=140)
+        asset_tree.column("asset", width=260)
+        asset_tree.pack(side="left", fill="both", expand=True)
+        asset_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=asset_tree.yview)
+        asset_scroll.pack(side="left", fill="y")
+        asset_tree["yscrollcommand"] = asset_scroll.set
+
+        def refresh_asset_tree() -> None:
+            asset_tree.delete(*asset_tree.get_children())
+            chosen = category_var.get()
+            for i, entry in enumerate(CLUSTERABLE_ENTRIES):
+                description = ASSET_CATEGORIES[entry.category].description
+                if chosen != "All" and description != chosen:
+                    continue
+                asset_tree.insert("", "end", iid=str(i), values=(description, entry.label))
+
+        category_box.bind("<<ComboboxSelected>>", lambda e: refresh_asset_tree())
+        refresh_asset_tree()
+
+        ratio_row = ttk.Frame(dialog)
+        ratio_row.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(ratio_row, text="Raster ratio:").pack(side="left")
+        ratio_var = tk.StringVar(value=str(DEFAULT_RASTER_RATIO))
+        ratio_entry = ttk.Entry(ratio_row, textvariable=ratio_var, width=6)
+        ratio_entry.pack(side="left", padx=4)
+        _Tooltip(ratio_entry, "How much placed stamps are allowed to overlap each other during packing "
+                 "-- minimum center-to-center separation is (r1+r2) x ratio. 1.0 means stamps may only "
+                 "just touch; <1 lets them overlap more (denser fill); >1 spaces them further apart. "
+                 "Applies to every asset picked in this dialog, across all 3 packing passes.")
+
+        def do_fill() -> None:
+            selected_rows = asset_tree.selection()
+            if not selected_rows:
+                messagebox.showwarning("No asset selected", "Select one or more assets to fill with.", parent=dialog)
+                return
+            try:
+                ratio = float(ratio_var.get())
+                if ratio <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("Invalid ratio", "Raster ratio must be a positive number.", parent=dialog)
+                return
+
+            chosen_entries = [CLUSTERABLE_ENTRIES[int(i)] for i in selected_rows]
+            for f in area_targets:
+                fills = f.tags.setdefault(PGA_CLUSTER_FILLS_TAG, [])
+                for entry in chosen_entries:
+                    fills.append({"category": entry.category, "type": entry.type, "ratio": ratio})
+
+            save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+            self._refresh_splines_list()
+            restorable_ids = [str(i) for i in selected_ids if self.splines_tree.exists(str(i))]
+            if restorable_ids:
+                self.splines_tree.selection_set(restorable_ids)
+            skipped = len(targets) - len(area_targets)
+            note = f" ({skipped} non-area spline(s) skipped)" if skipped else ""
+            self._append_log(
+                f"\n[filled {len(area_targets)} spline(s) with {len(chosen_entries)} asset(s) "
+                f"at ratio={ratio}{note}]\n"
+            )
+            dialog.destroy()
+
+        button_row = ttk.Frame(dialog)
+        button_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(button_row, text="Fill", command=do_fill).pack(side="left")
+        ttk.Button(button_row, text="Cancel", command=dialog.destroy).pack(side="left", padx=(4, 0))
+
     def _splines_memory_store(self) -> None:
         """MS: remember the current row selection (by osm_id), independent of the active Filter."""
         self._splines_selection_memory = set(self.splines_tree.selection())
@@ -1950,6 +2325,12 @@ class PGAGenGUI:
             self.game_version.set(project.get("game_version", DEFAULT_GAME_VERSION))
         finally:
             self._suppress_game_version_save = False
+        self._suppress_objects_theme_save = True
+        try:
+            theme_name = THEMES_V2019.get(project.get("objects_theme"), "(not set)")
+            self.objects_theme_var.set(theme_name)
+        finally:
+            self._suppress_objects_theme_save = False
         self._refresh_refine_stats()
         self._refresh_preview_and_slider()
 
@@ -1985,6 +2366,15 @@ class PGAGenGUI:
         if not wd or not Path(wd).is_dir():
             return
         save_project(Path(wd), {"game_version": self.game_version.get()})
+
+    def _on_objects_theme_changed(self) -> None:
+        if self._suppress_objects_theme_save:
+            return
+        wd = self.working_dir.get().strip()
+        if not wd or not Path(wd).is_dir():
+            return
+        theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
+        save_project(Path(wd), {"objects_theme": theme_id})
 
     # ------------------------------------------------------------------
     # Folder / file pickers
@@ -2177,15 +2567,13 @@ class PGAGenGUI:
             sweet_spot_seeds = self.sweet_spot_seeds_var.get().strip()
             if sweet_spot_seeds:
                 args += ["--sweet-spot-seeds", sweet_spot_seeds]
-            sweet_spot_max_candidates = self.sweet_spot_max_candidates_var.get().strip()
-            if sweet_spot_max_candidates:
-                args += ["--sweet-spot-max-candidates", sweet_spot_max_candidates]
-            sweet_spot_time_budget = self.sweet_spot_time_budget_var.get().strip()
-            if sweet_spot_time_budget:
-                args += ["--sweet-spot-time-budget-s", sweet_spot_time_budget]
-            random_seed = self.random_seed_var.get().strip()
-            if random_seed:
-                args += ["--random-seed", random_seed]
+            # MAX candidates / TIME budget are no longer user-tunable -- the
+            # GUI's old defaults (50000 / 60s) matched terrain/contour_layers.py's
+            # own DEFAULT_SWEET_SPOT_MAX_CANDIDATES/_TIME_BUDGET_S exactly, so
+            # simply not passing them lets the backend defaults apply. SEED is
+            # gone the same way: no reproducible fixed seed to set, just a
+            # fresh random one every run.
+            args += ["--random-seed", str(random.randint(1, 2**31 - 1))]
             denoise_px = self.denoise_px_var.get().strip()
             if denoise_px:
                 args += ["--denoise-px", denoise_px]
@@ -2372,15 +2760,25 @@ class PGAGenGUI:
         self.refine_stats_text.insert("1.0", "\n".join(lines))
         self.refine_stats_text.config(state="disabled")
 
-    def _run_output_terrain(self) -> None:
+    def _write_terrain_water_args(self, step: str) -> list[str]:
+        args = ["--step", step]
+        if self.registration_marks_var.get():
+            args.append("--registration-marks")
+        args.append("--direct-height-shift" if self.direct_height_shift_var.get()
+                     else "--no-direct-height-shift")
+        args.append("--prune-overlapped-stamps" if self.prune_overlapped_stamps_var.get()
+                     else "--no-prune-overlapped-stamps")
+        return args
+
+    def _run_write_terrain(self) -> None:
         wd = self._require_working_dir()
         if wd:
-            args = ["--step", "output-terrain"]
-            if self.registration_marks_var.get():
-                args.append("--registration-marks")
-            if self.direct_height_shift_var.get():
-                args.append("--direct-height-shift")
-            self._run_step(args, wd)
+            self._run_step(self._write_terrain_water_args("write-terrain"), wd)
+
+    def _run_write_water(self) -> None:
+        wd = self._require_working_dir()
+        if wd:
+            self._run_step(self._write_terrain_water_args("write-water"), wd)
 
     def _run_repack(self) -> None:
         wd = self._require_working_dir()
@@ -2563,6 +2961,28 @@ class PGAGenGUI:
         except OSError:
             pass
         self.stop_button.config(state="disabled")
+
+    def _restart_app(self) -> None:
+        """
+        Relaunch this script as a fresh process with the current
+        working directory passed on argv (see main()), then close this
+        one -- a full interpreter restart rather than e.g. rebuilding
+        the Tk widget tree in place, so it also picks up any edits to
+        this file itself without the user having to relaunch by hand.
+        """
+        if self.running:
+            if not messagebox.askyesno(
+                "Restart", "A step is currently running -- restarting will stop it. Restart anyway?"
+            ):
+                return
+            self._stop_current_step()
+
+        wd = self.working_dir.get().strip()
+        cmd = [sys.executable, str(Path(__file__).resolve())]
+        if wd:
+            cmd.append(wd)
+        subprocess.Popen(cmd, cwd=str(SCRIPT_DIR))
+        self.root.destroy()
 
     def _poll_log_queue(self) -> None:
         try:
@@ -2965,6 +3385,189 @@ class PGAGenGUI:
         if not relevant:
             return None
         return unary_union(relevant)
+
+    _OBJECT_DOT_RADIUS_PX = 1  # -> a 2px-diameter dot, per the Objects tab's "Show objects" spec
+    _OBJECT_LAYER_FILL_ALPHA = round(255 * 0.4)  # circle interior only -- center dot/outer stroke stay 100%
+
+    def _get_cached_object_preview_layer(self, working_dir: Path):
+        """
+        Lazily build the "Show objects" preview overlay's point list --
+        (x, z, radius_or_None, category_id) triples in the local
+        [0, COURSE_SIZE_M] frame -- mtime-keyed the same idiom as
+        _get_cached_mask_merged_geometry/_get_cached_heightmap.
+
+        Trees always come from object_list.json, never placedObjects2.
+        json's "items": it's the same data the Objects tab list itself
+        already shows, available as soon as Generate Trees has run
+        (rather than needing a full Write Objects first), and keeps a
+        per-tree LIDAR canopy radius (TREE_RADIUS_TAG) around for the
+        circle-vs-dot choice below -- placedObjects2.json's tree items
+        have already baked that into an opaque scale factor by the time
+        they're written (see objects.py's build_tree_objects_v2019),
+        losing it. Rocks/grass/ground-cover/display-plants have no pre-
+        Write-Objects equivalent at all -- a cluster fill spec
+        (features.geojson's PGA_CLUSTER_FILLS_TAG) has no concrete
+        positions until course_output/object_clusters.py actually packs
+        it -- so those come from placedObjects2.json's "clusters" only.
+        Splitting the two sources this way (trees from one file, every
+        other nature category from the other, items vs. clusters never
+        both read for the same category) means nothing is ever drawn
+        twice.
+
+        A tree renders as a circle sized to TREE_RADIUS_TAG when present
+        (LIDAR-detected), otherwise a plain dot -- OSM-sourced trees
+        carry no per-tree size data. A cluster stamp always renders as a
+        circle at its own packed radius (see object_clusters.py's
+        _cluster_entry) -- the closest thing this pipeline has to a
+        "spacing"-derived on-the-ground size for a scatter-fill area.
+        """
+        object_list_path = working_dir / OBJECT_LIST_FILE
+        placed_objects_path = working_dir / "course" / "CourseDescription_nodes" / PLACED_OBJECTS_FILE
+        ol_mtime = object_list_path.stat().st_mtime if object_list_path.exists() else None
+        po_mtime = placed_objects_path.stat().st_mtime if placed_objects_path.exists() else None
+        cache_key = (str(working_dir), ol_mtime, po_mtime)
+        if getattr(self, "_cached_object_layer_key", None) == cache_key:
+            return self._cached_object_layer
+
+        points: list[tuple[float, float, Optional[float], int]] = []
+
+        if object_list_path.exists():
+            try:
+                for x, z, tags in load_object_list(object_list_path):
+                    try:
+                        radius = float(tags[TREE_RADIUS_TAG]) if TREE_RADIUS_TAG in tags else None
+                    except (TypeError, ValueError):
+                        radius = None
+                    points.append((x, z, radius, 0))
+            except (json.JSONDecodeError, OSError, KeyError):
+                pass
+
+        if placed_objects_path.exists():
+            try:
+                for group in load_placed_objects(placed_objects_path):
+                    key = group.get("Key", {})
+                    category = _ASSET_CATEGORY_BY_PATH.get(key["path"]) if "path" in key else key.get("category")
+                    if category not in _OBJECT_LAYER_STYLE:
+                        continue
+                    for cluster in group.get("Value", {}).get("clusters", []):
+                        pos = cluster.get("position", {})
+                        x = pos.get("x", 0.0) + GRID_ORIGIN_OFFSET
+                        z = pos.get("z", 0.0) + GRID_ORIGIN_OFFSET
+                        points.append((x, z, cluster.get("radius"), category))
+            except (json.JSONDecodeError, OSError, KeyError):
+                pass
+
+        self._cached_object_layer = points
+        self._cached_object_layer_key = cache_key
+        return points
+
+    def _composite_objects_layer(self, img: "Image.Image", working_dir: Path) -> "Image.Image":
+        """
+        Composite the "Show objects" overlay onto `img` (already at its
+        current zoomed size) -- one filled circle per point from
+        _get_cached_object_preview_layer, colored/sized per _OBJECT_
+        LAYER_STYLE, plus a legend key in the lower-left corner for
+        whichever categories actually appeared. Same _PLOT_RECT-aware
+        data-area positioning as the mask buffer/elevation contour/
+        highlight overlays above -- course-cropped previews only (see
+        their shared caller-side exclusion in _show_preview).
+
+        Dot radius (_OBJECT_DOT_RADIUS_PX) is a fixed SCREEN size,
+        deliberately not scaled with zoom -- it's a location marker, not
+        a to-scale measurement, so it should stay visible/legible at any
+        zoom level. A cluster/tree circle's radius, by contrast, IS a
+        real ground measurement (a packed stamp's radius, or a tree's
+        measured canopy radius) and is converted through the SAME
+        data_width/COURSE_SIZE_M scale used for point positions, so it
+        shrinks and grows with zoom exactly like the geometry it
+        represents.
+
+        Points are drawn in _OBJECT_LAYER_DRAW_ORDER, not the order
+        _get_cached_object_preview_layer happened to return them --
+        plain overwrite onto `layer` (PIL's ImageDraw doesn't alpha-
+        blend between separate draw calls), so whatever's drawn last
+        visually sits on top wherever markers overlap. A circle draws
+        as three passes -- semi-transparent fill, then an opaque outer
+        stroke, then an opaque center dot on top -- so the exact center
+        stays pinpoint-legible even where a large, mutually-overlapping
+        cluster of circles would otherwise blur it into the fill.
+        """
+        points = self._get_cached_object_preview_layer(working_dir)
+        if not points:
+            return img
+
+        left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
+        data_left = round(img.width * left_frac)
+        data_top = round(img.height * (1 - bottom_frac - height_frac))
+        data_width = max(1, round(img.width * width_frac))
+        data_height = max(1, round(img.height * height_frac))
+
+        order = {cat: i for i, cat in enumerate(_OBJECT_LAYER_DRAW_ORDER)}
+        points = sorted(points, key=lambda p: order.get(p[3], -1))
+
+        layer = Image.new("RGBA", (data_width, data_height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        used_categories: set[int] = set()
+        for x, z, radius, category in points:
+            style = _OBJECT_LAYER_STYLE.get(category)
+            if style is None:
+                continue
+            used_categories.add(category)
+            color = style[1]
+            px = (x / COURSE_SIZE_M) * data_width
+            py = (1.0 - z / COURSE_SIZE_M) * data_height  # row 0 = max z, same flip as the other overlays
+            if radius:
+                radius_px = max(self._OBJECT_DOT_RADIUS_PX, (radius / COURSE_SIZE_M) * data_width)
+                bbox = (px - radius_px, py - radius_px, px + radius_px, py + radius_px)
+                draw.ellipse(bbox, fill=(*color, self._OBJECT_LAYER_FILL_ALPHA))
+                draw.ellipse(bbox, outline=(*color, 255))
+            draw.ellipse(
+                (
+                    px - self._OBJECT_DOT_RADIUS_PX, py - self._OBJECT_DOT_RADIUS_PX,
+                    px + self._OBJECT_DOT_RADIUS_PX, py + self._OBJECT_DOT_RADIUS_PX,
+                ),
+                fill=(*color, 255),
+            )
+
+        full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
+        full.paste(layer, (data_left, data_top), layer)
+        img = Image.alpha_composite(img, full)
+
+        if used_categories:
+            img = self._draw_object_layer_key(img, used_categories)
+        return img
+
+    @staticmethod
+    def _draw_object_layer_key(img: "Image.Image", used_categories: set) -> "Image.Image":
+        """Small swatch+label legend, lower-left corner of `img`, one row
+        per category actually present in the current overlay -- so a
+        course with e.g. no cluster-filled rocks yet just shows Trees,
+        not a 5-row key advertising categories with nothing on screen."""
+        entries = [style for cat, style in _OBJECT_LAYER_STYLE.items() if cat in used_categories]
+        if not entries:
+            return img
+
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.load_default()
+        swatch = 10
+        pad = 6
+        line_h = swatch + 5
+        try:
+            text_w = max(draw.textlength(label, font=font) for label, _ in entries)
+        except AttributeError:  # older Pillow without textlength
+            text_w = max(len(label) for label, _ in entries) * 6
+        box_w = int(pad * 2 + swatch + 6 + text_w)
+        box_h = int(pad * 2 + line_h * len(entries))
+        x0, y0 = 8, img.height - box_h - 8
+
+        draw.rectangle((x0, y0, x0 + box_w, y0 + box_h), fill=(255, 255, 255, 210), outline=(0, 0, 0, 255))
+        for i, (label, color) in enumerate(entries):
+            sy = y0 + pad + i * line_h
+            draw.ellipse(
+                (x0 + pad, sy, x0 + pad + swatch, sy + swatch), fill=(*color, 255), outline=(0, 0, 0, 255),
+            )
+            draw.text((x0 + pad + swatch + 6, sy - 1), label, fill=(0, 0, 0, 255), font=font)
+        return img
 
     def _get_cached_heightmap(self, working_dir: Path):
         """
@@ -3545,6 +4148,15 @@ class PGAGenGUI:
                     highlight_full.paste(highlight_img, (data_left, data_top), highlight_img)
                     img = Image.alpha_composite(img, highlight_full)
 
+            # "Show objects" (Objects tab) -- drawn last, on top of
+            # everything else, so placed-object markers are never hidden
+            # under the mask/elevation/highlight overlays above. Same
+            # course-cropped-previews-only restriction as those.
+            if self.show_objects_var.get() and viz.strip_preview_version(path.name) not in (
+                PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+            ):
+                img = self._composite_objects_layer(img, Path(wd))
+
             self._set_preview_image(img)
         except Exception as e:
             self._set_preview_text(f"(couldn't load {path.name}: {e})")
@@ -3559,7 +4171,9 @@ def main() -> int:
         return 1
 
     root = tk.Tk()
-    PGAGenGUI(root)
+    gui = PGAGenGUI(root)
+    if len(sys.argv) > 1:
+        gui.working_dir.set(sys.argv[1])
     root.mainloop()
     return 0
 

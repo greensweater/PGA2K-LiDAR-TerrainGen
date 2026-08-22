@@ -14,7 +14,10 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step generate-terrain
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
                                  [--method adaptive|scatter] [--rad-m M]
-    PGA2k_gen.py <working_dir> --step output-terrain
+    PGA2k_gen.py <working_dir> --step write-terrain [--registration-marks] [--direct-height-shift]
+                                 [--prune-overlapped-stamps]
+    PGA2k_gen.py <working_dir> --step write-water [--registration-marks] [--direct-height-shift]
+                                 [--prune-overlapped-stamps]
     PGA2k_gen.py <working_dir> --step generate-trees [--detect-lidar-trees] [--mark-cartpath-trees]
     PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023|2025>]
                                  [--theme <id-or-name>] [--tree-variety] [--stake-buildings]  (2019)
@@ -45,7 +48,7 @@ independently resumable and inspectable, never a black box.
                              over earlier ones wherever they overlap;
                              deleting the highest N undoes that pass
     course/                  extracted blank .course, always at this
-                             fixed path (see ingest-course / output-terrain)
+                             fixed path (see ingest-course / write-terrain / write-water)
 
 Step ordering is enforced with clear errors (e.g. generate-terrain
 without a pointcloud.npz on disk yet) rather than letting a later step
@@ -95,6 +98,7 @@ from course_output.splines import (
     build_registration_mark_splines, build_surface_splines, feature_to_spline, save_surface_splines,
 )
 from course_output.holes import build_holes, save_holes
+from course_output.object_clusters import PGA_CLUSTER_FILLS_TAG, build_cluster_objects_v2019
 from course_output.objects import (
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_TYPE_TAG,
     apply_area_tree_type_hints, build_building_stake_objects_v2019, build_building_stake_objects_v2021,
@@ -943,7 +947,7 @@ def step_write_holes(working_dir: Path) -> None:
     actually gates export (everything else in surfaceSplines.json
     exports regardless -- see step_write_splines).
 
-    Deliberately separate from step_write_splines/step_output_terrain --
+    Deliberately separate from step_write_splines/step_write_terrain --
     lets mask settings be tweaked and holes.json regenerated on its
     own, without redoing the terrain height export or surface splines.
 
@@ -1259,20 +1263,38 @@ def step_write_objects(
         if trees:
             print(f"  theme={theme}  tree_variety={tree_variety}")
             placed_objects += build_tree_objects_v2019(trees, theme=theme, tree_variety=tree_variety)
+
+        # Loaded once and shared between stake-building and cluster-fill
+        # below (both just read features.geojson, never write it) --
+        # stake_buildings is an explicit request (errors if the file's
+        # missing); cluster-fill only fires if a feature actually carries
+        # PGA_CLUSTER_FILLS_TAG, so a missing file there just means
+        # nothing could have been tagged -- silent no-op, not an error.
+        features = None
+        features_path = working_dir / FEATURES_FILE
+        if features_path.exists():
+            features = _crop_features_to_course(working_dir, load_features(features_path))
+
         if stake_buildings:
-            features_path = working_dir / FEATURES_FILE
-            if not features_path.exists():
+            if features is None:
                 raise StepError(
                     f"--stake-buildings was given but no {FEATURES_FILE} found under {working_dir} "
                     "(needed for building corners) -- run --step ingest-osm first."
                 )
-            features = load_features(features_path)
-            features = _crop_features_to_course(working_dir, features)
             building_count = sum(1 for f in features if f.kind == "building")
             stakes = build_building_stake_objects_v2019(features)
             stake_count = sum(len(g["Value"]["items"]) for g in stakes)
             print(f"  {stake_count} stake(s) at corners of {building_count} building(s)")
             placed_objects += stakes
+
+        if features is not None:
+            tagged = [f for f in features if f.tags.get(PGA_CLUSTER_FILLS_TAG)]
+            if tagged:
+                cluster_groups = build_cluster_objects_v2019(tagged)
+                cluster_count_total = sum(len(g["Value"]["clusters"]) for g in cluster_groups)
+                print(f"  {cluster_count_total} cluster(s) across {len(tagged)} tagged spline(s)")
+                placed_objects += cluster_groups
+
         if stake_asset_path:
             print("  NOTE: --stake-asset-path is set but ignored for game_version=2019 -- "
                   "that's a v2021+-only scheme (see objects.py's build_building_stake_objects_v2021 "
@@ -2540,40 +2562,51 @@ def step_refine_terrain(
     step_visualize(working_dir)
 
 
-def _set_course_name_in_file(path: Path, course_name: str, key: str) -> None:
+def _set_json_key_in_file(path: Path, value, key: str, label: str) -> None:
     """
-    Set `key` to `course_name` in the JSON object at `path`, preserving
-    every other key already there (same preserve-everything-else
-    pattern write_user_layers.py uses for userLayers.json's sibling
-    keys). No-ops with a note if `path` doesn't exist yet, rather than
-    creating a file whose overall structure we don't actually know.
+    Set `key` to `value` in the JSON object at `path`, preserving every
+    other key already there (same preserve-everything-else pattern
+    write_user_layers.py uses for userLayers.json's sibling keys).
+    No-ops with a note if `path` doesn't exist yet, rather than creating
+    a file whose overall structure we don't actually know.
     """
     if not path.exists():
-        print(f"NOTE: course_name is set ('{course_name}') but {path} doesn't exist yet "
-              "-- run --step ingest-course first if you want the name applied there.")
+        print(f"NOTE: {label} is set ({value!r}) but {path} doesn't exist yet "
+              "-- run --step ingest-course first if you want it applied there.")
         return
 
     with path.open(encoding="utf-8") as f:
         data = json.load(f)
-    data[key] = course_name
+    data[key] = value
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    print(f"Set course name to '{course_name}' in {path}")
+    print(f"Set {label} to {value!r} in {path}")
 
 
-def step_output_terrain(
-    working_dir: Path, registration_marks: bool = False, direct_height_shift: bool = False,
-) -> None:
-    course_dir = working_dir / "course"
-
+def _load_normalized_stamps(
+    working_dir: Path, registration_marks: bool, direct_height_shift: bool,
+    prune_overlapped_stamps: bool,
+) -> tuple[list, "BoundingBox", float, float]:
+    """
+    Shared by step_write_terrain and step_write_water: load every
+    stamp layer, optionally prune fully-overwritten stamps, optionally
+    add registration marks, then height-normalize -- the exact stamp
+    list/normalization both steps need to agree on, since water levels
+    (course_output/water.py) are fit against the ALREADY-normalized
+    stamp list, not the raw one. Returns (stamps, bounds, true_min,
+    true_max) -- true_min/true_max are the pre-shift resolved range,
+    used by the terrain step to persist output_height_shift_m/
+    output_height_range_m.
+    """
     print(f"Loading stamps from {working_dir} (all layers)...")
     stamps = load_all_stamps(working_dir)
     print(f"  {len(stamps)} stamps")
 
-    stamps, pruned_count = prune_overwritten_stamps(stamps)
-    if pruned_count:
-        print(f"  Pruned {pruned_count} stamp(s) fully overwritten by later stamps "
-              f"({len(stamps)} remain)")
+    if prune_overlapped_stamps:
+        stamps, pruned_count = prune_overwritten_stamps(stamps)
+        if pruned_count:
+            print(f"  Pruned {pruned_count} stamp(s) fully overwritten by later stamps "
+                  f"({len(stamps)} remain)")
 
     if registration_marks:
         marks = build_registration_mark_stamps(COURSE_SIZE_M)
@@ -2588,24 +2621,25 @@ def step_output_terrain(
     try:
         if direct_height_shift:
             print("  Using --direct-height-shift: shifting each stamp's own value directly "
-                  "(A/B test) instead of appending a course-wide shim stamp.")
+                  "instead of appending a course-wide shim stamp.")
             stamps = normalize_stamp_heights_by_value_shift(stamps, bounds)
         else:
             stamps = normalize_stamp_heights(stamps, bounds)
     except ValueError as e:
         raise StepError(str(e)) from e
 
-    water_entries: list[dict] = []
-    features_path = working_dir / FEATURES_FILE
-    if features_path.exists():
-        print("Building water objects from OSM water features (course_output/water.py)...")
-        features = load_features(features_path)
-        features = _crop_features_to_course(working_dir, features)
-        water_features = [f for f in features if f.kind == "water"]
-        water_entries = build_water_objects(water_features, stamps)
-    else:
-        print(f"  No {FEATURES_FILE} found -- skipping water objects (run --step ingest-osm first "
-              "if this course has water hazards).")
+    return stamps, bounds, true_min, true_max
+
+
+def step_write_terrain(
+    working_dir: Path, registration_marks: bool = False, direct_height_shift: bool = True,
+    prune_overlapped_stamps: bool = True,
+) -> None:
+    course_dir = working_dir / "course"
+
+    stamps, _bounds, true_min, true_max = _load_normalized_stamps(
+        working_dir, registration_marks, direct_height_shift, prune_overlapped_stamps,
+    )
 
     nodes_dir = course_dir / "CourseDescription_nodes"
     if not nodes_dir.is_dir():
@@ -2615,7 +2649,7 @@ def step_output_terrain(
         )
 
     out_path = nodes_dir / "userLayers.json"
-    write_user_layers(stamps, out_path, water=water_entries)
+    write_user_layers(out_path, stamps=stamps)
     print(f"Wrote {out_path}")
 
     # If a course name has been set (see the GUI's "Course name" field /
@@ -2628,16 +2662,77 @@ def step_output_terrain(
     project = load_project(working_dir)
     course_name = project.get("course_name")
     if course_name:
-        _set_course_name_in_file(course_dir / "CourseDescription.json", course_name, "name")
+        _set_json_key_in_file(course_dir / "CourseDescription.json", course_name, "name", "course name")
         # ASSUMPTION: using the same "name" key here as CourseDescription.json --
         # unconfirmed for CourseMetadata.json specifically. If the game doesn't
         # pick up the name after this, that key name is the first thing to check.
-        _set_course_name_in_file(course_dir / "CourseMetadata.json", course_name, "name")
+        _set_json_key_in_file(course_dir / "CourseMetadata.json", course_name, "name", "course name")
+
+    # Same idea for the selected theme (see the GUI's Objects tab / the
+    # objects_theme project.json field, set by --step write-objects or
+    # the GUI dropdown).
+    theme_id = project.get("objects_theme")
+    if theme_id is not None:
+        # ASSUMPTION: writing the integer theme id (matching THEMES_V2019 /
+        # objects_theme's existing representation) into both files' root --
+        # unconfirmed against a real CourseDescription.json/CourseMetadata.json
+        # sample. If the game doesn't pick up the theme after this, check
+        # whether it expects the theme *name* instead (see THEMES_V2019).
+        _set_json_key_in_file(course_dir / "CourseDescription.json", theme_id, "theme", "theme")
+        _set_json_key_in_file(course_dir / "CourseMetadata.json", theme_id, "courseTheme", "theme")
 
     save_project(working_dir, {
         "output_height_shift_m": -true_min,
         "output_height_range_m": true_max - true_min,
     })
+
+
+def step_write_water(
+    working_dir: Path, registration_marks: bool = False, direct_height_shift: bool = True,
+    prune_overlapped_stamps: bool = True,
+) -> None:
+    """
+    Writes only userLayers.json's "water" key, leaving "height" (and
+    everything else) exactly as found -- split out from step_write_terrain
+    because building water objects means re-running the full stamp
+    load/prune/normalize pipeline AND fitting each water polygon
+    against a fresh TerrainModel (course_output/water.py), which is
+    slow enough that it shouldn't be forced on every terrain-only
+    iteration. Water is fit against the CURRENT stamp list here (same
+    pruning/registration-marks/direct-height-shift settings as
+    step_write_terrain), not whatever was last written to
+    userLayers.json -- run this again after any terrain change that
+    should be reflected in water levels.
+    """
+    course_dir = working_dir / "course"
+
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(
+            f"No {FEATURES_FILE} found under {working_dir} -- run --step ingest-osm first "
+            "if this course has water hazards."
+        )
+
+    nodes_dir = course_dir / "CourseDescription_nodes"
+    if not nodes_dir.is_dir():
+        raise StepError(
+            f"{nodes_dir} doesn't exist. Run --step ingest-course to extract a blank "
+            f"starting .course into {course_dir} first."
+        )
+
+    stamps, _bounds, _true_min, _true_max = _load_normalized_stamps(
+        working_dir, registration_marks, direct_height_shift, prune_overlapped_stamps,
+    )
+
+    print("Building water objects from OSM water features (course_output/water.py)...")
+    features = load_features(features_path)
+    features = _crop_features_to_course(working_dir, features)
+    water_features = [f for f in features if f.kind == "water"]
+    water_entries = build_water_objects(water_features, stamps)
+
+    out_path = nodes_dir / "userLayers.json"
+    write_user_layers(out_path, water=water_entries)
+    print(f"Wrote {out_path} ({len(water_entries)} water object(s))")
 
 
 def step_ingest_course(working_dir: Path, course_file: Path) -> None:
@@ -2722,7 +2817,8 @@ STEPS = {
     "generate-terrain": step_generate_terrain,
     "generate-cart-paths": step_generate_cart_paths,
     "refine-terrain": step_refine_terrain,
-    "output-terrain": step_output_terrain,
+    "write-terrain": step_write_terrain,
+    "write-water": step_write_water,
     "write-splines": step_write_splines,
     "write-holes": step_write_holes,
     "generate-trees": step_generate_trees,
@@ -3118,20 +3214,24 @@ def main(argv: list[str] | None = None) -> int:
                               "can hit an exact target height. Default: use whatever's saved in "
                               "project.json, or all four (8,9,10,54) if never set.")
     parser.add_argument("--registration-marks", action="store_true",
-                         help="output-terrain/write-splines: add a small type-73 (circle) raise "
-                              "stamp and a matching 5m circle spline (cart path surface) at each of "
-                              "the 4 course corners (5m inset from each edge) -- for visually "
+                         help="write-terrain/write-water/write-splines: add a small type-73 (circle) "
+                              "raise stamp and a matching 5m circle spline (cart path surface) at "
+                              "each of the 4 course corners (5m inset from each edge) -- for visually "
                               "confirming in-game that terrain and splines land exactly where "
                               "expected, and that the game isn't scaling/repositioning either one "
                               "unexpectedly. Opt-in; off by default.")
-    parser.add_argument("--direct-height-shift", action="store_true",
-                         help="output-terrain: A/B test for the 'cheese grater' stamp-seam artifact -- "
-                              "normalize final heights by shifting every stamp's own value directly "
-                              "(normalize_stamp_heights_by_value_shift) instead of the default method's "
-                              "appended course-wide raise stamp (normalize_stamp_heights). Not a "
-                              "mathematically equivalent shift (see that function's docstring); this "
-                              "exists to check whether the default method's shim stamp is what's "
-                              "causing the seams, not to replace it. Opt-in; off by default.")
+    parser.add_argument("--direct-height-shift", action=argparse.BooleanOptionalAction, default=True,
+                         help="write-terrain/write-water: normalize final heights by shifting every "
+                              "stamp's own value directly (normalize_stamp_heights_by_value_shift) "
+                              "instead of appending a course-wide shim stamp (normalize_stamp_heights, "
+                              "--no-direct-height-shift) -- not a mathematically equivalent shift (see "
+                              "that function's docstring). Default: on.")
+    parser.add_argument("--prune-overlapped-stamps", action=argparse.BooleanOptionalAction, default=True,
+                         help="write-terrain/write-water: drop stamps fully overwritten by later "
+                              "stamps before writing/fitting water (terrain/stamp_pruning.py) -- pure "
+                              "cleanup with no effect on the resolved terrain, just fewer stamps in "
+                              "the output. --no-prune-overlapped-stamps keeps every stamp as-is. "
+                              "Default: on.")
     parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
@@ -3357,9 +3457,14 @@ def main(argv: list[str] | None = None) -> int:
                                  args.use_slope_radius, args.use_variation_radius,
                                  args.variation_contrast_gamma, args.density_weighted,
                                  args.subpixel_jitter_fraction)
-        elif args.step == "output-terrain":
-            step_output_terrain(working_dir, registration_marks=args.registration_marks,
-                                 direct_height_shift=args.direct_height_shift)
+        elif args.step == "write-terrain":
+            step_write_terrain(working_dir, registration_marks=args.registration_marks,
+                                direct_height_shift=args.direct_height_shift,
+                                prune_overlapped_stamps=args.prune_overlapped_stamps)
+        elif args.step == "write-water":
+            step_write_water(working_dir, registration_marks=args.registration_marks,
+                              direct_height_shift=args.direct_height_shift,
+                              prune_overlapped_stamps=args.prune_overlapped_stamps)
         elif args.step == "write-splines":
             step_write_splines(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-holes":

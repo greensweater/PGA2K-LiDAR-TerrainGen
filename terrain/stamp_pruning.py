@@ -4,9 +4,10 @@ terrain/stamp_pruning.py
 Detects and drops stamps whose entire effect is masked out by later
 stamps -- e.g. a coarse SHAPE_SQUARE "raster fill" tile (see
 rastergrid.py) that a subsequent higher-resolution flatten pass has
-completely paved over. Folded automatically into step_output_terrain
-(see PGA2k_gen.py) right after the stamp list is loaded, so it needs
-no separate opt-in step and no GUI toggle.
+completely paved over. Folded automatically into step_write_terrain/
+step_write_water (see PGA2k_gen.py's _load_normalized_stamps) right
+after the stamp list is loaded -- opt-out via --no-prune-overlapped-
+stamps / the GUI's "Delete overlapped stamps" checkbox, on by default.
 
 Why a later stamp can make an earlier one *provably* irrelevant:
 TerrainModel folds every stamp as an affine map of the incoming height

@@ -121,7 +121,9 @@ to change from an earlier version to get here:
 
 This means water objects must be built AFTER terrain generation/
 refinement AND normalize_stamp_heights have both already run (see
-PGA2k_gen.py's step_output_terrain) -- not before, and not against the
+PGA2k_gen.py's step_write_water, which re-runs that same load/prune/
+normalize pipeline itself via _load_normalized_stamps rather than
+trusting whatever's already on disk) -- not before, and not against the
 pre-normalization stamp list. A water body with no stamp centers inside
 it (rare, but possible for a very small pond sitting between coarse
 hex-grid stamps) has no level to compute from and is skipped -- logged

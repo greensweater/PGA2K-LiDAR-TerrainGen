@@ -17,11 +17,12 @@ produces landscape-mode ("flatten", tool 0) stamps, which belong under
 the "height" key; "terrainHeight" is where sculpt-mode stamps would go
 (tied to a zero-height baseline), which we deliberately don't use (see
 terrain_model.py). write_user_layers() therefore reads whatever's
-already at the target path, replaces only "height", and leaves every
-other key exactly as it found it -- falling back to an all-empty
-schema if no file exists there yet. As more of the pipeline gets built
-(trees, water, surfaces, ...), more keys will start getting generated
-here instead of just passed through.
+already at the target path, replaces only whichever of "height"/
+"water" it was actually given, and leaves every other key (including
+the other of that pair, if omitted) exactly as it found it -- falling
+back to an all-empty schema if no file exists there yet. As more of
+the pipeline gets built (trees, surfaces, ...), more keys will start
+getting generated here instead of just passed through.
 
 Field mapping from Stamp -> one entry in the "height" array:
     tool     -- stamp.tool (0=flatten, 1=raise). Both live in the same
@@ -394,15 +395,18 @@ def stamp_to_entry(stamp: Stamp) -> dict:
 
 
 def write_user_layers(
-    stamps: Sequence[Stamp], path: Path, water: Optional[Sequence[dict]] = None,
+    path: Path, stamps: Optional[Sequence[Stamp]] = None, water: Optional[Sequence[dict]] = None,
 ) -> None:
     """
-    Write `stamps` into the "height" key of the userLayers.json at
-    `path`, preserving every other key already there. If `water` is
-    given (see water.py's build_water_objects), also replaces the
-    "water" key the same way; if omitted (None), "water" is left
-    exactly as found -- same "only touch what you were actually asked
-    to write" principle as "height" itself.
+    Write into the userLayers.json at `path`, preserving every other
+    key already there. If `stamps` is given, replaces the "height" key;
+    if `water` is given (see water.py's build_water_objects), replaces
+    the "water" key -- each independently, so a caller can write just
+    one without disturbing the other (e.g. PGA2k_gen.py's
+    step_write_terrain writes only "height", step_write_water only
+    "water"). Either or both may be omitted (None), in which case that
+    key is left exactly as found -- same "only touch what you were
+    actually asked to write" principle throughout.
 
     If `path` doesn't exist yet, falls back to an all-empty schema
     (_BLANK_USER_LAYERS_SCHEMA) rather than writing a bare array --
@@ -416,7 +420,8 @@ def write_user_layers(
     else:
         data = dict(_BLANK_USER_LAYERS_SCHEMA)
 
-    data["height"] = [stamp_to_entry(s) for s in stamps]
+    if stamps is not None:
+        data["height"] = [stamp_to_entry(s) for s in stamps]
     if water is not None:
         data["water"] = list(water)
 
