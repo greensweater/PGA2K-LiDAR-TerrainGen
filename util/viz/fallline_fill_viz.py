@@ -78,7 +78,7 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from boundary_trace_viz import trace_and_simplify, DEFAULT_TOLERANCE
+    from util.viz.boundary_trace_viz import trace_and_simplify, DEFAULT_TOLERANCE
 except ImportError as e:
     print(f"Couldn't import boundary_trace_viz ({e}).\n"
           "This tool reuses trace_and_simplify rather than re-deriving it -- "
