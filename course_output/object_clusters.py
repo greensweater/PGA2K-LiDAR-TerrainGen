@@ -62,7 +62,7 @@ import math
 import random
 from typing import Optional
 
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
 from course_output.asset_catalog import ASSET_CATEGORIES, ASSET_ENTRIES, AssetCategory, AssetEntry, cluster_count
@@ -80,12 +80,39 @@ from ingest.osm import Feature
 # value round-trips fine (not restricted to OSM-style string tags).
 PGA_CLUSTER_FILLS_TAG = "pga_cluster_fills"
 
+# Feature.kind values for the two synthetic, GUI-generated Features this
+# module's border/masked-manual fill modes create (see PGA2k_gen_gui.py's
+# _open_cluster_fill_dialog) -- neither exists anywhere in ingest/osm.py's
+# classify_way, so both are guaranteed never to be picked up by any
+# f.kind == "..." check elsewhere in the pipeline (splines/holes/water/mask
+# building all filter by a fixed allow-list of real OSM-derived kinds).
+SYNTHETIC_BORDER_KIND = "pga_cluster_border"
+SYNTHETIC_MASKED_KIND = "pga_cluster_masked"
+
+# Fill spec dicts' "source" field -- distinguishes a fill tagged directly
+# onto a real spline's own geometry (manual, the original/default behavior)
+# from one tagged onto a synthetic ring/clipped Feature (border). Purely a
+# display/bookkeeping field: packing code (below) never reads it, so a spec
+# predating this field's existence is fine to treat as "manual" wherever it
+# does get read (see PGA2k_gen_gui.py's _build_cluster_fill_rows).
+CLUSTER_FILL_SOURCE_MANUAL = "manual"
+CLUSTER_FILL_SOURCE_BORDER = "border"
+
 DEFAULT_RASTER_RATIO = 1.0
 SUBDIVIDE_RATIO = 0.5  # pass 2's radius relative to pass 1's (max_radius * this)
 MAX_CONSECUTIVE_FAILURES = 30  # a dart-throw pass gives up once this many candidates in a row are rejected
 MAX_PACK_ATTEMPTS = 500  # hard cap on candidate draws per dart-throw pass, safety net for pathological geometry
 _MIN_USEFUL_RADIUS = 0.1  # below this a pass is pointless (every real category's radius is well above it)
 _AREA_GEOM_TYPES = ("Polygon", "MultiPolygon")
+
+# Matches userLayers.py/water.py's own _DECIMALS convention -- every
+# value written into placedObjects2.json is rounded to millimeter
+# precision, plenty for this project's purposes.
+_DECIMALS = 3
+
+
+def _round(value: float) -> float:
+    return round(float(value), _DECIMALS)
 
 _ENTRIES_BY_KEY = {(e.category, e.type): e for e in ASSET_ENTRIES}
 
@@ -185,15 +212,39 @@ def _pack_circles(geometry, max_radius: float, ratio: float, rng: random.Random)
     return placed
 
 
+def build_border_ring_geometry(mask_geometry, border_width: float):
+    """
+    Stroke mask_geometry's own outline (its .boundary) by border_width --
+    a SYMMETRIC stroke, since Shapely buffers a LineString/MultiLineString
+    outward on both sides: half of border_width extends inward from the
+    outline, half extends outward. If border_width/2 exceeds however far
+    mask_geometry's own outline already sits from the original spline(s)
+    it was buffered from, the inward half can reach back past that
+    original edge -- intentional, lets a ring dip inside the source shape
+    rather than only ever sitting entirely outside it.
+
+    mask_geometry.boundary on a MultiPolygon is a MultiLineString --
+    buffering it still produces one separate ring per disjoint region,
+    which is what e.g. several individually-marked lake splines want.
+
+    Returns an empty Polygon (never raises) if mask_geometry is None/empty
+    or border_width <= 0 -- callers must check .is_empty before using the
+    result (e.g. before persisting it into a Feature).
+    """
+    if mask_geometry is None or mask_geometry.is_empty or border_width <= 0:
+        return Polygon()
+    return mask_geometry.boundary.buffer(border_width / 2.0)
+
+
 def _cluster_entry(x: float, z: float, radius: float, count: int, rng: random.Random) -> dict:
     """One Value.clusters entry -- schema confirmed directly against a real placedObjects2.json."""
     return {
-        "position": {"x": x - GRID_ORIGIN_OFFSET, "y": "-Infinity", "z": z - GRID_ORIGIN_OFFSET},
+        "position": {"x": _round(x - GRID_ORIGIN_OFFSET), "y": "-Infinity", "z": _round(z - GRID_ORIGIN_OFFSET)},
         "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
         "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
         "seed": rng.randrange(0, 2**31 - 1),
         "count": count,
-        "radius": radius,
+        "radius": _round(radius),
     }
 
 

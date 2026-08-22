@@ -157,6 +157,15 @@ TREE_RADIUS_TAG = "pga_tree_radius"
 MIN_HEIGHT_SCALE = 0.5
 MAX_HEIGHT_SCALE = 1.2
 
+# Matches userLayers.py/water.py's own _DECIMALS convention -- every
+# value written into placedObjects2.json is rounded to millimeter
+# precision, plenty for this project's purposes.
+_DECIMALS = 3
+
+
+def _round(value: float) -> float:
+    return round(float(value), _DECIMALS)
+
 # ---------------------------------------------------------------------------
 # v2019 -- Chad Rockey's TGC-Designer-Tools category/type/theme scheme,
 # ported from OSMTGC.py's newTree()/tgc_image_terrain.py's get_trees(),
@@ -533,9 +542,9 @@ def _placed_item(x: float, z: float, scale: float, rotation_degrees: float = 0.0
     scale.z = `scale`. Shared by every version's builder -- see module
     docstring on why this shape is assumed version-independent."""
     return {
-        "position": {"x": x - GRID_ORIGIN_OFFSET, "y": "-Infinity", "z": z - GRID_ORIGIN_OFFSET},
-        "rotation": {"x": 0.0, "y": rotation_degrees, "z": 0.0},
-        "scale": {"x": scale, "y": scale, "z": scale},
+        "position": {"x": _round(x - GRID_ORIGIN_OFFSET), "y": "-Infinity", "z": _round(z - GRID_ORIGIN_OFFSET)},
+        "rotation": {"x": 0.0, "y": _round(rotation_degrees), "z": 0.0},
+        "scale": {"x": _round(scale), "y": _round(scale), "z": _round(scale)},
     }
 
 
@@ -816,6 +825,39 @@ def build_building_stake_objects_v2021(features: list[Feature], stake_asset_path
             group["Value"]["items"].append(_placed_item(x, z, scale=1.0))
 
     return [group] if group["Value"]["items"] else []
+
+
+def merge_object_groups(groups: list[dict]) -> list[dict]:
+    """
+    Collapse `groups` down to exactly one group per distinct Key,
+    concatenating each Value list field (items/clusters/splines) in
+    encounter order, first-seen Key order preserved.
+
+    build_tree_objects_v2019/_v2021 and build_cluster_objects_v2019
+    already merge groups sharing a Key WITHIN their own call, but
+    step_write_objects concatenates several independent builder calls
+    (trees, building stakes, cluster fills) with a plain `+=` -- if two
+    of those calls happen to land on the same Key (e.g. a user's
+    cluster-fill spec tagged onto the same category/type
+    BUILDING_STAKE_CATEGORY_V2019/TYPE_V2019 uses, or a cluster-fill
+    category that happens to match the tree category), the result was
+    two separate placedObjects2.json nodes for what the game treats as
+    one asset, instead of one node with everything merged in. This is
+    the single place that's fixed up, applied once after every
+    builder's contribution has been concatenated together.
+    """
+    merged: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for g in groups:
+        key = tuple(sorted(g["Key"].items()))
+        if key not in merged:
+            merged[key] = {"Key": g["Key"], "Value": {}}
+            order.append(key)
+        dest_value = merged[key]["Value"]
+        for field, seq in g.get("Value", {}).items():
+            dest_value.setdefault(field, [])
+            dest_value[field].extend(seq)
+    return [merged[k] for k in order]
 
 
 def object_counts(objects: list[dict]) -> list[tuple[str, int, int, int]]:

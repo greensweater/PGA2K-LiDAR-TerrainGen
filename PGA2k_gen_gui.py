@@ -68,7 +68,10 @@ from course_output.objects import (  # noqa: E402
 from course_output.asset_catalog import (  # noqa: E402
     ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS,
 )
-from course_output.object_clusters import DEFAULT_RASTER_RATIO, PGA_CLUSTER_FILLS_TAG  # noqa: E402
+from course_output.object_clusters import (  # noqa: E402
+    CLUSTER_FILL_SOURCE_BORDER, CLUSTER_FILL_SOURCE_MANUAL, DEFAULT_RASTER_RATIO,
+    PGA_CLUSTER_FILLS_TAG, SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND, build_border_ring_geometry,
+)
 from course_output.userLayers import GRID_ORIGIN_OFFSET  # noqa: E402
 from ingest.osm import (  # noqa: E402
     DEFAULT_HOLE_CORRIDOR_BUFFER_PX, Feature, build_height_mask, crop_features,
@@ -254,11 +257,15 @@ class PGAGenGUI:
         self._cached_mask_geom_key = None
         self._cached_composited_base = None  # see _show_preview's static-part cache (zoom-independent)
         self._cached_composited_base_key = None
+        self._cached_geo_overlay = None  # see _show_preview's geo-overlay cache (mask buffer/spline highlight, also zoom-independent)
+        self._cached_geo_overlay_key = None
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
-        self._cluster_fill_rows = []  # (spline_osm_ids_str, asset_label, ratio) -- see _build_cluster_fill_rows
+        self._cluster_fill_rows = []  # (spline_osm_ids_str, asset_label, ratio, source) -- see _build_cluster_fill_rows
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
+        self._highlighted_object_points = []  # (x, z) of currently-selected individual object/tree row(s), for a preview ring
+        self._highlighted_object_group_spline_ids = set()  # currently-selected cluster-fill row(s)' source spline osm_ids, unioned into the spline highlight overlay
         self._selection_preview_job = None  # see _on_spline_selected's debounce
         self._splines_selection_memory: set[str] = set()  # see _splines_memory_store/_recall
         self._suppress_course_name_save = False
@@ -1472,25 +1479,15 @@ class PGAGenGUI:
         "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
         "water", "cartpath", "service_road", "roadway", "driveway", "path",
         "building", "wood", "pavement", "mulch", "hole",
+        SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND,
     )
 
     BRUSH_TYPE_ORDER = (8, 9, 10, 54)
     BRUSH_TYPE_LABELS = {8: "hard", 9: "med", 10: "soft", 54: "smooth"}
 
-    _OBJECT_SOURCE_FILTERS = ("All", "OSM", "LIDAR", "Manual")
+    _OBJECT_SOURCE_FILTERS = ("All", "OSM", "LIDAR", "Manual", "Border")
 
     def _build_splines_tab(self, parent: ttk.Frame) -> None:
-        filter_row = ttk.Frame(parent)
-        filter_row.pack(fill="x")
-        ttk.Label(filter_row, text="Filter:").pack(side="left")
-        self.splines_kind_filter_var = tk.StringVar(value="All")
-        filter_box = ttk.Combobox(
-            filter_row, textvariable=self.splines_kind_filter_var, state="readonly", width=12,
-            values=self._SPLINE_KIND_FILTERS,
-        )
-        filter_box.pack(side="left", padx=4)
-        filter_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_splines_list())
-        ttk.Button(filter_row, text="Refresh", command=self._refresh_splines_list).pack(side="left")
 
         hole_width_row = ttk.Frame(parent)
         hole_width_row.pack(fill="x", pady=(4, 0))
@@ -1523,25 +1520,29 @@ class PGAGenGUI:
         # dragging the slider shows exactly how far the buffer currently
         # reaches without needing to re-run ingest-osm each time (see
         # _get_cached_mask_merged_geometry / ingest.osm.rasterize_mask_rgba).
-        mask_row = ttk.Frame(parent)
-        mask_row.pack(fill="x", pady=(4, 0))
+        # Also doubles as the base geometry for the "Border" object-fill
+        # mode below (see _mask_geometry_full_frame) -- Mask/Source/Buffer
+        # (px) are shared by both the preview and that fill mode; Border
+        # and Border width (m) are new, only meaningful to the fill mode.
+        mask_section = ttk.Frame(parent)
+        mask_section.pack(fill="x", pady=(4, 0))
+
+        mask_row1 = ttk.Frame(mask_section)
+        mask_row1.pack(fill="x")
         self.show_mask_buffer_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            mask_row, text="Mask buffer", variable=self.show_mask_buffer_var,
+            mask_row1, text="Mask", variable=self.show_mask_buffer_var,
             command=self._show_preview,
         ).pack(side="left")
-        ttk.Label(mask_row, text="Buffer (px):").pack(side="left", padx=(8, 0))
-        self.mask_buffer_preview_var = tk.DoubleVar(value=50.0)
-        ttk.Scale(
-            mask_row, from_=0.0, to=400.0, orient="horizontal",
-            variable=self.mask_buffer_preview_var, command=lambda _v: self._show_preview(),
-        ).pack(side="left", fill="x", expand=True, padx=4)
-        self.mask_buffer_preview_label = ttk.Label(mask_row, text="50", width=4)
-        self.mask_buffer_preview_label.pack(side="left")
-        ttk.Label(mask_row, text="Source:").pack(side="left", padx=(8, 0))
+        self.mask_border_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            mask_row1, text="Border", variable=self.mask_border_var,
+            command=self._show_preview,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(mask_row1, text="Source:").pack(side="left", padx=(8, 0))
         self.mask_source_var = tk.StringVar(value="marked")
         mask_source_combo = ttk.Combobox(
-            mask_row, textvariable=self.mask_source_var, state="readonly", width=8,
+            mask_row1, textvariable=self.mask_source_var, state="readonly", width=8,
             values=("marked", "selected"),
         )
         mask_source_combo.pack(side="left", padx=(2, 0))
@@ -1549,8 +1550,43 @@ class PGAGenGUI:
         _Tooltip(mask_source_combo, "What defines the mask region: 'marked' uses whatever Features "
                  "are flagged in the Splines tab (Toggle Mask/Toggle All); 'selected' uses whichever "
                  "spline(s) are currently selected in the Splines tab instead, regardless of their "
-                 "mask flag. Both still go through the same Buffer (px) outward buffer above.")
+                 "mask flag. Both still go through the same Buffer (px) outward buffer above -- and, "
+                 "when 'Border' is checked, feed the border ring's base outline too.")
 
+        mask_row2 = ttk.Frame(mask_section)
+        mask_row2.pack(fill="x", pady=(2, 0))
+        ttk.Label(mask_row2, text="Buffer:").pack(side="left")
+        self.mask_buffer_preview_var = tk.DoubleVar(value=50.0)
+        ttk.Scale(
+            mask_row2, from_=0.0, to=400.0, orient="horizontal",
+            variable=self.mask_buffer_preview_var, command=lambda _v: self._show_preview(),
+        ).pack(side="left", fill="x", expand=True, padx=4)
+        self.mask_buffer_preview_label = ttk.Label(mask_row2, text="50", width=4)
+        self.mask_buffer_preview_label.pack(side="left")
+
+        mask_row3 = ttk.Frame(mask_section)
+        mask_row3.pack(fill="x", pady=(2, 0))
+        ttk.Label(mask_row3, text="Border:").pack(side="left")
+        self.border_width_var = tk.DoubleVar(value=10.0)
+        ttk.Scale(
+            mask_row3, from_=0.0, to=400.0, orient="horizontal",
+            variable=self.border_width_var, command=lambda _v: self._show_preview(),
+        ).pack(side="left", fill="x", expand=True, padx=4)
+        self.border_width_preview_label = ttk.Label(mask_row3, text="10", width=4)
+        self.border_width_preview_label.pack(side="left")
+
+        filter_row = ttk.Frame(parent)
+        filter_row.pack(fill="x")
+        ttk.Label(filter_row, text="Filter:").pack(side="left")
+        self.splines_kind_filter_var = tk.StringVar(value="All")
+        filter_box = ttk.Combobox(
+            filter_row, textvariable=self.splines_kind_filter_var, state="readonly", width=12,
+            values=self._SPLINE_KIND_FILTERS,
+        )
+        filter_box.pack(side="left", padx=4)
+        filter_box.bind("<<ComboboxSelected>>", lambda e: self._refresh_splines_list())
+        ttk.Button(filter_row, text="Refresh", command=self._refresh_splines_list).pack(side="left")
+        
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.splines_tree = ttk.Treeview(
@@ -1711,6 +1747,7 @@ class PGAGenGUI:
         self.objects_tree.column("source", width=55, anchor="center")
         self.objects_tree.column("detail", width=110)
         self.objects_tree.pack(side="left", fill="both", expand=True)
+        self.objects_tree.bind("<<TreeviewSelect>>", lambda e: self._on_object_selected())
         obj_tree_scroll = ttk.Scrollbar(obj_tree_frame, orient="vertical", command=self.objects_tree.yview)
         obj_tree_scroll.pack(side="left", fill="y")
         self.objects_tree["yscrollcommand"] = obj_tree_scroll.set
@@ -1886,29 +1923,31 @@ class PGAGenGUI:
         return " ".join(parts)
 
     @staticmethod
-    def _build_cluster_fill_rows(features: list) -> list[tuple[str, str, float]]:
+    def _build_cluster_fill_rows(features: list) -> list[tuple[str, str, float, str]]:
         """
-        (spline_osm_ids, asset_label, ratio) -- one row per distinct
-        {"category","type","ratio"} fill spec seen across `features`
-        (see course_output/object_clusters.py's PGA_CLUSTER_FILLS_TAG),
-        with every contributing spline's osm_id collected together --
-        so a single Fill action (which can target many splines and
-        several assets at once) shows as one row per asset/ratio
-        combo, not one row per spline.
+        (spline_osm_ids, asset_label, ratio, source) -- one row per
+        distinct {"category","type","ratio","source"} fill spec seen
+        across `features` (see course_output/object_clusters.py's
+        PGA_CLUSTER_FILLS_TAG), with every contributing spline's osm_id
+        collected together -- so a single Fill action (which can target
+        many splines and several assets at once) shows as one row per
+        asset/ratio/source combo, not one row per spline. `source`
+        defaults to "manual" for specs saved before that field existed.
         """
         groups: dict[tuple, list[int]] = {}
         for f in features:
             if f.osm_id is None:
                 continue
             for spec in f.tags.get(PGA_CLUSTER_FILLS_TAG) or []:
-                key = (spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO))
+                source = spec.get("source", CLUSTER_FILL_SOURCE_MANUAL)
+                key = (spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO), source)
                 groups.setdefault(key, []).append(f.osm_id)
 
         rows = []
-        for (category, type_, ratio), osm_ids in groups.items():
+        for (category, type_, ratio, source), osm_ids in groups.items():
             label = _ASSET_LABEL_BY_KEY.get((category, type_), f"category={category}/type={type_}")
             ids_str = ",".join(str(i) for i in sorted(set(osm_ids)))
-            rows.append((ids_str, label, ratio))
+            rows.append((ids_str, label, ratio, source))
         return rows
 
     def _refresh_objects_list(self) -> None:
@@ -1917,14 +1956,19 @@ class PGAGenGUI:
         object_list.json (individually placed trees -- iid is a plain
         int index into self._objects_tree_list, source OSM/LIDAR) and
         features.geojson's cluster-fill tags (area fills -- iid is
-        "c"+index into self._cluster_fill_rows, source "manual"). Kept
-        as two disjoint iid namespaces so _clear_filtered_objects (tree-
-        only) can never mistake one for the other.
+        "c"+index into self._cluster_fill_rows, source "manual" or
+        "border"). Kept as two disjoint iid namespaces so
+        _clear_filtered_objects (tree-only) can never mistake one for
+        the other.
         """
         wd = self.working_dir.get().strip()
         self.objects_tree.delete(*self.objects_tree.get_children())
         self._objects_tree_list = []
         self._cluster_fill_rows = []
+        # Old iids/indices are gone along with the rows above -- drop any
+        # stale preview highlight state rather than let it dangle.
+        self._highlighted_object_points = []
+        self._highlighted_object_group_spline_ids = set()
         if not wd or not Path(wd).is_dir():
             return
 
@@ -1951,16 +1995,17 @@ class PGAGenGUI:
                 "", "end", iid=str(i), values=(f"{x:.1f}", f"{z:.1f}", source, self._object_detail(tags)),
             )
 
-        if filter_val in ("All", "Manual"):
-            for j, (spline_ids, asset_label, ratio) in enumerate(self._cluster_fill_rows):
-                detail = f"splines={spline_ids} fill={asset_label} ratio={ratio:g}"
-                self.objects_tree.insert("", "end", iid=f"c{j}", values=("", "", "manual", detail))
+        for j, (spline_ids, asset_label, ratio, source) in enumerate(self._cluster_fill_rows):
+            if filter_val not in ("All", source.capitalize()):
+                continue
+            detail = f"splines={spline_ids} fill={asset_label} ratio={ratio:g}"
+            self.objects_tree.insert("", "end", iid=f"c{j}", values=("", "", source, detail))
 
     def _clear_filtered_objects(self) -> None:
         """
-        Deletes trees only -- manual cluster fills (source "manual",
-        iid prefixed "c") are managed from the Splines tab's Clear
-        Cluster Fills instead, since they live in features.geojson's
+        Deletes trees only -- cluster fills (source "manual" or
+        "border", iid prefixed "c") are managed from the Splines tab's
+        Clear Cluster Fills instead, since they live in features.geojson's
         tags, not object_list.json.
         """
         wd = self._require_working_dir()
@@ -2036,6 +2081,44 @@ class PGAGenGUI:
     def _show_preview_after_selection(self) -> None:
         self._selection_preview_job = None
         self._show_preview()
+
+    def _on_object_selected(self) -> None:
+        """
+        Objects-tab counterpart to _on_spline_selected -- same debounce
+        (and same shared self._selection_preview_job/_show_preview_after_selection),
+        since only one of the two trees is ever the one the user just
+        clicked in. A plain object/tree row (iid is a digit, indexing
+        self._objects_tree_list) has a concrete (x, z) to ring-highlight
+        directly in _composite_objects_layer. A cluster-fill "group" row
+        (iid "c"+index into self._cluster_fill_rows) has no such fixed
+        points -- object_clusters.py's packed positions carry no
+        back-reference to the spline(s) that produced them -- so instead
+        its source spline osm_ids feed into the SAME spline-highlight
+        overlay _on_spline_selected drives, unioned rather than
+        overwritten so a Splines-tab selection isn't clobbered.
+        """
+        selection = self.objects_tree.selection()
+        points: list[tuple[float, float]] = []
+        spline_ids: set[int] = set()
+        for iid in selection:
+            if iid.isdigit():
+                idx = int(iid)
+                if 0 <= idx < len(self._objects_tree_list):
+                    x, z, _tags = self._objects_tree_list[idx]
+                    points.append((x, z))
+            elif iid.startswith("c"):
+                try:
+                    j = int(iid[1:])
+                except ValueError:
+                    continue
+                if 0 <= j < len(self._cluster_fill_rows):
+                    ids_str = self._cluster_fill_rows[j][0]
+                    spline_ids.update(int(s) for s in ids_str.split(",") if s)
+        self._highlighted_object_points = points
+        self._highlighted_object_group_spline_ids = spline_ids
+        if self._selection_preview_job is not None:
+            self.root.after_cancel(self._selection_preview_job)
+        self._selection_preview_job = self.root.after(150, self._show_preview_after_selection)
 
     def _regenerate_height_mask(self, working_dir: Path) -> None:
         """
@@ -2123,8 +2206,18 @@ class PGAGenGUI:
         self._refresh_splines_list()
         self._show_preview()
 
+    _SYNTHETIC_CLUSTER_KINDS = (SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND)
+
     def _clear_selected_cluster_fills(self) -> None:
-        """Remove PGA_CLUSTER_FILLS_TAG entirely from every currently-selected row (multi-select)."""
+        """
+        Remove PGA_CLUSTER_FILLS_TAG from every currently-selected row
+        (multi-select). For a real spline (kind not one of
+        _SYNTHETIC_CLUSTER_KINDS) that just strips the tag, same as
+        always. For a border/masked-manual row, the underlying Feature
+        exists ONLY to carry that tag (see _open_cluster_fill_dialog) --
+        stripping the tag would leave a permanent, purposeless row, so
+        the whole Feature is deleted instead.
+        """
         wd = self.working_dir.get().strip()
         selected_ids = {int(s) for s in self.splines_tree.selection()}
         if not wd or not selected_ids:
@@ -2133,45 +2226,91 @@ class PGAGenGUI:
         if not targets:
             return
         changed = False
+        remove_ids = set()
         for f in targets:
-            if f.tags.pop(PGA_CLUSTER_FILLS_TAG, None) is not None:
+            if f.kind in self._SYNTHETIC_CLUSTER_KINDS:
+                remove_ids.add(f.osm_id)
+                changed = True
+            elif f.tags.pop(PGA_CLUSTER_FILLS_TAG, None) is not None:
                 changed = True
         if not changed:
             return
+        if remove_ids:
+            self._splines_features = [f for f in self._splines_features if f.osm_id not in remove_ids]
         save_features(self._splines_features, Path(wd) / FEATURES_FILE)
         self._refresh_splines_list()
-        restorable_ids = [str(i) for i in selected_ids if self.splines_tree.exists(str(i))]
+        restorable_ids = [
+            str(i) for i in selected_ids if i not in remove_ids and self.splines_tree.exists(str(i))
+        ]
         if restorable_ids:
             self.splines_tree.selection_set(restorable_ids)
 
     def _open_cluster_fill_dialog(self) -> None:
         """
         "Fill with Clusters...": pick one or more nature assets (see
-        course_output/asset_catalog.py) and a raster ratio, then append
-        a {"category","type","ratio"} spec per chosen asset to
-        PGA_CLUSTER_FILLS_TAG on every currently-selected spline (see
-        course_output/object_clusters.py for what actually consumes
-        that tag at write-objects time). Splines are captured up front,
-        before the dialog steals focus -- the dialog's own asset
-        Treeview otherwise makes it easy to lose track of which rows
-        were selected in the main list.
+        course_output/asset_catalog.py) and a raster ratio, then create
+        a {"category","type","ratio","source"} spec per chosen asset
+        (see course_output/object_clusters.py for what actually
+        consumes these tags at write-objects time -- it treats any
+        tagged Feature identically regardless of "source" or how its
+        geometry was built).
+
+        Two modes, chosen by the Splines tab's "Border" checkbox
+        (self.mask_border_var), decided once here before the dialog
+        opens:
+
+        - Manual (default): specs are appended directly to every
+          currently-selected spline's own tags, same as always -- unless
+          "Use mask" is checked in the dialog, in which case each
+          selected spline instead gets a NEW synthetic Feature (kind
+          SYNTHETIC_MASKED_KIND) carrying its geometry intersected with
+          the current mask region, so the real spline's own geometry
+          (shared with splines/holes/water output) is never mutated.
+
+        - Border: the current Mask/Source/Buffer(px)/Border-width
+          controls build a ring polygon ONCE, right now (while marked/
+          selected state is still available), wrapped in a single new
+          synthetic Feature (kind SYNTHETIC_BORDER_KIND) carrying the
+          fill specs -- see _mask_geometry_full_frame's docstring for
+          why this has to happen now rather than being deferred to
+          write-objects time.
+
+        Splines/mask state are captured up front, before the dialog
+        steals focus -- the dialog's own asset Treeview otherwise makes
+        it easy to lose track of what was selected in the main list.
         """
         wd = self.working_dir.get().strip()
         if not wd:
             messagebox.showwarning("No working directory", "Set a working directory first.")
             return
+
+        border_mode = self.mask_border_var.get()
         selected_ids = {int(s) for s in self.splines_tree.selection()}
-        if not selected_ids:
-            messagebox.showwarning("No splines selected", "Select one or more splines in the list first.")
-            return
-        targets = [f for f in self._splines_features if f.osm_id in selected_ids]
-        area_targets = [f for f in targets if f.geometry.geom_type in ("Polygon", "MultiPolygon")]
-        if not area_targets:
-            messagebox.showwarning(
-                "No fillable splines", "None of the selected splines have polygon area to fill "
-                "(cluster fill needs a Polygon/MultiPolygon spline, not a bare line).",
-            )
-            return
+        targets: list[Feature] = []
+        area_targets: list[Feature] = []
+        mask_geom = None
+
+        if border_mode:
+            mask_geom = self._mask_geometry_full_frame(Path(wd))
+            if mask_geom is None or mask_geom.is_empty:
+                messagebox.showwarning(
+                    "No mask geometry",
+                    f"No '{self.mask_source_var.get()}' splines found to build a border from -- "
+                    "mark or select some splines first (see the Source dropdown above the Splines list).",
+                )
+                return
+        else:
+            if not selected_ids:
+                messagebox.showwarning("No splines selected", "Select one or more splines in the list first.")
+                return
+            targets = [f for f in self._splines_features if f.osm_id in selected_ids]
+            area_targets = [f for f in targets if f.geometry.geom_type in ("Polygon", "MultiPolygon")]
+            if not area_targets:
+                messagebox.showwarning(
+                    "No fillable splines", "None of the selected splines have polygon area to fill "
+                    "(cluster fill needs a Polygon/MultiPolygon spline, not a bare line).",
+                )
+                return
         if not CLUSTERABLE_ENTRIES:
             messagebox.showinfo(
                 "No clusterable assets", "course_output/asset_catalog.json has no entries with both "
@@ -2180,7 +2319,7 @@ class PGAGenGUI:
             return
 
         dialog = tk.Toplevel(self.root)
-        dialog.title("Fill with Clusters")
+        dialog.title("Fill with Border Clusters" if border_mode else "Fill with Clusters")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -2231,6 +2370,24 @@ class PGAGenGUI:
                  "just touch; <1 lets them overlap more (denser fill); >1 spaces them further apart. "
                  "Applies to every asset picked in this dialog, across all 3 packing passes.")
 
+        use_mask_var = tk.BooleanVar(value=False)
+        if border_mode:
+            ttk.Label(
+                dialog, text=f"Border ring from '{self.mask_source_var.get()}' mask "
+                f"(Buffer (px)={self.mask_buffer_preview_var.get():g}, "
+                f"Border width (m)={self.border_width_var.get()})",
+            ).pack(anchor="w", padx=8, pady=(0, 4))
+        else:
+            use_mask_row = ttk.Frame(dialog)
+            use_mask_row.pack(fill="x", padx=8, pady=(0, 4))
+            use_mask_checkbox = ttk.Checkbutton(use_mask_row, text="Use mask", variable=use_mask_var)
+            use_mask_checkbox.pack(side="left")
+            _Tooltip(use_mask_checkbox, "Restrict each selected spline's fill area to its intersection "
+                     "with the current mask region (Source/Buffer (px) above), instead of filling the "
+                     "whole spline. The real spline geometry is never modified -- a new tagged copy is "
+                     "created for the clipped area, the same synthetic-Feature mechanism 'Border' fills "
+                     "use.")
+
         def do_fill() -> None:
             selected_rows = asset_tree.selection()
             if not selected_rows:
@@ -2245,22 +2402,87 @@ class PGAGenGUI:
                 return
 
             chosen_entries = [CLUSTERABLE_ENTRIES[int(i)] for i in selected_rows]
-            for f in area_targets:
-                fills = f.tags.setdefault(PGA_CLUSTER_FILLS_TAG, [])
-                for entry in chosen_entries:
-                    fills.append({"category": entry.category, "type": entry.type, "ratio": ratio})
 
-            save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+            if border_mode:
+                try:
+                    border_width = float(self.border_width_var.get())
+                    if border_width <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showwarning(
+                        "Invalid border width", "Border width (m) must be a positive number.", parent=dialog,
+                    )
+                    return
+                ring = build_border_ring_geometry(mask_geom, border_width)
+                if ring.is_empty:
+                    messagebox.showwarning(
+                        "Empty ring", "The border ring came out empty -- try a larger Border width (m) "
+                        "or a wider Buffer (px), or check that the mask region isn't degenerate.",
+                        parent=dialog,
+                    )
+                    return
+                specs = [
+                    {"category": e.category, "type": e.type, "ratio": ratio, "source": CLUSTER_FILL_SOURCE_BORDER}
+                    for e in chosen_entries
+                ]
+                border_feature = Feature(
+                    geometry=ring, kind=SYNTHETIC_BORDER_KIND, tags={PGA_CLUSTER_FILLS_TAG: specs},
+                    osm_id=self._next_synthetic_osm_id(), mask=True,
+                )
+                self._splines_features.append(border_feature)
+                save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+                self._append_log(
+                    f"\n[created border ring (source={self.mask_source_var.get()}, width={border_width}) "
+                    f"filled with {len(chosen_entries)} asset(s) at ratio={ratio}]\n"
+                )
+            else:
+                specs = [
+                    {"category": e.category, "type": e.type, "ratio": ratio, "source": CLUSTER_FILL_SOURCE_MANUAL}
+                    for e in chosen_entries
+                ]
+                if use_mask_var.get():
+                    live_mask_geom = self._mask_geometry_full_frame(Path(wd))
+                    if live_mask_geom is None or live_mask_geom.is_empty:
+                        messagebox.showwarning(
+                            "No mask geometry",
+                            f"No '{self.mask_source_var.get()}' splines found to mask against -- mark "
+                            "or select some splines first (see the Source dropdown above the Splines "
+                            "list), or uncheck 'Use mask'.", parent=dialog,
+                        )
+                        return
+                    created = 0
+                    for f in area_targets:
+                        clipped = f.geometry.intersection(live_mask_geom)
+                        if clipped.is_empty or clipped.geom_type not in ("Polygon", "MultiPolygon"):
+                            continue
+                        synth = Feature(
+                            geometry=clipped, kind=SYNTHETIC_MASKED_KIND,
+                            tags={PGA_CLUSTER_FILLS_TAG: [dict(s) for s in specs]},
+                            osm_id=self._next_synthetic_osm_id(), mask=True,
+                        )
+                        self._splines_features.append(synth)
+                        created += 1
+                    save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+                    self._append_log(
+                        f"\n[masked-filled {created}/{len(area_targets)} spline(s) with "
+                        f"{len(chosen_entries)} asset(s) at ratio={ratio}]\n"
+                    )
+                else:
+                    for f in area_targets:
+                        fills = f.tags.setdefault(PGA_CLUSTER_FILLS_TAG, [])
+                        fills.extend(dict(s) for s in specs)
+                    save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+                    skipped = len(targets) - len(area_targets)
+                    note = f" ({skipped} non-area spline(s) skipped)" if skipped else ""
+                    self._append_log(
+                        f"\n[filled {len(area_targets)} spline(s) with {len(chosen_entries)} asset(s) "
+                        f"at ratio={ratio}{note}]\n"
+                    )
+
             self._refresh_splines_list()
             restorable_ids = [str(i) for i in selected_ids if self.splines_tree.exists(str(i))]
             if restorable_ids:
                 self.splines_tree.selection_set(restorable_ids)
-            skipped = len(targets) - len(area_targets)
-            note = f" ({skipped} non-area spline(s) skipped)" if skipped else ""
-            self._append_log(
-                f"\n[filled {len(area_targets)} spline(s) with {len(chosen_entries)} asset(s) "
-                f"at ratio={ratio}{note}]\n"
-            )
             dialog.destroy()
 
         button_row = ttk.Frame(dialog)
@@ -3182,6 +3404,7 @@ class PGAGenGUI:
             f"(click Redo to bring them back)\n"
         )
         self._cached_composited_base_key = None  # the on-disk "latest" just changed underneath it
+        self._cached_geo_overlay_key = None
         self._refresh_preview_and_slider()
 
     def _run_redo(self) -> None:
@@ -3205,6 +3428,7 @@ class PGAGenGUI:
             restored += 1
         self._append_log(f"\n[redo] restored {restored} file(s) from {timestamp}\n")
         self._cached_composited_base_key = None
+        self._cached_geo_overlay_key = None
         self._refresh_preview_and_slider()
 
     def _refresh_preview_and_slider(self) -> None:
@@ -3386,6 +3610,51 @@ class PGAGenGUI:
             return None
         return unary_union(relevant)
 
+    def _mask_geometry_full_frame(self, working_dir: Path):
+        """
+        Same "marked union" (merge_height_mask_features) / "selected
+        union" semantics as _get_cached_mask_merged_geometry /
+        _get_selected_mask_merged_geometry above, buffered by the same
+        mask_buffer_preview_var -- but computed directly against
+        self._splines_features WITHOUT _shift_and_crop_to_course, so the
+        result stays in features.geojson's own full, uncropped frame
+        (see PGA2k_gen.py's _crop_features_to_course docstring). The two
+        _get_*_mask_merged_geometry methods above are course-cropped/
+        shifted -- correct for preview rasterization, but WRONG to
+        persist directly into a new Feature: it would silently double-
+        shift on next load and truncate the ring to the current course
+        crop rectangle. Used only for building geometry meant to be
+        SAVED (border rings, masked-manual clips), never for preview.
+
+        Returns None if there's nothing to union.
+        """
+        self._ensure_splines_features_fresh(working_dir)
+        if self.mask_source_var.get() == "selected":
+            selected_ids = {int(s) for s in self.splines_tree.selection()}
+            if not selected_ids:
+                return None
+            relevant = [f.geometry for f in self._splines_features if f.osm_id in selected_ids]
+            merged = unary_union(relevant) if relevant else None
+        else:
+            merged = merge_height_mask_features(self._splines_features)
+        if merged is None or merged.is_empty:
+            return None
+        return merged.buffer(self.mask_buffer_preview_var.get())
+
+    def _next_synthetic_osm_id(self) -> int:
+        """
+        First unused negative int -- real OSM way ids are always
+        non-negative, so a negative synthetic id can never collide with
+        one. osm_id is otherwise only used for GUI selection/display
+        (see _spline_cluster_detail, _build_cluster_fill_rows), never
+        for cross-referencing back to real OSM data.
+        """
+        existing = {f.osm_id for f in self._splines_features if f.osm_id is not None}
+        candidate = -1
+        while candidate in existing:
+            candidate -= 1
+        return candidate
+
     _OBJECT_DOT_RADIUS_PX = 1  # -> a 2px-diameter dot, per the Objects tab's "Show objects" spec
     _OBJECT_LAYER_FILL_ALPHA = round(255 * 0.4)  # circle interior only -- center dot/outer stroke stay 100%
 
@@ -3527,6 +3796,18 @@ class PGAGenGUI:
                     px + self._OBJECT_DOT_RADIUS_PX, py + self._OBJECT_DOT_RADIUS_PX,
                 ),
                 fill=(*color, 255),
+            )
+
+        # Objects-tab selection ring -- same cyan as the Splines tab's
+        # highlight overlay, drawn as an outlined ring (not a fill) so it
+        # doesn't hide the marker/color it's pointing at underneath.
+        for hx, hz in self._highlighted_object_points:
+            hpx = (hx / COURSE_SIZE_M) * data_width
+            hpy = (1.0 - hz / COURSE_SIZE_M) * data_height
+            ring_radius = self._OBJECT_DOT_RADIUS_PX + 5
+            draw.ellipse(
+                (hpx - ring_radius, hpy - ring_radius, hpx + ring_radius, hpy + ring_radius),
+                outline=(0, 255, 255, 255), width=2,
             )
 
         full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
@@ -3915,6 +4196,14 @@ class PGAGenGUI:
             return
 
         try:
+            # path.name is always versioned now (e.g. "preview_hex_3.png",
+            # never bare "preview_hex.png"), so compare against the
+            # stripped kind, not the exact name -- see visualize.py's
+            # strip_preview_version. Hoisted above the composite cache so
+            # the geo-overlay cache below (mask buffer / spline highlight)
+            # can use it regardless of whether that cache hits or misses.
+            base_kind = viz.strip_preview_version(path.name)
+
             # Cache the "static" part -- base image + OSM overlay, at
             # FULL resolution, BEFORE the zoom-dependent resize -- keyed
             # on everything that would change IT specifically. zoom is
@@ -3940,12 +4229,6 @@ class PGAGenGUI:
                 composited = self._cached_composited_base
             else:
                 img = Image.open(path).convert("RGBA")
-
-                # path.name is always versioned now (e.g.
-                # "preview_hex_3.png", never bare "preview_hex.png"),
-                # so compare against the stripped kind, not the exact
-                # name -- see visualize.py's strip_preview_version.
-                base_kind = viz.strip_preview_version(path.name)
 
                 # The LIDAR previews render the *full* merged point cloud
                 # in its own local frame, not the course crop's
@@ -3986,6 +4269,145 @@ class PGAGenGUI:
                 self._cached_composited_base = composited
                 self._cached_composited_base_key = composite_key
 
+            # Geometry-based overlays (mask-buffer highlight, selected-
+            # spline highlight) that rasterize a shapely geometry via
+            # shapely.vectorized.contains -- cached at composited's
+            # native resolution, by their own inputs, same reasoning as
+            # the composite cache above. These used to rasterize at
+            # whatever the CURRENT ZOOMED size was (up to ~3x native
+            # pixel count at max zoom), re-running shapely over millions
+            # of points on every single zoom tick even though neither
+            # shape had changed -- that's what made zooming laggy again,
+            # the same bug the composite cache above already fixed once,
+            # just in code added afterward that didn't inherit it.
+            # Rasterizing once at native resolution and letting the
+            # existing cheap zoom-resize below scale the result (like
+            # the base composite already does) fixes it the same way.
+            mask_buffer_on = self.show_mask_buffer_var.get() and base_kind not in (
+                PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+            )
+            buffer_px = self.mask_buffer_preview_var.get() if mask_buffer_on else None
+            border_on = self.mask_border_var.get() if mask_buffer_on else None
+            border_width_raw = self.border_width_var.get() if mask_buffer_on else None
+            if mask_buffer_on:
+                self.mask_buffer_preview_label.config(text=f"{buffer_px:.0f}")
+                self.border_width_preview_label.config(text=f"{border_width_raw:.0f}")
+                # _get_cached_mask_merged_geometry can source the mask
+                # geometry from features.geojson's marked fairway/green
+                # features OR (mask_source_var == "selected") from
+                # whatever's currently selected in the Splines tree --
+                # neither of those is reflected in composite_key (which
+                # only tracks the *preview PNG's* path/mtime), so without
+                # this fingerprint a re-ingest or a changed tree
+                # selection would leave this cache silently serving a
+                # stale mask overlay.
+                features_path = Path(wd) / FEATURES_FILE
+                mask_geom_fingerprint = (
+                    self.mask_source_var.get(),
+                    features_path.stat().st_mtime if features_path.exists() else None,
+                    tuple(sorted(self.splines_tree.selection())),
+                )
+            else:
+                mask_geom_fingerprint = None
+
+            # Objects tab's selected cluster-fill "group" rows unioned in
+            # here too (see _on_object_selected) -- they highlight via
+            # their source spline(s)' own geometry, the same overlay a
+            # Splines-tab selection drives, rather than a separate
+            # highlight pass.
+            combined_highlight_ids = self._highlighted_feature_osm_ids | self._highlighted_object_group_spline_ids
+            highlight_on = bool(combined_highlight_ids) and base_kind not in (
+                PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+            )
+            if highlight_on:
+                self._ensure_splines_features_fresh(Path(wd))
+
+            geo_overlay_key = (
+                composite_key, composited.size,
+                mask_buffer_on, buffer_px, border_on, border_width_raw, mask_geom_fingerprint,
+                highlight_on,
+                tuple(sorted(combined_highlight_ids)) if highlight_on else None,
+                self._splines_features_mtime if highlight_on else None,
+            )
+            if getattr(self, "_cached_geo_overlay_key", None) == geo_overlay_key:
+                geo_img = self._cached_geo_overlay
+            else:
+                geo_img = composited
+
+                if mask_buffer_on:
+                    merged_geom = self._get_cached_mask_merged_geometry(Path(wd))
+                    if merged_geom is not None:
+                        buffered = merged_geom.buffer(buffer_px)
+                        if border_on:
+                            # Preview only -- draws the same ring shape Fill
+                            # would persist, but built from the course-cropped
+                            # preview geometry, not _mask_geometry_full_frame's
+                            # save-safe one (see that method's docstring for
+                            # why the two must stay separate).
+                            try:
+                                border_width = float(border_width_raw)
+                            except (TypeError, ValueError):
+                                border_width = 0.0
+                            ring = build_border_ring_geometry(buffered, border_width)
+                            if not ring.is_empty:
+                                buffered = ring
+                        course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+                        # The course's 2000x2000 data only occupies the
+                        # _PLOT_RECT sub-region of the image (margins around
+                        # it hold axis labels/title/colorbar) -- rasterizing
+                        # at the full geo_img.width/height, as done before,
+                        # stretched the mask across the *entire* image
+                        # instead of just that data area. Compute the same
+                        # sub-region in pixel terms (matplotlib's _PLOT_RECT
+                        # is figure-fraction, origin bottom-left; image
+                        # pixels are top-left) and rasterize/paste only
+                        # there, leaving the margin fully transparent.
+                        left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
+                        data_left = round(geo_img.width * left_frac)
+                        data_top = round(geo_img.height * (1 - bottom_frac - height_frac))
+                        data_width = max(1, round(geo_img.width * width_frac))
+                        data_height = max(1, round(geo_img.height * height_frac))
+
+                        mask_rgba = rasterize_mask_rgba(buffered, course_bounds, data_width, data_height)
+                        mask_data_img = Image.fromarray(mask_rgba, mode="RGBA")
+                        mask_full = Image.new("RGBA", (geo_img.width, geo_img.height), (0, 0, 0, 0))
+                        mask_full.paste(mask_data_img, (data_left, data_top), mask_data_img)
+                        geo_img = Image.alpha_composite(geo_img, mask_full)
+
+                if highlight_on:
+                    course_features = self._shift_and_crop_to_course(Path(wd), self._splines_features)
+                    selected_features = [
+                        f for f in course_features if f.osm_id in combined_highlight_ids
+                    ]
+                    if selected_features:
+                        geoms = []
+                        for f in selected_features:
+                            g = f.geometry
+                            if g.geom_type == "LineString":
+                                # A zero-area line has nothing for
+                                # shapely.vectorized.contains to find "inside" --
+                                # buffer it into a thin ribbon so it's visible.
+                                g = g.buffer(5.0)
+                            geoms.append(g)
+                        highlight_geom = geoms[0] if len(geoms) == 1 else unary_union(geoms)
+                        course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+                        left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
+                        data_left = round(geo_img.width * left_frac)
+                        data_top = round(geo_img.height * (1 - bottom_frac - height_frac))
+                        data_width = max(1, round(geo_img.width * width_frac))
+                        data_height = max(1, round(geo_img.height * height_frac))
+                        highlight_rgba = rasterize_mask_rgba(
+                            highlight_geom, course_bounds, data_width, data_height,
+                            color=(0, 255, 255), opacity=0.6, invert=False,
+                        )
+                        highlight_img = Image.fromarray(highlight_rgba, mode="RGBA")
+                        highlight_full = Image.new("RGBA", (geo_img.width, geo_img.height), (0, 0, 0, 0))
+                        highlight_full.paste(highlight_img, (data_left, data_top), highlight_img)
+                        geo_img = Image.alpha_composite(geo_img, highlight_full)
+
+                self._cached_geo_overlay = geo_img
+                self._cached_geo_overlay_key = geo_overlay_key
+
             # zoom=1.0 shows the image at its actual native resolution
             # (1959x1780) rather than the old fixed 900x900 cap --
             # nearly 80% of the real pixel area was being thrown away
@@ -3993,48 +4415,12 @@ class PGAGenGUI:
             # _build_preview_panel) handle the case where the zoomed
             # image no longer fits the visible area. This resize runs
             # fresh every call (cheap, in-memory) -- only the composite
-            # above is cached.
-            target_w = max(1, round(composited.width * zoom))
-            target_h = max(1, round(composited.height * zoom))
-            base_thumb = composited.resize((target_w, target_h), Image.LANCZOS)
+            # and geo-overlay stages above are cached.
+            target_w = max(1, round(geo_img.width * zoom))
+            target_h = max(1, round(geo_img.height * zoom))
+            base_thumb = geo_img.resize((target_w, target_h), Image.LANCZOS)
 
             img = base_thumb
-
-            # Live mask-buffer highlight -- separate/independent from the
-            # static OSM overlay above. Only meaningful for the
-            # course-cropped previews: the mask is defined in that
-            # frame, and (unlike the static OSM overlay) there's no
-            # shifted "_full" variant for the LIDAR previews here.
-            if self.show_mask_buffer_var.get() and viz.strip_preview_version(path.name) not in (
-                PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
-            ):
-                buffer_px = self.mask_buffer_preview_var.get()
-                self.mask_buffer_preview_label.config(text=f"{buffer_px:.0f}")
-                merged_geom = self._get_cached_mask_merged_geometry(Path(wd))
-                if merged_geom is not None:
-                    buffered = merged_geom.buffer(buffer_px)
-                    course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
-                    # The course's 2000x2000 data only occupies the
-                    # _PLOT_RECT sub-region of the image (margins around
-                    # it hold axis labels/title/colorbar) -- rasterizing
-                    # at the full img.width/height, as done before,
-                    # stretched the mask across the *entire* image
-                    # instead of just that data area. Compute the same
-                    # sub-region in pixel terms (matplotlib's _PLOT_RECT
-                    # is figure-fraction, origin bottom-left; image
-                    # pixels are top-left) and rasterize/paste only
-                    # there, leaving the margin fully transparent.
-                    left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
-                    data_left = round(img.width * left_frac)
-                    data_top = round(img.height * (1 - bottom_frac - height_frac))
-                    data_width = max(1, round(img.width * width_frac))
-                    data_height = max(1, round(img.height * height_frac))
-
-                    mask_rgba = rasterize_mask_rgba(buffered, course_bounds, data_width, data_height)
-                    mask_data_img = Image.fromarray(mask_rgba, mode="RGBA")
-                    mask_full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
-                    mask_full.paste(mask_data_img, (data_left, data_top), mask_data_img)
-                    img = Image.alpha_composite(img, mask_full)
 
             # Live elevation-band overlay -- see _build_preview_panel's
             # comment and _get_cached_heightmap. Reads heightmap.npz
@@ -4108,45 +4494,6 @@ class PGAGenGUI:
                     band_full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
                     band_full.paste(band_resized, (data_left, data_top), band_resized)
                     img = Image.alpha_composite(img, band_full)
-
-            # Highlight the currently-selected spline (Splines tab),
-            # same _PLOT_RECT-aware positioning as the mask buffer above
-            # -- course-cropped previews only, same reasoning (the
-            # feature geometry is in that frame, not the LIDAR previews'
-            # full-point-cloud one).
-            if self._highlighted_feature_osm_ids and viz.strip_preview_version(path.name) not in (
-                PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
-            ):
-                self._ensure_splines_features_fresh(Path(wd))
-                course_features = self._shift_and_crop_to_course(Path(wd), self._splines_features)
-                selected_features = [
-                    f for f in course_features if f.osm_id in self._highlighted_feature_osm_ids
-                ]
-                if selected_features:
-                    geoms = []
-                    for f in selected_features:
-                        g = f.geometry
-                        if g.geom_type == "LineString":
-                            # A zero-area line has nothing for
-                            # shapely.vectorized.contains to find "inside" --
-                            # buffer it into a thin ribbon so it's visible.
-                            g = g.buffer(5.0)
-                        geoms.append(g)
-                    highlight_geom = geoms[0] if len(geoms) == 1 else unary_union(geoms)
-                    course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
-                    left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
-                    data_left = round(img.width * left_frac)
-                    data_top = round(img.height * (1 - bottom_frac - height_frac))
-                    data_width = max(1, round(img.width * width_frac))
-                    data_height = max(1, round(img.height * height_frac))
-                    highlight_rgba = rasterize_mask_rgba(
-                        highlight_geom, course_bounds, data_width, data_height,
-                        color=(0, 255, 255), opacity=0.6, invert=False,
-                    )
-                    highlight_img = Image.fromarray(highlight_rgba, mode="RGBA")
-                    highlight_full = Image.new("RGBA", (img.width, img.height), (0, 0, 0, 0))
-                    highlight_full.paste(highlight_img, (data_left, data_top), highlight_img)
-                    img = Image.alpha_composite(img, highlight_full)
 
             # "Show objects" (Objects tab) -- drawn last, on top of
             # everything else, so placed-object markers are never hidden

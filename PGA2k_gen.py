@@ -103,7 +103,8 @@ from course_output.objects import (
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_TYPE_TAG,
     apply_area_tree_type_hints, build_building_stake_objects_v2019, build_building_stake_objects_v2021,
     build_tree_objects_v2019, build_tree_objects_v2021, lidar_trees_to_tagged, load_object_list,
-    move_trees_off_cartpaths, object_counts, parse_osm_trees, save_object_list, save_placed_objects,
+    merge_object_groups, move_trees_off_cartpaths, object_counts, parse_osm_trees, save_object_list,
+    save_placed_objects,
 )
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -1052,7 +1053,14 @@ def step_generate_trees(
     is expected to populate everywhere else, so detecting real trees
     there too would double up rather than add detail. Requires
     heightmap.npz and pointcloud.npz (both from --step ingest-laz);
-    raises StepError if either is missing while this is on.
+    raises StepError if either is missing while this is on. OSM
+    building footprints (features.geojson's kind == "building") are
+    also masked out of the canopy raster before detection -- some LAZ
+    sources never classify buildings separately (ASPRS class 6), so
+    their flat roof returns can land in the same bucket
+    rasterize_canopy_heightmap_with_fallback falls back to, which
+    watershed would otherwise mistake for a crown and place a "tree"
+    on the roof.
 
     This overwrites object_list.json wholesale.
     """
@@ -1098,6 +1106,14 @@ def step_generate_trees(
     print(f"  {len(trees)} of {len(full_frame_trees)} tree(s) fall inside the current "
           f"{COURSE_SIZE_M:.0f}x{COURSE_SIZE_M:.0f} m course crop")
 
+    features_path = working_dir / FEATURES_FILE
+    features = []
+    building_geometries = []
+    if features_path.exists():
+        features = load_features(features_path)
+        features = _crop_features_to_course(working_dir, features)
+        building_geometries = [f.geometry for f in features if f.kind == "building"]
+
     if detect_lidar_trees:
         heightmap_path = working_dir / HEIGHTMAP_FILE
         pointcloud_path = working_dir / POINTCLOUD_FILE
@@ -1115,6 +1131,21 @@ def step_generate_trees(
         course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
         canopy_heights = rasterize_canopy_heightmap_with_fallback(course_cloud, course_bounds, resolution)
 
+        if building_geometries:
+            # OSM building footprints, not LIDAR classification -- some LAZ
+            # deliveries never classify buildings (ASPRS class 6) separately,
+            # so their roof returns land in the same "unclassified" bucket
+            # rasterize_canopy_heightmap_with_fallback falls back to,
+            # producing a flat elevated blob that watershed mistakes for a
+            # crown. Buildings aren't real canopy regardless of why a LAZ
+            # source misclassified them, so mask footprint cells out of the
+            # canopy raster entirely -- routes through detect_trees_from_lidar's
+            # existing "no vegetation return here" -> ground-height handling.
+            building_mask = rasterize_mask(unary_union(building_geometries), course_bounds, resolution)
+            canopy_heights[building_mask] = np.nan
+            print(f"  masked out {len(building_geometries)} OSM building footprint(s) from the "
+                  "canopy raster (ingest/osm.py) to avoid rooftop false-positive trees")
+
         mask_path = working_dir / HEIGHT_MASK_FILE
         mask_geometry = load_height_mask(mask_path) if mask_path.exists() else None
         if mask_geometry is None:
@@ -1128,10 +1159,7 @@ def step_generate_trees(
         print(f"  {len(lidar_trees)} LIDAR-detected tree(s) added "
               f"({len(trees)} total tree(s) now)")
 
-    features_path = working_dir / FEATURES_FILE
-    if features_path.exists() and trees:
-        features = load_features(features_path)
-        features = _crop_features_to_course(working_dir, features)
+    if trees:
         wood_features = [f for f in features if f.kind == "wood"]
         if wood_features:
             untyped_before = sum(1 for _, _, tags in trees if TREE_TYPE_TAG not in tags)
@@ -1325,6 +1353,8 @@ def step_write_objects(
             stake_count = sum(len(g["Value"]["items"]) for g in stakes)
             print(f"  {stake_count} stake(s) at corners of {building_count} building(s)")
             placed_objects += stakes
+
+    placed_objects = merge_object_groups(placed_objects)
 
     for label, item_count, cluster_count, spline_count in object_counts(placed_objects):
         print(f"    {label}: {item_count} item(s), {cluster_count} cluster(s), {spline_count} spline(s)")

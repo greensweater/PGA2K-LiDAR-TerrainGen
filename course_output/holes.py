@@ -68,8 +68,18 @@ _HOLE_JSON_TEMPLATE = {
 }
 
 
+# Matches userLayers.py/water.py/objects.py's own _DECIMALS convention
+# -- every computed value written into holes.json is rounded to
+# millimeter precision, plenty for this project's purposes.
+_DECIMALS = 3
+
+
+def _round(value: float) -> float:
+    return round(float(value), _DECIMALS)
+
+
 def _waypoint3d(x: float, y: float, z: float) -> dict:
-    return {"x": x, "y": y, "z": z}
+    return {"x": _round(x), "y": _round(y), "z": _round(z)}
 
 
 def _add_halfway_point(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
