@@ -30,13 +30,20 @@ Steps:
 12. Shortcuts: mouse wheel toggles preview versions; shift-wheel changes preview; ctrl-wheel zooms; wheel click moves map.
 13. Click "Write Terrain" to create the heightmap.
 14. Under "Splines", click "Write Splines" to generate course objects from OSM.
-15. Under "Splines", filter by "hole" to select up to 18 holes for your course (apply Mask to exclude holes). Click "Write Holes" to add holes.
+15. Under "Splines", filter by "hole" to select up to 18 holes for your course (apply Mask to exclude holes from output). Click "Write Holes" to add holes.
 16. Click "Repack" to output the .course file to the working directory (give it a name first; ".course" suffix is not needed).
 17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. Only v2019 is supported but .course can be opened in v2021. (TODO: compatibility)
 
+### Funsies
+
+1. Place "stakes" at the corners of buildings for easier placement, clear when done
+2. Apply a tight landscaping on cart paths so they line up nicely
+3. Import collections of objects & splines (e.g. house with landscaping, driveway, car, patio set, deck, pergola; hole marker with mulch, bench, ball washer, bin; custom combinations of fencing/bridges/objects) and place/orient it using OSM tags.
+4. Create "borders" using splines filled with object clusters, e.g. water hazard edges, course O.B. areas
+
 ### TODO
 
-- Trees from LiDAR
-- Water bodies & streams with procedurally-generated natural features
+- ~~Trees from LiDAR~~ done
+- ~~Water bodies & streams with procedurally-generated natural features~~ done
 - Assign tree types & vegetation using customized OSM ways
 - Assign heavy rough to clear built-in natural objects and create OB

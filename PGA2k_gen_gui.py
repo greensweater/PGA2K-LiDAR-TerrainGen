@@ -1698,7 +1698,7 @@ class PGAGenGUI:
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.splines_tree = ttk.Treeview(
-            tree_frame, columns=("kind", "tag", "mask", "clusters"), show="headings", height=18,
+            tree_frame, columns=("kind", "tag", "mask", "clusters"), show="headings", height=10,
             selectmode="extended",
         )
         self.splines_tree.heading("kind", text="Kind")
@@ -1846,7 +1846,7 @@ class PGAGenGUI:
         obj_tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.objects_tree = ttk.Treeview(
             obj_tree_frame, columns=("x", "z", "source", "detail"), show="headings",
-            height=18, selectmode="extended",
+            height=10, selectmode="extended",
         )
         self.objects_tree.heading("x", text="X")
         self.objects_tree.heading("z", text="Z")
