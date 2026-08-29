@@ -12,12 +12,20 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step ingest-course --course-file <path>
     PGA2k_gen.py <working_dir> --step dig-water [--dig-depth M] [--dig-buffer M]
     PGA2k_gen.py <working_dir> --step generate-terrain
+    PGA2k_gen.py <working_dir> --step generate-streams
+    PGA2k_gen.py <working_dir> --step generate-collections [--collection-library <dir>]
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
                                  [--method adaptive|scatter] [--rad-m M]
     PGA2k_gen.py <working_dir> --step write-terrain [--registration-marks] [--direct-height-shift]
                                  [--prune-overlapped-stamps]
     PGA2k_gen.py <working_dir> --step write-water [--registration-marks] [--direct-height-shift]
-                                 [--prune-overlapped-stamps]
+                                 [--prune-overlapped-stamps] [--multi-tile-water]
+                                 [--water-tile-tolerance-m M] [--water-tile-min-edge-m M]
+                                 [--water-tile-max-search-m M] [--water-tile-width-samples N]
+                                 [--water-tile-redundancy-ratio R] [--water-tile-overlap-m M]
+                                 [--water-fill-mode edge|stripe] [--water-stripe-overlap-m M]
+                                 [--water-stripe-min-edge-m M] [--water-stripe-tolerance-m M]
+                                 [--water-stripe-max-stripes-per-side N]
     PGA2k_gen.py <working_dir> --step generate-trees [--detect-lidar-trees] [--mark-cartpath-trees]
     PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023|2025>]
                                  [--theme <id-or-name>] [--tree-variety] [--stake-buildings]  (2019)
@@ -90,21 +98,31 @@ from ingest.tree_detection import (
     detect_trees_from_lidar, rasterize_canopy_heightmap_with_fallback,
 )
 from ingest.osm import (
-    DEFAULT_HEIGHT_MASK_BUFFER_PX, DEFAULT_HOLE_CORRIDOR_BUFFER_PX, build_height_mask, crop_features,
-    load_features, load_height_mask, parse_osm_features, rasterize_mask, save_features,
+    DEFAULT_HEIGHT_MASK_BUFFER_PX, DEFAULT_HOLE_CORRIDOR_BUFFER_PX, Feature, build_height_mask,
+    crop_features, load_features, load_height_mask, parse_osm_features, rasterize_mask, save_features,
     save_height_mask, shift_features,
 )
 from course_output.splines import (
     build_registration_mark_splines, build_surface_splines, feature_to_spline, save_surface_splines,
 )
 from course_output.holes import build_holes, save_holes
-from course_output.object_clusters import PGA_CLUSTER_FILLS_TAG, build_cluster_objects_v2019
+from course_output.object_clusters import (
+    CLUSTER_FILL_SOURCE_STREAM, PGA_CLUSTER_FILLS_TAG, SYNTHETIC_MASKED_KIND,
+    cluster_records_to_v2019_groups, next_synthetic_osm_id, pack_cluster_records,
+)
 from course_output.objects import (
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_TYPE_TAG,
-    apply_area_tree_type_hints, build_building_stake_objects_v2019, build_building_stake_objects_v2021,
-    build_tree_objects_v2019, build_tree_objects_v2021, lidar_trees_to_tagged, load_object_list,
-    merge_object_groups, move_trees_off_cartpaths, object_counts, parse_osm_trees, save_object_list,
-    save_placed_objects,
+    WATERFALL_DEFAULT_ASSET_PATH, apply_area_tree_type_hints, build_building_stake_objects_v2019,
+    build_building_stake_objects_v2021, build_tree_objects_v2019, build_tree_objects_v2021,
+    build_waterfall_objects_v2019, build_waterfall_objects_v2021, lidar_trees_to_tagged, load_object_list,
+    load_objects, merge_object_groups, move_trees_off_cartpaths, object_counts, parse_osm_trees,
+    save_object_list, save_objects, save_placed_objects,
+)
+from course_output.collection_library import default_library_dir, load_library
+from course_output.collections import (
+    _bearing_deg as _collection_bearing_deg,
+    build_collection_objects_v2019, build_collection_objects_v2021, build_collection_splines,
+    iter_collection_objects, load_collection_records, resolve_collection, save_collection_records,
 )
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -174,11 +192,22 @@ from terrain.cart_paths import (
 )
 from terrain.terrain_model import TerrainModel
 from terrain.stamp_pruning import prune_overwritten_stamps
+from terrain.streams import (
+    BANK_VEG_WIDTH_M, StreamCenterline, build_stream_records, generate_stream_stamps,
+    load_stream_records, save_stream_records,
+)
 from course_output.userLayers import (
     build_baseline_flatten_stamp, build_registration_mark_stamps, normalize_stamp_heights,
     normalize_stamp_heights_by_value_shift, write_user_layers,
 )
-from course_output.water import build_water_objects
+from course_output.water import (
+    build_water_objects, build_stream_water_objects,
+    DEFAULT_WATER_TILE_TOLERANCE_M, DEFAULT_WATER_TILE_MIN_EDGE_M,
+    DEFAULT_WATER_TILE_MAX_SEARCH_M, DEFAULT_WATER_TILE_WIDTH_SAMPLES,
+    DEFAULT_WATER_TILE_REDUNDANCY_RATIO, DEFAULT_WATER_TILE_OVERLAP_M,
+    DEFAULT_WATER_STRIPE_OVERLAP_M, DEFAULT_WATER_STRIPE_TOLERANCE_M,
+    DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
+)
 
 FEATURES_FILE = "features.geojson"
 HEIGHT_MASK_FILE = "height_mask.geojson"
@@ -186,6 +215,39 @@ HEIGHTMAP_FILE = "heightmap.npz"
 STAMPS_PATTERN = "stamps_{n}.json"
 PLACED_OBJECTS_FILE = "placedObjects2.json"
 OBJECT_LIST_FILE = "object_list.json"
+OBJECTS_FILE = "objects.json"
+STREAMS_FILE = "streams.json"
+COLLECTIONS_FILE = "collections.json"
+
+# This project's own OSM tag (not an OSM standard) on a 2-node way that
+# places a reusable object/spline collection -- value is the template
+# name (see course_output/collection_library.py, ingest/osm.py's
+# classify_way "collection" kind, and step_generate_collections).
+PGA_COLLECTION_TAG = "pga_collection"
+
+# Optional companion tag on the same way -- a free-form value passed
+# through to resolve_collection so one template can adapt per placement
+# (a hole sign that swaps by hole number, etc.) via member "variants" /
+# a "{param}" asset-path token. See course_output/collections.py.
+PGA_PARAMETER_TAG = "pga_parameter"
+
+# OSM waterway tag values treated as linear streams (carved bed + flowing
+# water + bank vegetation), as opposed to filled water bodies.
+STREAM_WATERWAY_KINDS = ("stream", "ditch")
+
+# Marker tag on the synthetic stream-bank Features step_generate_streams
+# creates, so a re-run can find and replace its own (see that step).
+STREAM_BANK_MARKER_TAG = "pga_stream_bank"
+
+# Default cluster-fill specs tagged onto each stream-bank polygon --
+# grass + waterside rock + lily ground-cover, all real
+# course_output/asset_catalog.json (category, type) pairs. Overridable
+# per project via project.json's "streams_bank_veg_specs".
+DEFAULT_STREAM_BANK_VEG_SPECS = [
+    {"category": 2, "type": 0, "ratio": 1.0, "density": 60.0, "source": CLUSTER_FILL_SOURCE_STREAM},
+    {"category": 1, "type": 7, "ratio": 1.0, "density": 25.0, "source": CLUSTER_FILL_SOURCE_STREAM},
+    {"category": 3, "type": 1, "ratio": 1.0, "density": 30.0, "source": CLUSTER_FILL_SOURCE_STREAM},
+]
 
 DEFAULT_DIG_WATER_DEPTH_M = 3.0
 DEFAULT_DIG_WATER_BUFFER_M = 1.0
@@ -487,6 +549,8 @@ def step_visualize(
             extra_label = (
                 f"cart-paths: stamp_radius={p.get('stamp_radius_m')} spacing={p.get('spacing_m')}"
             )
+        elif step_name == "generate-streams":
+            extra_label = f"streams: {p.get('stream_count')} centerline(s) {p.get('waterway_kinds')}"
         else:
             extra_label = f"step={step_name}"
         if p.get("use_height_mask"):
@@ -913,6 +977,16 @@ def step_write_splines(working_dir: Path, registration_marks: bool = False) -> N
     features = _crop_features_to_course(working_dir, features)
     splines = build_surface_splines(features)
 
+    # Spline members of any placed object collection (see
+    # step_generate_collections). Carried through verbatim from capture,
+    # just rotated/translated into place and shifted into the game grid.
+    collections_path = working_dir / COLLECTIONS_FILE
+    if collections_path.exists():
+        collection_splines = build_collection_splines(load_collection_records(collections_path))
+        if collection_splines:
+            splines = splines + collection_splines
+            print(f"  + {len(collection_splines)} spline(s) from placed collections")
+
     if registration_marks:
         marks = build_registration_mark_splines(COURSE_SIZE_M)
         splines = splines + marks
@@ -1198,6 +1272,69 @@ def step_generate_trees(
     })
 
 
+def step_pack_objects(working_dir: Path) -> None:
+    """
+    Generate objects.json (see course_output/objects.py's save_objects)
+    -- the intermediate, VERSION-AGNOSTIC combined object list: trees,
+    passed through unchanged from object_list.json (see
+    step_generate_trees; run that first), plus packed cluster-fill
+    records from every features.geojson Feature carrying
+    PGA_CLUSTER_FILLS_TAG (see course_output/object_clusters.py's
+    pack_cluster_records -- tiered dart-throw or ring-walk circle
+    placement, RNG seed draws, all done here and FROZEN into the file).
+
+    Extends the "compile once, format at write time" split
+    step_generate_trees' own docstring describes to cluster fills too:
+    step_write_objects (any game_version) now just formats this file's
+    contents into that version's schema -- no packing, no RNG, no
+    `course/` dependency -- so it's cheap enough for a GUI Fill/Clear
+    action to re-run synchronously for an instant preview, and
+    switching game_version later reuses the exact same in-game layout
+    rather than re-rolling a fresh random one.
+
+    Also folds in resolved object-collection placements from
+    collections.json (see step_generate_collections) as
+    kind="collection_object" records -- deterministic, no RNG.
+
+    Requires object_list.json to exist (same convention
+    step_write_objects used before this step existed) -- an empty tree
+    list still needs the file to be there. features.geojson and
+    collections.json are both optional: a missing file just means zero
+    records of that kind, not an error.
+
+    This overwrites objects.json wholesale.
+    """
+    object_list_path = working_dir / OBJECT_LIST_FILE
+    if not object_list_path.exists():
+        raise StepError(f"No {OBJECT_LIST_FILE} found under {working_dir}. Run --step generate-trees first.")
+    trees = load_object_list(object_list_path)
+
+    cluster_records: list[dict] = []
+    features_path = working_dir / FEATURES_FILE
+    if features_path.exists():
+        features = _crop_features_to_course(working_dir, load_features(features_path))
+        tagged = [f for f in features if f.tags.get(PGA_CLUSTER_FILLS_TAG)]
+        if tagged:
+            cluster_records = pack_cluster_records(features)
+            print(f"  packed {len(cluster_records)} cluster stamp(s) across {len(tagged)} tagged spline(s)")
+
+    # Resolved collection member placements (see step_generate_collections
+    # -- run that first). Deterministic, no RNG: just flattened out of
+    # collections.json's per-record "objects" lists.
+    collection_objects: list[dict] = []
+    collections_path = working_dir / COLLECTIONS_FILE
+    if collections_path.exists():
+        records = load_collection_records(collections_path)
+        collection_objects = list(iter_collection_objects(records))
+        if collection_objects:
+            print(f"  {len(collection_objects)} collection object(s) across {len(records)} placement(s)")
+
+    out_path = working_dir / OBJECTS_FILE
+    save_objects(trees, cluster_records, out_path, collection_objects)
+    print(f"Wrote {out_path} ({len(trees)} tree(s), {len(cluster_records)} cluster stamp(s), "
+          f"{len(collection_objects)} collection object(s))")
+
+
 def step_write_objects(
     working_dir: Path,
     game_version: str | None = None,
@@ -1207,18 +1344,28 @@ def step_write_objects(
     tree_type_asset_paths: dict[str, str] | None = None,
     stake_asset_path: str | None = None,
     stake_buildings: bool | None = None,
+    waterfall_asset_path: str | None = None,
 ) -> None:
     """
-    Generate placedObjects2.json -- formats object_list.json (see
-    step_generate_trees; run that first) into the target game_version's
-    schema, plus, optionally, a stake at every building corner (from
-    features.geojson's "building" ways): stake_buildings for v2019 (the
-    fence-post prop at category=objects.BUILDING_STAKE_CATEGORY_V2019/
-    type=objects.BUILDING_STAKE_TYPE_V2019, scaled to
-    objects.BUILDING_STAKE_SCALE_V2019 -- see
+    Generate placedObjects2.json -- formats objects.json (see
+    step_pack_objects; run that first, after step_generate_trees) into
+    the target game_version's schema, plus, optionally, a stake at
+    every building corner (from features.geojson's "building" ways):
+    stake_buildings for v2019 (the fence-post prop at category=objects.
+    BUILDING_STAKE_CATEGORY_V2019/type=objects.BUILDING_STAKE_TYPE_V2019,
+    scaled to objects.BUILDING_STAKE_SCALE_V2019 -- see
     build_building_stake_objects_v2019), stake_asset_path for v2021+
     (see build_building_stake_objects_v2021). Each is only consulted
     for its own game_version -- see below.
+
+    Purely a formatting step now -- no packing, no RNG: tree positions
+    come straight from objects.json's tree records, and cluster-fill
+    circle positions/counts/seeds were already frozen in there by
+    step_pack_objects, so re-running this (e.g. after switching
+    game_version) reproduces the exact same in-game layout rather than
+    rerolling a fresh random one. Building stakes are the one exception
+    -- cheap and non-randomized, so they're still computed directly
+    from features.geojson here rather than routed through objects.json.
 
     game_version selects which of objects.py's two confirmed schemas
     to write (see that module's docstring: v2019 is Chad Rockey's
@@ -1254,10 +1401,11 @@ def step_write_objects(
     This overwrites placedObjects2.json wholesale, same as
     step_write_splines/step_write_holes do for their own files.
     """
-    object_list_path = working_dir / OBJECT_LIST_FILE
-    if not object_list_path.exists():
+    objects_path = working_dir / OBJECTS_FILE
+    if not objects_path.exists():
         raise StepError(
-            f"No {OBJECT_LIST_FILE} found under {working_dir}. Run --step generate-trees first."
+            f"No {OBJECTS_FILE} found under {working_dir}. Run --step pack-objects first "
+            "(after --step generate-trees)."
         )
 
     project = load_project(working_dir)
@@ -1281,9 +1429,12 @@ def step_write_objects(
         stake_asset_path = project.get("objects_stake_asset_path")
     if stake_buildings is None:
         stake_buildings = project.get("objects_stake_buildings", False)
+    if waterfall_asset_path is None:
+        waterfall_asset_path = project.get("streams_waterfall_asset_path", WATERFALL_DEFAULT_ASSET_PATH)
 
-    trees = load_object_list(object_list_path)
-    print(f"game_version={game_version}  loaded {len(trees)} tree(s) from {OBJECT_LIST_FILE}")
+    trees, cluster_records, collection_objects = load_objects(objects_path)
+    print(f"game_version={game_version}  loaded {len(trees)} tree(s), {len(cluster_records)} cluster "
+          f"stamp(s), {len(collection_objects)} collection object(s) from {OBJECTS_FILE}")
 
     placed_objects: list[dict] = []
 
@@ -1292,36 +1443,32 @@ def step_write_objects(
             print(f"  theme={theme}  tree_variety={tree_variety}")
             placed_objects += build_tree_objects_v2019(trees, theme=theme, tree_variety=tree_variety)
 
-        # Loaded once and shared between stake-building and cluster-fill
-        # below (both just read features.geojson, never write it) --
-        # stake_buildings is an explicit request (errors if the file's
-        # missing); cluster-fill only fires if a feature actually carries
-        # PGA_CLUSTER_FILLS_TAG, so a missing file there just means
-        # nothing could have been tagged -- silent no-op, not an error.
-        features = None
-        features_path = working_dir / FEATURES_FILE
-        if features_path.exists():
-            features = _crop_features_to_course(working_dir, load_features(features_path))
+        if cluster_records:
+            cluster_groups = cluster_records_to_v2019_groups(cluster_records)
+            cluster_count_total = sum(len(g["Value"]["clusters"]) for g in cluster_groups)
+            spline_count = len({r["spline_id"] for r in cluster_records})
+            print(f"  {cluster_count_total} cluster(s) across {spline_count} tagged spline(s)")
+            placed_objects += cluster_groups
+
+        if collection_objects:
+            collection_groups = build_collection_objects_v2019(collection_objects)
+            placed_count = sum(len(g["Value"]["items"]) for g in collection_groups)
+            print(f"  {placed_count} collection object(s) in {len(collection_groups)} group(s)")
+            placed_objects += collection_groups
 
         if stake_buildings:
-            if features is None:
+            features_path = working_dir / FEATURES_FILE
+            if not features_path.exists():
                 raise StepError(
                     f"--stake-buildings was given but no {FEATURES_FILE} found under {working_dir} "
                     "(needed for building corners) -- run --step ingest-osm first."
                 )
+            features = _crop_features_to_course(working_dir, load_features(features_path))
             building_count = sum(1 for f in features if f.kind == "building")
             stakes = build_building_stake_objects_v2019(features)
             stake_count = sum(len(g["Value"]["items"]) for g in stakes)
             print(f"  {stake_count} stake(s) at corners of {building_count} building(s)")
             placed_objects += stakes
-
-        if features is not None:
-            tagged = [f for f in features if f.tags.get(PGA_CLUSTER_FILLS_TAG)]
-            if tagged:
-                cluster_groups = build_cluster_objects_v2019(tagged)
-                cluster_count_total = sum(len(g["Value"]["clusters"]) for g in cluster_groups)
-                print(f"  {cluster_count_total} cluster(s) across {len(tagged)} tagged spline(s)")
-                placed_objects += cluster_groups
 
         if stake_asset_path:
             print("  NOTE: --stake-asset-path is set but ignored for game_version=2019 -- "
@@ -1331,7 +1478,7 @@ def step_write_objects(
         if trees:
             if not tree_asset_paths and not tree_type_asset_paths:
                 raise StepError(
-                    f"{len(trees)} tree(s) found in object_list.json, but no tree asset path "
+                    f"{len(trees)} tree(s) found in {OBJECTS_FILE}, but no tree asset path "
                     "is set -- pass --tree-asset-path (repeatable) and/or --tree-type-asset-path "
                     "TAG=path (repeatable). See objects.py's module docstring: there's no built-in "
                     "catalog to fall back to, v2021+ placed objects need real Unity asset paths."
@@ -1354,6 +1501,33 @@ def step_write_objects(
             print(f"  {stake_count} stake(s) at corners of {building_count} building(s)")
             placed_objects += stakes
 
+        if collection_objects:
+            collection_groups = build_collection_objects_v2021(collection_objects)
+            placed_count = sum(len(g["Value"]["items"]) for g in collection_groups)
+            print(f"  {placed_count} collection object(s) in {len(collection_groups)} group(s)")
+            placed_objects += collection_groups
+
+    # Waterfall prefabs from streams.json (see step_generate_streams).
+    # y needs project.json's output_height_shift_m (persisted by
+    # write-terrain) to land in the normalized frame -- warn if it looks
+    # like write-terrain hasn't run since generate-streams.
+    streams_path = working_dir / STREAMS_FILE
+    if streams_path.exists():
+        stream_records = load_stream_records(streams_path)
+        n_falls = sum(len(r.get("waterfalls", [])) for r in stream_records)
+        if n_falls:
+            height_shift_m = project.get("output_height_shift_m")
+            if height_shift_m is None:
+                print("  NOTE: no output_height_shift_m in project.json yet -- run write-terrain "
+                      "so stream waterfalls sit at the right elevation. Using 0 for now.")
+                height_shift_m = 0.0
+            if game_version == "2019":
+                falls = build_waterfall_objects_v2019(stream_records, height_shift_m)
+            else:
+                falls = build_waterfall_objects_v2021(stream_records, waterfall_asset_path, height_shift_m)
+            print(f"  {n_falls} stream waterfall(s)")
+            placed_objects += falls
+
     placed_objects = merge_object_groups(placed_objects)
 
     for label, item_count, cluster_count, spline_count in object_counts(placed_objects):
@@ -1375,6 +1549,7 @@ def step_write_objects(
         "objects_tree_type_asset_paths": tree_type_asset_paths,
         "objects_stake_asset_path": stake_asset_path,
         "objects_stake_buildings": stake_buildings,
+        "streams_waterfall_asset_path": waterfall_asset_path,
     })
 
 
@@ -2241,6 +2416,233 @@ def step_generate_cart_paths(
     step_visualize(working_dir)
 
 
+def _select_stream_centerlines(features: list[Feature]) -> list[Feature]:
+    """OSM water Features that are linear (LineString) streams/ditches --
+    the source for step_generate_streams, as opposed to the filled water
+    polygons course_output/water.py handles."""
+    return [
+        f for f in features
+        if f.kind == "water"
+        and f.geometry.geom_type == "LineString"
+        and not f.geometry.is_empty
+        and f.tags.get("waterway") in STREAM_WATERWAY_KINDS
+    ]
+
+
+def step_generate_streams(working_dir: Path) -> None:
+    """
+    Turn OSM stream/ditch centerlines (features.geojson water Features
+    with LineString geometry and waterway=stream|ditch) into a full
+    stream, the "compile once, format at write" way:
+
+      1. A downhill-carved streambed, saved as the next stamps_N.json
+         layer (step="generate-streams") -- picked up automatically by
+         write-terrain AND write-water via _load_normalized_stamps, same
+         as generate-cart-paths' output.
+      2. streams.json -- a frozen, version-agnostic record of the pearl
+         chain, one flow-orientation bearing per stream, and the pearls
+         where the bed drops sharply enough for a waterfall. Consumed by
+         write-water (flowing water strips, course_output/water.py's
+         build_stream_water_objects) and write-objects (waterfall
+         prefabs, v2021+ only).
+      3. Synthetic stream-bank Features appended to features.geojson --
+         the centerline buffered by BANK_VEG_WIDTH_M, tagged with
+         PGA_CLUSTER_FILLS_TAG (DEFAULT_STREAM_BANK_VEG_SPECS, or
+         project.json's "streams_bank_veg_specs"). These ride the
+         existing pack-objects -> write-objects cluster-fill path.
+
+    Re-runnable: the trench stamps flatten to an absolute bed height
+    (so a re-run's extra stamp layer is idempotent, just redundant --
+    delete an older generate-streams layer by hand if they pile up),
+    and this step first strips any stream-bank Features a previous run
+    added (STREAM_BANK_MARKER_TAG) before adding fresh ones. NOTE:
+    re-running ingest-osm rewrites features.geojson from scratch and
+    drops the synthetic bank Features -- re-run generate-streams
+    afterwards (same wrinkle as the GUI's border rings).
+    """
+    heightmap_path = working_dir / HEIGHTMAP_FILE
+    if not heightmap_path.exists():
+        raise StepError(f"No {HEIGHTMAP_FILE} found under {working_dir}. Run --step ingest-laz first.")
+    if not _stamps_files(working_dir):
+        raise StepError(
+            f"No stamp layers found under {_stamps_dir(working_dir)}. Run --step generate-terrain "
+            "first -- the streambed is carved relative to terrain that must already exist."
+        )
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
+
+    project = load_project(working_dir)
+    bank_veg_specs = project.get("streams_bank_veg_specs") or DEFAULT_STREAM_BANK_VEG_SPECS
+
+    full_features = load_features(features_path)
+    course_features = _crop_features_to_course(working_dir, full_features)
+
+    course_streams = _select_stream_centerlines(course_features)
+    if not course_streams:
+        print("No stream/ditch centerlines in features.geojson (water LineString + "
+              f"waterway in {STREAM_WATERWAY_KINDS}) -- nothing to do.")
+        return
+
+    print(f"Loading heightmap from {heightmap_path}...")
+    heights, bounds = load_heightmap(heightmap_path)
+
+    centerlines = [
+        StreamCenterline(line=f.geometry, source_id=f.osm_id, waterway=f.tags.get("waterway", "stream"))
+        for f in course_streams
+    ]
+    print(f"  {len(centerlines)} stream/ditch centerline(s)")
+
+    stamps = generate_stream_stamps(centerlines, heights, bounds)
+    if not stamps:
+        print("  No usable streambed stamps (no finite heightmap data along any centerline) -- nothing written.")
+        return
+
+    # Appended as the next stamps_N.json, same as generate-cart-paths --
+    # keeps preview-count / stamp-count in lockstep (see step_visualize)
+    # and "delete the highest N" a clean undo. The trench flattens to an
+    # absolute bed height, so a re-run's extra layer is idempotent (same
+    # terrain), just redundant -- delete the older generate-streams layer
+    # by hand if they pile up.
+    next_n = len(_stamps_files(working_dir)) + 1
+    out_path = _stamps_dir(working_dir) / STAMPS_PATTERN.format(n=next_n)
+    save_stamp_file(stamps, out_path, step="generate-streams", parameters={
+        "waterway_kinds": list(STREAM_WATERWAY_KINDS), "stream_count": len(centerlines),
+    })
+    print(f"  wrote {out_path} ({len(stamps)} streambed stamp(s))")
+
+    records = build_stream_records(centerlines, heights, bounds)
+    save_stream_records(records, working_dir / STREAMS_FILE)
+    print(f"  wrote {working_dir / STREAMS_FILE}")
+
+    # Stream-bank vegetation: buffer the FULL-frame centerlines (bank
+    # polygons ride features.geojson's own uncropped frame; pack-objects
+    # crops later) and tag each with the cluster-fill specs. Replace any
+    # this step added on a previous run first.
+    kept = [
+        f for f in full_features
+        if not (f.kind == SYNTHETIC_MASKED_KIND and f.tags.get(STREAM_BANK_MARKER_TAG))
+    ]
+    full_streams = _select_stream_centerlines(full_features)
+    bank_count = 0
+    for f in full_streams:
+        poly = f.geometry.buffer(BANK_VEG_WIDTH_M, cap_style=2, join_style=2)
+        if poly.is_empty or poly.geom_type not in ("Polygon", "MultiPolygon"):
+            continue
+        kept.append(Feature(
+            geometry=poly, kind=SYNTHETIC_MASKED_KIND,
+            tags={
+                PGA_CLUSTER_FILLS_TAG: [dict(s) for s in bank_veg_specs],
+                STREAM_BANK_MARKER_TAG: True,
+            },
+            osm_id=next_synthetic_osm_id(kept), mask=True,
+        ))
+        bank_count += 1
+
+    save_features(kept, features_path)
+    print(f"  tagged {bank_count} stream-bank vegetation polygon(s) into {FEATURES_FILE} "
+          "(run pack-objects + write-objects to place them)")
+
+    save_project(working_dir, {"streams_bank_veg_specs": bank_veg_specs})
+
+    print("Refreshing previews...")
+    step_visualize(working_dir)
+
+
+def step_generate_collections(working_dir: Path, library_dir: Path | None = None) -> None:
+    """
+    Resolve every OSM 2-node way tagged pga_collection=<template name>
+    (features.geojson "collection" Features -- see ingest/osm.py) against
+    the collection library into collections.json, the frozen version-
+    agnostic per-project record.
+
+    Node 1 of the line is the anchor; the direction node 1 -> node 2 is
+    the group heading. Every template member is rotated about the anchor
+    by that heading and translated into place -- see
+    course_output/collections.py's resolve_collection. An optional
+    pga_parameter tag on the same way is passed through so one template
+    can adapt per placement (member "variants" / a "{param}" asset-path
+    token -- e.g. a hole sign that swaps by hole number).
+
+    The library is a directory of *.json templates (one per template,
+    see course_output/collection_library.py). Order of precedence:
+    `library_dir` arg, then project.json's "collections_library_dir",
+    then ~/.pga2k/collections/. A missing directory is just an empty
+    library (every placement line then logs "unknown template" and is
+    skipped -- the step still succeeds).
+
+    "compile once, format at write" split, same as streams.json:
+      - the object members ride pack-objects -> write-objects (folded
+        into objects.json as kind="collection_object"), and
+      - the spline members ride write-splines (appended to
+        surfaceSplines.json).
+    So run this before pack-objects / write-splines. Re-runnable;
+    overwrites collections.json wholesale. Re-run after any fresh
+    ingest-osm (which rewrites features.geojson) or library edit.
+    """
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
+
+    project = load_project(working_dir)
+    if library_dir is None:
+        saved = project.get("collections_library_dir")
+        library_dir = Path(saved) if saved else default_library_dir()
+    library_dir = Path(library_dir)
+    print(f"Collection library: {library_dir}")
+
+    features = _crop_features_to_course(working_dir, load_features(features_path))
+    placements = [
+        f for f in features
+        if f.kind == "collection" and f.geometry.geom_type == "LineString"
+        and len(f.geometry.coords) >= 2
+    ]
+    if not placements:
+        print(f"No collection placement lines in {FEATURES_FILE} "
+              f"(a 2-node way tagged {PGA_COLLECTION_TAG}=<template name>) -- nothing to do.")
+        save_collection_records([], working_dir / COLLECTIONS_FILE)
+        return
+
+    library = load_library(library_dir)
+    print(f"  {len(placements)} placement line(s), {len(library)} template(s) in the library")
+
+    records: list[dict] = []
+    skipped = 0
+    for f in placements:
+        name = f.tags.get(PGA_COLLECTION_TAG)
+        template = library.get(name)
+        if template is None:
+            print(f"  NOTE: skipping placement (osm_id={f.osm_id}) -- no template named {name!r} "
+                  f"in {library_dir}")
+            skipped += 1
+            continue
+        (x1, z1), (x2, z2) = f.geometry.coords[0], f.geometry.coords[1]
+        heading = _collection_bearing_deg(x2 - x1, z2 - z1)
+        parameter = f.tags.get(PGA_PARAMETER_TAG)
+        records.append(resolve_collection(
+            template, x1, z1, heading, source_id=f.osm_id, parameter=parameter,
+        ))
+        param_note = f" ({PGA_PARAMETER_TAG}={parameter!r})" if parameter is not None else ""
+        print(f"  placed {name!r}{param_note} at ({x1:.1f}, {z1:.1f}) heading {heading:.0f}")
+
+    save_collection_records(records, working_dir / COLLECTIONS_FILE)
+    n_obj = sum(len(r["objects"]) for r in records)
+    n_spl = sum(len(r["splines"]) for r in records)
+    print(f"  wrote {working_dir / COLLECTIONS_FILE} ({len(records)} placement(s), {n_obj} object(s), "
+          f"{n_spl} spline(s); {skipped} skipped)")
+
+    save_project(working_dir, {"collections_library_dir": str(library_dir)})
+
+    # Collections only need OSM, so this step can legitimately run before
+    # ingest-laz -- don't let a not-yet-possible preview refresh fail the
+    # step once collections.json is already written.
+    try:
+        print("Refreshing previews...")
+        step_visualize(working_dir)
+    except StepError as e:
+        print(f"  (skipping preview refresh: {e})")
+
+
 def step_refine_terrain(
     working_dir: Path,
     tolerance: float,
@@ -2719,7 +3121,18 @@ def step_write_terrain(
 
 def step_write_water(
     working_dir: Path, registration_marks: bool = False, direct_height_shift: bool = True,
-    prune_overlapped_stamps: bool = True,
+    prune_overlapped_stamps: bool = True, multi_tile_water: bool = False,
+    water_fill_mode: str = "edge",
+    water_tile_tolerance_m: float = DEFAULT_WATER_TILE_TOLERANCE_M,
+    water_tile_min_edge_m: float = DEFAULT_WATER_TILE_MIN_EDGE_M,
+    water_tile_max_search_m: float = DEFAULT_WATER_TILE_MAX_SEARCH_M,
+    water_tile_width_samples: int = DEFAULT_WATER_TILE_WIDTH_SAMPLES,
+    water_tile_redundancy_ratio: float = DEFAULT_WATER_TILE_REDUNDANCY_RATIO,
+    water_tile_overlap_m: float = DEFAULT_WATER_TILE_OVERLAP_M,
+    water_stripe_overlap_m: float = DEFAULT_WATER_STRIPE_OVERLAP_M,
+    water_stripe_min_edge_m: float = DEFAULT_WATER_TILE_MIN_EDGE_M,
+    water_stripe_tolerance_m: float = DEFAULT_WATER_STRIPE_TOLERANCE_M,
+    water_stripe_max_stripes_per_side: int = DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
 ) -> None:
     """
     Writes only userLayers.json's "water" key, leaving "height" (and
@@ -2733,6 +3146,15 @@ def step_write_water(
     step_write_terrain), not whatever was last written to
     userLayers.json -- run this again after any terrain change that
     should be reflected in water levels.
+
+    multi_tile_water (default False, byte-identical output to before
+    this flag existed) fills each pond with several smaller, possibly-
+    overlapping tiles hugging its real boundary instead of one single
+    minimum-rotated-rectangle. water_fill_mode picks which multi-tile
+    algorithm ("edge" -- the original, default -- or "stripe"; see
+    course_output/water.py's fit_water_tiles/fit_water_stripes) and is
+    only consulted when multi_tile_water is set. The water_tile_*/
+    water_stripe_* args tune their own respective fill mode only.
     """
     course_dir = working_dir / "course"
 
@@ -2758,7 +3180,26 @@ def step_write_water(
     features = load_features(features_path)
     features = _crop_features_to_course(working_dir, features)
     water_features = [f for f in features if f.kind == "water"]
-    water_entries = build_water_objects(water_features, stamps)
+    water_entries = build_water_objects(
+        water_features, stamps, multi_tile_water=multi_tile_water, water_fill_mode=water_fill_mode,
+        water_tile_tolerance_m=water_tile_tolerance_m, water_tile_min_edge_m=water_tile_min_edge_m,
+        water_tile_max_search_m=water_tile_max_search_m, water_tile_width_samples=water_tile_width_samples,
+        water_tile_redundancy_ratio=water_tile_redundancy_ratio, water_tile_overlap_m=water_tile_overlap_m,
+        water_stripe_overlap_m=water_stripe_overlap_m, water_stripe_min_edge_m=water_stripe_min_edge_m,
+        water_stripe_tolerance_m=water_stripe_tolerance_m,
+        water_stripe_max_stripes_per_side=water_stripe_max_stripes_per_side,
+    )
+
+    streams_path = working_dir / STREAMS_FILE
+    if streams_path.exists():
+        print("Building stream water tiles (course_output/water.py)...")
+        project = load_project(working_dir)
+        height_shift_m = project.get("output_height_shift_m")
+        if height_shift_m is None:
+            print("  NOTE: no output_height_shift_m in project.json yet -- run write-terrain so "
+                  "stream water tiles sit at the right elevation. Using 0 for now.")
+            height_shift_m = 0.0
+        water_entries += build_stream_water_objects(load_stream_records(streams_path), height_shift_m)
 
     out_path = nodes_dir / "userLayers.json"
     write_user_layers(out_path, water=water_entries)
@@ -2846,12 +3287,15 @@ STEPS = {
     "dig-water": step_dig_water,
     "generate-terrain": step_generate_terrain,
     "generate-cart-paths": step_generate_cart_paths,
+    "generate-streams": step_generate_streams,
+    "generate-collections": step_generate_collections,
     "refine-terrain": step_refine_terrain,
     "write-terrain": step_write_terrain,
     "write-water": step_write_water,
     "write-splines": step_write_splines,
     "write-holes": step_write_holes,
     "generate-trees": step_generate_trees,
+    "pack-objects": step_pack_objects,
     "write-objects": step_write_objects,
     "repack": step_repack,
     "visualize": step_visualize,
@@ -3262,6 +3706,67 @@ def main(argv: list[str] | None = None) -> int:
                               "cleanup with no effect on the resolved terrain, just fewer stamps in "
                               "the output. --no-prune-overlapped-stamps keeps every stamp as-is. "
                               "Default: on.")
+    parser.add_argument("--multi-tile-water", action="store_true",
+                         help="write-water: fill each water hazard polygon with several smaller, "
+                              "possibly-overlapping rectangular tiles hugging its real boundary, "
+                              "instead of one single minimum-rotated-rectangle -- reduces (does not "
+                              "guarantee zero) visible water-over-land overshoot on non-rectangular "
+                              "ponds. Overlap between tiles is fine (renders with a clean seam in-"
+                              "game); only overshoot past the polygon boundary is minimized. Opt-in; "
+                              "off by default -- output is byte-identical to the single-rectangle path "
+                              "when unset. See course_output/water.py's fit_water_tiles.")
+    parser.add_argument("--water-tile-tolerance-m", type=float, default=DEFAULT_WATER_TILE_TOLERANCE_M,
+                         help="write-water, --multi-tile-water only: Douglas-Peucker boundary-simplify "
+                              "tolerance (m) applied to a pond polygon before per-edge tile placement "
+                              f"-- collapses small boundary wiggles into fewer, longer edges. Default: "
+                              f"{DEFAULT_WATER_TILE_TOLERANCE_M}.")
+    parser.add_argument("--water-tile-min-edge-m", type=float, default=DEFAULT_WATER_TILE_MIN_EDGE_M,
+                         help="write-water, --multi-tile-water only: floor depth (m) for a per-edge "
+                              "tile when no opposite wall is found within --water-tile-max-search-m. "
+                              f"Default: {DEFAULT_WATER_TILE_MIN_EDGE_M}.")
+    parser.add_argument("--water-tile-max-search-m", type=float, default=DEFAULT_WATER_TILE_MAX_SEARCH_M,
+                         help="write-water, --multi-tile-water only: cap (m) on the ray-cast search for "
+                              f"the wall opposite each boundary edge. Default: {DEFAULT_WATER_TILE_MAX_SEARCH_M}.")
+    parser.add_argument("--water-tile-width-samples", type=int, default=DEFAULT_WATER_TILE_WIDTH_SAMPLES,
+                         help="write-water, --multi-tile-water only: points sampled across each "
+                              "boundary edge's own width (not just its center) when ray-casting for "
+                              f"the opposite wall. Default: {DEFAULT_WATER_TILE_WIDTH_SAMPLES}.")
+    parser.add_argument("--water-tile-redundancy-ratio", type=float, default=DEFAULT_WATER_TILE_REDUNDANCY_RATIO,
+                         help="write-water, --multi-tile-water only: a candidate tile contributing "
+                              "less than this fraction of its own area as genuinely new coverage (not "
+                              "already covered by tiles already placed) is dropped as redundant. Lower "
+                              f"= more, more-overlapping tiles kept. Default: {DEFAULT_WATER_TILE_REDUNDANCY_RATIO}.")
+    parser.add_argument("--water-tile-overlap-m", type=float, default=DEFAULT_WATER_TILE_OVERLAP_M,
+                         help="write-water, --multi-tile-water only: extend each per-edge tile's width "
+                              "by this much (m) at BOTH ends, centered the same as before -- without "
+                              "it, adjacent tiles meet exactly corner-to-corner and can look visibly "
+                              f"inset once real rounding is involved. Default: {DEFAULT_WATER_TILE_OVERLAP_M}.")
+    parser.add_argument("--water-fill-mode", choices=["edge", "stripe"], default="edge",
+                         help="write-water, --multi-tile-water only: 'edge' (default) fits one "
+                              "rectangle per simplified boundary edge with a greedy redundancy-dedup "
+                              "pass (course_output/water.py's fit_water_tiles); 'stripe' seeds from the "
+                              "outer fitted rectangle's center and walks outward in independently-sized "
+                              "stripes (fit_water_stripes) -- avoids edge-fill's dedup pass "
+                              "unpredictably leaving gaps on complex pond shapes, at the cost of "
+                              "possibly more overshoot on very irregular boundaries. Ignored unless "
+                              "--multi-tile-water is set.")
+    parser.add_argument("--water-stripe-overlap-m", type=float, default=DEFAULT_WATER_STRIPE_OVERLAP_M,
+                         help="write-water, --water-fill-mode stripe only: the single knob controlling "
+                              "both how far a stripe may overshoot the true polygon boundary and how "
+                              f"much consecutive stripes overlap along the stacking axis. Default: "
+                              f"{DEFAULT_WATER_STRIPE_OVERLAP_M}.")
+    parser.add_argument("--water-stripe-min-edge-m", type=float, default=DEFAULT_WATER_TILE_MIN_EDGE_M,
+                         help="write-water, --water-fill-mode stripe only: floor (m) for a stripe's "
+                              f"found width/depth. Default: {DEFAULT_WATER_TILE_MIN_EDGE_M}.")
+    parser.add_argument("--water-stripe-tolerance-m", type=float, default=DEFAULT_WATER_STRIPE_TOLERANCE_M,
+                         help="write-water, --water-fill-mode stripe only: optional boundary-simplify "
+                              "(m) before probing -- perf/noise-reduction only, not structural (unlike "
+                              f"--water-tile-tolerance-m). Default: {DEFAULT_WATER_STRIPE_TOLERANCE_M}.")
+    parser.add_argument("--water-stripe-max-stripes-per-side", type=int,
+                         default=DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
+                         help="write-water, --water-fill-mode stripe only: safety cap on stripes walked "
+                              "outward in each of the +/- stacking directions. Default: "
+                              f"{DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE}.")
     parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
@@ -3379,6 +3884,15 @@ def main(argv: list[str] | None = None) -> int:
                               "objects.BUILDING_STAKE_SCALE_V2019 scale) at every corner of every "
                               "'building' feature. Default: use whatever's saved in project.json, or "
                               "OFF if never set.")
+    parser.add_argument("--waterfall-asset-path", type=str, default=None,
+                         help="write-objects (game_version=2021+ only): Unity asset path for the "
+                              "waterfall prefab placed at each stream drop (see --step generate-streams "
+                              "/ streams.json). Default: use whatever's saved in project.json, or "
+                              f"'{WATERFALL_DEFAULT_ASSET_PATH}' if never set.")
+    parser.add_argument("--collection-library", type=Path, default=None,
+                         help="generate-collections: directory of *.json collection templates (see "
+                              "course_output/collection_library.py). Default: project.json's "
+                              "'collections_library_dir', or ~/.pga2k/collections/.")
     parser.add_argument("--detect-lidar-trees", action=argparse.BooleanOptionalAction, default=None,
                          help="generate-trees: also detect individual trees directly from LIDAR canopy "
                               "points (ingest/tree_detection.py), added on top of any OSM natural=tree "
@@ -3473,6 +3987,10 @@ def main(argv: list[str] | None = None) -> int:
                 spacing_m=args.cart_path_spacing,
                 height_avg_radius_m=args.cart_path_height_avg_radius,
             )
+        elif args.step == "generate-streams":
+            step_generate_streams(working_dir)
+        elif args.step == "generate-collections":
+            step_generate_collections(working_dir, args.collection_library)
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
                 tuple(int(b.strip()) for b in args.candidate_brushes.split(","))
@@ -3494,13 +4012,27 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "write-water":
             step_write_water(working_dir, registration_marks=args.registration_marks,
                               direct_height_shift=args.direct_height_shift,
-                              prune_overlapped_stamps=args.prune_overlapped_stamps)
+                              prune_overlapped_stamps=args.prune_overlapped_stamps,
+                              multi_tile_water=args.multi_tile_water,
+                              water_tile_tolerance_m=args.water_tile_tolerance_m,
+                              water_tile_min_edge_m=args.water_tile_min_edge_m,
+                              water_tile_max_search_m=args.water_tile_max_search_m,
+                              water_tile_width_samples=args.water_tile_width_samples,
+                              water_tile_redundancy_ratio=args.water_tile_redundancy_ratio,
+                              water_tile_overlap_m=args.water_tile_overlap_m,
+                              water_fill_mode=args.water_fill_mode,
+                              water_stripe_overlap_m=args.water_stripe_overlap_m,
+                              water_stripe_min_edge_m=args.water_stripe_min_edge_m,
+                              water_stripe_tolerance_m=args.water_stripe_tolerance_m,
+                              water_stripe_max_stripes_per_side=args.water_stripe_max_stripes_per_side)
         elif args.step == "write-splines":
             step_write_splines(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-holes":
             step_write_holes(working_dir)
         elif args.step == "generate-trees":
             step_generate_trees(working_dir, args.detect_lidar_trees, args.mark_cartpath_trees)
+        elif args.step == "pack-objects":
+            step_pack_objects(working_dir)
         elif args.step == "write-objects":
             tree_type_asset_paths = None
             if args.tree_type_asset_paths is not None:
@@ -3513,7 +4045,7 @@ def main(argv: list[str] | None = None) -> int:
             step_write_objects(
                 working_dir, args.game_version, _resolve_theme(args.theme), args.tree_variety,
                 args.tree_asset_paths, tree_type_asset_paths, args.stake_asset_path,
-                args.stake_buildings,
+                args.stake_buildings, args.waterfall_asset_path,
             )
         elif args.step == "repack":
             if not args.repack_filename:

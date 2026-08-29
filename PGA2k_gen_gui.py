@@ -22,6 +22,7 @@ still works without Pillow, previews just won't render).
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import queue
@@ -31,11 +32,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import numpy as np
 
@@ -57,22 +59,30 @@ from constants import (  # noqa: E402
     PREVIEW_STAMPS, STAMPS_DIR,
 )
 from PGA2k_gen import (  # noqa: E402
-    DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M, FEATURES_FILE, HEIGHT_MASK_FILE,
-    HEIGHTMAP_FILE, OBJECT_LIST_FILE, PLACED_OBJECTS_FILE, load_all_stamps, load_project, save_project,
+    COLLECTIONS_FILE, DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M, FEATURES_FILE,
+    HEIGHT_MASK_FILE, HEIGHTMAP_FILE, OBJECT_LIST_FILE, OBJECTS_FILE, PGA_COLLECTION_TAG,
+    load_all_stamps, load_project, save_project,
+)
+from course_output.collection_library import (  # noqa: E402
+    capture_from_course, default_library_dir, load_library, save_collection,
+)
+from course_output.collections import (  # noqa: E402
+    iter_collection_objects, load_collection_records,
 )
 from ingest.heightmap import load_heightmap  # noqa: E402
 from course_output.objects import (  # noqa: E402
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_HEIGHT_TAG,
-    TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, load_placed_objects, save_object_list,
+    TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, load_objects, save_object_list, save_objects,
 )
 from course_output.asset_catalog import (  # noqa: E402
     ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS,
 )
 from course_output.object_clusters import (  # noqa: E402
-    CLUSTER_FILL_SOURCE_BORDER, CLUSTER_FILL_SOURCE_MANUAL, DEFAULT_RASTER_RATIO,
-    PGA_CLUSTER_FILLS_TAG, SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND, build_border_ring_geometry,
+    CLUSTER_FILL_SOURCE_BORDER, CLUSTER_FILL_SOURCE_MANUAL, DEFAULT_FILL_DENSITY, DEFAULT_RASTER_RATIO,
+    PGA_CLUSTER_CENTERLINE_REF_TAG, PGA_CLUSTER_FILLS_TAG, SYNTHETIC_BORDER_CENTERLINE_KIND,
+    SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND, build_border_ring_geometry, next_synthetic_osm_id,
+    pack_cluster_records,
 )
-from course_output.userLayers import GRID_ORIGIN_OFFSET  # noqa: E402
 from ingest.osm import (  # noqa: E402
     DEFAULT_HOLE_CORRIDOR_BUFFER_PX, Feature, build_height_mask, crop_features,
     merge_height_mask_features, load_features,
@@ -93,6 +103,14 @@ from terrain.rastergrid import (  # noqa: E402
 )
 from terrain.cart_paths import (  # noqa: E402
     CART_PATH_STAMP_RADIUS, CART_PATH_SPACING_M, CART_PATH_HEIGHT_AVG_RADIUS_M,
+)
+from course_output.water import (  # noqa: E402
+    fit_water_rectangle, fit_water_tiles, fit_water_stripes,
+    DEFAULT_WATER_TILE_TOLERANCE_M, DEFAULT_WATER_TILE_MIN_EDGE_M,
+    DEFAULT_WATER_TILE_MAX_SEARCH_M, DEFAULT_WATER_TILE_WIDTH_SAMPLES,
+    DEFAULT_WATER_TILE_REDUNDANCY_RATIO, DEFAULT_WATER_TILE_OVERLAP_M,
+    DEFAULT_WATER_STRIPE_OVERLAP_M, DEFAULT_WATER_STRIPE_TOLERANCE_M,
+    DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
 )
 from shapely.ops import unary_union  # noqa: E402
 import viz.visualize as viz  # noqa: E402
@@ -158,13 +176,6 @@ def _spline_tag_detail(f: Feature) -> str:
 
 _ASSET_LABEL_BY_KEY = {(e.category, e.type): e.label for e in ASSET_ENTRIES}
 
-# v2021+ placedObjects2 groups are keyed by {"path": ...} rather than
-# v2019's {"category", "type", "theme"} (see course_output/objects.py's
-# module docstring) -- this resolves a group's asset path back to its
-# asset_catalog.json category, so the "Show objects" preview overlay
-# (below) can color either schema's groups the same way.
-_ASSET_CATEGORY_BY_PATH = {e.path: e.category for e in ASSET_ENTRIES}
-
 # Category id -> (legend label, RGB) for the Objects tab's "Show objects"
 # preview overlay. Only the "nature"/scatterable categories (course_output.
 # asset_catalog.NATURE_CATEGORY_IDS) get a color -- building stakes,
@@ -173,13 +184,31 @@ _ASSET_CATEGORY_BY_PATH = {e.path: e.category for e in ASSET_ENTRIES}
 # _get_cached_object_preview_layer). Deliberately dark, desaturated
 # tones -- bright colors would be hard to pick out against the OSM
 # overlay/heightmap this draws on top of.
+# The sentinel "category" every placed object-collection member
+# (course_output/collections.py) is drawn under in the overlay,
+# regardless of its real asset category -- collection members are
+# benches/signs/vehicles/etc. with no per-category meaning worth
+# splitting out here, unlike the nature categories above/below.
+_COLLECTION_LAYER_CATEGORY = -1
+
 _OBJECT_LAYER_STYLE = {
     0: ("Trees", (8, 36, 8)),
     3: ("Ground cover", (30, 74, 30)),
     2: ("Grass", (94, 90, 45)),
     12: ("Display plants", (110, 24, 24)),
     1: ("Rocks", (68, 68, 68)),
+    _COLLECTION_LAYER_CATEGORY: ("Collections", (120, 80, 140)),
 }
+
+# Fitted water-rectangle preview color -- same steel-blue as the OSM
+# overlay's own water color (PGA2k_gen.py's FEATURE_COLORS "water"
+# entry, "#4682B4"), so the fitted rectangle reads as "the same feature"
+# rather than an unrelated new color. Drawn as an outlined rotated
+# rectangle, not a circle, so it's never confused with a tree/cluster
+# marker from _OBJECT_LAYER_STYLE below.
+_WATER_LAYER_LABEL = "Water (fitted rectangle)"
+_WATER_LAYER_COLOR = (70, 130, 180)
+_WATER_LAYER_FILL_ALPHA = round(255 * 0.25)
 
 # Draw order for the "Show objects" overlay -- LOW to HIGH, i.e. this
 # index is the position in the stack (later entries drawn on top of
@@ -190,7 +219,7 @@ _OBJECT_LAYER_STYLE = {
 # Buildings (category 5) aren't in _OBJECT_LAYER_STYLE yet -- no building
 # placement data currently feeds this overlay -- but would slot in just
 # before trees (second-to-last) if that ever changes.
-_OBJECT_LAYER_DRAW_ORDER = (1, 2, 3, 12, 0)  # rocks, grass, ground cover, display plants, trees
+_OBJECT_LAYER_DRAW_ORDER = (1, 2, 3, 12, _COLLECTION_LAYER_CATEGORY, 0)  # rocks, grass, ground cover, display plants, collections, trees
 
 
 def _spline_cluster_detail(f: Feature) -> str:
@@ -252,6 +281,7 @@ class PGAGenGUI:
         self._current_proc = None  # see _stop_current_step
         self._stop_requested = False
         self._step_start_time = 0.0
+        self._step_on_done: Optional[Callable[[], None]] = None  # see _run_step's on_done param
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
         self._cached_mask_merged_geom = None  # see _get_cached_mask_merged_geometry
         self._cached_mask_geom_key = None
@@ -262,7 +292,7 @@ class PGAGenGUI:
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
-        self._cluster_fill_rows = []  # (spline_osm_ids_str, asset_label, ratio, source) -- see _build_cluster_fill_rows
+        self._cluster_fill_rows = []  # (spline_osm_ids_str, asset_label, ratio, density, source, category, type_) -- see _build_cluster_fill_rows
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._highlighted_object_points = []  # (x, z) of currently-selected individual object/tree row(s), for a preview ring
         self._highlighted_object_group_spline_ids = set()  # currently-selected cluster-fill row(s)' source spline osm_ids, unioned into the spline highlight overlay
@@ -1245,6 +1275,84 @@ class PGAGenGUI:
                  "leaves \"water\" exactly as it was found (see the separate Write Water button below, "
                  "which is slower and only needs re-running when water levels should track a terrain "
                  "change).")
+
+        self.multi_tile_water_var = tk.BooleanVar(value=False)
+        multi_tile_checkbox = ttk.Checkbutton(
+            parent, text="Multi-tile water fill", variable=self.multi_tile_water_var,
+            command=self._show_preview,
+        )
+        multi_tile_checkbox.pack(anchor="w")
+        _Tooltip(multi_tile_checkbox, "Write Water only: fill each pond with several smaller, "
+                 "possibly-overlapping rectangular tiles hugging its real boundary, instead of one "
+                 "single minimum-rotated-rectangle -- reduces visible water-over-land overshoot on "
+                 "non-rectangular ponds (overlap between tiles is fine, renders with a clean seam "
+                 "in-game). Also affects the \"Show objects\" water preview immediately. Off by "
+                 "default -- single-rectangle behavior.")
+
+        self.water_fill_mode_var = tk.StringVar(value="edge")
+        mode_grid = ttk.Frame(parent)
+        mode_grid.pack(anchor="w")
+        mode_entry = self._add_grid_field(
+            mode_grid, 0, 0, self.water_fill_mode_var, "FILL MODE",
+            "Multi-tile water fill only: 'edge' (default) fits one rectangle per boundary edge with "
+            "a redundancy-dedup pass; 'stripe' seeds one tile at the pond's own center and walks "
+            "outward in independently-sized stripes -- avoids edge-fill's dedup pass unpredictably "
+            "leaving gaps on complex pond shapes, at the cost of possibly more overshoot on very "
+            "irregular boundaries.",
+            combobox_values=["edge", "stripe"],
+        )
+        mode_entry.bind("<<ComboboxSelected>>", lambda _e: self._show_preview())
+
+        water_tile_grid = ttk.Frame(parent)
+        water_tile_grid.pack(anchor="w", fill="x")
+        self.water_tile_tolerance_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_TOLERANCE_M))
+        self._add_grid_field(water_tile_grid, 0, 0, self.water_tile_tolerance_var, "TOL m",
+                 "Multi-tile water fill only: Douglas-Peucker boundary-simplify tolerance (m) applied "
+                 "to a pond polygon before per-edge tile placement -- collapses small boundary "
+                 "wiggles into fewer, longer edges.")
+        self.water_tile_min_edge_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_MIN_EDGE_M))
+        self._add_grid_field(water_tile_grid, 0, 1, self.water_tile_min_edge_var, "MIN m",
+                 "Multi-tile water fill only: floor depth (m) for a per-edge tile when no opposite "
+                 "wall is found within SEARCH m.")
+        self.water_tile_max_search_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_MAX_SEARCH_M))
+        self._add_grid_field(water_tile_grid, 0, 2, self.water_tile_max_search_var, "SEARCH m",
+                 "Multi-tile water fill only: cap (m) on the ray-cast search for the wall opposite "
+                 "each boundary edge.")
+        self.water_tile_width_samples_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_WIDTH_SAMPLES))
+        self._add_grid_field(water_tile_grid, 1, 0, self.water_tile_width_samples_var, "SAMPLES",
+                 "Multi-tile water fill only: points sampled across each boundary edge's own width "
+                 "when ray-casting for the opposite wall.")
+        self.water_tile_redundancy_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_REDUNDANCY_RATIO))
+        self._add_grid_field(water_tile_grid, 1, 1, self.water_tile_redundancy_var, "REDUN",
+                 "Multi-tile water fill only: a candidate tile contributing less than this fraction "
+                 "of its own area as new coverage is dropped as redundant. Lower = more, "
+                 "more-overlapping tiles kept.")
+        self.water_tile_overlap_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_OVERLAP_M))
+        self._add_grid_field(water_tile_grid, 1, 2, self.water_tile_overlap_var, "OVERLAP m",
+                 "Multi-tile water fill only: extend each per-edge tile's width by this much (m) at "
+                 "BOTH ends, centered the same as before -- without it, adjacent tiles meet exactly "
+                 "corner-to-corner and can look visibly inset once real rounding is involved.")
+
+        water_stripe_grid = ttk.Frame(parent)
+        water_stripe_grid.pack(anchor="w", fill="x")
+        self.water_stripe_overlap_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_OVERLAP_M))
+        self._add_grid_field(water_stripe_grid, 0, 0, self.water_stripe_overlap_var, "STRIPE OVERLAP m",
+                 "Stripe water fill only: the single knob controlling both how far a stripe may "
+                 "overshoot the true polygon boundary and how much consecutive stripes overlap along "
+                 "the stacking axis.")
+        self.water_stripe_min_edge_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_MIN_EDGE_M))
+        self._add_grid_field(water_stripe_grid, 0, 1, self.water_stripe_min_edge_var, "STRIPE MIN m",
+                 "Stripe water fill only: floor (m) for a stripe's found width/depth.")
+        self.water_stripe_tolerance_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_TOLERANCE_M))
+        self._add_grid_field(water_stripe_grid, 0, 2, self.water_stripe_tolerance_var, "STRIPE TOL m",
+                 "Stripe water fill only: optional boundary-simplify tolerance (m) before probing -- "
+                 "perf/noise-reduction only, not structural (unlike the edge-fill TOL m field). "
+                 "Defaults off (0).")
+        self.water_stripe_max_stripes_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE))
+        self._add_grid_field(water_stripe_grid, 1, 0, self.water_stripe_max_stripes_var, "MAX/SIDE",
+                 "Stripe water fill only: safety cap on stripes walked outward in each of the +/- "
+                 "stacking directions -- defensive only, not expected to bind on a real pond.")
+
         write_water_btn = self._add_step_button(parent, "Write Water", self._run_write_water)
         _Tooltip(write_water_btn, "Writes userLayers.json's \"water\" key -- leaves \"height\" exactly "
                  "as it was found (see course_output/water.py). Water objects are built from "
@@ -1715,7 +1823,9 @@ class PGAGenGUI:
                  "(Preview tab) -- individually placed trees (object_list.json, after Generate Trees) "
                  "as a 2px dot, or a circle sized to its measured LIDAR canopy radius if it has one; "
                  "rock/grass/ground-cover/display-plant cluster-fill stamps (placedObjects2.json, after "
-                 "Write Objects) as a circle at that stamp's own packed radius. Colored by category, "
+                 "Write Objects) as a circle at that stamp's own packed radius; each OSM water body as "
+                 "the outlined, rotated rectangle its water object will actually be sized/placed to "
+                 "(live from features.geojson -- no Write Water run needed). Colored by category, "
                  "fully opaque -- see the key drawn on the preview. Categories with no placed objects "
                  "yet just don't appear.")
 
@@ -1754,14 +1864,21 @@ class PGAGenGUI:
 
         obj_button_row = ttk.Frame(parent)
         obj_button_row.pack(fill="x", pady=(6, 0))
-        clear_all_btn = ttk.Button(obj_button_row, text="Clear All", command=self._clear_filtered_objects)
-        clear_all_btn.pack(side="left")
-        _Tooltip(clear_all_btn, "Delete every tree currently shown (i.e. matching the active Filter) "
-                 "from object_list.json permanently, then re-run Write Objects to pick up the change. "
-                 "Set Filter to 'LIDAR' first to dump only auto-detected trees, keeping any hand-tagged "
-                 "OSM ones -- useful for clearing out a bad detection run without losing curated data. "
-                 "'Manual' (cluster fill) rows are never affected -- use Clear Cluster Fills in the "
-                 "Splines tab for those.")
+        delete_btn = ttk.Button(obj_button_row, text="Delete", command=self._delete_selected_objects)
+        delete_btn.pack(side="left")
+        _Tooltip(delete_btn, "Permanently delete the currently selected row(s) -- individual trees "
+                 "are removed from object_list.json; cluster-fill groups have just their own "
+                 "{category, type, ratio, source} spec stripped from the spline(s) that carry it "
+                 "(other specs on the same spline are left alone), or the whole synthetic border/"
+                 "masked Feature deleted if that spec was the only thing on it. Re-run Generate "
+                 "Trees / Fill with Clusters to get them back.")
+        delete_all_btn = ttk.Button(obj_button_row, text="Delete All", command=self._delete_all_filtered_objects)
+        delete_all_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(delete_all_btn, "Delete every tree and cluster-fill group currently shown (i.e. "
+                 "matching the active Filter), same as Delete but scoped to the whole filtered list "
+                 "rather than just the selection. Set Filter to 'LIDAR' first to dump only "
+                 "auto-detected trees, keeping any hand-tagged OSM ones -- useful for clearing out a "
+                 "bad detection run without losing curated data.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(parent, text="Generate Trees", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
@@ -1796,7 +1913,137 @@ class PGAGenGUI:
                  "Stake Buildings can always bring them back.")
         
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Streams", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        streams_btn = ttk.Button(parent, text="Generate", command=self._run_generate_streams)
+        streams_btn.pack(anchor="w", pady=2)
+        _Tooltip(streams_btn, "Turns every OSM waterway=stream / waterway=ditch line (a water "
+                 "LineString in features.geojson) into a stream: a downhill-carved streambed added "
+                 "as a new terrain stamp layer, flowing-water strips + waterfall records frozen into "
+                 "streams.json, and a buffered stream-bank vegetation polygon tagged for cluster "
+                 "fill. Needs Ingest OSM + a terrain layer already. Re-run Write Terrain, Write "
+                 "Water AND Write Objects afterwards to render it. Re-runnable; re-run after any "
+                 "fresh Ingest OSM (that drops the bank tags).")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Collections", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+
+        lib_row = ttk.Frame(parent)
+        lib_row.pack(anchor="w", fill="x", pady=(0, 2))
+        ttk.Label(lib_row, text="Library:").pack(side="left")
+        self.collections_library_var = tk.StringVar(value=str(default_library_dir()))
+        lib_entry = ttk.Entry(lib_row, textvariable=self.collections_library_var, width=22)
+        lib_entry.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(lib_row, text="...", width=3, command=self._browse_collection_library).pack(side="left")
+        _Tooltip(lib_entry, "Directory of *.json collection templates (course_output/collection_library.py). "
+                 "Default ~/.pga2k/collections/. Persisted per project as 'collections_library_dir'.")
+
+        cap_gen_row = ttk.Frame(parent)
+        cap_gen_row.pack(anchor="w", fill="x", pady=2)
+        cap_btn = ttk.Button(cap_gen_row, text="Capture from .course...", command=self._capture_collection_dialog)
+        cap_btn.pack(side="left")
+        _Tooltip(cap_btn, "Pick a .course file and snapshot EVERY placed object + surface spline in it "
+                 "into one collection template (anchor = their centroid, heading 0). Edit the saved "
+                 "JSON afterward to trim/tune members.")
+        gen_btn = ttk.Button(cap_gen_row, text="Generate", command=self._run_generate_collections)
+        gen_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(gen_btn, "Resolve every OSM 2-node way tagged pga_collection=<template name> "
+                 "(features.geojson) against the library into collections.json. Needs Ingest OSM. "
+                 "Re-run Write Objects AND Write Splines afterwards to render. Re-run after any fresh "
+                 "Ingest OSM.")
+
+        self.collections_templates_tree = ttk.Treeview(
+            parent, columns=("objects", "splines"), show="tree headings", height=5, selectmode="none",
+        )
+        self.collections_templates_tree.heading("#0", text="Template")
+        self.collections_templates_tree.heading("objects", text="Obj")
+        self.collections_templates_tree.heading("splines", text="Spl")
+        self.collections_templates_tree.column("#0", width=160)
+        self.collections_templates_tree.column("objects", width=44, anchor="center")
+        self.collections_templates_tree.column("splines", width=44, anchor="center")
+        self.collections_templates_tree.pack(fill="x", pady=(4, 0))
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._add_step_button(parent, "Write Objects", self._run_write_objects)
+
+    def _collection_library_dir(self) -> Path:
+        text = self.collections_library_var.get().strip()
+        return Path(text) if text else default_library_dir()
+
+    def _browse_collection_library(self) -> None:
+        d = filedialog.askdirectory(title="Select the collection template library directory")
+        if d:
+            self.collections_library_var.set(d)
+            wd = self.working_dir.get().strip()
+            if wd and Path(wd).is_dir():
+                save_project(Path(wd), {"collections_library_dir": d})
+            self._refresh_collection_templates()
+
+    def _refresh_collection_templates(self) -> None:
+        tree = getattr(self, "collections_templates_tree", None)
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        try:
+            library = load_library(self._collection_library_dir())
+        except OSError:
+            library = {}
+        for name, collection in sorted(library.items()):
+            tree.insert("", "end", text=name, values=(len(collection.objects), len(collection.splines)))
+
+    def _capture_collection_dialog(self) -> None:
+        course_file = filedialog.askopenfilename(
+            title="Select a .course file to capture a collection from",
+            filetypes=[(".course files", "*.course"), ("All files", "*.*")],
+        )
+        if not course_file:
+            return
+        default_name = Path(course_file).stem
+        name = simpledialog.askstring(
+            "Collection name", "Name for this collection template:", initialvalue=default_name, parent=self.root,
+        )
+        if not name:
+            return
+
+        libdir = self._collection_library_dir()
+        tmp_dir = Path(tempfile.mkdtemp(prefix="pga2k_collection_"))
+        try:
+            self._append_log(f"\n[capturing collection {name!r} from {course_file}]\n")
+            script = Path(__file__).resolve().parent / "util" / "course_extract.py"
+            result = subprocess.run(
+                [sys.executable, str(script), str(course_file), str(tmp_dir)],
+                capture_output=True, text=True,
+            )
+            if result.stdout:
+                self._append_log(result.stdout)
+            if result.returncode != 0:
+                self._append_log(result.stderr or "course_extract.py failed\n")
+                messagebox.showerror("Capture failed", "Could not extract the .course file -- see the log.")
+                return
+            collection = capture_from_course(tmp_dir / "CourseDescription_nodes", name)
+            out_path = save_collection(collection, libdir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        wd = self.working_dir.get().strip()
+        if wd and Path(wd).is_dir():
+            save_project(Path(wd), {"collections_library_dir": str(libdir)})
+        self._append_log(
+            f"[captured {len(collection.objects)} object(s), {len(collection.splines)} spline(s) "
+            f"-> {out_path}]\n"
+        )
+        self._refresh_collection_templates()
+
+    def _run_generate_collections(self) -> None:
+        """Objects / Collections / Generate -- runs the generate-collections
+        CLI step (features.geojson pga_collection lines -> collections.json).
+        Touches objects AND splines, so the user still has to re-run Write
+        Objects and Write Splines. on_done re-packs objects.json and
+        refreshes the Objects list."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = ["--step", "generate-collections", "--collection-library", str(self._collection_library_dir())]
+        self._run_step(args, wd, on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True))
 
     def _build_options_tab(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Options", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
@@ -1833,6 +2080,24 @@ class PGAGenGUI:
         if f:
             self.objects_asset_list_var.set(f)
 
+    def _on_objects_step_done(self, wd: str, regenerate_packed: bool) -> None:
+        """
+        Shared _run_step on_done callback for Generate Trees / Write
+        Objects / Stake Buildings -- refreshes the Objects tab list
+        (rebuilt from whatever object_list.json/features.geojson now
+        hold) once the subprocess has actually finished. regenerate_
+        packed=True (Generate Trees only -- the other two only ever
+        FORMAT objects.json, never change what trees/cluster fills
+        exist, so they instead pre-regenerate it BEFORE launching, see
+        _run_write_objects) re-packs objects.json first, so the "Show
+        objects" preview and this list both pick up the new tree set
+        immediately, without a separate Splines-tab action needed.
+        """
+        working_dir = Path(wd)
+        if regenerate_packed:
+            self._regenerate_packed_objects(working_dir)
+        self._refresh_objects_list()
+
     def _run_generate_trees(self) -> None:
         wd = self._require_working_dir()
         if not wd:
@@ -1860,25 +2125,52 @@ class PGAGenGUI:
             "--step", "generate-trees",
             "--detect-lidar-trees" if self.detect_lidar_trees_var.get() else "--no-detect-lidar-trees",
         ]
-        self._run_step(args, wd)
-        self._refresh_objects_list()
+        # regenerate objects.json (which embeds a COPY of whatever
+        # object_list.json holds -- see _regenerate_packed_objects) as
+        # part of on_done, not right away -- generate-trees runs as a
+        # background subprocess (see _run_step), so object_list.json
+        # doesn't actually have this run's new trees in it until the
+        # "done" queue message arrives; regenerating any sooner would
+        # just re-pack the PREVIOUS run's tree set.
+        self._run_step(args, wd, on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True))
 
     def _run_write_objects(self) -> None:
         wd = self._require_working_dir()
         if not wd:
             return
+        # write-objects (unlike generate-trees) only ever FORMATS
+        # objects.json -- it never changes what trees/cluster fills
+        # exist -- so it's safe (and necessary, now that write-objects
+        # requires the file to exist) to make sure it's current
+        # BEFORE launching the step, rather than racing it via on_done.
+        self._regenerate_packed_objects(Path(wd))
         args = ["--step", "write-objects", "--tree-variety"]
         theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
         if theme_id is not None:
             args += ["--theme", str(theme_id)]
-        self._run_step(args, wd)
-        self._refresh_objects_list()
+        self._run_step(args, wd, on_done=lambda: self._refresh_objects_list())
 
     def _run_stake_buildings(self) -> None:
         self._run_write_objects_with_stakes(True)
 
     def _run_clear_building_stakes(self) -> None:
         self._run_write_objects_with_stakes(False)
+
+    def _run_generate_streams(self) -> None:
+        """Objects / Generate Streams -- runs the generate-streams CLI
+        step (streambed stamp layer + streams.json + stream-bank
+        vegetation tags from OSM waterway=stream/ditch lines). Touches
+        terrain, water AND objects, so it can't finish the job on its
+        own: the user still has to re-run Write Terrain, Write Water and
+        Write Objects. on_done re-packs objects.json (features.geojson
+        just changed) and refreshes the Objects list."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        self._run_step(
+            ["--step", "generate-streams"], wd,
+            on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True),
+        )
 
     def _run_write_objects_with_stakes(self, stake_buildings: bool) -> None:
         """Shared by the Stake Buildings / Clear Building Stakes buttons --
@@ -1891,6 +2183,7 @@ class PGAGenGUI:
         wd = self._require_working_dir()
         if not wd:
             return
+        self._regenerate_packed_objects(Path(wd))  # see _run_write_objects's identical call
         args = [
             "--step", "write-objects", "--tree-variety",
             "--stake-buildings" if stake_buildings else "--no-stake-buildings",
@@ -1898,8 +2191,7 @@ class PGAGenGUI:
         theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
         if theme_id is not None:
             args += ["--theme", str(theme_id)]
-        self._run_step(args, wd)
-        self._refresh_objects_list()
+        self._run_step(args, wd, on_done=lambda: self._refresh_objects_list())
 
     @staticmethod
     def _object_source(tags: dict) -> str:
@@ -1923,16 +2215,21 @@ class PGAGenGUI:
         return " ".join(parts)
 
     @staticmethod
-    def _build_cluster_fill_rows(features: list) -> list[tuple[str, str, float, str]]:
+    def _build_cluster_fill_rows(features: list) -> list[tuple[str, str, float, float, str, int, int]]:
         """
-        (spline_osm_ids, asset_label, ratio, source) -- one row per
-        distinct {"category","type","ratio","source"} fill spec seen
+        (spline_osm_ids, asset_label, ratio, density, source, category,
+        type_) -- one row per distinct
+        {"category","type","ratio","density","source"} fill spec seen
         across `features` (see course_output/object_clusters.py's
         PGA_CLUSTER_FILLS_TAG), with every contributing spline's osm_id
         collected together -- so a single Fill action (which can target
         many splines and several assets at once) shows as one row per
-        asset/ratio/source combo, not one row per spline. `source`
-        defaults to "manual" for specs saved before that field existed.
+        asset/ratio/density/source combo, not one row per spline.
+        `source` defaults to "manual" and `density` to
+        DEFAULT_FILL_DENSITY for specs saved before those fields
+        existed. category/type_ are carried alongside the display label
+        so _on_object_selected can resolve which of placedObjects2.json's
+        already-packed clusters belong to this row's asset (see there).
         """
         groups: dict[tuple, list[int]] = {}
         for f in features:
@@ -1940,14 +2237,17 @@ class PGAGenGUI:
                 continue
             for spec in f.tags.get(PGA_CLUSTER_FILLS_TAG) or []:
                 source = spec.get("source", CLUSTER_FILL_SOURCE_MANUAL)
-                key = (spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO), source)
+                key = (
+                    spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO),
+                    spec.get("density", DEFAULT_FILL_DENSITY), source,
+                )
                 groups.setdefault(key, []).append(f.osm_id)
 
         rows = []
-        for (category, type_, ratio, source), osm_ids in groups.items():
+        for (category, type_, ratio, density, source), osm_ids in groups.items():
             label = _ASSET_LABEL_BY_KEY.get((category, type_), f"category={category}/type={type_}")
             ids_str = ",".join(str(i) for i in sorted(set(osm_ids)))
-            rows.append((ids_str, label, ratio, source))
+            rows.append((ids_str, label, ratio, density, source, category, type_))
         return rows
 
     def _refresh_objects_list(self) -> None:
@@ -1958,8 +2258,8 @@ class PGAGenGUI:
         features.geojson's cluster-fill tags (area fills -- iid is
         "c"+index into self._cluster_fill_rows, source "manual" or
         "border"). Kept as two disjoint iid namespaces so
-        _clear_filtered_objects (tree-only) can never mistake one for
-        the other.
+        _delete_selected_objects/_delete_all_filtered_objects can
+        always tell which kind of row a given iid is.
         """
         wd = self.working_dir.get().strip()
         self.objects_tree.delete(*self.objects_tree.get_children())
@@ -1995,43 +2295,166 @@ class PGAGenGUI:
                 "", "end", iid=str(i), values=(f"{x:.1f}", f"{z:.1f}", source, self._object_detail(tags)),
             )
 
-        for j, (spline_ids, asset_label, ratio, source) in enumerate(self._cluster_fill_rows):
+        for j, (spline_ids, asset_label, ratio, density, source, _category, _type) in enumerate(self._cluster_fill_rows):
             if filter_val not in ("All", source.capitalize()):
                 continue
-            detail = f"splines={spline_ids} fill={asset_label} ratio={ratio:g}"
+            detail = f"splines={spline_ids} fill={asset_label} ratio={ratio:g} density={density:g}%"
             self.objects_tree.insert("", "end", iid=f"c{j}", values=("", "", source, detail))
 
-    def _clear_filtered_objects(self) -> None:
+    def _remove_cluster_fill_groups(self, working_dir: Path, group_rows: list[tuple]) -> None:
         """
-        Deletes trees only -- cluster fills (source "manual" or
-        "border", iid prefixed "c") are managed from the Splines tab's
-        Clear Cluster Fills instead, since they live in features.geojson's
-        tags, not object_list.json.
+        Removes each given Objects-tab cluster-fill "group" row's own
+        {category, type, ratio, density, source} spec from every Feature
+        it was built from, surgically -- unlike _clear_selected_cluster_fills
+        (Splines tab), which wipes ALL specs off a selected Feature at
+        once, a single group row here is only one spec among
+        potentially several sharing that Feature (see
+        _open_cluster_fill_dialog: choosing multiple assets in one Fill
+        action tags them all onto the same synthetic Feature). A
+        synthetic border/masked Feature left with no specs afterward is
+        deleted outright, same rationale as _clear_selected_cluster_fills.
+        Caller is responsible for re-running self._refresh_objects_list()
+        and self._regenerate_packed_objects() afterward, if the "Show
+        objects" preview/highlight should reflect this -- not done here
+        since a caller that's also touching object_list.json in the
+        same action (_delete_selected_objects/_delete_all_filtered_objects)
+        only needs one repack covering both, not one per helper call.
+        """
+        self._ensure_splines_features_fresh(working_dir)
+        target_osm_ids: set[int] = set()
+        match_keys: set[tuple] = set()
+        for ids_str, _label, ratio, density, source, category, type_ in group_rows:
+            target_osm_ids.update(int(s) for s in ids_str.split(",") if s)
+            match_keys.add((category, type_, ratio, density, source))
+
+        remove_feature_ids: set[int] = set()
+        changed = False
+        for f in self._splines_features:
+            if f.osm_id not in target_osm_ids:
+                continue
+            specs = f.tags.get(PGA_CLUSTER_FILLS_TAG)
+            if not specs:
+                continue
+            kept = [
+                spec for spec in specs
+                if (spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO),
+                    spec.get("density", DEFAULT_FILL_DENSITY),
+                    spec.get("source", CLUSTER_FILL_SOURCE_MANUAL)) not in match_keys
+            ]
+            if len(kept) == len(specs):
+                continue
+            changed = True
+            if kept:
+                f.tags[PGA_CLUSTER_FILLS_TAG] = kept
+            elif f.kind in self._SYNTHETIC_CLUSTER_KINDS:
+                remove_feature_ids.add(f.osm_id)
+                centerline_id = f.tags.get(PGA_CLUSTER_CENTERLINE_REF_TAG)
+                if centerline_id is not None:
+                    remove_feature_ids.add(centerline_id)  # its SYNTHETIC_BORDER_CENTERLINE_KIND companion
+            else:
+                f.tags.pop(PGA_CLUSTER_FILLS_TAG, None)
+
+        if not changed:
+            return
+        if remove_feature_ids:
+            self._splines_features = [f for f in self._splines_features if f.osm_id not in remove_feature_ids]
+        save_features(self._splines_features, working_dir / FEATURES_FILE)
+        self._refresh_splines_list()
+
+    def _delete_selected_objects(self) -> None:
+        """
+        Deletes exactly the currently-selected row(s) in the Objects
+        list -- individual trees (iid is a digit) and/or cluster-fill
+        groups (iid prefixed "c") together, so both kinds can be
+        cleared from this tab without a trip to the Splines tab.
+        Objects-tab counterpart of the Splines tab's Mask button.
         """
         wd = self._require_working_dir()
         if not wd:
             return
-        visible_iids = [iid for iid in self.objects_tree.get_children() if iid.isdigit()]
-        if not visible_iids:
+        selection = self.objects_tree.selection()
+        tree_indices = {int(iid) for iid in selection if iid.isdigit()}
+        group_rows = []
+        for iid in selection:
+            if iid.startswith("c"):
+                try:
+                    j = int(iid[1:])
+                except ValueError:
+                    continue
+                if 0 <= j < len(self._cluster_fill_rows):
+                    group_rows.append(self._cluster_fill_rows[j])
+        if not tree_indices and not group_rows:
+            return
+        if not messagebox.askyesno(
+            "Delete selected objects",
+            f"Permanently delete {len(tree_indices)} tree(s) and {len(group_rows)} cluster-fill "
+            "group(s)? This can't be undone.",
+        ):
+            return
+
+        if tree_indices:
+            self._objects_tree_list = [
+                tree for i, tree in enumerate(self._objects_tree_list) if i not in tree_indices
+            ]
+            save_object_list(self._objects_tree_list, Path(wd) / OBJECT_LIST_FILE)
+        if group_rows:
+            self._remove_cluster_fill_groups(Path(wd), group_rows)
+
+        self._append_log(
+            f"\n[deleted {len(tree_indices)} tree(s), {len(group_rows)} cluster-fill group(s)]\n"
+        )
+        self._regenerate_packed_objects(Path(wd))
+        self._refresh_objects_list()
+        self._show_preview()
+
+    def _delete_all_filtered_objects(self) -> None:
+        """
+        Deletes everything currently shown in the Objects list (i.e.
+        matching the active Filter) -- both trees and cluster-fill
+        groups, no longer punting cluster fills to the Splines tab's
+        Clear Cluster Fills. Objects-tab counterpart of the Splines
+        tab's Mask All button.
+        """
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        visible_tree_iids = [iid for iid in self.objects_tree.get_children() if iid.isdigit()]
+        visible_group_iids = [iid for iid in self.objects_tree.get_children() if iid.startswith("c")]
+        if not visible_tree_iids and not visible_group_iids:
             messagebox.showinfo(
-                "Nothing to clear", "No trees are currently shown for the active filter. (Manual cluster "
-                "fills aren't cleared here -- use Clear Cluster Fills in the Splines tab.)",
+                "Nothing to delete", "No objects are currently shown for the active filter.",
             )
             return
         if not messagebox.askyesno(
-            "Clear filtered trees",
-            f"Permanently delete {len(visible_iids)} tree(s) currently shown (filter="
-            f"{self.objects_filter_var.get()!r}) from object_list.json? This can't be undone -- "
-            "re-run Generate Trees to get them back.",
+            "Delete filtered objects",
+            f"Permanently delete {len(visible_tree_iids)} tree(s) and {len(visible_group_iids)} "
+            f"cluster-fill group(s) currently shown (filter={self.objects_filter_var.get()!r})? "
+            "This can't be undone -- re-run Generate Trees / Fill with Clusters to get them back.",
         ):
             return
-        remove_indices = {int(iid) for iid in visible_iids}
-        self._objects_tree_list = [
-            tree for i, tree in enumerate(self._objects_tree_list) if i not in remove_indices
-        ]
-        save_object_list(self._objects_tree_list, Path(wd) / OBJECT_LIST_FILE)
-        self._append_log(f"\n[cleared {len(remove_indices)} tree(s) from {OBJECT_LIST_FILE}]\n")
+
+        remove_indices = {int(iid) for iid in visible_tree_iids}
+        if remove_indices:
+            self._objects_tree_list = [
+                tree for i, tree in enumerate(self._objects_tree_list) if i not in remove_indices
+            ]
+            save_object_list(self._objects_tree_list, Path(wd) / OBJECT_LIST_FILE)
+
+        group_rows = []
+        for iid in visible_group_iids:
+            j = int(iid[1:])
+            if 0 <= j < len(self._cluster_fill_rows):
+                group_rows.append(self._cluster_fill_rows[j])
+        if group_rows:
+            self._remove_cluster_fill_groups(Path(wd), group_rows)
+
+        self._append_log(
+            f"\n[deleted {len(remove_indices)} tree(s), {len(group_rows)} cluster-fill group(s) "
+            f"from {OBJECT_LIST_FILE}]\n"
+        )
+        self._regenerate_packed_objects(Path(wd))
         self._refresh_objects_list()
+        self._show_preview()
 
     def _refresh_splines_list(self) -> None:
         wd = self.working_dir.get().strip()
@@ -2051,6 +2474,8 @@ class PGAGenGUI:
         self._splines_features_mtime = features_path.stat().st_mtime
         kind_filter = self.splines_kind_filter_var.get()
         for f in self._splines_features:
+            if f.kind == SYNTHETIC_BORDER_CENTERLINE_KIND:
+                continue  # implementation detail of a border fill, not a user-facing row -- see _open_cluster_fill_dialog
             if kind_filter != "All" and f.kind != kind_filter:
                 continue
             if f.osm_id is None:
@@ -2091,15 +2516,25 @@ class PGAGenGUI:
         self._objects_tree_list) has a concrete (x, z) to ring-highlight
         directly in _composite_objects_layer. A cluster-fill "group" row
         (iid "c"+index into self._cluster_fill_rows) has no such fixed
-        points -- object_clusters.py's packed positions carry no
-        back-reference to the spline(s) that produced them -- so instead
-        its source spline osm_ids feed into the SAME spline-highlight
-        overlay _on_spline_selected drives, unioned rather than
-        overwritten so a Splines-tab selection isn't clobbered.
+        points of its own until packed -- so its source spline osm_ids
+        feed into the SAME spline-highlight overlay _on_spline_selected
+        drives (unioned rather than overwritten so a Splines-tab
+        selection isn't clobbered), AND, once objects.json exists (see
+        _regenerate_packed_objects), every packed cluster record whose
+        own "spline_id" is one of this row's source splines and whose
+        category matches gets ring-highlighted too -- a plain field
+        lookup against objects.json's cluster records (each carries its
+        source spline's osm_id directly -- see course_output/
+        object_clusters.py's pack_cluster_records), not the point-in-
+        polygon geometry cross-reference an earlier version needed back
+        when the only available packed-position source (placedObjects2.
+        json) had already lost that back-reference by merging every
+        spline's clusters into shared per-asset groups.
         """
         selection = self.objects_tree.selection()
         points: list[tuple[float, float]] = []
         spline_ids: set[int] = set()
+        group_specs: list[tuple[set[int], int]] = []  # (this row's spline osm_ids, asset category)
         for iid in selection:
             if iid.isdigit():
                 idx = int(iid)
@@ -2112,8 +2547,23 @@ class PGAGenGUI:
                 except ValueError:
                     continue
                 if 0 <= j < len(self._cluster_fill_rows):
-                    ids_str = self._cluster_fill_rows[j][0]
-                    spline_ids.update(int(s) for s in ids_str.split(",") if s)
+                    ids_str, _label, _ratio, _density, _source, category, _type = self._cluster_fill_rows[j]
+                    row_spline_ids = {int(s) for s in ids_str.split(",") if s}
+                    spline_ids.update(row_spline_ids)
+                    group_specs.append((row_spline_ids, category))
+
+        wd = self.working_dir.get().strip()
+        objects_path = Path(wd) / OBJECTS_FILE if wd else None
+        if group_specs and objects_path is not None and objects_path.exists():
+            try:
+                _, cluster_records, _ = load_objects(objects_path)
+            except (json.JSONDecodeError, OSError, KeyError):
+                cluster_records = []
+            for row_spline_ids, category in group_specs:
+                for record in cluster_records:
+                    if record.get("category") == category and record.get("spline_id") in row_spline_ids:
+                        points.append((record["x"], record["z"]))
+
         self._highlighted_object_points = points
         self._highlighted_object_group_spline_ids = spline_ids
         if self._selection_preview_job is not None:
@@ -2136,6 +2586,53 @@ class PGAGenGUI:
         save_height_mask(mask_geometry, working_dir / HEIGHT_MASK_FILE)
         self._cached_mask_merged_geom = None
         self._cached_mask_geom_key = None
+
+    def _regenerate_packed_objects(self, working_dir: Path) -> None:
+        """
+        Rebuild objects.json in-process, right away, from the currently
+        in-memory feature list (self._splines_features) plus whatever
+        object_list.json currently holds -- same "regenerate immediately
+        rather than wait for the next explicit pipeline step" idea
+        _regenerate_height_mask already uses for the mask, so a Splines/
+        Objects-tab Fill/Clear/Delete (or a fresh Generate Trees run)
+        shows up in the "Show objects" preview and the Objects-tab
+        cluster-fill selection highlight (_on_object_selected) right
+        away -- no `course/` extraction or a full Write Objects run
+        needed (see _get_cached_object_preview_layer's docstring).
+
+        trees come from object_list.json if it exists yet (an empty
+        list otherwise -- packing cluster fills doesn't actually need
+        trees to have been generated first); cluster records come from
+        packing self._splines_features, course-cropped, through
+        object_clusters.pack_cluster_records -- the exact same packer
+        PGA2k_gen.py's step_pack_objects uses, just invoked directly
+        here instead of as a subprocess step.
+        """
+        trees = []
+        object_list_path = working_dir / OBJECT_LIST_FILE
+        if object_list_path.exists():
+            try:
+                trees = load_object_list(object_list_path)
+            except (json.JSONDecodeError, OSError, KeyError):
+                trees = []
+
+        self._ensure_splines_features_fresh(working_dir)
+        course_features = self._shift_and_crop_to_course(working_dir, self._splines_features)
+        cluster_records = pack_cluster_records(course_features)
+
+        # Preserve resolved collection placements -- they're owned by
+        # collections.json (written by the generate-collections step),
+        # not by this in-process cluster re-pack, so fold them straight
+        # back in rather than dropping them until the next CLI run.
+        collection_objects = []
+        collections_path = working_dir / COLLECTIONS_FILE
+        if collections_path.exists():
+            try:
+                collection_objects = list(iter_collection_objects(load_collection_records(collections_path)))
+            except (json.JSONDecodeError, OSError, KeyError):
+                collection_objects = []
+
+        save_objects(trees, cluster_records, working_dir / OBJECTS_FILE, collection_objects)
 
     def _toggle_selected_mask(self) -> None:
         """
@@ -2230,6 +2727,9 @@ class PGAGenGUI:
         for f in targets:
             if f.kind in self._SYNTHETIC_CLUSTER_KINDS:
                 remove_ids.add(f.osm_id)
+                centerline_id = f.tags.get(PGA_CLUSTER_CENTERLINE_REF_TAG)
+                if centerline_id is not None:
+                    remove_ids.add(centerline_id)  # its SYNTHETIC_BORDER_CENTERLINE_KIND companion (see _open_cluster_fill_dialog)
                 changed = True
             elif f.tags.pop(PGA_CLUSTER_FILLS_TAG, None) is not None:
                 changed = True
@@ -2238,19 +2738,23 @@ class PGAGenGUI:
         if remove_ids:
             self._splines_features = [f for f in self._splines_features if f.osm_id not in remove_ids]
         save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+        self._regenerate_packed_objects(Path(wd))
         self._refresh_splines_list()
+        self._refresh_objects_list()
         restorable_ids = [
             str(i) for i in selected_ids if i not in remove_ids and self.splines_tree.exists(str(i))
         ]
         if restorable_ids:
             self.splines_tree.selection_set(restorable_ids)
+        self._show_preview()
 
     def _open_cluster_fill_dialog(self) -> None:
         """
         "Fill with Clusters...": pick one or more nature assets (see
-        course_output/asset_catalog.py) and a raster ratio, then create
-        a {"category","type","ratio","source"} spec per chosen asset
-        (see course_output/object_clusters.py for what actually
+        course_output/asset_catalog.py), a raster ratio, and a fill
+        density (%), then create a
+        {"category","type","ratio","density","source"} spec per chosen
+        asset (see course_output/object_clusters.py for what actually
         consumes these tags at write-objects time -- it treats any
         tagged Feature identically regardless of "source" or how its
         geometry was built).
@@ -2370,6 +2874,16 @@ class PGAGenGUI:
                  "just touch; <1 lets them overlap more (denser fill); >1 spaces them further apart. "
                  "Applies to every asset picked in this dialog, across all 3 packing passes.")
 
+        ttk.Label(ratio_row, text="Fill density (%):").pack(side="left", padx=(12, 0))
+        density_var = tk.StringVar(value=str(DEFAULT_FILL_DENSITY))
+        density_entry = ttk.Entry(ratio_row, textvariable=density_var, width=6)
+        density_entry.pack(side="left", padx=4)
+        _Tooltip(density_entry, "How many instances render inside each placed stamp circle, as a percent "
+                 "of the asset's own measured planting density -- 100 is the catalog's real density, 50 "
+                 "is half as many instances at the same stamp size/positions, 200 is double. Doesn't "
+                 "change stamp size, count, or placement (see Raster ratio for that) -- only how packed "
+                 "each stamp looks in-game.")
+
         use_mask_var = tk.BooleanVar(value=False)
         if border_mode:
             ttk.Label(
@@ -2400,6 +2914,15 @@ class PGAGenGUI:
             except ValueError:
                 messagebox.showwarning("Invalid ratio", "Raster ratio must be a positive number.", parent=dialog)
                 return
+            try:
+                density = float(density_var.get())
+                if density <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid density", "Fill density (%) must be a positive number.", parent=dialog,
+                )
+                return
 
             chosen_entries = [CLUSTERABLE_ENTRIES[int(i)] for i in selected_rows]
 
@@ -2422,22 +2945,44 @@ class PGAGenGUI:
                     )
                     return
                 specs = [
-                    {"category": e.category, "type": e.type, "ratio": ratio, "source": CLUSTER_FILL_SOURCE_BORDER}
+                    {
+                        "category": e.category, "type": e.type, "ratio": ratio, "density": density,
+                        "source": CLUSTER_FILL_SOURCE_BORDER,
+                    }
                     for e in chosen_entries
                 ]
+                # Companion Feature carrying the ORIGINAL boundary line (pre-buffer)
+                # as its own .geometry -- object_clusters.py's new ring-walk packer
+                # needs that path, which the buffered `ring` polygon itself doesn't
+                # retain. A separate Feature (not a tag on border_feature) so it
+                # rides the normal shift_features/_crop_features_to_course pipeline
+                # like every other Feature's geometry, rather than needing a
+                # shift-aware special case for a geometry value buried in tags.
+                centerline_feature = Feature(
+                    geometry=mask_geom.boundary, kind=SYNTHETIC_BORDER_CENTERLINE_KIND, tags={},
+                    osm_id=self._next_synthetic_osm_id(), mask=True,
+                )
+                # Appended before the next _next_synthetic_osm_id() call so that
+                # call sees centerline_feature's own id in `existing` and can't
+                # hand border_feature the same one back.
+                self._splines_features.append(centerline_feature)
                 border_feature = Feature(
-                    geometry=ring, kind=SYNTHETIC_BORDER_KIND, tags={PGA_CLUSTER_FILLS_TAG: specs},
+                    geometry=ring, kind=SYNTHETIC_BORDER_KIND,
+                    tags={PGA_CLUSTER_FILLS_TAG: specs, PGA_CLUSTER_CENTERLINE_REF_TAG: centerline_feature.osm_id},
                     osm_id=self._next_synthetic_osm_id(), mask=True,
                 )
                 self._splines_features.append(border_feature)
                 save_features(self._splines_features, Path(wd) / FEATURES_FILE)
                 self._append_log(
                     f"\n[created border ring (source={self.mask_source_var.get()}, width={border_width}) "
-                    f"filled with {len(chosen_entries)} asset(s) at ratio={ratio}]\n"
+                    f"filled with {len(chosen_entries)} asset(s) at ratio={ratio} density={density}%]\n"
                 )
             else:
                 specs = [
-                    {"category": e.category, "type": e.type, "ratio": ratio, "source": CLUSTER_FILL_SOURCE_MANUAL}
+                    {
+                        "category": e.category, "type": e.type, "ratio": ratio, "density": density,
+                        "source": CLUSTER_FILL_SOURCE_MANUAL,
+                    }
                     for e in chosen_entries
                 ]
                 if use_mask_var.get():
@@ -2465,7 +3010,7 @@ class PGAGenGUI:
                     save_features(self._splines_features, Path(wd) / FEATURES_FILE)
                     self._append_log(
                         f"\n[masked-filled {created}/{len(area_targets)} spline(s) with "
-                        f"{len(chosen_entries)} asset(s) at ratio={ratio}]\n"
+                        f"{len(chosen_entries)} asset(s) at ratio={ratio} density={density}%]\n"
                     )
                 else:
                     for f in area_targets:
@@ -2476,13 +3021,16 @@ class PGAGenGUI:
                     note = f" ({skipped} non-area spline(s) skipped)" if skipped else ""
                     self._append_log(
                         f"\n[filled {len(area_targets)} spline(s) with {len(chosen_entries)} asset(s) "
-                        f"at ratio={ratio}{note}]\n"
+                        f"at ratio={ratio} density={density}%{note}]\n"
                     )
 
+            self._regenerate_packed_objects(Path(wd))
             self._refresh_splines_list()
+            self._refresh_objects_list()
             restorable_ids = [str(i) for i in selected_ids if self.splines_tree.exists(str(i))]
             if restorable_ids:
                 self.splines_tree.selection_set(restorable_ids)
+            self._show_preview()
             dialog.destroy()
 
         button_row = ttk.Frame(dialog)
@@ -2553,6 +3101,9 @@ class PGAGenGUI:
             self.objects_theme_var.set(theme_name)
         finally:
             self._suppress_objects_theme_save = False
+        saved_libdir = project.get("collections_library_dir")
+        self.collections_library_var.set(saved_libdir or str(default_library_dir()))
+        self._refresh_collection_templates()
         self._refresh_refine_stats()
         self._refresh_preview_and_slider()
 
@@ -2990,6 +3541,25 @@ class PGAGenGUI:
                      else "--no-direct-height-shift")
         args.append("--prune-overlapped-stamps" if self.prune_overlapped_stamps_var.get()
                      else "--no-prune-overlapped-stamps")
+        if step == "write-water":
+            if self.multi_tile_water_var.get():
+                args.append("--multi-tile-water")
+            args += ["--water-fill-mode", self.water_fill_mode_var.get()]
+            for flag, var in (
+                ("--water-tile-tolerance-m", self.water_tile_tolerance_var),
+                ("--water-tile-min-edge-m", self.water_tile_min_edge_var),
+                ("--water-tile-max-search-m", self.water_tile_max_search_var),
+                ("--water-tile-width-samples", self.water_tile_width_samples_var),
+                ("--water-tile-redundancy-ratio", self.water_tile_redundancy_var),
+                ("--water-tile-overlap-m", self.water_tile_overlap_var),
+                ("--water-stripe-overlap-m", self.water_stripe_overlap_var),
+                ("--water-stripe-min-edge-m", self.water_stripe_min_edge_var),
+                ("--water-stripe-tolerance-m", self.water_stripe_tolerance_var),
+                ("--water-stripe-max-stripes-per-side", self.water_stripe_max_stripes_var),
+            ):
+                value = var.get().strip()
+                if value:  # blank field (mid-edit) -- let the CLI fall back to its own default
+                    args += [flag, value]
         return args
 
     def _run_write_terrain(self) -> None:
@@ -3081,13 +3651,30 @@ class PGAGenGUI:
     # Subprocess execution (pipeline steps only -- see Copy to Game above)
     # ------------------------------------------------------------------
 
-    def _run_step(self, extra_args: list[str], working_dir: Path) -> None:
+    def _run_step(
+        self, extra_args: list[str], working_dir: Path, on_done: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """
+        on_done, if given, runs once the subprocess actually finishes
+        (from _poll_log_queue's "done" handling, same completion signal
+        _refresh_preview_and_slider already uses) -- regardless of
+        success/failure/stop, same as that refresh, and BEFORE it, so
+        anything on_done writes (e.g. regenerating objects.json) is
+        already in place by the time the preview redraws. NOT a
+        substitute for checking the step's own exit status; just a hook
+        for GUI state (e.g. re-reading a file the step just wrote) that
+        would be wrong if run immediately after this call returns,
+        since _run_subprocess does its actual work on a background
+        thread -- this method itself only launches that thread and
+        returns right away.
+        """
         if self.running:
             messagebox.showinfo("Busy", "A step is already running -- wait for it to finish.")
             return
 
         self.running = True
         self._stop_requested = False
+        self._step_on_done = on_done
         self.stop_button.config(state="normal")
         step_name = extra_args[1]
         self.status_label.config(text=f"Running {step_name}...", foreground="orange")
@@ -3227,6 +3814,9 @@ class PGAGenGUI:
                             text=f"Failed (exit {payload}, {elapsed:.1f}s)", foreground="red"
                         )
                         self._append_log(f"\n[finished in {elapsed:.1f}s]\n")
+                    on_done, self._step_on_done = self._step_on_done, None
+                    if on_done is not None:
+                        on_done()
                     self._refresh_preview_and_slider()
                     self._ring_bell()
                 elif kind == "error":
@@ -3235,6 +3825,7 @@ class PGAGenGUI:
                     elapsed = time.time() - self._step_start_time
                     self.status_label.config(text=f"Error ({elapsed:.1f}s)", foreground="red")
                     self._append_log(f"\n[GUI error] {payload}\n[finished in {elapsed:.1f}s]\n")
+                    self._step_on_done = None  # never fired -- the subprocess itself never started
                     self._ring_bell()
         except queue.Empty:
             pass
@@ -3649,11 +4240,7 @@ class PGAGenGUI:
         (see _spline_cluster_detail, _build_cluster_fill_rows), never
         for cross-referencing back to real OSM data.
         """
-        existing = {f.osm_id for f in self._splines_features if f.osm_id is not None}
-        candidate = -1
-        while candidate in existing:
-            candidate -= 1
-        return candidate
+        return next_synthetic_osm_id(self._splines_features)
 
     _OBJECT_DOT_RADIUS_PX = 1  # -> a 2px-diameter dot, per the Objects tab's "Show objects" spec
     _OBJECT_LAYER_FILL_ALPHA = round(255 * 0.4)  # circle interior only -- center dot/outer stroke stay 100%
@@ -3665,36 +4252,42 @@ class PGAGenGUI:
         [0, COURSE_SIZE_M] frame -- mtime-keyed the same idiom as
         _get_cached_mask_merged_geometry/_get_cached_heightmap.
 
-        Trees always come from object_list.json, never placedObjects2.
-        json's "items": it's the same data the Objects tab list itself
-        already shows, available as soon as Generate Trees has run
-        (rather than needing a full Write Objects first), and keeps a
-        per-tree LIDAR canopy radius (TREE_RADIUS_TAG) around for the
-        circle-vs-dot choice below -- placedObjects2.json's tree items
-        have already baked that into an opaque scale factor by the time
-        they're written (see objects.py's build_tree_objects_v2019),
-        losing it. Rocks/grass/ground-cover/display-plants have no pre-
-        Write-Objects equivalent at all -- a cluster fill spec
-        (features.geojson's PGA_CLUSTER_FILLS_TAG) has no concrete
-        positions until course_output/object_clusters.py actually packs
-        it -- so those come from placedObjects2.json's "clusters" only.
+        Trees always come from object_list.json (available as soon as
+        Generate Trees has run), keeping a per-tree LIDAR canopy radius
+        (TREE_RADIUS_TAG) around for the circle-vs-dot choice below --
+        placedObjects2.json's tree items would have already baked that
+        into an opaque scale factor by the time they're written (see
+        objects.py's build_tree_objects_v2019), losing it.
+
+        Rocks/grass/ground-cover/display-plants come from objects.json's
+        already-packed cluster records (course_output/object_clusters.py's
+        pack_cluster_records -- run by the pack-objects CLI step, or, in
+        this GUI, synchronously in-process by _regenerate_packed_objects
+        right after a Splines/Objects-tab Fill/Clear/Delete or Generate
+        Trees -- see that method). Reading objects.json directly here
+        rather than placedObjects2.json means this overlay reflects a
+        cluster fill immediately, with no `course/` extraction or a full
+        Write Objects run needed first, and no version-specific Key
+        shape (Key.path vs. Key.category/type) to translate back through
+        -- objects.json's cluster records already carry a plain
+        version-agnostic category id.
+
         Splitting the two sources this way (trees from one file, every
-        other nature category from the other, items vs. clusters never
-        both read for the same category) means nothing is ever drawn
-        twice.
+        other nature category from the other) means nothing is ever
+        drawn twice.
 
         A tree renders as a circle sized to TREE_RADIUS_TAG when present
         (LIDAR-detected), otherwise a plain dot -- OSM-sourced trees
         carry no per-tree size data. A cluster stamp always renders as a
-        circle at its own packed radius (see object_clusters.py's
-        _cluster_entry) -- the closest thing this pipeline has to a
-        "spacing"-derived on-the-ground size for a scatter-fill area.
+        circle at its own packed radius -- the closest thing this
+        pipeline has to a "spacing"-derived on-the-ground size for a
+        scatter-fill area.
         """
         object_list_path = working_dir / OBJECT_LIST_FILE
-        placed_objects_path = working_dir / "course" / "CourseDescription_nodes" / PLACED_OBJECTS_FILE
+        objects_path = working_dir / OBJECTS_FILE
         ol_mtime = object_list_path.stat().st_mtime if object_list_path.exists() else None
-        po_mtime = placed_objects_path.stat().st_mtime if placed_objects_path.exists() else None
-        cache_key = (str(working_dir), ol_mtime, po_mtime)
+        obj_mtime = objects_path.stat().st_mtime if objects_path.exists() else None
+        cache_key = (str(working_dir), ol_mtime, obj_mtime)
         if getattr(self, "_cached_object_layer_key", None) == cache_key:
             return self._cached_object_layer
 
@@ -3711,18 +4304,16 @@ class PGAGenGUI:
             except (json.JSONDecodeError, OSError, KeyError):
                 pass
 
-        if placed_objects_path.exists():
+        if objects_path.exists():
             try:
-                for group in load_placed_objects(placed_objects_path):
-                    key = group.get("Key", {})
-                    category = _ASSET_CATEGORY_BY_PATH.get(key["path"]) if "path" in key else key.get("category")
+                _, cluster_records, collection_objects = load_objects(objects_path)
+                for record in cluster_records:
+                    category = record.get("category")
                     if category not in _OBJECT_LAYER_STYLE:
                         continue
-                    for cluster in group.get("Value", {}).get("clusters", []):
-                        pos = cluster.get("position", {})
-                        x = pos.get("x", 0.0) + GRID_ORIGIN_OFFSET
-                        z = pos.get("z", 0.0) + GRID_ORIGIN_OFFSET
-                        points.append((x, z, cluster.get("radius"), category))
+                    points.append((record["x"], record["z"], record.get("radius"), category))
+                for obj in collection_objects:
+                    points.append((obj["x"], obj["z"], None, _COLLECTION_LAYER_CATEGORY))
             except (json.JSONDecodeError, OSError, KeyError):
                 pass
 
@@ -3730,16 +4321,101 @@ class PGAGenGUI:
         self._cached_object_layer_key = cache_key
         return points
 
+    @staticmethod
+    def _float_field(var: "tk.StringVar", default: float) -> float:
+        """Parse a numeric tolerance Entry's current text, falling back to `default`
+        on a blank/invalid value (e.g. mid-edit) -- same idiom as _snap_elevation."""
+        try:
+            return float(var.get())
+        except ValueError:
+            return default
+
+    def _get_water_preview_rects(self, working_dir: Path) -> list[tuple[float, float, float, float, float]]:
+        """
+        (center_x, center_z, width_m, depth_m, rotation_deg) for every
+        "water" Feature currently in self._splines_features, course-
+        cropped/shifted the same way the Splines-tab highlight overlay
+        is (_shift_and_crop_to_course) -- so this lines up with the
+        base preview image without needing course/ extraction or a
+        Write Water run first. Mirrors the Refine tab's "Multi-tile
+        water fill" checkbox and FILL MODE selector: when checked,
+        calls course_output.water.fit_water_tiles ("edge" mode) or
+        fit_water_stripes ("stripe" mode) per pond -- using the same
+        tolerance fields that feed the actual Write Water run, see
+        _write_terrain_water_args -- and returns every tile/stripe;
+        otherwise calls fit_water_rectangle, exactly as before. Either
+        way this is the exact geometry fit build_water_objects itself
+        uses, not a re-derived approximation, and skips the water-level
+        lookup entirely -- this overlay only needs the 2D footprint,
+        not an elevation, so it never needs normalized stamps and never
+        skips a pond just because refine-terrain hasn't reached it yet.
+
+        Not cached like _get_cached_object_preview_layer: self.
+        _splines_features already carries its own mtime-freshness check
+        (_ensure_splines_features_fresh), and a course typically has few
+        enough water bodies that re-fitting each redraw is cheap -- same
+        "compute directly, no extra cache" choice as _get_selected_mask_
+        merged_geometry above.
+        """
+        self._ensure_splines_features_fresh(working_dir)
+        features = self._shift_and_crop_to_course(working_dir, self._splines_features)
+        multi_tile = self.multi_tile_water_var.get()
+        fill_mode = self.water_fill_mode_var.get()
+        rects = []
+        for f in features:
+            if f.kind != "water" or f.geometry.geom_type != "Polygon":
+                continue
+            if multi_tile and fill_mode == "stripe":
+                fits = fit_water_stripes(
+                    f.geometry,
+                    overlap_m=self._float_field(self.water_stripe_overlap_var, DEFAULT_WATER_STRIPE_OVERLAP_M),
+                    min_edge_m=self._float_field(self.water_stripe_min_edge_var, DEFAULT_WATER_TILE_MIN_EDGE_M),
+                    tolerance_m=self._float_field(self.water_stripe_tolerance_var, DEFAULT_WATER_STRIPE_TOLERANCE_M),
+                    max_stripes_per_side=int(self._float_field(
+                        self.water_stripe_max_stripes_var, DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
+                    )),
+                )
+                if fits:
+                    rects.extend(fits)
+            elif multi_tile:
+                fits = fit_water_tiles(
+                    f.geometry,
+                    tolerance_m=self._float_field(self.water_tile_tolerance_var, DEFAULT_WATER_TILE_TOLERANCE_M),
+                    min_edge_m=self._float_field(self.water_tile_min_edge_var, DEFAULT_WATER_TILE_MIN_EDGE_M),
+                    max_search_m=self._float_field(self.water_tile_max_search_var, DEFAULT_WATER_TILE_MAX_SEARCH_M),
+                    width_samples=int(self._float_field(
+                        self.water_tile_width_samples_var, DEFAULT_WATER_TILE_WIDTH_SAMPLES,
+                    )),
+                    redundancy_ratio=self._float_field(
+                        self.water_tile_redundancy_var, DEFAULT_WATER_TILE_REDUNDANCY_RATIO,
+                    ),
+                    overlap_m=self._float_field(self.water_tile_overlap_var, DEFAULT_WATER_TILE_OVERLAP_M),
+                )
+                if fits:
+                    rects.extend(fits)
+            else:
+                fit = fit_water_rectangle(f.geometry)
+                if fit is not None:
+                    rects.append(fit)
+        return rects
+
     def _composite_objects_layer(self, img: "Image.Image", working_dir: Path) -> "Image.Image":
         """
         Composite the "Show objects" overlay onto `img` (already at its
         current zoomed size) -- one filled circle per point from
         _get_cached_object_preview_layer, colored/sized per _OBJECT_
-        LAYER_STYLE, plus a legend key in the lower-left corner for
-        whichever categories actually appeared. Same _PLOT_RECT-aware
-        data-area positioning as the mask buffer/elevation contour/
-        highlight overlays above -- course-cropped previews only (see
-        their shared caller-side exclusion in _show_preview).
+        LAYER_STYLE, one outlined rotated rectangle per water body from
+        _get_water_preview_rects, plus a legend key in the lower-left
+        corner for whichever categories actually appeared. Same
+        _PLOT_RECT-aware data-area positioning as the mask buffer/
+        elevation contour/highlight overlays above -- course-cropped
+        previews only (see their shared caller-side exclusion in
+        _show_preview).
+
+        Water rectangles are drawn first, underneath every tree/cluster
+        circle -- a pond is a large background feature, and a tree/rock
+        marker sitting on its bank should never be hidden under the
+        water fill.
 
         Dot radius (_OBJECT_DOT_RADIUS_PX) is a fixed SCREEN size,
         deliberately not scaled with zoom -- it's a location marker, not
@@ -3762,7 +4438,8 @@ class PGAGenGUI:
         cluster of circles would otherwise blur it into the fill.
         """
         points = self._get_cached_object_preview_layer(working_dir)
-        if not points:
+        water_rects = self._get_water_preview_rects(working_dir)
+        if not points and not water_rects:
             return img
 
         left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
@@ -3771,11 +4448,34 @@ class PGAGenGUI:
         data_width = max(1, round(img.width * width_frac))
         data_height = max(1, round(img.height * height_frac))
 
+        def _to_px(x: float, z: float) -> tuple[float, float]:
+            return (
+                (x / COURSE_SIZE_M) * data_width,
+                (1.0 - z / COURSE_SIZE_M) * data_height,  # row 0 = max z, same flip as the other overlays
+            )
+
         order = {cat: i for i, cat in enumerate(_OBJECT_LAYER_DRAW_ORDER)}
         points = sorted(points, key=lambda p: order.get(p[3], -1))
 
         layer = Image.new("RGBA", (data_width, data_height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(layer)
+
+        for cx, cz, width_m, depth_m, rotation_deg in water_rects:
+            angle = math.radians(rotation_deg)
+            width_dir = (math.cos(angle), math.sin(angle))
+            depth_dir = (-math.sin(angle), math.cos(angle))
+            half_w, half_d = width_m / 2.0, depth_m / 2.0
+            corners = [
+                (
+                    cx + sw * half_w * width_dir[0] + sd * half_d * depth_dir[0],
+                    cz + sw * half_w * width_dir[1] + sd * half_d * depth_dir[1],
+                )
+                for sw, sd in ((-1, -1), (1, -1), (1, 1), (-1, 1))
+            ]
+            corners_px = [_to_px(x, z) for x, z in corners]
+            draw.polygon(corners_px, fill=(*_WATER_LAYER_COLOR, _WATER_LAYER_FILL_ALPHA))
+            draw.line(corners_px + [corners_px[0]], fill=(*_WATER_LAYER_COLOR, 255), width=2)
+
         used_categories: set[int] = set()
         for x, z, radius, category in points:
             style = _OBJECT_LAYER_STYLE.get(category)
@@ -3814,17 +4514,22 @@ class PGAGenGUI:
         full.paste(layer, (data_left, data_top), layer)
         img = Image.alpha_composite(img, full)
 
-        if used_categories:
-            img = self._draw_object_layer_key(img, used_categories)
+        if used_categories or water_rects:
+            img = self._draw_object_layer_key(img, used_categories, show_water=bool(water_rects))
         return img
 
     @staticmethod
-    def _draw_object_layer_key(img: "Image.Image", used_categories: set) -> "Image.Image":
+    def _draw_object_layer_key(img: "Image.Image", used_categories: set, show_water: bool = False) -> "Image.Image":
         """Small swatch+label legend, lower-left corner of `img`, one row
         per category actually present in the current overlay -- so a
         course with e.g. no cluster-filled rocks yet just shows Trees,
-        not a 5-row key advertising categories with nothing on screen."""
-        entries = [style for cat, style in _OBJECT_LAYER_STYLE.items() if cat in used_categories]
+        not a 5-row key advertising categories with nothing on screen.
+        Water gets a rectangle swatch (not an ellipse, like every other
+        row) since it's drawn on the map as a rotated rectangle, not a
+        circle -- the legend shape should match what's actually on screen."""
+        entries = [(*style, False) for cat, style in _OBJECT_LAYER_STYLE.items() if cat in used_categories]
+        if show_water:
+            entries.append((_WATER_LAYER_LABEL, _WATER_LAYER_COLOR, True))
         if not entries:
             return img
 
@@ -3834,19 +4539,21 @@ class PGAGenGUI:
         pad = 6
         line_h = swatch + 5
         try:
-            text_w = max(draw.textlength(label, font=font) for label, _ in entries)
+            text_w = max(draw.textlength(label, font=font) for label, _, _ in entries)
         except AttributeError:  # older Pillow without textlength
-            text_w = max(len(label) for label, _ in entries) * 6
+            text_w = max(len(label) for label, _, _ in entries) * 6
         box_w = int(pad * 2 + swatch + 6 + text_w)
         box_h = int(pad * 2 + line_h * len(entries))
         x0, y0 = 8, img.height - box_h - 8
 
         draw.rectangle((x0, y0, x0 + box_w, y0 + box_h), fill=(255, 255, 255, 210), outline=(0, 0, 0, 255))
-        for i, (label, color) in enumerate(entries):
+        for i, (label, color, is_rect) in enumerate(entries):
             sy = y0 + pad + i * line_h
-            draw.ellipse(
-                (x0 + pad, sy, x0 + pad + swatch, sy + swatch), fill=(*color, 255), outline=(0, 0, 0, 255),
-            )
+            swatch_box = (x0 + pad, sy, x0 + pad + swatch, sy + swatch)
+            if is_rect:
+                draw.rectangle(swatch_box, fill=(*color, 255), outline=(0, 0, 0, 255))
+            else:
+                draw.ellipse(swatch_box, fill=(*color, 255), outline=(0, 0, 0, 255))
             draw.text((x0 + pad + swatch + 6, sy - 1), label, fill=(0, 0, 0, 255), font=font)
         return img
 

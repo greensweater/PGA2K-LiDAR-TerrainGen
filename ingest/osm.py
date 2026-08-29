@@ -111,6 +111,16 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     if scatter_type is not None:
         return ("vegetation", True)
 
+    # pga_collection=<template name> -- this project's own tag (not OSM
+    # standard) for a 2-node way that places a reusable object/spline
+    # collection (see course_output/collection_library.py): node 1 is the
+    # anchor, node 2 gives the heading. Always a line, never an area --
+    # the template name stays in the Feature's tags for
+    # step_generate_collections to resolve against the library. No
+    # surface spline / hole / mask consumer matches "collection".
+    if tags.get("pga_collection") is not None:
+        return ("collection", False)
+
     # area:highway=footway -- the OSM convention for a closed way meant
     # to render as a filled AREA (a plaza-style wide path) rather than
     # a linear route, independent of (and not always accompanied by) a

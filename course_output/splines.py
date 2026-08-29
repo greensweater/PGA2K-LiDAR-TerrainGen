@@ -217,6 +217,7 @@ def _build_waypoints(
     shrunk_points: list[tuple[float, float]], handle_length: float,
     is_clockwise: bool, tight_splines: bool,
     adaptive_handle_cap: bool = True, handle_scale: float = DEFAULT_HANDLE_SCALE,
+    is_closed: bool = True,
 ) -> list[dict]:
     n = len(shrunk_points)
     waypoints = []
@@ -224,6 +225,27 @@ def _build_waypoints(
         p = shrunk_points[i - 1]
         t = shrunk_points[i]
         nxt = shrunk_points[(i + 1) % n]
+
+        # Open-spline endpoints: the first/last waypoint has no real
+        # neighbor on one side, so the circular indexing above computes
+        # its tangent across the last<->first wrap -- a direction
+        # unrelated to the path's actual local heading. That's the
+        # literal cause of "the spline end has a handle pointing away,
+        # [making] the last segment render weird as if pushed
+        # underground". Emit a degenerate handle (pointOne == pointTwo
+        # == waypoint) instead: matches ref/spline_cleanup.py's
+        # auto_smooth_handles, where min(prev_len, next_len) *
+        # handle_scale collapses to 0 at an open end, leaving the
+        # terminal segment effectively linear. Closed polygons (every
+        # _STATIC_SPLINE_PARAMS kind, the registration circle) keep the
+        # circular tangent -- there every point has two real neighbors.
+        if not is_closed and (i == 0 or i == n - 1):
+            wp = {"x": round(t[0], 3), "y": round(t[1], 3)}
+            waypoints.append({
+                "pointOne": dict(wp), "pointTwo": dict(wp), "waypoint": dict(wp),
+            })
+            continue
+
         angle = _tangent_angle(p, nxt)
 
         # Cap (never extend) the configured handle_length by the local
@@ -295,7 +317,8 @@ def _build_spline(
         shrink_distance = path_width / 2.0
     shrunk = _shrink_normals(points, shrink_distance, is_clockwise)
     waypoints = _build_waypoints(
-        shrunk, handle_length, is_clockwise, tight_splines, adaptive_handle_cap=clean_up,
+        shrunk, handle_length, is_clockwise, tight_splines,
+        adaptive_handle_cap=clean_up, is_closed=is_closed,
     )
     return {
         "surface": FEATURES_TO_SURFACES[surface],

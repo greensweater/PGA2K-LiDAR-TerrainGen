@@ -827,14 +827,97 @@ def build_building_stake_objects_v2021(features: list[Feature], stake_asset_path
     return [group] if group["Value"]["items"] else []
 
 
+# The v2019 "low falls" prefab -- category/type/theme confirmed directly
+# against a real hand-placed 2019 course (a row of three of these keyed
+# {"category": 16, "type": 3, "theme": false}, items carrying an explicit
+# elevation, not "-Infinity").
+WATERFALL_CATEGORY_V2019 = 16
+WATERFALL_TYPE_V2019 = 3
+
+WATERFALL_DEFAULT_ASSET_PATH = "Assets/Effects/Waterfalls/Prefabs/Waterfall_LowFallsPrefab"
+WATERFALL_DOWNSTREAM_OFFSET_M = 3.9  # nudge each falls prefab this far along its heading (ref/generate_streams.py)
+WATERFALL_SCALE_V2019 = (1.0, 1.0, 1.0)  # confirmed from the real 2019 sample
+WATERFALL_SCALE_V2021 = (0.5, 1.0, 1.0)  # ref/generate_streams.py's value
+
+
+def _waterfall_item(x: float, z: float, rot_y: float, bed_h: float, height_shift_m: float,
+                    scale: tuple[float, float, float]) -> dict:
+    """One waterfall instance: nudged WATERFALL_DOWNSTREAM_OFFSET_M along
+    its own heading (so the mesh sits just downstream of the pearl, not
+    centered on it), at an EXPLICIT elevation bed_h + height_shift_m --
+    the real 2019 sample carries a real y, and a waterfall (like a water
+    plane, unlike a tree) isn't ground-snapped by the game. Non-uniform
+    scale, so not via _placed_item."""
+    rad = math.radians(rot_y)
+    fx = x + math.sin(rad) * WATERFALL_DOWNSTREAM_OFFSET_M
+    fz = z + math.cos(rad) * WATERFALL_DOWNSTREAM_OFFSET_M
+    sx, sz_width, sy = scale
+    return {
+        "position": {
+            "x": _round(fx - GRID_ORIGIN_OFFSET),
+            "y": _round(bed_h + height_shift_m),
+            "z": _round(fz - GRID_ORIGIN_OFFSET),
+        },
+        "rotation": {"x": 0.0, "y": _round(rot_y), "z": 0.0},
+        "scale": {"x": _round(sx), "y": _round(sy), "z": _round(sz_width)},
+    }
+
+
+def _iter_waterfalls(stream_records: list[dict]):
+    for record in stream_records:
+        for wf in record.get("waterfalls", []):
+            # [x, z, rot_y, bed_h]
+            yield wf[0], wf[1], wf[2], wf[3]
+
+
+def build_waterfall_objects_v2019(stream_records: list[dict], height_shift_m: float = 0.0) -> list[dict]:
+    """
+    One "low falls" prefab (Key {"category": 16, "type": 3, "theme":
+    false}) at every waterfall point frozen into streams.json (see
+    terrain/streams.py's build_stream_records). height_shift_m is
+    project.json's output_height_shift_m -- added to each point's stored
+    absolute bed height to land in the same normalized frame the rest of
+    the course was written in (so run write-terrain first).
+    """
+    group = {
+        "Key": {"category": WATERFALL_CATEGORY_V2019, "type": WATERFALL_TYPE_V2019, "theme": False},
+        "Value": {"items": [], "clusters": []},
+    }
+    for x, z, rot_y, bed_h in _iter_waterfalls(stream_records):
+        group["Value"]["items"].append(
+            _waterfall_item(x, z, rot_y, bed_h, height_shift_m, WATERFALL_SCALE_V2019)
+        )
+    return [group] if group["Value"]["items"] else []
+
+
+def build_waterfall_objects_v2021(
+    stream_records: list[dict], asset_path: str, height_shift_m: float = 0.0,
+) -> list[dict]:
+    """
+    v2021+ equivalent of build_waterfall_objects_v2019 -- a single
+    Key.path group. asset_path defaults (in step_write_objects) to
+    WATERFALL_DEFAULT_ASSET_PATH.
+    """
+    if not asset_path:
+        raise ValueError("build_waterfall_objects_v2021 needs a real waterfall asset path -- see module docstring.")
+
+    group = _placed_object_group_v2021(asset_path)
+    for x, z, rot_y, bed_h in _iter_waterfalls(stream_records):
+        group["Value"]["items"].append(
+            _waterfall_item(x, z, rot_y, bed_h, height_shift_m, WATERFALL_SCALE_V2021)
+        )
+    return [group] if group["Value"]["items"] else []
+
+
 def merge_object_groups(groups: list[dict]) -> list[dict]:
     """
     Collapse `groups` down to exactly one group per distinct Key,
     concatenating each Value list field (items/clusters/splines) in
     encounter order, first-seen Key order preserved.
 
-    build_tree_objects_v2019/_v2021 and build_cluster_objects_v2019
-    already merge groups sharing a Key WITHIN their own call, but
+    build_tree_objects_v2019/_v2021 and
+    object_clusters.cluster_records_to_v2019_groups already merge
+    groups sharing a Key WITHIN their own call, but
     step_write_objects concatenates several independent builder calls
     (trees, building stakes, cluster fills) with a plain `+=` -- if two
     of those calls happen to land on the same Key (e.g. a user's
@@ -921,6 +1004,59 @@ def load_object_list(path: Path) -> list[tuple[float, float, dict]]:
     with Path(path).open(encoding="utf-8") as fh:
         entries = json.load(fh)
     return [(e["x"], e["z"], e["tags"]) for e in entries]
+
+
+def save_objects(
+    trees: list[tuple[float, float, dict]], cluster_records: list[dict], path: Path,
+    collection_objects: Optional[list[dict]] = None,
+) -> None:
+    """
+    Write objects.json -- the pack-objects step's combined, VERSION-
+    AGNOSTIC output: `trees` (see save_object_list; passed through
+    unchanged, same shape), `cluster_records`
+    (course_output/object_clusters.py's pack_cluster_records output --
+    already-packed circle positions/counts/RNG seeds, frozen at pack
+    time so they don't reroll on every read), and `collection_objects`
+    (course_output/collections.py -- resolved collection member
+    placements, {"x","z","rotation_deg","scale","category","type",
+    "theme","path","source_id"}, deterministic, no RNG).
+
+    This is what step_write_objects (any game_version) and the GUI's
+    live preview both read -- neither needs its own copy of cluster-
+    fill packing logic, and switching game_version, or just previewing
+    after a Splines-tab Fill/Clear, never re-rolls cluster RNG or
+    requires a `course/` extraction. Same "compile once, format/consume
+    at read time" split object_list.json already established for trees
+    alone (see step_generate_trees' docstring); this extends it to
+    cluster fills and collections, which previously had no version-
+    agnostic intermediate at all -- they were packed directly into
+    placedObjects2.json's schema inside step_write_objects.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [{"kind": "tree", "x": x, "z": z, "tags": tags} for x, z, tags in trees]
+    entries += [dict(record, kind="cluster") for record in cluster_records]
+    entries += [dict(obj, kind="collection_object") for obj in (collection_objects or [])]
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(entries, fh, indent=2)
+
+
+def load_objects(
+    path: Path,
+) -> tuple[list[tuple[float, float, dict]], list[dict], list[dict]]:
+    """(trees, cluster_records, collection_objects) from objects.json --
+    inverse of save_objects, split back into the shapes their respective
+    consumers (build_tree_objects_v20XX,
+    object_clusters.cluster_records_to_v2019_groups,
+    collections.build_collection_objects_v20XX) already expect."""
+    with Path(path).open(encoding="utf-8") as fh:
+        entries = json.load(fh)
+    trees = [(e["x"], e["z"], e["tags"]) for e in entries if e["kind"] == "tree"]
+    cluster_records = [{k: v for k, v in e.items() if k != "kind"} for e in entries if e["kind"] == "cluster"]
+    collection_objects = [
+        {k: v for k, v in e.items() if k != "kind"} for e in entries if e["kind"] == "collection_object"
+    ]
+    return trees, cluster_records, collection_objects
 
 
 def save_placed_objects(objects: list[dict], path: Path) -> None:
