@@ -1399,12 +1399,13 @@ def build_stream_water_objects(
     terrain/streams.py's build_stream_records / streams.json). These are
     the SAME objects as pond planes -- perfectly horizontal, carrying a
     real elevation -- so a descending stream becomes a CHAIN of tiles,
-    one per shallow elevation band (segment_stream_pearls_by_elevation:
-    each tile drops <= STREAM_WATER_TILE_DROP_M of bed). Each tile's
-    level is its band's upstream bed height + STREAM_WATER_FILL_DEPTH_M;
-    width grows with the tile's own deep-end depth AND with total descent
-    from the source, because a horizontal plane sitting further below the
-    original grade spreads wider before the banks clip it.
+    one per shallow elevation band. terrain.streams.stream_water_tiles is
+    the shared geometry helper (each tile drops <= STREAM_WATER_TILE_DROP_M
+    of bed; level = band upstream bed + STREAM_WATER_FILL_DEPTH_M; width
+    grows with the tile's own deep-end depth AND total descent from the
+    source, because a horizontal plane further below the original grade
+    spreads wider before the banks clip it). build_stream_records reuses
+    the same helper to hang a waterfall + splash on each tile seam.
 
     bed_h in streams.json is the pre-normalization absolute height;
     height_shift_m (project.json's output_height_shift_m, persisted by
@@ -1417,13 +1418,11 @@ def build_stream_water_objects(
 
     rotation.y is the flow's compass bearing; scale.z (long axis) runs
     along the flow (see _water_entry, rotation_deg = -bearing).
-    options.flowSpeed is STREAM_WATER_FLOW_SPEED (50 is the engine max).
+    options.flowOrientation is that bearing + 180 (PGA treats it as a
+    "flow-from" heading -- verified in-game). options.flowSpeed is
+    STREAM_WATER_FLOW_SPEED (50 is the engine max).
     """
-    from terrain.streams import (
-        STREAM_WATER_BASE_WIDTH_M, STREAM_WATER_FILL_DEPTH_M, STREAM_WATER_FLOW_SPEED,
-        STREAM_WATER_OVERLAP_M, STREAM_WATER_WIDEN_PER_DESCENT, STREAM_WATER_WIDEN_PER_DEPTH,
-        segment_stream_pearls_by_elevation,
-    )
+    from terrain.streams import STREAM_WATER_FLOW_SPEED, stream_water_tiles
 
     entries: list[dict] = []
     tiles = 0
@@ -1436,36 +1435,18 @@ def build_stream_water_objects(
             continue
         source_bed = pearls[0][2]
 
-        for segment in segment_stream_pearls_by_elevation(pearls):
-            (ax, az, bed_up), (bx, bz, bed_down) = segment[0], segment[-1]
-            length = math.hypot(bx - ax, bz - az)
-            if length < 1e-6:
-                continue
-            cx, cz = 0.5 * (ax + bx), 0.5 * (az + bz)
-            bearing = math.degrees(math.atan2(bx - ax, bz - az)) % 360.0
-
-            # circular-mean heading of this run's own legs -> flowOrientation
-            legs = [
-                math.atan2(p2[0] - p1[0], p2[1] - p1[1])
-                for p1, p2 in zip(segment, segment[1:])
-            ]
-            flow_orientation = math.degrees(math.atan2(
-                sum(math.sin(a) for a in legs), sum(math.cos(a) for a in legs),
-            )) % 360.0
-
-            level = bed_up + STREAM_WATER_FILL_DEPTH_M + height_shift_m
-            deep_end_depth = max(0.0, (bed_up + STREAM_WATER_FILL_DEPTH_M) - bed_down)
-            total_descent = max(0.0, source_bed - bed_down)
-            width_m = (
-                STREAM_WATER_BASE_WIDTH_M
-                + STREAM_WATER_WIDEN_PER_DEPTH * deep_end_depth
-                + STREAM_WATER_WIDEN_PER_DESCENT * total_descent
-            )
-
+        for tile in stream_water_tiles(pearls, source_bed):
+            # _water_entry mirrors rotation_deg into a compass bearing
+            # (rotation.y = -rotation_deg % 360), so pre-negate the tile
+            # bearing to land on it exactly; long axis (scale.z) then runs
+            # along the flow.
             entries.append(_water_entry(
-                cx, cz, width_m=width_m, depth_m=length + STREAM_WATER_OVERLAP_M,
-                rotation_deg=(-bearing) % 360.0, level=level,
-                flow_orientation=flow_orientation, flow_speed=STREAM_WATER_FLOW_SPEED,
+                tile.cx, tile.cz,
+                width_m=tile.width_m, depth_m=tile.rendered_length,
+                rotation_deg=(-tile.bearing) % 360.0,
+                level=tile.level + height_shift_m,
+                flow_orientation=tile.flow_orientation,
+                flow_speed=STREAM_WATER_FLOW_SPEED,
             ))
             tiles += 1
 

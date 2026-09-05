@@ -158,7 +158,7 @@ import math
 import random
 from typing import Optional
 
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 from shapely.ops import unary_union
 
 from course_output.asset_catalog import ASSET_CATEGORIES, ASSET_ENTRIES, AssetCategory, AssetEntry, cluster_count
@@ -237,6 +237,21 @@ def next_synthetic_osm_id(features) -> int:
 
 DEFAULT_RASTER_RATIO = 1.0
 DEFAULT_FILL_DENSITY = 100.0  # percent; scales cluster_count(...) -- see DENSITY in the module docstring
+
+# Fill spec dicts' "mode" field -- "stamps" (default, back-compat with
+# every spec predating this field) packs circle-scatter stamps into
+# Value.clusters (see pack_cluster_records); "spline" instead emits an
+# engine-auto-scattered object-spline fill region into Value.splines,
+# v2021+ only (see pack_spline_records). One Feature can carry both --
+# each fill spec picks its own mode independently.
+CLUSTER_FILL_MODE_STAMPS = "stamps"
+CLUSTER_FILL_MODE_SPLINE = "spline"
+
+# The engine appears to cap a single object-spline's bounding box --
+# see ref/generate_rough_border_v2.py's MAX_SPLINE_BOUNDS (100m there).
+# An oversized spline-mode fill polygon is chopped into pieces no
+# larger than this on either side first (see subdivide_polygon).
+MAX_SPLINE_FILL_PIECE_SIZE_M = 50.0
 TIER_STEP_RATIO = 0.5  # each tier's radius = previous tier's radius * this
 MIN_TIER_RADIUS = 1.0  # meters; smallest radius a tier (or a ring-walk circle) is ever allowed to target
 MAX_TIERS = 6  # hard cap on tier count, safety net -- not expected to bind for any current catalog cluster_radius
@@ -1163,6 +1178,8 @@ def fill_feature_with_clusters(feature: Feature, rng: Optional[random.Random] = 
 
     records: list[dict] = []
     for spec in specs:
+        if spec.get("mode", CLUSTER_FILL_MODE_STAMPS) != CLUSTER_FILL_MODE_STAMPS:
+            continue  # mode="spline" -- see pack_spline_records, not this stamp packer
         resolved = _resolve_spec(spec)
         if resolved is None:
             print(f"  NOTE: skipping unresolvable cluster fill spec "
@@ -1219,6 +1236,8 @@ def pack_cluster_records(features: list[Feature], rng: Optional[random.Random] =
         if not specs:
             continue
         for spec in specs:
+            if spec.get("mode", CLUSTER_FILL_MODE_STAMPS) != CLUSTER_FILL_MODE_STAMPS:
+                continue  # mode="spline" -- see pack_spline_records, not this stamp packer
             resolved = _resolve_spec(spec)
             if resolved is None:
                 print(f"  NOTE: skipping unresolvable cluster fill spec "
@@ -1230,6 +1249,108 @@ def pack_cluster_records(features: list[Feature], rng: Optional[random.Random] =
             density = spec.get("density", DEFAULT_FILL_DENSITY)
             records.extend(_pack_spec(feature, category, entry, ratio, density, rng, centerline_by_id))
 
+    return records
+
+
+def subdivide_polygon(poly: Polygon, max_size: float = MAX_SPLINE_FILL_PIECE_SIZE_M) -> list[Polygon]:
+    """
+    Recursively splits poly's bounding box in half along its longer
+    axis, clipping poly into each half, until every piece's bbox is
+    <= max_size on both axes -- this project's own port of
+    ref/generate_rough_border_v2.py's subdivide_poly (same recursive-
+    bisection approach), used by pack_spline_records to keep an
+    oversized object-spline fill under the engine's apparent per-spline
+    bounding-box cap (see MAX_SPLINE_FILL_PIECE_SIZE_M).
+
+    poly must be a Polygon, not MultiPolygon -- a caller with
+    MultiPolygon feature geometry (e.g. a "Use mask" clip split into
+    several disjoint pieces) subdivides each of its .geoms separately.
+    """
+    min_x, min_z, max_x, max_z = poly.bounds
+    if (max_x - min_x) <= max_size and (max_z - min_z) <= max_size:
+        return [poly]
+
+    if (max_x - min_x) >= (max_z - min_z):
+        split = (min_x + max_x) * 0.5
+        half_a = box(min_x, min_z, split, max_z)
+        half_b = box(split, min_z, max_x, max_z)
+    else:
+        split = (min_z + max_z) * 0.5
+        half_a = box(min_x, min_z, max_x, split)
+        half_b = box(min_x, split, max_x, max_z)
+
+    pieces: list[Polygon] = []
+    for clipped in (poly.intersection(half_a), poly.intersection(half_b)):
+        if clipped.is_empty:
+            continue
+        if isinstance(clipped, MultiPolygon):
+            for geom in clipped.geoms:
+                pieces.extend(subdivide_polygon(geom, max_size))
+        elif isinstance(clipped, Polygon):
+            pieces.extend(subdivide_polygon(clipped, max_size))
+        # else: a degenerate sliver intersection (Point/LineString/
+        # GeometryCollection) -- discard, not a fillable area.
+    return pieces
+
+
+def pack_spline_records(features: list[Feature]) -> list[dict]:
+    """
+    Schema-neutral object-spline-fill records -- {"category", "type",
+    "waypoints", "fill_pct", "spline_id"} -- for every mode="spline"
+    fill spec (see pack_cluster_records's mode="stamps" counterpart).
+
+    Unlike stamp-mode packing, there's no circle placement here and
+    nothing to freeze via RNG: an object-spline fill is just the
+    feature's own polygon (already the buffered ring for a border
+    fill, already the clipped shape for a masked fill -- the exact
+    same geometry _pack_spec's dart-throw/ring-walk packing consumes
+    for stamp mode) chopped into <= MAX_SPLINE_FILL_PIECE_SIZE_M pieces
+    (subdivide_polygon) and reported as-is. fill_pct is the spec's
+    existing density percent / 100 -- reusing the same knob stamp-mode
+    already exposes rather than adding a second one (see the
+    conversation's decision).
+
+    waypoints are the piece's exterior ring, course-local frame, closed
+    point dropped (shapely repeats the first point at the end) --
+    course_output/objects.py's object_spline_fill_records_to_v2021_groups
+    turns these into the game's degenerate-handle waypoint dicts and
+    applies GRID_ORIGIN_OFFSET at write time, same "freeze at pack,
+    format at write" split as pack_cluster_records.
+    """
+    records: list[dict] = []
+    for feature in features:
+        if feature.geometry.geom_type not in _AREA_GEOM_TYPES:
+            continue
+        specs = feature.tags.get(PGA_CLUSTER_FILLS_TAG)
+        if not specs:
+            continue
+        polys = (
+            list(feature.geometry.geoms) if feature.geometry.geom_type == "MultiPolygon"
+            else [feature.geometry]
+        )
+        for spec in specs:
+            if spec.get("mode", CLUSTER_FILL_MODE_STAMPS) != CLUSTER_FILL_MODE_SPLINE:
+                continue
+            resolved = _resolve_spec(spec)
+            if resolved is None:
+                print(f"  NOTE: skipping unresolvable object-spline fill spec "
+                      f"category={spec.get('category')}/type={spec.get('type')} "
+                      "(stale tag or asset_catalog.json no longer has it)")
+                continue
+            category, entry = resolved
+            fill_pct = spec.get("density", DEFAULT_FILL_DENSITY) / 100.0
+            for poly in polys:
+                for piece in subdivide_polygon(poly, MAX_SPLINE_FILL_PIECE_SIZE_M):
+                    if piece.is_empty or not isinstance(piece, Polygon):
+                        continue
+                    waypoints = list(piece.exterior.coords[:-1])
+                    if len(waypoints) < 3:
+                        continue
+                    records.append({
+                        "category": category.id, "type": entry.type,
+                        "waypoints": waypoints, "fill_pct": fill_pct,
+                        "spline_id": feature.osm_id,
+                    })
     return records
 
 
@@ -1256,6 +1377,4 @@ def cluster_records_to_v2019_groups(records: list[dict]) -> list[dict]:
             "Value": {"items": [], "clusters": []},
         })
         group["Value"]["clusters"].append(_cluster_entry_from_record(record))
-    return list(groups.values())
-
     return list(groups.values())

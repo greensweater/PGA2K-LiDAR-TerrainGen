@@ -20,8 +20,10 @@ A collections.json record:
      "x": float, "z": float,           # anchor, course-local metres
      "heading_deg": float,             # 0 = +Z, 90 = +X (see _bearing_deg)
      "objects": [{"x","z","rotation_deg","scale",
-                  "category","type","theme","path"}, ...],
-     "splines": [ <surfaceSplines.json spline dict, points in course-local frame> ]}
+                  "category","type","theme","path",
+                  "dy"?}, ...],   # dy present => designed elevation
+     "splines": [ <surfaceSplines.json spline dict, points in course-local frame> ],
+     "stamps": [{"x","z","scale_x","scale_z","value","brush","rotation_deg","tool"}, ...]}
 
 Every coordinate is in the course-local [0, COURSE_SIZE_M] frame -- the
 object/spline writers apply the usual GRID_ORIGIN_OFFSET shift, same as
@@ -36,6 +38,20 @@ member (any field: category/type/theme/path/scale/dx/dz/rotation_deg),
 and/or a `"{param}"` token in its asset `path` that's substituted with
 the parameter value. A member with neither is placed identically
 regardless of the parameter. Spline members are always static.
+
+VERTICAL: object members carrying a `"dy"` (captured from a prop placed
+at a designed elevation -- see collection_library.py's VERTICAL
+GROUNDING) get an absolute `y` = target terrain height + dy at
+write-objects time (apply_terrain_heights). Members with no `"dy"` keep
+position.y = "-Infinity" and the game ground-snaps them.
+
+STAMPS: stamp members (raised flowerbed beds, berms) are resolved into
+the record's "stamps" list (rotated/translated like objects) and turned
+into terrain.stamp.Stamp objects by build_collection_stamps, which
+PGA2k_gen.py's _load_normalized_stamps folds into the stamp list every
+write-terrain / write-water run -- NOT persisted as a stamps_N.json
+layer, so re-running generate-collections never double-applies them.
+All are raise-tool (relative); capture never records a flatten.
 """
 
 from __future__ import annotations
@@ -49,6 +65,7 @@ from course_output.asset_catalog import ASSET_ENTRIES
 from course_output.collection_library import Collection
 from course_output.objects import _placed_item, _placed_object_group_v2021
 from course_output.userLayers import GRID_ORIGIN_OFFSET
+from terrain.stamp import TOOL_RAISE, Stamp
 
 _DECIMALS = 3
 
@@ -112,7 +129,7 @@ def resolve_collection(
     for raw in template.objects:
         m = _resolve_member(raw, parameter)
         rx, rz = _rotate(m.get("dx", 0.0), m.get("dz", 0.0), heading_deg)
-        objects.append({
+        obj = {
             "x": _round(anchor_x + rx),
             "z": _round(anchor_z + rz),
             "rotation_deg": _round((m.get("rotation_deg", 0.0) + heading_deg) % 360.0),
@@ -121,7 +138,15 @@ def resolve_collection(
             "type": m.get("type"),
             "theme": m.get("theme"),
             "path": m.get("path"),
-        })
+        }
+        # `dy` (height above the source course's flatten datum) rides
+        # through unrotated -- heading is a yaw, it doesn't touch
+        # elevation. step_write_objects turns it into an absolute y
+        # against the target terrain; a member with no `dy` keeps
+        # position.y = "-Infinity" (game ground-snap).
+        if m.get("dy") is not None:
+            obj["dy"] = _round(m["dy"])
+        objects.append(obj)
 
     splines: list[dict] = []
     for spline in template.splines:
@@ -136,6 +161,20 @@ def resolve_collection(
         placed["waypoints"] = new_waypoints
         splines.append(placed)
 
+    stamps: list[dict] = []
+    for s in template.stamps:
+        rx, rz = _rotate(s.get("dx", 0.0), s.get("dz", 0.0), heading_deg)
+        stamps.append({
+            "x": _round(anchor_x + rx),
+            "z": _round(anchor_z + rz),
+            "scale_x": _round(s.get("scale_x", 1.0)),
+            "scale_z": _round(s.get("scale_z", 1.0)),
+            "value": _round(s.get("value", 0.0)),
+            "brush": s.get("brush"),
+            "rotation_deg": _round((s.get("rotation_deg", 0.0) + heading_deg) % 360.0),
+            "tool": TOOL_RAISE,  # capture only ever records raise; enforce it here too
+        })
+
     return {
         "source_id": source_id,
         "name": template.name,
@@ -145,6 +184,7 @@ def resolve_collection(
         "heading_deg": _round(heading_deg % 360.0),
         "objects": objects,
         "splines": splines,
+        "stamps": stamps,
     }
 
 
@@ -175,6 +215,26 @@ def iter_collection_objects(records: list[dict]):
 # ---------------------------------------------------------------------------
 # write-objects formatting
 # ---------------------------------------------------------------------------
+
+
+def apply_terrain_heights(objects: list[dict], height_at, height_shift_m: float = 0.0) -> list[dict]:
+    """For every collection object carrying a `dy` (it had a designed
+    scalar y in the source course, recorded as a height above that
+    course's flatten datum -- see collection_library.py), set an
+    absolute `y` = height_at(x, z) + height_shift_m + dy, so the prop
+    sits the same distance above local ground on the target course.
+    `height_at(x, z)` is the target terrain height in the pre-shift
+    frame (e.g. terrain.terrain_model.TerrainModel.evaluate over the raw
+    stamp list); height_shift_m is project.json's output_height_shift_m
+    (write-terrain's normalization). Objects with no `dy` are left
+    untouched -- they keep position.y = "-Infinity" (game ground-snap).
+    Mutates and returns `objects`."""
+    for obj in objects:
+        dy = obj.get("dy")
+        if dy is None:
+            continue
+        obj["y"] = round(height_at(obj["x"], obj["z"]) + height_shift_m + dy, 3)
+    return objects
 
 
 def _resolve_v2019_key(obj: dict) -> Optional[tuple[int, int, bool]]:
@@ -215,9 +275,10 @@ def build_collection_objects_v2019(objects: list[dict]) -> list[dict]:
             "Key": {"category": key[0], "type": key[1], "theme": key[2]},
             "Value": {"items": [], "clusters": []},
         })
-        group["Value"]["items"].append(
-            _placed_item(obj["x"], obj["z"], obj.get("scale", 1.0), obj.get("rotation_deg", 0.0))
-        )
+        group["Value"]["items"].append(_placed_item(
+            obj["x"], obj["z"], obj.get("scale", 1.0), obj.get("rotation_deg", 0.0),
+            y=obj.get("y", "-Infinity"),
+        ))
     if skipped:
         print(f"  NOTE: {skipped} collection object(s) skipped -- no v2019 category/type "
               "(captured from a v2021 course whose asset path isn't in asset_catalog.json)")
@@ -236,9 +297,10 @@ def build_collection_objects_v2021(objects: list[dict]) -> list[dict]:
             skipped += 1
             continue
         group = groups.setdefault(path, _placed_object_group_v2021(path))
-        group["Value"]["items"].append(
-            _placed_item(obj["x"], obj["z"], obj.get("scale", 1.0), obj.get("rotation_deg", 0.0))
-        )
+        group["Value"]["items"].append(_placed_item(
+            obj["x"], obj["z"], obj.get("scale", 1.0), obj.get("rotation_deg", 0.0),
+            y=obj.get("y", "-Infinity"),
+        ))
     if skipped:
         print(f"  NOTE: {skipped} collection object(s) skipped -- no v2021 asset path "
               "(captured from a v2019 course whose category/type isn't in asset_catalog.json)")
@@ -272,4 +334,31 @@ def build_collection_splines(records: list[dict]) -> list[dict]:
                 for wp in spline.get("waypoints", [])
             ]
             out.append(shifted)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# write-terrain / write-water formatting
+# ---------------------------------------------------------------------------
+
+
+def build_collection_stamps(records: list[dict]) -> list[Stamp]:
+    """terrain.stamp.Stamp objects for every stamp member across every
+    collection record, in the course-local [0, COURSE_SIZE_M] frame (same
+    frame PGA2k_gen.py's load_all_stamps returns -- the GRID_ORIGIN_OFFSET
+    shift happens later, in userLayers.stamp_to_entry). Every one is
+    forced to TOOL_RAISE: a collection stamp is a relative delta on top
+    of whatever terrain it lands on, never an absolute-height flatten.
+    Entries missing a brush id are skipped."""
+    out: list[Stamp] = []
+    for record in records:
+        for s in record.get("stamps", []):
+            if s.get("brush") is None:
+                continue
+            out.append(Stamp(
+                x=float(s["x"]), z=float(s["z"]),
+                scale_x=float(s.get("scale_x", 1.0)), scale_z=float(s.get("scale_z", 1.0)),
+                value=float(s.get("value", 0.0)), brush=int(s["brush"]),
+                rotation=float(s.get("rotation_deg", 0.0)), tool=TOOL_RAISE,
+            ))
     return out

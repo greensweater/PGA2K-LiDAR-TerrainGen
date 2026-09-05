@@ -1,0 +1,13 @@
+{
+  "_note": "Per-theme grouping of v2019 category-0 tree 'type' ids into named species buckets, so course_output/objects.py's build_tree_objects_v2019 can route a tree by its pga_tree_type tag (objects.py's TREE_TYPE_TAG / LEAF_TYPE_TREE_HINTS) instead of picking blindly from the whole NORMAL_TREES_V2019/SKINNY_TREES_V2019 pool. 'default_species' names the bucket a tree with NO pga_tree_type tag draws from. A theme absent from 'themes' (or this whole file missing) => build_tree_objects_v2019 keeps its original random-pool behavior, no change. The id lists are read off asset_catalog.json's v2021 asset-path filenames (that catalog was captured from a hand-placed rustic v2019 file, so every id here is a confirmed-valid rustic prefab). Add a theme block by characterizing its NORMAL_TREES_V2019/SKINNY_TREES_V2019 ids the same way.",
+  "themes": {
+    "11": {
+      "name": "rustic",
+      "default_species": "deciduous",
+      "species": {
+        "deciduous": [0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        "pine": [13, 14, 15, 16]
+      }
+    }
+  }
+}

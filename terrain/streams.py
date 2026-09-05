@@ -74,13 +74,19 @@ STREAM_WATER_WIDEN_PER_DESCENT = 0.4  # + this * (total bed descent from the str
 STREAM_WATER_OVERLAP_M = 6.0         # each tile's length = run length + this, so adjacent tiles overlap
 STREAM_WATER_FLOW_SPEED = 37.0       # options.flowSpeed (real stream tile ~37; 50 is the engine max)
 
-# A bed drop of at least this much between consecutive pearls emits a
-# waterfall record at the lower pearl; consecutive falls are then thinned
-# so no two sit within WATERFALL_MIN_SPACING_M of each other (a single
-# cliff smeared across a few pearls by the height-sampling radius would
-# otherwise stack several overlapping prefabs).
+# The seam between two consecutive horizontal water tiles emits a
+# waterfall + splash prefab group when the upper tile's surface sits at
+# least this far above the lower tile's (tiles that split on a bend or
+# the length cap rather than a real drop are skipped). Tiles are the
+# natural spacing, so no separate thinning pass is needed.
 WATERFALL_MIN_DROP_M = 0.3
-WATERFALL_MIN_SPACING_M = 12.0
+
+# The "low falls" prefab's pivot sits this far BELOW the water surface it
+# pours from -- so the waterfall's y is (upper tile surface - this),
+# applied uniformly to every fall. Measured ~1.0 m against a hand-placed
+# 2019 sample (falls y 4.261 vs its water tile 5.255). The splash prefab
+# instead sits right on the surface it lands on (lower tile), no drop.
+WATERFALL_LIP_DROP_M = 1.0
 
 # Centerline buffer (each side) for the stream-bank vegetation polygon
 # that step_generate_streams tags with cluster fills.
@@ -243,6 +249,81 @@ def segment_stream_pearls_by_elevation(
     return segments
 
 
+@dataclass
+class StreamWaterTile:
+    """One horizontal type-72 water tile along a stream -- the rectangle
+    course_output/water.py's _water_entry renders. All lengths in meters,
+    course-local frame; `level` is PRE height-normalization (add
+    output_height_shift_m at write time, exactly like a pearl's bed_h).
+
+    `bearing` is the compass heading of the band's upstream->downstream
+    chord (0 = +Z, clockwise) and is EXACTLY the tile's written
+    rotation.y. `rendered_length` (band chord + the overlap pad that
+    becomes scale.z) is the tile's full along-flow extent, so
+    `edge_offset(+1)` is the downstream edge center and `edge_offset(-1)`
+    the upstream edge center -- the anchor a waterfall / splash prefab
+    hangs on."""
+    cx: float
+    cz: float
+    bearing: float
+    band_length: float          # upstream->downstream chord of the elevation band
+    width_m: float              # cross-flow footprint (before _water_entry's /1.8)
+    level: float                # water surface = band upstream bed + fill depth, pre-shift
+    flow_orientation: float     # options.flowOrientation (leg circular mean + 180)
+
+    @property
+    def rendered_length(self) -> float:
+        return self.band_length + STREAM_WATER_OVERLAP_M
+
+    def edge_offset(self, sign: float) -> tuple[float, float]:
+        """Center of the downstream (sign=+1) or upstream (sign=-1) short
+        edge of the rendered rectangle."""
+        rad = math.radians(self.bearing)
+        half = 0.5 * self.rendered_length
+        return (self.cx + math.sin(rad) * half * sign,
+                self.cz + math.cos(rad) * half * sign)
+
+
+def stream_water_tiles(
+    pearls_bed: list[tuple[float, float, float]], source_bed: float,
+) -> list[StreamWaterTile]:
+    """The chain of horizontal water tiles for one stream -- the single
+    source of tile geometry, shared by course_output/water.py (renders
+    them as type-72 planes) and build_stream_records (hangs a waterfall +
+    splash on the seam between consecutive tiles). `pearls_bed` is the
+    stream's (x, z, bed_h) pearl chain in downhill order; `source_bed` is
+    the stream's own first-pearl bed height (drives the widen-with-total-
+    descent term)."""
+    tiles: list[StreamWaterTile] = []
+    for segment in segment_stream_pearls_by_elevation(pearls_bed):
+        (ax, az, bed_up), (bx, bz, bed_down) = segment[0], segment[-1]
+        length = math.hypot(bx - ax, bz - az)
+        if length < 1e-6:
+            continue
+        legs = [
+            math.atan2(p2[0] - p1[0], p2[1] - p1[1])
+            for p1, p2 in zip(segment, segment[1:])
+        ]
+        flow_orientation = (math.degrees(math.atan2(
+            sum(math.sin(a) for a in legs), sum(math.cos(a) for a in legs),
+        )) + 180.0) % 360.0
+        deep_end_depth = max(0.0, (bed_up + STREAM_WATER_FILL_DEPTH_M) - bed_down)
+        total_descent = max(0.0, source_bed - bed_down)
+        tiles.append(StreamWaterTile(
+            cx=0.5 * (ax + bx), cz=0.5 * (az + bz),
+            bearing=_bearing_deg(bx - ax, bz - az),
+            band_length=length,
+            width_m=(
+                STREAM_WATER_BASE_WIDTH_M
+                + STREAM_WATER_WIDEN_PER_DEPTH * deep_end_depth
+                + STREAM_WATER_WIDEN_PER_DESCENT * total_descent
+            ),
+            level=bed_up + STREAM_WATER_FILL_DEPTH_M,
+            flow_orientation=flow_orientation,
+        ))
+    return tiles
+
+
 def _pearls_bed_rots(stream: StreamCenterline, average_height, spacing_m: float):
     """Shared front half of generate_stream_stamps / build_stream_records:
     orient downhill, resample, compute bed profile, drop dead-data
@@ -300,11 +381,21 @@ def build_stream_records(
          "waterway": "stream" | "ditch",
          "pearls": [[x, z, rot_y, bed_h], ...],     # course frame, downhill order
          "flow_orientation": <compass bearing deg>,
-         "waterfalls": [[x, z, rot_y, bed_h], ...]}  # subset of pearls where the bed
-                                                     # drops >= waterfall_min_drop_m
+         "waterfalls": [[x, z, rot_y, level], ...],  # one per seam between consecutive
+                                                     # water tiles whose surfaces differ
+                                                     # by >= waterfall_min_drop_m
+         "splashes":   [[x, z, rot_y, level], ...]}  # 1:1 with waterfalls, SAME x/z/rot_y
 
-    bed_h everywhere is the ABSOLUTE carved bed height (pre height-
-    normalization). course_output/water.py and objects.py add
+    A waterfall + its splash are placed as a rigid group on the shared
+    edge of two adjacent water tiles (see stream_water_tiles): x/z is the
+    centre of the UPPER tile's downstream short edge (tile centre shifted
+    by half its rendered length along its rotation), rot_y is that tile's
+    bearing (== its written rotation.y). The two objects coincide in x/z
+    and rotation; only `level` differs -- the waterfall's is the UPPER
+    tile surface minus WATERFALL_LIP_DROP_M (the prefab pivot sits ~1 m
+    below the water it pours from), the splash's is the LOWER tile
+    surface. All heights are PRE height-normalization;
+    course_output/water.py and objects.py add
     project.json's output_height_shift_m (persisted by write-terrain) to
     reach the normalized frame -- so run write-terrain before write-water
     / write-objects. Stored rather than re-derived because neither writer
@@ -324,24 +415,37 @@ def build_stream_records(
         # Mean of the sin/cos of each leg's bearing -> a stable average
         # heading even across the 0/360 wrap. The +180 offset matches
         # ref/generate_streams.py's own `(180 + rot_y) % 360` for
-        # options.flowOrientation -- unverified in-game here; if the
-        # current visibly flows the wrong way, drop the +180.
+        # options.flowOrientation -- verified in-game: PGA reads
+        # flowOrientation as a "flow-from" heading (points upstream), so
+        # it's the downstream bearing mirrored.
         rads = [math.radians(r) for r in rots[:-1]] or [math.radians(rots[0])]
         mean_bearing = math.degrees(math.atan2(
             sum(math.sin(a) for a in rads), sum(math.cos(a) for a in rads),
         ))
         flow_orientation = (mean_bearing + 180.0) % 360.0
 
+        # Waterfall + splash on the seam of every consecutive water-tile
+        # pair (same tiles course_output/water.py renders -- one shared
+        # geometry helper) where the upper tile's surface sits at least
+        # waterfall_min_drop_m above the lower tile's. Anchor = the upper
+        # tile's downstream edge centre, rotated to the upper tile. The
+        # splash rides the SAME x/z/rotation; only the frozen height
+        # differs -- the falls at (upper surface - WATERFALL_LIP_DROP_M),
+        # uniformly; the splash on the lower tile's surface.
+        tiles = stream_water_tiles(
+            [(px, pz, pb) for (px, pz), pb in zip(pearls, bed)], float(bed[0]),
+        )
         waterfalls: list[list[float]] = []
-        last_xz: Optional[tuple[float, float]] = None
-        for i in range(1, len(bed)):
-            if bed[i - 1] - bed[i] < waterfall_min_drop_m:
+        splashes: list[list[float]] = []
+        for upper, lower in zip(tiles, tiles[1:]):
+            if upper.level - lower.level < waterfall_min_drop_m:
                 continue
-            x, z, r, _bed = pearl_rows[i]
-            if last_xz is not None and math.dist(last_xz, (x, z)) < WATERFALL_MIN_SPACING_M:
-                continue
-            waterfalls.append([x, z, r, float(bed[i])])
-            last_xz = (x, z)
+            ex, ez = upper.edge_offset(+1.0)
+            rot_y = round(upper.bearing, 3)
+            waterfalls.append(
+                [round(ex, 3), round(ez, 3), rot_y, round(upper.level - WATERFALL_LIP_DROP_M, 3)]
+            )
+            splashes.append([round(ex, 3), round(ez, 3), rot_y, round(lower.level, 3)])
 
         records.append({
             "source_id": stream.source_id,
@@ -349,6 +453,7 @@ def build_stream_records(
             "pearls": pearl_rows,
             "flow_orientation": round(flow_orientation, 3),
             "waterfalls": waterfalls,
+            "splashes": splashes,
         })
 
     n_falls = sum(len(r["waterfalls"]) for r in records)

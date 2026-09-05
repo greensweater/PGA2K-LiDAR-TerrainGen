@@ -58,6 +58,7 @@ time via apply_brush_adjustment().
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,7 +160,56 @@ def _load_all_profiles() -> dict[int, BrushProfile]:
     }
 
 
-BRUSH_PROFILES: dict[int, BrushProfile] = _load_all_profiles()
+def _make_fallback_profile(brush_id: int) -> BrushProfile:
+    """
+    Synthesized stand-in for a brush id that has no measured PNG scan --
+    only ~7 of PGA's ~65 brushes were ever ingested (see module
+    docstring / brush_profiles.json), and the rest are asymmetric bitmap
+    brushes used for small "raise"-tool touch-ups.
+
+    A near-flat radial plateau that eases to 0 over the outer 15% of the
+    radius: a uniform bump that preserves the authored peak delta is a
+    reasonable model for a minor raise adjustment, and the soft edge
+    still honors this module's "weight is 0 at r=1" invariant. Left
+    SHAPE_CIRCLE (not SHAPE_SQUARE) so it stays consistent with every
+    consumer that already reads a missing profile as BRUSH_PROFILES.get()
+    -> None and falls back to circular reach/distance on its own.
+    """
+    samples = np.array([[0.0, 1.0], [0.85, 1.0], [1.0, 0.0]], dtype=np.float64)
+    return BrushProfile(brush_id=brush_id, samples=samples, shape=SHAPE_CIRCLE)
+
+
+class _BrushProfileRegistry(dict):
+    """
+    {brush_id: BrushProfile}, but a lookup by ``[]`` for an unregistered
+    brush synthesizes a fallback profile (see _make_fallback_profile),
+    caches it, and warns once -- rather than raising KeyError. This is
+    what lets a stamp carrying one of the un-ingested brush types (e.g. a
+    collection berm captured with brush 76) still evaluate instead of
+    crashing TerrainModel / height_fit / stamp_pruning / the visualizer.
+
+    ``.get()`` and ``in`` keep plain dict semantics (unregistered -> None
+    / False) until something forces the synthesis via ``[]`` -- callers
+    that probe with ``.get()`` already handle None by assuming a circle,
+    which is exactly what the synthesized fallback is.
+    """
+
+    def __missing__(self, brush_id):
+        try:
+            key = int(brush_id)
+        except (TypeError, ValueError):
+            raise KeyError(brush_id)
+        profile = _make_fallback_profile(key)
+        self[brush_id] = profile
+        warnings.warn(
+            f"No measured BrushProfile for brush type {brush_id}; using a "
+            f"flat circular fallback (raise-only touch-up approximation).",
+            stacklevel=2,
+        )
+        return profile
+
+
+BRUSH_PROFILES: dict[int, BrushProfile] = _BrushProfileRegistry(_load_all_profiles())
 
 
 def apply_brush_adjustment(

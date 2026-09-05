@@ -110,8 +110,8 @@ def fit_stamp_heights(
     for offset, stamp in enumerate(stamps):
         index = n_seed + offset
         if stamp.brush not in kernels:
-            if stamp.brush not in BRUSH_PROFILES:
-                raise ValueError(f"No BrushProfile registered for brush type {stamp.brush}")
+            # BRUSH_PROFILES synthesizes a fallback for un-ingested brush
+            # ids (see terrain/brush_profiles.py) rather than raising.
             kernels[stamp.brush] = TerrainKernel(BRUSH_PROFILES[stamp.brush])
 
         # sample_heightmap_mean does a single-radius circular average --

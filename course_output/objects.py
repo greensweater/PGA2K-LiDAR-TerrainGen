@@ -48,12 +48,19 @@ course), not this compiler's local [0, COURSE_SIZE_M] working frame.
 sort_objects_v3.py's own in_bounds check (MAP_MIN=-1000, MAP_MAX=1000)
 confirms placed objects need this same shift regardless of version.
 
-The uniform x=y=z scale-from-height rule (see build_tree_objects_v2019
-/ _v2021) is applied identically in both versions, and turns out to
-already be established practice for v2021+ specifically --
-sort_objects_v3.py's normalize_scale() does exactly this as a cleanup
-pass over an existing file. Building it in at generation time means
-that cleanup pass has nothing left to fix.
+Scale is uniform x=y=z in both versions (established practice for v2021+
+already -- sort_objects_v3.py's normalize_scale() does exactly this as a
+cleanup pass; building it in at generation time leaves that pass nothing
+to fix). Its MAGNITUDE is CALIBRATED where possible: _tree_scale uses
+detected_canopy_height / the prefab's measured native height (from
+asset_catalog.json's native_height_m -- keyed by asset path for v2021+,
+by per-theme type id for v2019, see native_tree_height_v2019), so a tree
+detected at its real height renders at ~1.0. Prefabs with no measured
+native height (un-measured, non-rustic v2019 themes, OSM placeholder
+trees) fall back to the original course-relative height remap
+(_height_scale_lookup). Chad's original also stretched crown WIDTH
+(scale.x/z) from LiDAR canopy radius; that stays deliberately dropped --
+native_canopy_radius_m is captured but unused.
 
 Trees are parsed here directly from OSM node data (natural=tree),
 deliberately NOT through ingest/osm.py's Feature/parse_osm_features
@@ -69,17 +76,21 @@ parse -- see TREE_TYPE_TAG/TREE_HEIGHT_TAG -- version-independent,
 since which tags exist on an OSM node has nothing to do with which
 .course schema they eventually feed.
 
-Deliberately NOT built yet (see conversation, pending v2021+ schema
+Area-based tree-species "hints" ARE built now, both versions: an OSM
+natural=wood polygon tagged leaf_type=needleleaved/broadleaved hints
+every untyped tree inside it (LEAF_TYPE_TREE_HINTS /
+apply_area_tree_type_hints, applied in step_generate_trees), and both
+writers then honor the resulting TREE_TYPE_TAG -- v2021+ via
+tree_type_asset_paths, v2019 via a per-theme species-bucket table
+(tree_themes.json / TreeThemeSpecies / build_tree_objects_v2019's
+`species` arg).
+
+Deliberately still NOT built (see conversation, pending v2021+ schema
 confirmation beyond what generate_rough_border_v2.py already reverse-
 engineered): a generalized object-spline "scatter template" builder
 (e.g. a named recipe like "grass1, bush2, tree3" at various
 densities, applied to any OSM area instead of the hardcoded NATURE
-list), and area-based tree-species "hints" (an OSM polygon tagged
-conifer/deciduous/maple/etc., visible from satellite imagery, that an
-untagged tree node falling inside it inherits for asset selection --
-a natural companion to TREE_TYPE_TAG's per-node override, at the area
-level instead). Both are v2021+-only concepts (object splines don't
-exist in v2019 at all) and are next up once v2019 is solid.
+list) -- v2021+-only (object splines don't exist in v2019 at all).
 """
 
 from __future__ import annotations
@@ -87,6 +98,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -97,15 +109,13 @@ from shapely.geometry import Point
 from ingest.osm import Feature, latlon_to_local
 from terrain.bounding_box import BoundingBox
 from terrain.cart_paths import CART_PATH_WIDTH_M
+from course_output.asset_catalog import ASSET_ENTRIES, NATIVE_TREE_HEIGHT_BY_PATH, native_tree_height_v2019
 from course_output.userLayers import GRID_ORIGIN_OFFSET
-
-# All versions this project knows *about*; only IMPLEMENTED_GAME_VERSIONS
-# can actually be built for right now (see module docstring). Kept as
-# strings (not ints) since "2019" etc. are display/config labels, not
-# quantities -- nothing here does arithmetic on a version.
-GAME_VERSIONS = ("2019", "2021", "2023", "2025")
-IMPLEMENTED_GAME_VERSIONS = ("2019", "2021")
-DEFAULT_GAME_VERSION = "2019"
+# Re-exported for existing callers (PGA2k_gen.py, PGA2k_gen_gui.py) -- the
+# version registry itself now lives in game_versions.py, see its docstring.
+from course_output.game_versions import (  # noqa: F401
+    DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, VersionSchema, schema_for,
+)
 
 # Generic tree size -- used only when a tree has no more specific size
 # info (see TREE_HEIGHT_TAG). OSM tree nodes carry no real size data by
@@ -157,6 +167,16 @@ TREE_RADIUS_TAG = "pga_tree_radius"
 MIN_HEIGHT_SCALE = 0.5
 MAX_HEIGHT_SCALE = 1.2
 
+# Absolute clamp on a placed tree's final uniform scale, applied on BOTH
+# the calibrated (detected_height / native_height) and the fallback
+# (course-relative remap) path -- see _tree_scale. Wider than the
+# fallback curve's own 0.5..1.2 endpoints so genuine calibration isn't
+# squeezed back onto the old band, but still a backstop against a wild
+# LiDAR detection or a mistyped native_height_m. Taste knobs -- retune
+# freely.
+TREE_SCALE_CLAMP_MIN = 0.25
+TREE_SCALE_CLAMP_MAX = 1.75
+
 # Matches userLayers.py/water.py's own _DECIMALS convention -- every
 # value written into placedObjects2.json is rounded to millimeter
 # precision, plenty for this project's purposes.
@@ -206,6 +226,78 @@ SKINNY_TREES_V2019 = {
 }
 
 SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019 = 2.5  # h/r >= this -> classified "skinny", per Chad's get_trees()
+
+
+# ---------------------------------------------------------------------------
+# Per-theme tree "species" buckets -- lets build_tree_objects_v2019 route a
+# tree by its TREE_TYPE_TAG (e.g. "pine" from a leaf_type=needleleaved wood
+# hint, see LEAF_TYPE_TREE_HINTS / apply_area_tree_type_hints) into a
+# curated subset of the theme's type ids, instead of drawing blindly from
+# the whole NORMAL_TREES_V2019 / SKINNY_TREES_V2019 pool. Data lives in
+# tree_themes.json (see its own _note); a theme not covered there just
+# falls back to the original random-pool behavior.
+# ---------------------------------------------------------------------------
+
+TREE_THEMES_JSON = Path(__file__).resolve().parent / "tree_themes.json"
+
+
+@dataclass(frozen=True, slots=True)
+class TreeThemeSpecies:
+    """One theme's species-bucket table from tree_themes.json. `species`
+    maps a bucket name (matching a TREE_TYPE_TAG value, e.g. "pine",
+    "deciduous") to that bucket's list of v2019 category-0 type ids;
+    `default_species` is the bucket a tree with no TREE_TYPE_TAG uses."""
+    default_species: str
+    species: dict[str, tuple[int, ...]]
+
+    def ids_for(self, tree_type: Optional[str]) -> tuple[int, ...]:
+        """Type ids a tree tagged `tree_type` (or None/unknown) should draw
+        from -- its own bucket if known, else the default bucket, else an
+        empty tuple (caller decides the last-ditch fallback)."""
+        if tree_type is not None and tree_type in self.species:
+            return self.species[tree_type]
+        return self.species.get(self.default_species, ())
+
+    def is_known(self, tree_type: Optional[str]) -> bool:
+        return tree_type is not None and tree_type in self.species
+
+
+def _load_tree_themes() -> dict[int, TreeThemeSpecies]:
+    if not TREE_THEMES_JSON.exists():
+        return {}
+    data = json.loads(TREE_THEMES_JSON.read_text(encoding="utf-8"))
+    out: dict[int, TreeThemeSpecies] = {}
+    for theme_id, block in data.get("themes", {}).items():
+        out[int(theme_id)] = TreeThemeSpecies(
+            default_species=block["default_species"],
+            species={name: tuple(ids) for name, ids in block["species"].items()},
+        )
+    return out
+
+
+TREE_THEMES: dict[int, TreeThemeSpecies] = _load_tree_themes()
+
+
+def load_tree_theme_species(
+    theme: Optional[int], config_path: "str | Path | None" = None,
+) -> Optional[TreeThemeSpecies]:
+    """The TreeThemeSpecies for `theme`, or None if `theme` is None or has
+    no block in tree_themes.json (build_tree_objects_v2019 then keeps its
+    original random-pool behavior). config_path overrides the default
+    tree_themes.json location (e.g. a per-project override); its schema is
+    identical."""
+    if theme is None:
+        return None
+    if config_path is None:
+        return TREE_THEMES.get(theme)
+    data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    block = data.get("themes", {}).get(str(theme))
+    if block is None:
+        return None
+    return TreeThemeSpecies(
+        default_species=block["default_species"],
+        species={name: tuple(ids) for name, ids in block["species"].items()},
+    )
 
 
 def parse_osm_trees(
@@ -276,12 +368,15 @@ def lidar_trees_to_tagged(
 
 # OSM natural=wood polygons' leaf_type value -> a TREE_TYPE_TAG hint
 # for any tree that falls inside without its own explicit type already
-# (see apply_area_tree_type_hints). Deliberately small and easy to
-# extend -- only what's been directly requested so far -- rather than
-# guessing at a mapping for every possible leaf_type value (e.g.
-# "broadleaved", "mixed") without a specific asset in mind for each.
+# (see apply_area_tree_type_hints). The hint value is a species-bucket
+# name -- it must match a bucket key in tree_themes.json for the active
+# theme (v2019) or a key in tree_type_asset_paths (v2021+) to actually
+# change which asset the tree gets; an unmatched hint just falls through
+# to the default bucket / random pool. "mixed" is deliberately left
+# unmapped (ambiguous) -- those trees stay untyped and use the default.
 LEAF_TYPE_TREE_HINTS = {
     "needleleaved": "pine",
+    "broadleaved": "deciduous",
 }
 
 
@@ -536,13 +631,25 @@ def move_trees_off_cartpaths(
     return result
 
 
-def _placed_item(x: float, z: float, scale: float, rotation_degrees: float = 0.0) -> dict:
+def _placed_item(
+    x: float, z: float, scale: float, rotation_degrees: float = 0.0, y: "float | str" = "-Infinity",
+) -> dict:
     """One placed-object instance, position shifted into the game's
     origin-centered grid (see module docstring), scale.x = scale.y =
     scale.z = `scale`. Shared by every version's builder -- see module
-    docstring on why this shape is assumed version-independent."""
+    docstring on why this shape is assumed version-independent.
+
+    `y` defaults to the literal "-Infinity" -- the game drops the object
+    onto the terrain (with each prefab's own built-in vertical "bleed")
+    on load. Pass a real number for an object that carries a designed
+    elevation instead (a deck/railing built at a set height; see
+    course_output/collections.py's terrain-relative collection members)."""
     return {
-        "position": {"x": _round(x - GRID_ORIGIN_OFFSET), "y": "-Infinity", "z": _round(z - GRID_ORIGIN_OFFSET)},
+        "position": {
+            "x": _round(x - GRID_ORIGIN_OFFSET),
+            "y": y if isinstance(y, str) else _round(y),
+            "z": _round(z - GRID_ORIGIN_OFFSET),
+        },
         "rotation": {"x": 0.0, "y": _round(rotation_degrees), "z": 0.0},
         "scale": {"x": _round(scale), "y": _round(scale), "z": _round(scale)},
     }
@@ -552,12 +659,13 @@ def _height_scale_lookup(
     trees: list[tuple[float, float, dict]],
 ) -> tuple[list[float], float, float, float]:
     """
-    (heights, min_h, min_scale, scale_multiplier) for the shared
-    height-driven uniform-scale rule (see module docstring) --
-    scale = (h - min_h) * scale_multiplier + min_scale gives every
-    tree's single x=y=z scale factor. Factored out since both
-    version-specific builders use the exact same rule, just grouping
-    the result differently afterward.
+    (heights, min_h, min_scale, scale_multiplier) for the FALLBACK
+    course-relative height remap -- the path _tree_scale takes for any
+    tree whose chosen prefab has no measured native height (see module
+    docstring). `fallback_scale = (h - min_h) * scale_multiplier +
+    min_scale` stretches this batch's detected-height span onto
+    [MIN_HEIGHT_SCALE, MAX_HEIGHT_SCALE]. Computed once per batch; both
+    builders pass the result through _tree_scale per tree.
     """
     heights = []
     for _, _, tags in trees:
@@ -575,11 +683,73 @@ def _height_scale_lookup(
     return heights, min_h, 1.0, 0.0
 
 
+def _tree_scale(
+    detected_h: float,
+    native_h: Optional[float],
+    fb_min_h: float,
+    fb_min_scale: float,
+    fb_multiplier: float,
+) -> float:
+    """One tree's uniform x=y=z scale factor.
+
+    CALIBRATED (`native_h` known and > 0): `detected_h / native_h` -- the
+    tree renders at its LiDAR-detected canopy height relative to the
+    prefab's measured native (scale-1.0) height, so a tree detected at
+    its native height lands at ~1.0.
+
+    FALLBACK (`native_h` is None): the original course-relative remap,
+    `(detected_h - fb_min_h) * fb_multiplier + fb_min_scale`, with the
+    `fb_*` values straight from _height_scale_lookup.
+
+    Either result is clamped to [TREE_SCALE_CLAMP_MIN,
+    TREE_SCALE_CLAMP_MAX]. With `native_h` None the result is identical
+    to the pre-calibration arithmetic (the fallback curve already lands
+    inside the clamp).
+
+    Crown-WIDTH is not scaled independently (x=y=z). If that's ever
+    wanted back (Chad's original did scale.x/z from LiDAR canopy radius),
+    asset_catalog.json's native_canopy_radius_m is the measured value to
+    divide the detected radius by here.
+    """
+    if native_h is not None and native_h > 0:
+        raw = detected_h / native_h
+    else:
+        raw = (detected_h - fb_min_h) * fb_multiplier + fb_min_scale
+    return min(max(raw, TREE_SCALE_CLAMP_MIN), TREE_SCALE_CLAMP_MAX)
+
+
+def _deterministic_tree_rng(x: float, z: float, salt: int = 0) -> random.Random:
+    """
+    A per-tree random.Random seeded from its own (rounded) position --
+    used by build_tree_objects_v2019/_v2021 whenever no explicit `rng`
+    is passed in, so repeated builds of the SAME object_list.json
+    (unchanged tree positions) reproduce the exact same rotation/type-
+    bucket/asset-path draws every time, instead of a single shared
+    unseeded random.Random() reshuffling everything on every call.
+
+    This matters beyond cosmetic reproducibility: PGA2k_gen.py's
+    step_import_ingame_edits recomputes this exact construction in
+    memory to diff against a previously-written, saved course -- with
+    an unseeded shared RNG, EVERY tree would read as "new" (freshly
+    drawn) plus "missing" (the old draw), even with zero real in-game
+    edits. Seeding per-tree from position fixes that while still
+    varying naturally tree-to-tree (unlike one fixed global seed, which
+    would make every tree at every position share the same draw
+    sequence offset).
+
+    hash() of a tuple of floats/ints (unlike of str/bytes) isn't
+    affected by PYTHONHASHSEED randomization, so this is stable across
+    separate process runs, not just within one.
+    """
+    return random.Random(hash((round(x, 3), round(z, 3), salt)))
+
+
 def build_tree_objects_v2019(
     trees: list[tuple[float, float, dict]],
     theme: Optional[int],
     tree_variety: bool = False,
     rng: Optional[random.Random] = None,
+    species: Optional[TreeThemeSpecies] = None,
 ) -> list[dict]:
     """
     v2019 placedObjects2 groups -- Key is {"category": 0, "type": id,
@@ -591,10 +761,23 @@ def build_tree_objects_v2019(
     original) also forces that single generic type regardless of
     theme, and disables the skinny-tree pool entirely.
 
-    A tree's TREE_TYPE_TAG is NOT consulted here -- v2019's catalog is
-    numeric ids per theme, not asset names, so there's no meaningful
-    way to map an OSM tag value onto it; that per-tree override only
-    applies to v2021+ (see build_tree_objects_v2021).
+    SPECIES ROUTING (species != None -- a TreeThemeSpecies from
+    tree_themes.json, see load_tree_theme_species): each tree is routed
+    by its TREE_TYPE_TAG value into that theme's matching species
+    bucket (e.g. "pine" from a leaf_type=needleleaved hint -- see
+    LEAF_TYPE_TREE_HINTS / apply_area_tree_type_hints), and its type id
+    is drawn at random from that bucket. A tree with no TREE_TYPE_TAG
+    (or one whose value isn't a bucket name for this theme) uses
+    species.default_species. This mode replaces the theme /
+    tree_variety / normal-vs-skinny logic below entirely -- the buckets
+    ARE the curated pools. A bucket that somehow resolves empty falls
+    back to type id 0. This is the v2019 counterpart to
+    build_tree_objects_v2021's tree_type_asset_paths.
+
+    Without species (the default), a tree's TREE_TYPE_TAG is NOT
+    consulted -- v2019's catalog is numeric ids per theme, and with no
+    species table there's no mapping from an OSM tag value onto it;
+    classification is height/radius normal-vs-skinny only, as below.
 
     Classification as "normal" vs. "skinny" uses height/radius (h/r
     >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019), same as Chad's original.
@@ -603,12 +786,16 @@ def build_tree_objects_v2019(
     ingest/tree_detection.py), falling back to the flat TREE_RADIUS_M
     otherwise (matching upstream OSM node tags' own lack of a tree-
     radius concept -- there's nothing to read for a plain OSM-sourced
-    tree). Scale is the same shared height-driven uniform x=y=z rule
-    every version uses (see _height_scale_lookup / module docstring)
-    -- Chad's original v2019 tool scaled x/z from radius independently
-    of y from height; this project deliberately does not reproduce
-    that (see prior conversation: scale should track height alone,
-    uniformly, not stretch/squash per axis).
+    tree).
+
+    Scale is uniform x=y=z (see _tree_scale / module docstring): the
+    chosen type id is resolved FIRST, then its native height is looked
+    up via native_tree_height_v2019(type_id, theme) -- so calibration
+    only applies when `theme` is the theme asset_catalog.json was
+    captured from (rustic); every other theme's type ids fall back to
+    the course-relative remap. Chad's original also scaled x/z from
+    canopy radius independently of y from height; this project
+    deliberately keeps scale uniform.
 
     Any tree carrying CARTPATH_DEBUG_MARKER_TAG (see
     move_trees_off_cartpaths' debug_mark_only mode) is pulled out
@@ -617,9 +804,14 @@ def build_tree_objects_v2019(
     "type": CARTPATH_DEBUG_MARKER_TYPE_V2019, "theme": False}, items at
     CARTPATH_DEBUG_MARKER_SCALE -- so it shows up in-game as an
     oversized, obviously-not-a-tree prop instead of a real tree.
+
+    rng: pass an explicit random.Random for a single shared draw
+    sequence (e.g. deterministic testing); left as None (the default),
+    each tree instead gets its OWN random.Random seeded from its
+    position (see _deterministic_tree_rng) -- rotation/type-bucket
+    draws are then stable across repeated calls on the same trees list,
+    rather than reshuffling every call.
     """
-    if rng is None:
-        rng = random.Random()
     if not trees:
         return []
 
@@ -629,8 +821,26 @@ def build_tree_objects_v2019(
     ]
     trees = [(x, z, tags) for x, z, tags in trees if not tags.get(CARTPATH_DEBUG_MARKER_TAG)]
 
+    def _group(tree_type: int) -> dict:
+        return {"Key": {"category": 0, "type": tree_type, "theme": True}, "Value": {"items": [], "clusters": []}}
+
     groups: list[dict] = []
-    if trees:
+    if trees and species is not None:
+        type_groups: dict[int, dict] = {}
+        heights, min_h, min_scale, scale_multiplier = _height_scale_lookup(trees)
+        for (x, z, tags), h in zip(trees, heights):
+            tree_rng = rng if rng is not None else _deterministic_tree_rng(x, z)
+            rotation = tree_rng.uniform(0, 359)  # drawn before the type pick, order unchanged from before
+            bucket = species.ids_for(tags.get(TREE_TYPE_TAG)) or (0,)
+            tree_type = tree_rng.choice(list(bucket))
+            scale = _tree_scale(
+                h, native_tree_height_v2019(tree_type, theme), min_h, min_scale, scale_multiplier,
+            )
+            item = _placed_item(x, z, scale, rotation)
+            type_groups.setdefault(tree_type, _group(tree_type))["Value"]["items"].append(item)
+        groups = [type_groups[t] for t in sorted(type_groups)]
+
+    elif trees:
         normal_tree_ids = NORMAL_TREES_V2019.get(theme, [0])
         if (not tree_variety) or len(normal_tree_ids) == 0:
             normal_tree_ids = [0]
@@ -638,26 +848,27 @@ def build_tree_objects_v2019(
         if (not tree_variety) or len(skinny_tree_ids) == 0:
             skinny_tree_ids = []
 
-        def _group(tree_type: int) -> dict:
-            return {"Key": {"category": 0, "type": tree_type, "theme": True}, "Value": {"items": [], "clusters": []}}
-
         normal_groups = {t: _group(t) for t in normal_tree_ids}
         skinny_groups = {t: _group(t) for t in skinny_tree_ids}
 
         heights, min_h, min_scale, scale_multiplier = _height_scale_lookup(trees)
 
         for (x, z, tags), h in zip(trees, heights):
-            scale = (h - min_h) * scale_multiplier + min_scale
-            item = _placed_item(x, z, scale, rng.uniform(0, 359))
+            tree_rng = rng if rng is not None else _deterministic_tree_rng(x, z)
+            rotation = tree_rng.uniform(0, 359)  # drawn before the group pick, order unchanged from before
             try:
                 radius = float(tags.get(TREE_RADIUS_TAG, TREE_RADIUS_M))
             except (TypeError, ValueError):
                 radius = TREE_RADIUS_M
             if radius > 0 and h / radius >= SKINNY_HEIGHT_TO_RADIUS_RATIO_V2019 and skinny_groups:
-                group = rng.choice(list(skinny_groups.values()))
+                group = tree_rng.choice(list(skinny_groups.values()))
             else:
-                group = rng.choice(list(normal_groups.values()))
-            group["Value"]["items"].append(item)
+                group = tree_rng.choice(list(normal_groups.values()))
+            scale = _tree_scale(
+                h, native_tree_height_v2019(group["Key"]["type"], theme),
+                min_h, min_scale, scale_multiplier,
+            )
+            group["Value"]["items"].append(_placed_item(x, z, scale, rotation))
 
         groups = [g for g in list(normal_groups.values()) + list(skinny_groups.values()) if g["Value"]["items"]]
 
@@ -727,6 +938,104 @@ def _placed_object_group_v2021(asset_path: str) -> dict:
     return {"Key": {"path": asset_path}, "Value": {"items": [], "clusters": [], "splines": []}}
 
 
+# (category, type) -> AssetEntry(path=...) -- own copy of the same lookup
+# collections.py's _ENTRY_BY_KEY builds, used here to resolve cluster-fill
+# and object-spline-fill records (both still schema-neutral
+# {"category","type",...} dicts out of object_clusters.py) to a v2021+
+# asset path.
+_ENTRY_BY_KEY = {(e.category, e.type): e for e in ASSET_ENTRIES}
+
+
+def cluster_records_to_v2021_groups(records: list[dict]) -> list[dict]:
+    """
+    v2021+ counterpart to object_clusters.cluster_records_to_v2019_groups
+    -- placedObjects2 groups (Key {"path": ...}) from
+    pack_cluster_records' schema-neutral stamp-mode output, one group
+    per distinct asset path, via _placed_object_group_v2021. The
+    Value.clusters entry shape itself (_cluster_entry_from_record) is
+    already version-agnostic (confirmed identical in the hhills3_2019
+    vs hhills3_2021 diff), so this only differs from the v2019 version
+    in how the Key is resolved. Exists so stamp-mode cluster fills keep
+    working under game_version=2021+ even though spline-mode fills are
+    the new default there (see the conversation) -- this was previously
+    a gap: step_write_objects's v2021+ branch dropped cluster_records
+    entirely.
+    """
+    groups: dict[str, dict] = {}
+    for record in records:
+        entry = _ENTRY_BY_KEY.get((record["category"], record["type"]))
+        if entry is None:
+            continue  # asset_catalog.json changed since this record was packed
+        group = groups.setdefault(entry.path, _placed_object_group_v2021(entry.path))
+        group["Value"]["clusters"].append({
+            "position": {
+                "x": _round(record["x"] - GRID_ORIGIN_OFFSET), "y": "-Infinity",
+                "z": _round(record["z"] - GRID_ORIGIN_OFFSET),
+            },
+            "rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+            "seed": record["seed"],
+            "count": record["count"],
+            "radius": _round(record["radius"]),
+        })
+    return list(groups.values())
+
+
+def _make_object_spline_waypoint(x: float, z: float) -> dict:
+    """
+    One waypoint of an object-spline fill's path.waypoints -- degenerate
+    bezier handles (pointOne == pointTwo == waypoint), same convention
+    ref/generate_rough_border_v2.py's make_waypoint uses for every point
+    of a polygon-derived object spline (lets the engine round the
+    corners itself rather than this project computing real tangent
+    handles the way splines.py's _build_waypoints does for surface
+    splines). `z` lands in the waypoint dict's "y" field -- 2-D,
+    top-down, same convention surfaceSplines.json's own waypoints use.
+    """
+    point = {"x": _round(x), "y": _round(z)}
+    return {"pointOne": dict(point), "pointTwo": dict(point), "waypoint": dict(point)}
+
+
+def object_spline_fill_records_to_v2021_groups(records: list[dict]) -> list[dict]:
+    """
+    v2021+ ONLY -- placedObjects2 groups (Key {"path": ...}) from
+    object_clusters.pack_spline_records' schema-neutral output, one
+    group per distinct asset path. Each record becomes one
+    Value.splines[] entry: a closed, filled object spline around the
+    record's (already <= MAX_SPLINE_FILL_PIECE_SIZE_M) polygon piece,
+    density fillPct -- see the module docstring and
+    ref/generate_rough_border_v2.py's polygon_to_object_spline, which
+    this mirrors exactly (state=0, ClosedPath/isClosed/isFilled=True,
+    width=1.0 -- the width of a FILLED spline doesn't bound the fill
+    area, just the corner rounding, so a fixed value is fine here).
+    v2019 has no object-spline concept at all -- there is no v2019
+    counterpart to this function (see step_write_objects: those records
+    are dropped with a printed note for that game_version instead).
+    """
+    groups: dict[str, dict] = {}
+    for record in records:
+        entry = _ENTRY_BY_KEY.get((record["category"], record["type"]))
+        if entry is None:
+            continue  # asset_catalog.json changed since this record was packed
+        group = groups.setdefault(entry.path, _placed_object_group_v2021(entry.path))
+        waypoints = [
+            _make_object_spline_waypoint(x - GRID_ORIGIN_OFFSET, z - GRID_ORIGIN_OFFSET)
+            for x, z in record["waypoints"]
+        ]
+        group["Value"]["splines"].append({
+            "path": {
+                "waypoints": waypoints,
+                "width": 1.0,
+                "state": 0,
+                "ClosedPath": True,
+                "isClosed": True,
+                "isFilled": True,
+            },
+            "fillPct": _round(record["fill_pct"]),
+        })
+    return list(groups.values())
+
+
 def build_tree_objects_v2021(
     trees: list[tuple[float, float, dict]],
     tree_asset_paths: list[str],
@@ -749,17 +1058,24 @@ def build_tree_objects_v2021(
     always gets whatever path tree_type_asset_paths["oak"] is, while
     untagged trees still draw from tree_asset_paths.
 
-    Scale is the same shared height-driven uniform x=y=z rule every
-    version uses (see _height_scale_lookup / module docstring).
+    Scale is uniform x=y=z (see _tree_scale / module docstring):
+    calibrated as detected_height / the prefab's measured native height
+    when `path` is in asset_catalog.json's NATIVE_TREE_HEIGHT_BY_PATH,
+    else the course-relative height remap.
 
     Unlike build_tree_objects_v2019, a CARTPATH_DEBUG_MARKER_TAG tree is
     NOT special-cased here -- built as an ordinary tree, same as any
     other -- since there's no known v2021 marker asset path to swap it
     for (v2019's CARTPATH_DEBUG_MARKER_CATEGORY_V2019/TYPE_V2019 debug
     marker has no v2021 equivalent yet).
+
+    rng: pass an explicit random.Random for a single shared draw
+    sequence (e.g. deterministic testing); left as None (the default),
+    each tree instead gets its OWN random.Random seeded from its
+    position (see _deterministic_tree_rng) -- asset-path/rotation draws
+    are then stable across repeated calls on the same trees list,
+    rather than reshuffling every call.
     """
-    if rng is None:
-        rng = random.Random()
     if not trees:
         return []
     tree_type_asset_paths = tree_type_asset_paths or {}
@@ -781,18 +1097,21 @@ def build_tree_objects_v2021(
         return groups[path]
 
     for (x, z, tags), h in zip(trees, heights):
+        tree_rng = rng if rng is not None else _deterministic_tree_rng(x, z)
         tree_type = tags.get(TREE_TYPE_TAG)
         if tree_type is not None and tree_type in tree_type_asset_paths:
             path = tree_type_asset_paths[tree_type]
         elif tree_asset_paths:
-            path = rng.choice(tree_asset_paths)
+            path = tree_rng.choice(tree_asset_paths)
         else:
             # Tagged with a tree_type that isn't in
             # tree_type_asset_paths, and no general pool to fall back
             # to -- skip rather than guess at a path.
             continue
-        scale = (h - min_h) * scale_multiplier + min_scale
-        item = _placed_item(x, z, scale, rng.uniform(0, 359))
+        scale = _tree_scale(
+            h, NATIVE_TREE_HEIGHT_BY_PATH.get(path), min_h, min_scale, scale_multiplier,
+        )
+        item = _placed_item(x, z, scale, tree_rng.uniform(0, 359))
         _group_for(path)["Value"]["items"].append(item)
 
     return [g for g in groups.values() if g["Value"]["items"]]
@@ -827,86 +1146,126 @@ def build_building_stake_objects_v2021(features: list[Feature], stake_asset_path
     return [group] if group["Value"]["items"] else []
 
 
-# The v2019 "low falls" prefab -- category/type/theme confirmed directly
-# against a real hand-placed 2019 course (a row of three of these keyed
-# {"category": 16, "type": 3, "theme": false}, items carrying an explicit
-# elevation, not "-Infinity").
+# Stream drops are placed as a rigid waterfall + splash pair, one per
+# seam between two consecutive water tiles (see terrain/streams.py's
+# build_stream_records / stream_water_tiles). streams.json freezes the
+# geometry -- [x, z, rot_y, level] rows in the course-local frame, the
+# anchor already the upper tile's downstream edge centre -- so the
+# writer only shifts by GRID_ORIGIN_OFFSET and adds output_height_shift_m.
+# The waterfall and its splash share x/z and rot_y exactly; only `level`
+# differs (the falls carries the upper tile's surface height, the splash
+# the lower tile's).
+#
+# v2019 category/type/theme confirmed against a real hand-placed 2019
+# course: the "low falls" keyed {"category": 16, "type": 3, "theme":
+# false} and the "low splash" {"category": 16, "type": 4, "theme": false}
+# sitting beside it, items carrying an explicit elevation (not "-Infinity").
 WATERFALL_CATEGORY_V2019 = 16
 WATERFALL_TYPE_V2019 = 3
+WATERSPLASH_CATEGORY_V2019 = 16
+WATERSPLASH_TYPE_V2019 = 4
 
 WATERFALL_DEFAULT_ASSET_PATH = "Assets/Effects/Waterfalls/Prefabs/Waterfall_LowFallsPrefab"
-WATERFALL_DOWNSTREAM_OFFSET_M = 3.9  # nudge each falls prefab this far along its heading (ref/generate_streams.py)
+# TODO: unverified -- the v2021+ splash path is a best guess (sibling of
+# WATERFALL_DEFAULT_ASSET_PATH); only the v2019 form is confirmed.
+WATERSPLASH_DEFAULT_ASSET_PATH = "Assets/Effects/Waterfalls/Prefabs/Waterfall_LowSplashPrefab"
 WATERFALL_SCALE_V2019 = (1.0, 1.0, 1.0)  # confirmed from the real 2019 sample
 WATERFALL_SCALE_V2021 = (0.5, 1.0, 1.0)  # ref/generate_streams.py's value
 
 
-def _waterfall_item(x: float, z: float, rot_y: float, bed_h: float, height_shift_m: float,
-                    scale: tuple[float, float, float]) -> dict:
-    """One waterfall instance: nudged WATERFALL_DOWNSTREAM_OFFSET_M along
-    its own heading (so the mesh sits just downstream of the pearl, not
-    centered on it), at an EXPLICIT elevation bed_h + height_shift_m --
-    the real 2019 sample carries a real y, and a waterfall (like a water
-    plane, unlike a tree) isn't ground-snapped by the game. Non-uniform
-    scale, so not via _placed_item."""
-    rad = math.radians(rot_y)
-    fx = x + math.sin(rad) * WATERFALL_DOWNSTREAM_OFFSET_M
-    fz = z + math.cos(rad) * WATERFALL_DOWNSTREAM_OFFSET_M
+def _stream_drop_item(x: float, z: float, rot_y: float, level: float, height_shift_m: float,
+                      scale: tuple[float, float, float]) -> dict:
+    """One waterfall / splash instance at the frozen anchor (x, z), at an
+    EXPLICIT elevation level + height_shift_m -- the real 2019 sample
+    carries a real y, and these prefabs (like a water plane, unlike a
+    tree) aren't ground-snapped by the game. Non-uniform scale, so not
+    via _placed_item."""
     sx, sz_width, sy = scale
     return {
         "position": {
-            "x": _round(fx - GRID_ORIGIN_OFFSET),
-            "y": _round(bed_h + height_shift_m),
-            "z": _round(fz - GRID_ORIGIN_OFFSET),
+            "x": _round(x - GRID_ORIGIN_OFFSET),
+            "y": _round(level + height_shift_m),
+            "z": _round(z - GRID_ORIGIN_OFFSET),
         },
         "rotation": {"x": 0.0, "y": _round(rot_y), "z": 0.0},
         "scale": {"x": _round(sx), "y": _round(sy), "z": _round(sz_width)},
     }
 
 
-def _iter_waterfalls(stream_records: list[dict]):
+def _iter_stream_drops(stream_records: list[dict], key: str):
     for record in stream_records:
-        for wf in record.get("waterfalls", []):
-            # [x, z, rot_y, bed_h]
-            yield wf[0], wf[1], wf[2], wf[3]
+        for row in record.get(key, []):
+            # [x, z, rot_y, level]
+            yield row[0], row[1], row[2], row[3]
+
+
+def _stream_drop_group_v2019(
+    stream_records: list[dict], category: int, type_: int,
+    scale: tuple[float, float, float], key: str, height_shift_m: float,
+) -> list[dict]:
+    group = {
+        "Key": {"category": category, "type": type_, "theme": False},
+        "Value": {"items": [], "clusters": []},
+    }
+    for x, z, rot_y, level in _iter_stream_drops(stream_records, key):
+        group["Value"]["items"].append(_stream_drop_item(x, z, rot_y, level, height_shift_m, scale))
+    return [group] if group["Value"]["items"] else []
+
+
+def _stream_drop_group_v2021(
+    stream_records: list[dict], asset_path: str, scale: tuple[float, float, float],
+    key: str, height_shift_m: float, what: str,
+) -> list[dict]:
+    if not asset_path:
+        raise ValueError(f"build_{what}_objects_v2021 needs a real asset path -- see the module.")
+    group = _placed_object_group_v2021(asset_path)
+    for x, z, rot_y, level in _iter_stream_drops(stream_records, key):
+        group["Value"]["items"].append(_stream_drop_item(x, z, rot_y, level, height_shift_m, scale))
+    return [group] if group["Value"]["items"] else []
 
 
 def build_waterfall_objects_v2019(stream_records: list[dict], height_shift_m: float = 0.0) -> list[dict]:
-    """
-    One "low falls" prefab (Key {"category": 16, "type": 3, "theme":
-    false}) at every waterfall point frozen into streams.json (see
+    """One "low falls" prefab (Key {"category": 16, "type": 3, "theme":
+    false}) per stream-tile seam frozen into streams.json (see
     terrain/streams.py's build_stream_records). height_shift_m is
-    project.json's output_height_shift_m -- added to each point's stored
-    absolute bed height to land in the same normalized frame the rest of
-    the course was written in (so run write-terrain first).
-    """
-    group = {
-        "Key": {"category": WATERFALL_CATEGORY_V2019, "type": WATERFALL_TYPE_V2019, "theme": False},
-        "Value": {"items": [], "clusters": []},
-    }
-    for x, z, rot_y, bed_h in _iter_waterfalls(stream_records):
-        group["Value"]["items"].append(
-            _waterfall_item(x, z, rot_y, bed_h, height_shift_m, WATERFALL_SCALE_V2019)
-        )
-    return [group] if group["Value"]["items"] else []
+    project.json's output_height_shift_m -- added to each frozen surface
+    level to land in the normalized frame (so run write-terrain first)."""
+    return _stream_drop_group_v2019(
+        stream_records, WATERFALL_CATEGORY_V2019, WATERFALL_TYPE_V2019,
+        WATERFALL_SCALE_V2019, "waterfalls", height_shift_m,
+    )
 
 
 def build_waterfall_objects_v2021(
     stream_records: list[dict], asset_path: str, height_shift_m: float = 0.0,
 ) -> list[dict]:
-    """
-    v2021+ equivalent of build_waterfall_objects_v2019 -- a single
+    """v2021+ equivalent of build_waterfall_objects_v2019 -- a single
     Key.path group. asset_path defaults (in step_write_objects) to
-    WATERFALL_DEFAULT_ASSET_PATH.
-    """
-    if not asset_path:
-        raise ValueError("build_waterfall_objects_v2021 needs a real waterfall asset path -- see module docstring.")
+    WATERFALL_DEFAULT_ASSET_PATH."""
+    return _stream_drop_group_v2021(
+        stream_records, asset_path, WATERFALL_SCALE_V2021, "waterfalls", height_shift_m, "waterfall",
+    )
 
-    group = _placed_object_group_v2021(asset_path)
-    for x, z, rot_y, bed_h in _iter_waterfalls(stream_records):
-        group["Value"]["items"].append(
-            _waterfall_item(x, z, rot_y, bed_h, height_shift_m, WATERFALL_SCALE_V2021)
-        )
-    return [group] if group["Value"]["items"] else []
+
+def build_watersplash_objects_v2019(stream_records: list[dict], height_shift_m: float = 0.0) -> list[dict]:
+    """The "low splash" companion (Key {"category": 16, "type": 4,
+    "theme": false}) of each waterfall -- same x/z and rotation, dropped
+    to the LOWER tile's surface (see build_stream_records "splashes")."""
+    return _stream_drop_group_v2019(
+        stream_records, WATERSPLASH_CATEGORY_V2019, WATERSPLASH_TYPE_V2019,
+        WATERFALL_SCALE_V2019, "splashes", height_shift_m,
+    )
+
+
+def build_watersplash_objects_v2021(
+    stream_records: list[dict], asset_path: str, height_shift_m: float = 0.0,
+) -> list[dict]:
+    """v2021+ equivalent of build_watersplash_objects_v2019. asset_path
+    defaults (in step_write_objects) to WATERSPLASH_DEFAULT_ASSET_PATH
+    (unverified -- see the constant)."""
+    return _stream_drop_group_v2021(
+        stream_records, asset_path, WATERFALL_SCALE_V2021, "splashes", height_shift_m, "watersplash",
+    )
 
 
 def merge_object_groups(groups: list[dict]) -> list[dict]:
@@ -1009,6 +1368,8 @@ def load_object_list(path: Path) -> list[tuple[float, float, dict]]:
 def save_objects(
     trees: list[tuple[float, float, dict]], cluster_records: list[dict], path: Path,
     collection_objects: Optional[list[dict]] = None,
+    object_spline_fill_records: Optional[list[dict]] = None,
+    ingame_object_records: Optional[list[dict]] = None,
 ) -> None:
     """
     Write objects.json -- the pack-objects step's combined, VERSION-
@@ -1016,10 +1377,17 @@ def save_objects(
     unchanged, same shape), `cluster_records`
     (course_output/object_clusters.py's pack_cluster_records output --
     already-packed circle positions/counts/RNG seeds, frozen at pack
-    time so they don't reroll on every read), and `collection_objects`
+    time so they don't reroll on every read), `collection_objects`
     (course_output/collections.py -- resolved collection member
     placements, {"x","z","rotation_deg","scale","category","type",
-    "theme","path","source_id"}, deterministic, no RNG).
+    "theme","path","source_id"}, deterministic, no RNG),
+    `object_spline_fill_records` (object_clusters.py's
+    pack_spline_records output -- v2021+-only object-spline fills, no
+    RNG either, just an already-subdivided polygon per record), and
+    `ingame_object_records` (course_output/ingame_objects.py -- objects
+    a user placed by hand-editing an exported .course in the game's own
+    editor, captured back via PGA2k_gen.py's step_import_ingame_edits;
+    read from ingame_objects.json, not overwritten by this step).
 
     This is what step_write_objects (any game_version) and the GUI's
     live preview both read -- neither needs its own copy of cluster-
@@ -1028,8 +1396,9 @@ def save_objects(
     requires a `course/` extraction. Same "compile once, format/consume
     at read time" split object_list.json already established for trees
     alone (see step_generate_trees' docstring); this extends it to
-    cluster fills and collections, which previously had no version-
-    agnostic intermediate at all -- they were packed directly into
+    cluster fills, object-spline fills, collections, and imported
+    in-game objects, which previously had no version-agnostic
+    intermediate at all -- they were packed directly into
     placedObjects2.json's schema inside step_write_objects.
     """
     path = Path(path)
@@ -1037,18 +1406,23 @@ def save_objects(
     entries = [{"kind": "tree", "x": x, "z": z, "tags": tags} for x, z, tags in trees]
     entries += [dict(record, kind="cluster") for record in cluster_records]
     entries += [dict(obj, kind="collection_object") for obj in (collection_objects or [])]
+    entries += [dict(record, kind="object_spline_fill") for record in (object_spline_fill_records or [])]
+    entries += [dict(record, kind="ingame_object") for record in (ingame_object_records or [])]
     with path.open("w", encoding="utf-8") as fh:
         json.dump(entries, fh, indent=2)
 
 
 def load_objects(
     path: Path,
-) -> tuple[list[tuple[float, float, dict]], list[dict], list[dict]]:
-    """(trees, cluster_records, collection_objects) from objects.json --
-    inverse of save_objects, split back into the shapes their respective
-    consumers (build_tree_objects_v20XX,
-    object_clusters.cluster_records_to_v2019_groups,
-    collections.build_collection_objects_v20XX) already expect."""
+) -> tuple[list[tuple[float, float, dict]], list[dict], list[dict], list[dict], list[dict]]:
+    """(trees, cluster_records, collection_objects,
+    object_spline_fill_records, ingame_object_records) from
+    objects.json -- inverse of save_objects, split back into the shapes
+    their respective consumers (build_tree_objects_v20XX,
+    object_clusters.cluster_records_to_v20XX_groups,
+    collections.build_collection_objects_v20XX,
+    object_spline_fill_records_to_v2021_groups,
+    ingame_objects.build_ingame_objects_v20XX) already expect."""
     with Path(path).open(encoding="utf-8") as fh:
         entries = json.load(fh)
     trees = [(e["x"], e["z"], e["tags"]) for e in entries if e["kind"] == "tree"]
@@ -1056,7 +1430,13 @@ def load_objects(
     collection_objects = [
         {k: v for k, v in e.items() if k != "kind"} for e in entries if e["kind"] == "collection_object"
     ]
-    return trees, cluster_records, collection_objects
+    object_spline_fill_records = [
+        {k: v for k, v in e.items() if k != "kind"} for e in entries if e["kind"] == "object_spline_fill"
+    ]
+    ingame_object_records = [
+        {k: v for k, v in e.items() if k != "kind"} for e in entries if e["kind"] == "ingame_object"
+    ]
+    return trees, cluster_records, collection_objects, object_spline_fill_records, ingame_object_records
 
 
 def save_placed_objects(objects: list[dict], path: Path) -> None:

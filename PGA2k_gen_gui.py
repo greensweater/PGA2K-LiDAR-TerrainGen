@@ -60,14 +60,17 @@ from constants import (  # noqa: E402
 )
 from PGA2k_gen import (  # noqa: E402
     COLLECTIONS_FILE, DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M, FEATURES_FILE,
-    HEIGHT_MASK_FILE, HEIGHTMAP_FILE, OBJECT_LIST_FILE, OBJECTS_FILE, PGA_COLLECTION_TAG,
-    load_all_stamps, load_project, save_project,
+    HEIGHT_MASK_FILE, HEIGHTMAP_FILE, INGAME_OBJECTS_FILE, OBJECT_LIST_FILE, OBJECTS_FILE,
+    PGA_COLLECTION_TAG, load_all_stamps, load_project, save_project,
+)
+from course_output.ingame_objects import (  # noqa: E402
+    load_ingame_objects, remove_ingame_object_groups, save_ingame_objects, summarize_ingame_object_groups,
 )
 from course_output.collection_library import (  # noqa: E402
     capture_from_course, default_library_dir, load_library, save_collection,
 )
 from course_output.collections import (  # noqa: E402
-    iter_collection_objects, load_collection_records,
+    iter_collection_objects, load_collection_records, save_collection_records,
 )
 from ingest.heightmap import load_heightmap  # noqa: E402
 from course_output.objects import (  # noqa: E402
@@ -78,10 +81,11 @@ from course_output.asset_catalog import (  # noqa: E402
     ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS,
 )
 from course_output.object_clusters import (  # noqa: E402
-    CLUSTER_FILL_SOURCE_BORDER, CLUSTER_FILL_SOURCE_MANUAL, DEFAULT_FILL_DENSITY, DEFAULT_RASTER_RATIO,
+    CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_STAMPS, CLUSTER_FILL_SOURCE_BORDER,
+    CLUSTER_FILL_SOURCE_MANUAL, DEFAULT_FILL_DENSITY, DEFAULT_RASTER_RATIO,
     PGA_CLUSTER_CENTERLINE_REF_TAG, PGA_CLUSTER_FILLS_TAG, SYNTHETIC_BORDER_CENTERLINE_KIND,
     SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND, build_border_ring_geometry, next_synthetic_osm_id,
-    pack_cluster_records,
+    pack_cluster_records, pack_spline_records,
 )
 from ingest.osm import (  # noqa: E402
     DEFAULT_HOLE_CORRIDOR_BUFFER_PX, Feature, build_height_mask, crop_features,
@@ -112,7 +116,8 @@ from course_output.water import (  # noqa: E402
     DEFAULT_WATER_STRIPE_OVERLAP_M, DEFAULT_WATER_STRIPE_TOLERANCE_M,
     DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
 )
-from shapely.ops import unary_union  # noqa: E402
+from shapely.geometry import Point, box as shapely_box  # noqa: E402
+from shapely.ops import linemerge, unary_union  # noqa: E402
 import viz.visualize as viz  # noqa: E402
 
 try:
@@ -144,15 +149,17 @@ PREVIEW_FILES = [
 
 # Game version -> Courses folder name under .../AppData/LocalLow/2K/.
 # Windows-specific path (AppData/LocalLow only exists on Windows, which is
-# also the only platform The Golf Club / PGA 2K actually runs on) -- only
-# 2019 is wired up for now, per the request to add 2K21/23/25 later. Keyed
+# also the only platform The Golf Club / PGA 2K actually runs on). Keyed
 # by the SAME canonical version strings as objects.py's GAME_VERSIONS
 # ("2019", "2021", ...), not a display name -- this is looked up directly
 # from the single elevated Game version selector (self.game_version) at
 # the top of the window, same value write-objects targets, so "write" and
 # "move" (Copy to Game Folder) always agree on which version they mean.
+# 2023/2025 stay unmapped until those versions are actually implemented
+# (see objects.IMPLEMENTED_GAME_VERSIONS).
 GAME_VERSION_FOLDERS = {
     "2019": "The Golf Club 2019",
+    "2021": "PGA TOUR 2K21",
 }
 
 
@@ -222,15 +229,24 @@ _WATER_LAYER_FILL_ALPHA = round(255 * 0.25)
 _OBJECT_LAYER_DRAW_ORDER = (1, 2, 3, 12, _COLLECTION_LAYER_CATEGORY, 0)  # rocks, grass, ground cover, display plants, collections, trees
 
 
-def _spline_cluster_detail(f: Feature) -> str:
+def _spline_object_detail(f: Feature) -> str:
     """
-    Comma-joined asset labels for whatever's currently in
-    f.tags[PGA_CLUSTER_FILLS_TAG] (see course_output/object_clusters.py),
-    shown in the Splines tab's "Clusters" column -- "" if untagged. A
-    spec that no longer resolves (stale tag after asset_catalog.json
-    changed) shows as "?" rather than being silently dropped, so it's
-    still visible that *something* is tagged there.
+    What to show in the Splines tab's "Objects" column for this feature.
+
+    For a pga_collection placement line (kind "collection") -- the OSM
+    2-node marker way that places a reusable object/spline collection --
+    the template name it resolves against, so the row reads as an object
+    source too (its resolved objects live in collections.json, cleared
+    from this tab via the Spline Objects "Clear" button).
+
+    Otherwise: comma-joined asset labels for whatever's currently in
+    f.tags[PGA_CLUSTER_FILLS_TAG] (see course_output/object_clusters.py)
+    -- "" if untagged. A spec that no longer resolves (stale tag after
+    asset_catalog.json changed) shows as "?" rather than being silently
+    dropped, so it's still visible that *something* is tagged there.
     """
+    if f.kind == "collection":
+        return f.tags.get(PGA_COLLECTION_TAG, "")
     specs = f.tags.get(PGA_CLUSTER_FILLS_TAG)
     if not specs:
         return ""
@@ -293,10 +309,19 @@ class PGAGenGUI:
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
         self._cluster_fill_rows = []  # (spline_osm_ids_str, asset_label, ratio, density, source, category, type_) -- see _build_cluster_fill_rows
+        self._ingame_object_groups = []  # (group_name, count) -- see summarize_ingame_object_groups
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._highlighted_object_points = []  # (x, z) of currently-selected individual object/tree row(s), for a preview ring
         self._highlighted_object_group_spline_ids = set()  # currently-selected cluster-fill row(s)' source spline osm_ids, unioned into the spline highlight overlay
         self._selection_preview_job = None  # see _on_spline_selected's debounce
+        # Viewport picking / marquee-select (see _build_preview_panel's
+        # <Button-1> bindings and _on_preview_pick_*). _preview_render_meta
+        # records the last _show_preview render's final image size + base
+        # kind so a canvas click can be mapped back to course metres.
+        self._preview_render_meta = None
+        self._marquee_anchor = None  # (canvasx, canvasy) at Button-1 press, else None
+        self._marquee_rect_id = None  # canvas rectangle item id while dragging
+        self._marquee_subtract_mode = False  # latched between an <Alt-Button-1> press and its release
         self._splines_selection_memory: set[str] = set()  # see _splines_memory_store/_recall
         self._suppress_course_name_save = False
         self._suppress_repack_filename_save = False
@@ -488,6 +513,23 @@ class PGAGenGUI:
                  "immediately, used by write-objects and (eventually) write-splines/write-terrain/"
                  "repack.")
 
+        ttk.Label(parent, text="Theme:").pack(anchor="w")
+        self._theme_name_to_id = {"(not set)": None}
+        self._theme_name_to_id.update({name: theme_id for theme_id, name in THEMES_V2019.items()})
+        self.objects_theme_var = tk.StringVar(value="(not set)")
+        theme_box = ttk.Combobox(
+            parent, textvariable=self.objects_theme_var, state="readonly", width=14,
+            values=list(self._theme_name_to_id.keys()),
+        )
+        theme_box.pack(anchor="w", pady=(2, 8))
+        _Tooltip(theme_box, "Picked up front (not just an Objects-tab v2019 asset-id concern any "
+                 "more) -- selects which bundled blank template (templates/{game_version}_{theme}."
+                 "course) course/ is auto-provisioned from, so it has to be set before Ingest/Write "
+                 "Terrain/etc. run. Also still controls which of v2019's tree types are available at "
+                 "write-objects time (v2021+ has no numeric theme id, so there it's template "
+                 "selection + display only). Leave as '(not set)' only if you're not ready to pick a "
+                 "template yet -- write/repack steps will error clearly asking for one.")
+
         ttk.Label(parent, text="Course name:").pack(anchor="w")
         ttk.Entry(parent, textvariable=self.course_name, width=26).pack(anchor="w", fill="x", pady=(2, 8))
 
@@ -510,6 +552,16 @@ class PGAGenGUI:
         self._add_step_button(parent, "Ingest LAZ", self._run_ingest_laz)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self.preserve_synthetic_var = tk.BooleanVar(value=True)
+        preserve_cb = ttk.Checkbutton(
+            parent, text="Preserve GUI cluster-fill / mask edits on re-ingest",
+            variable=self.preserve_synthetic_var,
+        )
+        preserve_cb.pack(anchor="w")
+        _Tooltip(preserve_cb, "Keep GUI-authored cluster-fill border rings, 'Use mask' fills, "
+                 "per-feature mask overrides, cluster-fill specs, and generate-streams bank "
+                 "vegetation when re-running Ingest OSM. Uncheck to rebuild features.geojson "
+                 "purely from map.osm (old behavior).")
         self._add_step_button(parent, "Ingest OSM", self._run_ingest_osm)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -545,13 +597,15 @@ class PGAGenGUI:
                  "terrain logic needed downstream.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self.course_file_var = tk.StringVar()
-        ttk.Label(parent, text="Course file (.course):").pack(anchor="w")
-        course_file_row = ttk.Frame(parent)
-        course_file_row.pack(anchor="w", fill="x")
-        ttk.Entry(course_file_row, textvariable=self.course_file_var, width=18).pack(side="left")
-        ttk.Button(course_file_row, text="...", width=3, command=self._browse_course_file).pack(side="left")
-        self._add_step_button(parent, "Ingest Course", self._run_ingest_course)
+        reset_baseline_btn = self._add_step_button(
+            parent, "Reset Course Baseline", self._run_ingest_course,
+        )
+        _Tooltip(reset_baseline_btn, "Optional. course/ is auto-provisioned from the bundled "
+                 "templates/{game_version}_{theme}.course the first time any write/repack step needs "
+                 "it -- no manual ingest required. Only use this to explicitly re-extract course/ "
+                 "from scratch, e.g. after changing Game version or Theme once course/ already "
+                 "exists (which auto-provisioning won't do by itself, since it only fills in a "
+                 "missing course/, never overwrites an existing one).")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.repack_filename_var = tk.StringVar()
@@ -559,6 +613,41 @@ class PGAGenGUI:
         ttk.Label(parent, text="Repack filename:").pack(anchor="w")
         ttk.Entry(parent, textvariable=self.repack_filename_var, width=20).pack(anchor="w")
         self._add_step_button(parent, "Repack", self._run_repack)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Import in-game edits:").pack(anchor="w")
+        import_course_row = ttk.Frame(parent)
+        import_course_row.pack(fill="x", pady=(2, 0))
+        self.import_ingame_course_var = tk.StringVar()
+        import_course_entry = ttk.Entry(import_course_row, textvariable=self.import_ingame_course_var)
+        import_course_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            import_course_row, text="Browse...", command=self._browse_import_ingame_course,
+        ).pack(side="left", padx=(4, 0))
+        _Tooltip(import_course_entry, "A .course file exported by this tool, then hand-edited in "
+                 "PGA Tour 2K's own in-game object/terrain editor and saved -- reconciled against "
+                 "what this tool currently tracks (see course_output/ingame_objects.py). Never "
+                 "touches this project's own course/ folder.")
+        ttk.Label(parent, text="Group label:").pack(anchor="w", pady=(4, 0))
+        self.import_ingame_group_var = tk.StringVar()
+        ttk.Entry(parent, textvariable=self.import_ingame_group_var, width=24).pack(anchor="w")
+        import_buttons_row = ttk.Frame(parent)
+        import_buttons_row.pack(fill="x", pady=(4, 0))
+        preview_import_btn = ttk.Button(
+            import_buttons_row, text="Preview Import", command=self._run_import_ingame_preview,
+        )
+        preview_import_btn.pack(side="left")
+        _Tooltip(preview_import_btn, "Dry run -- prints a summary (new objects/stamps found, plus "
+                 "anything this tool tracks that's missing from the imported course, reported only, "
+                 "never removed) without changing anything on disk.")
+        commit_import_btn = ttk.Button(
+            import_buttons_row, text="Commit Import", command=self._run_import_ingame_commit,
+        )
+        commit_import_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(commit_import_btn, "Applies the same diff Preview Import shows: appends every new "
+                 "in-game object to ingame_objects.json (under the Group label above) and writes "
+                 "every new terrain stamp as the next stamps_N.json layer. Run Pack Objects / Write "
+                 "Objects / Write Terrain afterward to fold the result into placedObjects/userLayers.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._add_step_button(parent, "Copy to Game Folder", self._run_copy_to_game)
@@ -1503,7 +1592,17 @@ class PGAGenGUI:
 
         header = ttk.Frame(frame)
         header.pack(fill="x")
-        ttk.Label(header, text="Preview:").pack(side="left")
+        preview_label = ttk.Label(header, text="Preview:")
+        preview_label.pack(side="left")
+        _Tooltip(preview_label, "Left-click a spline/object on the image to select its row in the "
+                 "Splines/Objects list (Shift/Ctrl-click adds to the selection); left-drag a box to "
+                 "marquee-select everything inside it; click empty space to clear. Alt-drag a box "
+                 "to cut that region out of a selected GUI-authored border ring or 'Use mask' fill "
+                 "(e.g. leave one edge of a border unfilled) -- real OSM features are left alone. "
+                 "Splines are "
+                 "pickable only while 'Overlay OSM' is on, objects only while 'Show objects' is on. "
+                 "Right-drag pans; scroll zooms, Ctrl+scroll steps versions, Shift+scroll changes "
+                 "preview type. Picking is off on the LIDAR / full-frame OSM previews.")
         self.preview_choice = tk.StringVar(value=PREVIEW_FILES[0])
         dropdown = ttk.Combobox(
             header, textvariable=self.preview_choice, values=PREVIEW_FILES,
@@ -1528,10 +1627,12 @@ class PGAGenGUI:
         self.preview_version_label = ttk.Label(header, text="current", width=10)
         self.preview_version_label.pack(side="left")
 
-        # Scroll wheel over either the slider or the image itself steps
-        # through versions -- Windows/Mac send <MouseWheel> with event.delta;
-        # Linux sends <Button-4>/<Button-5> instead. Shift+scroll instead
-        # cycles the preview *type* dropdown (same cross-platform split).
+        # Scroll wheel over this slider steps through versions -- Windows/Mac
+        # send <MouseWheel> with event.delta; Linux sends <Button-4>/<Button-5>
+        # instead. Shift+scroll instead cycles the preview *type* dropdown
+        # (same cross-platform split). Over the image itself, plain scroll
+        # zooms and Ctrl+scroll does this version stepping -- see the canvas
+        # bindings below.
         for widget in (self.preview_version_scale,):
             widget.bind("<MouseWheel>", self._on_preview_scroll)
             widget.bind("<Button-4>", self._on_preview_scroll)
@@ -1564,36 +1665,54 @@ class PGAGenGUI:
         canvas_frame.grid_columnconfigure(0, weight=1)
         self._preview_canvas_image_id = None
 
-        # Plain scroll still cycles versions, Shift+scroll still cycles
-        # preview type (both unchanged) -- Ctrl+scroll is new, and zooms
-        # instead, so none of the existing scroll behavior is disturbed.
-        self.preview_canvas.bind("<MouseWheel>", self._on_preview_scroll)
-        self.preview_canvas.bind("<Button-4>", self._on_preview_scroll)
-        self.preview_canvas.bind("<Button-5>", self._on_preview_scroll)
+        # Over the image: plain scroll zooms (the common gesture),
+        # Ctrl+scroll steps through versions, Shift+scroll cycles the
+        # preview type. The Version slider itself still takes plain
+        # scroll for versions -- see its own bindings above.
+        self.preview_canvas.bind("<MouseWheel>", self._on_preview_zoom_scroll)
+        self.preview_canvas.bind("<Button-4>", self._on_preview_zoom_scroll)
+        self.preview_canvas.bind("<Button-5>", self._on_preview_zoom_scroll)
         self.preview_canvas.bind("<Shift-MouseWheel>", self._on_preview_type_scroll)
         self.preview_canvas.bind("<Shift-Button-4>", self._on_preview_type_scroll)
         self.preview_canvas.bind("<Shift-Button-5>", self._on_preview_type_scroll)
-        self.preview_canvas.bind("<Control-MouseWheel>", self._on_preview_zoom_scroll)
-        self.preview_canvas.bind("<Control-Button-4>", self._on_preview_zoom_scroll)
-        self.preview_canvas.bind("<Control-Button-5>", self._on_preview_zoom_scroll)
-        # Middle-click-drag pans the view -- scan_mark/scan_dragto are
+        self.preview_canvas.bind("<Control-MouseWheel>", self._on_preview_scroll)
+        self.preview_canvas.bind("<Control-Button-4>", self._on_preview_scroll)
+        self.preview_canvas.bind("<Control-Button-5>", self._on_preview_scroll)
+        # Right-click-hold-and-drag pans the view -- scan_mark/scan_dragto are
         # tkinter Canvas's own built-in support for exactly this, so no
         # manual scroll-position math is needed here.
-        self.preview_canvas.bind("<Button-2>", lambda e: self.preview_canvas.scan_mark(e.x, e.y))
-        self.preview_canvas.bind("<B2-Motion>", lambda e: self.preview_canvas.scan_dragto(e.x, e.y, gain=1))
+        self.preview_canvas.bind("<Button-3>", lambda e: self.preview_canvas.scan_mark(e.x, e.y))
+        self.preview_canvas.bind("<B3-Motion>", lambda e: self.preview_canvas.scan_dragto(e.x, e.y, gain=1))
+
+        # Left button: click a spline/object to select its row (in place,
+        # no tab switch); click+drag a box to marquee-select every
+        # spline/object inside it. Right button stays pan, so these don't
+        # collide. See _on_preview_pick_press/_motion/_release.
+        #
+        # Alt+left-drag a box instead SUBTRACTS that region from the
+        # geometry of the selected Splines row(s) (see _marquee_subtract).
+        # Only <Alt-Button-1> is bound -- the generic <B1-Motion>/
+        # <ButtonRelease-1> below still fire for the Alt-drag (Tk falls
+        # back to them when no <Alt-...> variant is bound), so a latched
+        # mode flag set at press is all that's needed and it survives the
+        # user letting go of Alt mid-drag.
+        self.preview_canvas.bind("<Button-1>", self._on_preview_pick_press)
+        self.preview_canvas.bind("<Alt-Button-1>", self._on_preview_subtract_press)
+        self.preview_canvas.bind("<B1-Motion>", self._on_preview_pick_motion)
+        self.preview_canvas.bind("<ButtonRelease-1>", self._on_preview_pick_release)
         self.preview_canvas.bind("<Configure>", self._center_preview_image)
 
     _SPLINE_KIND_FILTERS = (
         "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
         "water", "cartpath", "service_road", "roadway", "driveway", "path",
-        "building", "wood", "pavement", "mulch", "hole",
+        "building", "wood", "pavement", "mulch", "hole", "collection",
         SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND,
     )
 
     BRUSH_TYPE_ORDER = (8, 9, 10, 54)
     BRUSH_TYPE_LABELS = {8: "hard", 9: "med", 10: "soft", 54: "smooth"}
 
-    _OBJECT_SOURCE_FILTERS = ("All", "OSM", "LIDAR", "Manual", "Border")
+    _OBJECT_SOURCE_FILTERS = ("All", "OSM", "LIDAR", "Manual", "Border", "Imported")
 
     def _build_splines_tab(self, parent: ttk.Frame) -> None:
 
@@ -1614,7 +1733,7 @@ class PGAGenGUI:
         self.overlay_osm_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             overlay_row, text="Overlay OSM", variable=self.overlay_osm_var,
-            command=self._show_preview,
+            command=self._on_overlay_osm_toggled,
         ).pack(side="left")
         ttk.Label(overlay_row, text="Opacity:").pack(side="left", padx=(8, 0))
         self.overlay_opacity_var = tk.DoubleVar(value=0.6)
@@ -1698,17 +1817,17 @@ class PGAGenGUI:
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True, pady=(6, 0))
         self.splines_tree = ttk.Treeview(
-            tree_frame, columns=("kind", "tag", "mask", "clusters"), show="headings", height=10,
+            tree_frame, columns=("kind", "tag", "mask", "objects"), show="headings", height=10,
             selectmode="extended",
         )
         self.splines_tree.heading("kind", text="Kind")
         self.splines_tree.heading("tag", text="Tag")
         self.splines_tree.heading("mask", text="Mask")
-        self.splines_tree.heading("clusters", text="Clusters")
+        self.splines_tree.heading("objects", text="Objects")
         self.splines_tree.column("kind", width=90)
         self.splines_tree.column("tag", width=90)
         self.splines_tree.column("mask", width=24, anchor="center")
-        self.splines_tree.column("clusters", width=140)
+        self.splines_tree.column("objects", width=140)
         self.splines_tree.pack(side="left", fill="both", expand=True)
         tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.splines_tree.yview)
         tree_scroll.pack(side="left", fill="y")
@@ -1735,7 +1854,7 @@ class PGAGenGUI:
                  "'All' first to recall a selection that spans multiple kinds.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Label(parent, text="Object Clusters", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Label(parent, text="Spline Objects", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
         cluster_grid = ttk.Frame(parent)
         cluster_grid.pack(anchor="w", fill="x")
         fill_clusters_btn = ttk.Button(
@@ -1752,7 +1871,10 @@ class PGAGenGUI:
         )
         clear_clusters_btn.grid(row=0, column=1, sticky="w", padx=(4, 0), pady=2)
         _Tooltip(clear_clusters_btn, "Remove every cluster-fill asset from the selected spline(s), "
-                 "so Write Objects stops generating clusters for them.")
+                 "so Write Objects stops generating clusters for them. For a selected pga_collection "
+                 "marker, drops that placement's resolved objects from collections.json instead -- "
+                 "iteration-scoped: re-running Generate rebuilds it from the OSM markers. For "
+                 "permanent removal, delete the pga_collection way in your OSM editor and re-ingest.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         reg_marks_checkbox2 = ttk.Checkbutton(
@@ -1783,20 +1905,6 @@ class PGAGenGUI:
             self._run_step(["--step", "write-holes"], wd)
 
     def _build_objects_tab(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Theme:").pack(anchor="w")
-        self._theme_name_to_id = {"(not set)": None}
-        self._theme_name_to_id.update({name: theme_id for theme_id, name in THEMES_V2019.items()})
-        self.objects_theme_var = tk.StringVar(value="(not set)")
-        theme_box = ttk.Combobox(
-            parent, textvariable=self.objects_theme_var, state="readonly", width=14,
-            values=list(self._theme_name_to_id.keys()),
-        )
-        theme_box.pack(anchor="w", pady=(0, 8))
-        _Tooltip(theme_box, "From the ingested .course (CourseDescription.json's theme / "
-                 "CourseMetadata.json's courseTheme) -- controls which of the game's tree types are "
-                 "available, same set for every game version. Leave as '(not set)' to use a single "
-                 "generic tree type.")
-
         """
         Commenting this out for now.
         ttk.Label(parent, text="Asset List (.json):").pack(anchor="w")
@@ -1816,7 +1924,7 @@ class PGAGenGUI:
         self.show_objects_var = tk.BooleanVar(value=False)
         show_objects_checkbox = ttk.Checkbutton(
             show_objects_row, text="Show objects", variable=self.show_objects_var,
-            command=self._show_preview,
+            command=self._on_show_objects_toggled,
         )
         show_objects_checkbox.pack(side="left")
         _Tooltip(show_objects_checkbox, "Overlay placed objects on the preview, similar to Overlay OSM "
@@ -2019,7 +2127,10 @@ class PGAGenGUI:
                 self._append_log(result.stderr or "course_extract.py failed\n")
                 messagebox.showerror("Capture failed", "Could not extract the .course file -- see the log.")
                 return
-            collection = capture_from_course(tmp_dir / "CourseDescription_nodes", name)
+            collection = capture_from_course(
+                tmp_dir / "CourseDescription_nodes", name,
+                printf=lambda s: self._append_log(s + "\n"),
+            )
             out_path = save_collection(collection, libdir)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -2215,20 +2326,25 @@ class PGAGenGUI:
         return " ".join(parts)
 
     @staticmethod
-    def _build_cluster_fill_rows(features: list) -> list[tuple[str, str, float, float, str, int, int]]:
+    def _build_cluster_fill_rows(features: list) -> list[tuple[str, str, float, float, str, int, int, str]]:
         """
         (spline_osm_ids, asset_label, ratio, density, source, category,
-        type_) -- one row per distinct
-        {"category","type","ratio","density","source"} fill spec seen
-        across `features` (see course_output/object_clusters.py's
+        type_, mode) -- one row per distinct
+        {"category","type","ratio","density","source","mode"} fill spec
+        seen across `features` (see course_output/object_clusters.py's
         PGA_CLUSTER_FILLS_TAG), with every contributing spline's osm_id
         collected together -- so a single Fill action (which can target
         many splines and several assets at once) shows as one row per
-        asset/ratio/density/source combo, not one row per spline.
-        `source` defaults to "manual" and `density` to
-        DEFAULT_FILL_DENSITY for specs saved before those fields
-        existed. category/type_ are carried alongside the display label
-        so _on_object_selected can resolve which of placedObjects2.json's
+        asset/ratio/density/source/mode combo, not one row per spline.
+        `source` defaults to "manual", `density` to DEFAULT_FILL_DENSITY,
+        and `mode` to CLUSTER_FILL_MODE_STAMPS for specs saved before
+        those fields existed -- mode is part of the grouping key (not
+        just display) so a stamps-mode and spline-mode spec that
+        otherwise match never merge into one row (they're functionally
+        different fills, and _remove_cluster_fill_groups needs to be
+        able to remove just one without touching the other).
+        category/type_ are carried alongside the display label so
+        _on_object_selected can resolve which of placedObjects2.json's
         already-packed clusters belong to this row's asset (see there).
         """
         groups: dict[tuple, list[int]] = {}
@@ -2237,34 +2353,40 @@ class PGAGenGUI:
                 continue
             for spec in f.tags.get(PGA_CLUSTER_FILLS_TAG) or []:
                 source = spec.get("source", CLUSTER_FILL_SOURCE_MANUAL)
+                mode = spec.get("mode", CLUSTER_FILL_MODE_STAMPS)
                 key = (
                     spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO),
-                    spec.get("density", DEFAULT_FILL_DENSITY), source,
+                    spec.get("density", DEFAULT_FILL_DENSITY), source, mode,
                 )
                 groups.setdefault(key, []).append(f.osm_id)
 
         rows = []
-        for (category, type_, ratio, density, source), osm_ids in groups.items():
+        for (category, type_, ratio, density, source, mode), osm_ids in groups.items():
             label = _ASSET_LABEL_BY_KEY.get((category, type_), f"category={category}/type={type_}")
             ids_str = ",".join(str(i) for i in sorted(set(osm_ids)))
-            rows.append((ids_str, label, ratio, density, source, category, type_))
+            rows.append((ids_str, label, ratio, density, source, category, type_, mode))
         return rows
 
     def _refresh_objects_list(self) -> None:
         """
-        Populates the Objects tab list from two independent sources:
+        Populates the Objects tab list from three independent sources:
         object_list.json (individually placed trees -- iid is a plain
-        int index into self._objects_tree_list, source OSM/LIDAR) and
+        int index into self._objects_tree_list, source OSM/LIDAR),
         features.geojson's cluster-fill tags (area fills -- iid is
         "c"+index into self._cluster_fill_rows, source "manual" or
-        "border"). Kept as two disjoint iid namespaces so
-        _delete_selected_objects/_delete_all_filtered_objects can
-        always tell which kind of row a given iid is.
+        "border"), and ingame_objects.json's `group` labels (objects
+        imported from a hand-edited .course, see
+        step_import_ingame_edits -- iid is "g"+index into
+        self._ingame_object_groups, source "Imported"). Kept as three
+        disjoint iid namespaces so _delete_selected_objects/
+        _delete_all_filtered_objects can always tell which kind of row
+        a given iid is.
         """
         wd = self.working_dir.get().strip()
         self.objects_tree.delete(*self.objects_tree.get_children())
         self._objects_tree_list = []
         self._cluster_fill_rows = []
+        self._ingame_object_groups = []
         # Old iids/indices are gone along with the rows above -- drop any
         # stale preview highlight state rather than let it dangle.
         self._highlighted_object_points = []
@@ -2286,6 +2408,15 @@ class PGAGenGUI:
             except (json.JSONDecodeError, OSError, KeyError):
                 self._cluster_fill_rows = []
 
+        ingame_objects_path = Path(wd) / INGAME_OBJECTS_FILE
+        if ingame_objects_path.exists():
+            try:
+                self._ingame_object_groups = summarize_ingame_object_groups(
+                    load_ingame_objects(ingame_objects_path)
+                )
+            except (json.JSONDecodeError, OSError, KeyError):
+                self._ingame_object_groups = []
+
         filter_val = self.objects_filter_var.get()
         for i, (x, z, tags) in enumerate(self._objects_tree_list):
             source = self._object_source(tags)
@@ -2295,11 +2426,45 @@ class PGAGenGUI:
                 "", "end", iid=str(i), values=(f"{x:.1f}", f"{z:.1f}", source, self._object_detail(tags)),
             )
 
-        for j, (spline_ids, asset_label, ratio, density, source, _category, _type) in enumerate(self._cluster_fill_rows):
+        for j, (spline_ids, asset_label, ratio, density, source, _category, _type, mode) in enumerate(
+            self._cluster_fill_rows
+        ):
             if filter_val not in ("All", source.capitalize()):
                 continue
-            detail = f"splines={spline_ids} fill={asset_label} ratio={ratio:g} density={density:g}%"
+            if mode == CLUSTER_FILL_MODE_SPLINE:
+                detail = f"splines={spline_ids} fill={asset_label} [spline] fillPct={density / 100:g}"
+            else:
+                detail = f"splines={spline_ids} fill={asset_label} [stamps] ratio={ratio:g} density={density:g}%"
             self.objects_tree.insert("", "end", iid=f"c{j}", values=("", "", source, detail))
+
+        if filter_val in ("All", "Imported"):
+            for j, (group_name, count) in enumerate(self._ingame_object_groups):
+                self.objects_tree.insert(
+                    "", "end", iid=f"g{j}",
+                    values=("", "", "Imported", f"group={group_name!r} ({count} object(s))"),
+                )
+
+    def _remove_ingame_object_groups_by_name(self, working_dir: Path, group_names: set[str]) -> None:
+        """
+        Removes every ingame_objects.json record whose `group` is in
+        `group_names` -- Objects-tab counterpart of
+        _remove_cluster_fill_groups, but surgical by group label
+        instead of by feature/spec, since imported objects have no
+        Feature/OSM tie-in at all (see course_output/ingame_objects.py's
+        module docstring). No-op if the file doesn't exist. Caller is
+        responsible for re-running self._refresh_objects_list() and
+        self._regenerate_packed_objects() afterward.
+        """
+        path = working_dir / INGAME_OBJECTS_FILE
+        if not path.exists():
+            return
+        try:
+            records = load_ingame_objects(path)
+        except (json.JSONDecodeError, OSError, KeyError):
+            return
+        kept = remove_ingame_object_groups(records, group_names)
+        if len(kept) != len(records):
+            save_ingame_objects(kept, path)
 
     def _remove_cluster_fill_groups(self, working_dir: Path, group_rows: list[tuple]) -> None:
         """
@@ -2323,9 +2488,9 @@ class PGAGenGUI:
         self._ensure_splines_features_fresh(working_dir)
         target_osm_ids: set[int] = set()
         match_keys: set[tuple] = set()
-        for ids_str, _label, ratio, density, source, category, type_ in group_rows:
+        for ids_str, _label, ratio, density, source, category, type_, mode in group_rows:
             target_osm_ids.update(int(s) for s in ids_str.split(",") if s)
-            match_keys.add((category, type_, ratio, density, source))
+            match_keys.add((category, type_, ratio, density, source, mode))
 
         remove_feature_ids: set[int] = set()
         changed = False
@@ -2339,7 +2504,8 @@ class PGAGenGUI:
                 spec for spec in specs
                 if (spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO),
                     spec.get("density", DEFAULT_FILL_DENSITY),
-                    spec.get("source", CLUSTER_FILL_SOURCE_MANUAL)) not in match_keys
+                    spec.get("source", CLUSTER_FILL_SOURCE_MANUAL),
+                    spec.get("mode", CLUSTER_FILL_MODE_STAMPS)) not in match_keys
             ]
             if len(kept) == len(specs):
                 continue
@@ -2364,10 +2530,11 @@ class PGAGenGUI:
     def _delete_selected_objects(self) -> None:
         """
         Deletes exactly the currently-selected row(s) in the Objects
-        list -- individual trees (iid is a digit) and/or cluster-fill
-        groups (iid prefixed "c") together, so both kinds can be
-        cleared from this tab without a trip to the Splines tab.
-        Objects-tab counterpart of the Splines tab's Mask button.
+        list -- individual trees (iid is a digit), cluster-fill groups
+        (iid prefixed "c"), and/or imported in-game object groups (iid
+        prefixed "g") together, so all three kinds can be cleared from
+        this tab without a trip to the Splines tab. Objects-tab
+        counterpart of the Splines tab's Mask button.
         """
         wd = self._require_working_dir()
         if not wd:
@@ -2375,6 +2542,7 @@ class PGAGenGUI:
         selection = self.objects_tree.selection()
         tree_indices = {int(iid) for iid in selection if iid.isdigit()}
         group_rows = []
+        ingame_group_names = set()
         for iid in selection:
             if iid.startswith("c"):
                 try:
@@ -2383,12 +2551,19 @@ class PGAGenGUI:
                     continue
                 if 0 <= j < len(self._cluster_fill_rows):
                     group_rows.append(self._cluster_fill_rows[j])
-        if not tree_indices and not group_rows:
+            elif iid.startswith("g"):
+                try:
+                    j = int(iid[1:])
+                except ValueError:
+                    continue
+                if 0 <= j < len(self._ingame_object_groups):
+                    ingame_group_names.add(self._ingame_object_groups[j][0])
+        if not tree_indices and not group_rows and not ingame_group_names:
             return
         if not messagebox.askyesno(
             "Delete selected objects",
-            f"Permanently delete {len(tree_indices)} tree(s) and {len(group_rows)} cluster-fill "
-            "group(s)? This can't be undone.",
+            f"Permanently delete {len(tree_indices)} tree(s), {len(group_rows)} cluster-fill group(s), "
+            f"and {len(ingame_group_names)} imported group(s)? This can't be undone.",
         ):
             return
 
@@ -2399,9 +2574,12 @@ class PGAGenGUI:
             save_object_list(self._objects_tree_list, Path(wd) / OBJECT_LIST_FILE)
         if group_rows:
             self._remove_cluster_fill_groups(Path(wd), group_rows)
+        if ingame_group_names:
+            self._remove_ingame_object_groups_by_name(Path(wd), ingame_group_names)
 
         self._append_log(
-            f"\n[deleted {len(tree_indices)} tree(s), {len(group_rows)} cluster-fill group(s)]\n"
+            f"\n[deleted {len(tree_indices)} tree(s), {len(group_rows)} cluster-fill group(s), "
+            f"{len(ingame_group_names)} imported group(s)]\n"
         )
         self._regenerate_packed_objects(Path(wd))
         self._refresh_objects_list()
@@ -2410,26 +2588,28 @@ class PGAGenGUI:
     def _delete_all_filtered_objects(self) -> None:
         """
         Deletes everything currently shown in the Objects list (i.e.
-        matching the active Filter) -- both trees and cluster-fill
-        groups, no longer punting cluster fills to the Splines tab's
-        Clear Cluster Fills. Objects-tab counterpart of the Splines
-        tab's Mask All button.
+        matching the active Filter) -- trees, cluster-fill groups, and
+        imported in-game object groups alike, no longer punting cluster
+        fills to the Splines tab's Clear Cluster Fills. Objects-tab
+        counterpart of the Splines tab's Mask All button.
         """
         wd = self._require_working_dir()
         if not wd:
             return
         visible_tree_iids = [iid for iid in self.objects_tree.get_children() if iid.isdigit()]
         visible_group_iids = [iid for iid in self.objects_tree.get_children() if iid.startswith("c")]
-        if not visible_tree_iids and not visible_group_iids:
+        visible_ingame_iids = [iid for iid in self.objects_tree.get_children() if iid.startswith("g")]
+        if not visible_tree_iids and not visible_group_iids and not visible_ingame_iids:
             messagebox.showinfo(
                 "Nothing to delete", "No objects are currently shown for the active filter.",
             )
             return
         if not messagebox.askyesno(
             "Delete filtered objects",
-            f"Permanently delete {len(visible_tree_iids)} tree(s) and {len(visible_group_iids)} "
-            f"cluster-fill group(s) currently shown (filter={self.objects_filter_var.get()!r})? "
-            "This can't be undone -- re-run Generate Trees / Fill with Clusters to get them back.",
+            f"Permanently delete {len(visible_tree_iids)} tree(s), {len(visible_group_iids)} "
+            f"cluster-fill group(s), and {len(visible_ingame_iids)} imported group(s) currently shown "
+            f"(filter={self.objects_filter_var.get()!r})? This can't be undone -- re-run Generate Trees "
+            "/ Fill with Clusters to get generated ones back (imported ones can't be regenerated).",
         ):
             return
 
@@ -2448,9 +2628,17 @@ class PGAGenGUI:
         if group_rows:
             self._remove_cluster_fill_groups(Path(wd), group_rows)
 
+        ingame_group_names = {
+            self._ingame_object_groups[int(iid[1:])][0]
+            for iid in visible_ingame_iids
+            if 0 <= int(iid[1:]) < len(self._ingame_object_groups)
+        }
+        if ingame_group_names:
+            self._remove_ingame_object_groups_by_name(Path(wd), ingame_group_names)
+
         self._append_log(
-            f"\n[deleted {len(remove_indices)} tree(s), {len(group_rows)} cluster-fill group(s) "
-            f"from {OBJECT_LIST_FILE}]\n"
+            f"\n[deleted {len(remove_indices)} tree(s), {len(group_rows)} cluster-fill group(s), "
+            f"{len(ingame_group_names)} imported group(s)]\n"
         )
         self._regenerate_packed_objects(Path(wd))
         self._refresh_objects_list()
@@ -2473,6 +2661,7 @@ class PGAGenGUI:
         self._splines_features = load_features(features_path)
         self._splines_features_mtime = features_path.stat().st_mtime
         kind_filter = self.splines_kind_filter_var.get()
+        seen_iids: set[str] = set()
         for f in self._splines_features:
             if f.kind == SYNTHETIC_BORDER_CENTERLINE_KIND:
                 continue  # implementation detail of a border fill, not a user-facing row -- see _open_cluster_fill_dialog
@@ -2480,9 +2669,13 @@ class PGAGenGUI:
                 continue
             if f.osm_id is None:
                 continue  # nothing stable to select/highlight/toggle by
+            iid = str(f.osm_id)
+            if iid in seen_iids:
+                continue  # a corrupted features.geojson with duplicate osm_ids -- one row per id, Treeview iids must be unique
+            seen_iids.add(iid)
             self.splines_tree.insert(
-                "", "end", iid=str(f.osm_id),
-                values=(f.kind, _spline_tag_detail(f), "✔" if f.mask else "", _spline_cluster_detail(f)),
+                "", "end", iid=iid,
+                values=(f.kind, _spline_tag_detail(f), "✔" if f.mask else "", _spline_object_detail(f)),
             )
 
     def _on_spline_selected(self) -> None:
@@ -2547,7 +2740,7 @@ class PGAGenGUI:
                 except ValueError:
                     continue
                 if 0 <= j < len(self._cluster_fill_rows):
-                    ids_str, _label, _ratio, _density, _source, category, _type = self._cluster_fill_rows[j]
+                    ids_str, _label, _ratio, _density, _source, category, _type, _mode = self._cluster_fill_rows[j]
                     row_spline_ids = {int(s) for s in ids_str.split(",") if s}
                     spline_ids.update(row_spline_ids)
                     group_specs.append((row_spline_ids, category))
@@ -2556,7 +2749,7 @@ class PGAGenGUI:
         objects_path = Path(wd) / OBJECTS_FILE if wd else None
         if group_specs and objects_path is not None and objects_path.exists():
             try:
-                _, cluster_records, _ = load_objects(objects_path)
+                _, cluster_records, _, _, _ = load_objects(objects_path)
             except (json.JSONDecodeError, OSError, KeyError):
                 cluster_records = []
             for row_spline_ids, category in group_specs:
@@ -2619,6 +2812,7 @@ class PGAGenGUI:
         self._ensure_splines_features_fresh(working_dir)
         course_features = self._shift_and_crop_to_course(working_dir, self._splines_features)
         cluster_records = pack_cluster_records(course_features)
+        object_spline_fill_records = pack_spline_records(course_features)
 
         # Preserve resolved collection placements -- they're owned by
         # collections.json (written by the generate-collections step),
@@ -2632,7 +2826,21 @@ class PGAGenGUI:
             except (json.JSONDecodeError, OSError, KeyError):
                 collection_objects = []
 
-        save_objects(trees, cluster_records, working_dir / OBJECTS_FILE, collection_objects)
+        # Same "preserve, don't drop until the next CLI run" idea as
+        # collection_objects above -- ingame_objects.json is owned by
+        # the import-ingame-edits step, not this in-process re-pack.
+        ingame_object_records = []
+        ingame_objects_path = working_dir / INGAME_OBJECTS_FILE
+        if ingame_objects_path.exists():
+            try:
+                ingame_object_records = load_ingame_objects(ingame_objects_path)
+            except (json.JSONDecodeError, OSError, KeyError):
+                ingame_object_records = []
+
+        save_objects(
+            trees, cluster_records, working_dir / OBJECTS_FILE, collection_objects,
+            object_spline_fill_records, ingame_object_records,
+        )
 
     def _toggle_selected_mask(self) -> None:
         """
@@ -2714,6 +2922,13 @@ class PGAGenGUI:
         exists ONLY to carry that tag (see _open_cluster_fill_dialog) --
         stripping the tag would leave a permanent, purposeless row, so
         the whole Feature is deleted instead.
+
+        For a pga_collection marker (kind "collection") there's no tag to
+        strip -- its objects are the resolved records in collections.json
+        keyed by the marker way's osm_id as `source_id`. "Clear" drops
+        those records (Write Objects / the live preview then stop
+        emitting them); the marker row itself stays, since it's real OSM
+        data -- re-run Generate to resolve it again.
         """
         wd = self.working_dir.get().strip()
         selected_ids = {int(s) for s in self.splines_tree.selection()}
@@ -2725,6 +2940,8 @@ class PGAGenGUI:
         changed = False
         remove_ids = set()
         for f in targets:
+            if f.kind == "collection":
+                continue  # handled below against collections.json
             if f.kind in self._SYNTHETIC_CLUSTER_KINDS:
                 remove_ids.add(f.osm_id)
                 centerline_id = f.tags.get(PGA_CLUSTER_CENTERLINE_REF_TAG)
@@ -2733,11 +2950,26 @@ class PGAGenGUI:
                 changed = True
             elif f.tags.pop(PGA_CLUSTER_FILLS_TAG, None) is not None:
                 changed = True
-        if not changed:
+
+        collections_changed = False
+        collection_ids = {f.osm_id for f in targets if f.kind == "collection"}
+        collections_path = Path(wd) / COLLECTIONS_FILE
+        if collection_ids and collections_path.exists():
+            try:
+                records = load_collection_records(collections_path)
+            except (json.JSONDecodeError, OSError):
+                records = []
+            kept = [r for r in records if r.get("source_id") not in collection_ids]
+            if len(kept) != len(records):
+                save_collection_records(kept, collections_path)
+                collections_changed = True
+
+        if not changed and not collections_changed:
             return
         if remove_ids:
             self._splines_features = [f for f in self._splines_features if f.osm_id not in remove_ids]
-        save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+        if changed:
+            save_features(self._splines_features, Path(wd) / FEATURES_FILE)
         self._regenerate_packed_objects(Path(wd))
         self._refresh_splines_list()
         self._refresh_objects_list()
@@ -2863,26 +3095,64 @@ class PGAGenGUI:
         category_box.bind("<<ComboboxSelected>>", lambda e: refresh_asset_tree())
         refresh_asset_tree()
 
+        # Stamps (client-side circle-packed scatter, every game_version) vs
+        # Spline (v2021+ engine-auto-scattered object-spline fill region,
+        # no packing) -- see the conversation. Defaults to spline for
+        # 2021+ projects, stamps for 2019 (which has no spline-fill
+        # schema at all -- see step_write_objects).
+        mode_row = ttk.Frame(dialog)
+        mode_row.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(mode_row, text="Fill mode:").pack(side="left")
+        default_mode = (
+            CLUSTER_FILL_MODE_STAMPS if self.game_version.get() == "2019" else CLUSTER_FILL_MODE_SPLINE
+        )
+        mode_var = tk.StringVar(value=default_mode)
+        stamps_radio = ttk.Radiobutton(
+            mode_row, text="Stamps", value=CLUSTER_FILL_MODE_STAMPS, variable=mode_var,
+        )
+        stamps_radio.pack(side="left", padx=(4, 0))
+        spline_radio = ttk.Radiobutton(
+            mode_row, text="Spline", value=CLUSTER_FILL_MODE_SPLINE, variable=mode_var,
+        )
+        spline_radio.pack(side="left")
+        _Tooltip(stamps_radio, "Client-side circle-packed scatter stamps (Value.clusters) -- works for "
+                 "every game version, but density/placement is this tool's own approximation.")
+        _Tooltip(spline_radio, "An object-spline fill region (Value.splines, v2021+ only) -- the game "
+                 "engine itself auto-scatters the asset at the given density, no packing here. Dropped "
+                 "with a note if this project's game_version is 2019.")
+
         ratio_row = ttk.Frame(dialog)
         ratio_row.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Label(ratio_row, text="Raster ratio:").pack(side="left")
+        ratio_label = ttk.Label(ratio_row, text="Raster ratio:")
+        ratio_label.pack(side="left")
         ratio_var = tk.StringVar(value=str(DEFAULT_RASTER_RATIO))
         ratio_entry = ttk.Entry(ratio_row, textvariable=ratio_var, width=6)
         ratio_entry.pack(side="left", padx=4)
-        _Tooltip(ratio_entry, "How much placed stamps are allowed to overlap each other during packing "
-                 "-- minimum center-to-center separation is (r1+r2) x ratio. 1.0 means stamps may only "
-                 "just touch; <1 lets them overlap more (denser fill); >1 spaces them further apart. "
-                 "Applies to every asset picked in this dialog, across all 3 packing passes.")
+        _Tooltip(ratio_entry, "Stamps mode only: how much placed stamps are allowed to overlap each "
+                 "other during packing -- minimum center-to-center separation is (r1+r2) x ratio. 1.0 "
+                 "means stamps may only just touch; <1 lets them overlap more (denser fill); >1 spaces "
+                 "them further apart. Applies to every asset picked in this dialog, across all 3 "
+                 "packing passes. Ignored in spline mode.")
 
-        ttk.Label(ratio_row, text="Fill density (%):").pack(side="left", padx=(12, 0))
+        density_label = ttk.Label(ratio_row, text="Fill density (%):")
+        density_label.pack(side="left", padx=(12, 0))
         density_var = tk.StringVar(value=str(DEFAULT_FILL_DENSITY))
         density_entry = ttk.Entry(ratio_row, textvariable=density_var, width=6)
         density_entry.pack(side="left", padx=4)
-        _Tooltip(density_entry, "How many instances render inside each placed stamp circle, as a percent "
-                 "of the asset's own measured planting density -- 100 is the catalog's real density, 50 "
-                 "is half as many instances at the same stamp size/positions, 200 is double. Doesn't "
-                 "change stamp size, count, or placement (see Raster ratio for that) -- only how packed "
-                 "each stamp looks in-game.")
+        _Tooltip(density_entry, "Stamps mode: how many instances render inside each placed stamp circle, "
+                 "as a percent of the asset's own measured planting density -- 100 is the catalog's real "
+                 "density, 50 is half as many instances at the same stamp size/positions, 200 is double. "
+                 "Doesn't change stamp size, count, or placement (see Raster ratio for that). Spline "
+                 "mode: fed straight to the engine as fillPct = density / 100 (so 25% -> fillPct 0.25).")
+
+        def _update_mode_widgets(*_args) -> None:
+            spline = mode_var.get() == CLUSTER_FILL_MODE_SPLINE
+            ratio_entry.configure(state="disabled" if spline else "normal")
+            ratio_label.configure(text="Raster ratio (stamps only):" if spline else "Raster ratio:")
+            density_label.configure(text="Fill %:" if spline else "Fill density (%):")
+
+        mode_var.trace_add("write", _update_mode_widgets)
+        _update_mode_widgets()
 
         use_mask_var = tk.BooleanVar(value=False)
         if border_mode:
@@ -2907,13 +3177,18 @@ class PGAGenGUI:
             if not selected_rows:
                 messagebox.showwarning("No asset selected", "Select one or more assets to fill with.", parent=dialog)
                 return
-            try:
-                ratio = float(ratio_var.get())
-                if ratio <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showwarning("Invalid ratio", "Raster ratio must be a positive number.", parent=dialog)
-                return
+            mode = mode_var.get()
+            ratio = DEFAULT_RASTER_RATIO
+            if mode == CLUSTER_FILL_MODE_STAMPS:
+                try:
+                    ratio = float(ratio_var.get())
+                    if ratio <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showwarning(
+                        "Invalid ratio", "Raster ratio must be a positive number.", parent=dialog,
+                    )
+                    return
             try:
                 density = float(density_var.get())
                 if density <= 0:
@@ -2947,7 +3222,7 @@ class PGAGenGUI:
                 specs = [
                     {
                         "category": e.category, "type": e.type, "ratio": ratio, "density": density,
-                        "source": CLUSTER_FILL_SOURCE_BORDER,
+                        "source": CLUSTER_FILL_SOURCE_BORDER, "mode": mode,
                     }
                     for e in chosen_entries
                 ]
@@ -2981,7 +3256,7 @@ class PGAGenGUI:
                 specs = [
                     {
                         "category": e.category, "type": e.type, "ratio": ratio, "density": density,
-                        "source": CLUSTER_FILL_SOURCE_MANUAL,
+                        "source": CLUSTER_FILL_SOURCE_MANUAL, "mode": mode,
                     }
                     for e in chosen_entries
                 ]
@@ -3097,7 +3372,17 @@ class PGAGenGUI:
             self._suppress_game_version_save = False
         self._suppress_objects_theme_save = True
         try:
-            theme_name = THEMES_V2019.get(project.get("objects_theme"), "(not set)")
+            # Prefer the name-string "theme" field (works for any game
+            # version); fall back to the numeric v2019 "objects_theme" id
+            # for older projects saved before "theme" existed.
+            saved_theme = project.get("theme")
+            if saved_theme:
+                theme_name = next(
+                    (name for name in self._theme_name_to_id if name.lower() == saved_theme.lower()),
+                    "(not set)",
+                )
+            else:
+                theme_name = THEMES_V2019.get(project.get("objects_theme"), "(not set)")
             self.objects_theme_var.set(theme_name)
         finally:
             self._suppress_objects_theme_save = False
@@ -3141,13 +3426,25 @@ class PGAGenGUI:
         save_project(Path(wd), {"game_version": self.game_version.get()})
 
     def _on_objects_theme_changed(self) -> None:
+        """
+        objects_theme_var holds a theme NAME (e.g. "rustic"); this saves
+        it two ways: "objects_theme" as the numeric v2019 id (existing
+        use -- write-objects' --theme, v2019 asset resolution only), and
+        "theme" as the lowercase name itself (new -- course_templates.py's
+        resolve_course_template needs the name, not the id, and v2021+
+        has no numeric id at all).
+        """
         if self._suppress_objects_theme_save:
             return
         wd = self.working_dir.get().strip()
         if not wd or not Path(wd).is_dir():
             return
-        theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
-        save_project(Path(wd), {"objects_theme": theme_id})
+        theme_name = self.objects_theme_var.get()
+        theme_id = self._theme_name_to_id.get(theme_name)
+        save_project(Path(wd), {
+            "objects_theme": theme_id,
+            "theme": theme_name.lower() if theme_id is not None else None,
+        })
 
     # ------------------------------------------------------------------
     # Folder / file pickers
@@ -3157,13 +3454,6 @@ class PGAGenGUI:
         d = filedialog.askdirectory(title="Select working directory")
         if d:
             self.working_dir.set(d)
-
-    def _browse_course_file(self) -> None:
-        f = filedialog.askopenfilename(
-            title="Select a .course file", filetypes=[(".course files", "*.course"), ("All files", "*.*")]
-        )
-        if f:
-            self.course_file_var.set(f)
 
     # ------------------------------------------------------------------
     # Step commands -- each just builds a CLI arg list and hands off to
@@ -3204,6 +3494,8 @@ class PGAGenGUI:
             hole_corridor_buffer = self.hole_corridor_buffer_var.get().strip()
             if hole_corridor_buffer:
                 args += ["--hole-corridor-buffer-px", hole_corridor_buffer]
+            if not self.preserve_synthetic_var.get():
+                args += ["--no-preserve-synthetic"]
             self._run_step(args, wd)
 
     def _run_dig_water(self) -> None:
@@ -3220,14 +3512,16 @@ class PGAGenGUI:
         self._run_step(args, wd)
 
     def _run_ingest_course(self) -> None:
+        """
+        Explicit "reset course/ from the bundled template" action -- see
+        the button's tooltip. game_version/theme are already persisted
+        in project.json (set immediately on change), so this step just
+        re-reads them; no args needed here.
+        """
         wd = self._require_working_dir()
         if not wd:
             return
-        course_file = self.course_file_var.get().strip()
-        if not course_file:
-            messagebox.showwarning("No course file", "Choose a .course file to ingest first.")
-            return
-        self._run_step(["--step", "ingest-course", "--course-file", course_file], wd)
+        self._run_step(["--step", "ingest-course"], wd)
 
     def _run_generate_terrain(self) -> None:
         wd = self._require_working_dir()
@@ -3581,6 +3875,68 @@ class PGAGenGUI:
             messagebox.showwarning("No filename", "Enter a repack filename first.")
             return
         self._run_step(["--step", "repack", "--repack-filename", filename], wd)
+
+    def _browse_import_ingame_course(self) -> None:
+        course_file = filedialog.askopenfilename(
+            title="Select a saved, hand-edited .course file to import",
+            filetypes=[(".course files", "*.course"), ("All files", "*.*")],
+        )
+        if course_file:
+            self.import_ingame_course_var.set(course_file)
+
+    def _import_ingame_args(self) -> Optional[list[str]]:
+        course_file = self.import_ingame_course_var.get().strip()
+        if not course_file:
+            messagebox.showwarning("No course file", "Browse to a saved, hand-edited .course file first.")
+            return None
+        if not Path(course_file).is_file():
+            messagebox.showerror("File not found", f"{course_file} doesn't exist.")
+            return None
+        args = ["--step", "import-ingame-edits", "--edited-course", course_file]
+        if self.registration_marks_var.get():
+            args.append("--registration-marks")
+        args.append("--direct-height-shift" if self.direct_height_shift_var.get()
+                     else "--no-direct-height-shift")
+        args.append("--prune-overlapped-stamps" if self.prune_overlapped_stamps_var.get()
+                     else "--no-prune-overlapped-stamps")
+        return args
+
+    def _run_import_ingame_preview(self) -> None:
+        """Objects tab / File tab -- dry-run diff only, see
+        step_import_ingame_edits. Prints its summary to the log; changes
+        nothing on disk."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = self._import_ingame_args()
+        if args is None:
+            return
+        self._run_step(args, wd)
+
+    def _run_import_ingame_commit(self) -> None:
+        """Objects tab / File tab -- applies the diff (new objects ->
+        ingame_objects.json, new stamps -> the next stamps_N.json
+        layer), then re-packs objects.json in-process and refreshes the
+        Objects list so the import shows up immediately, same as any
+        other Objects-tab mutation."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = self._import_ingame_args()
+        if args is None:
+            return
+        args.append("--commit")
+        group = self.import_ingame_group_var.get().strip()
+        if group:
+            args += ["--import-group", group]
+        if not messagebox.askyesno(
+            "Commit import",
+            "This appends any new in-game objects to ingame_objects.json and writes any new terrain "
+            "stamps as a new stamps_N.json layer. Run Preview Import first if you haven't already, to "
+            "see counts. Continue?",
+        ):
+            return
+        self._run_step(args, wd, on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True))
 
     def _run_visualize(self) -> None:
         wd = self._require_working_dir()
@@ -4050,7 +4406,7 @@ class PGAGenGUI:
         self.preview_version_label.config(text="current" if v == 0 else f"-{v}")
 
     def _on_preview_zoom_scroll(self, event) -> None:
-        """Ctrl+scroll zooms the preview (see _on_preview_scroll for the plain-scroll version control)."""
+        """Plain scroll over the preview image zooms it (see _on_preview_scroll for version stepping, now Ctrl+scroll over the image)."""
         if event.num == 4:
             step = 0.1
         elif event.num == 5:
@@ -4237,13 +4593,14 @@ class PGAGenGUI:
         First unused negative int -- real OSM way ids are always
         non-negative, so a negative synthetic id can never collide with
         one. osm_id is otherwise only used for GUI selection/display
-        (see _spline_cluster_detail, _build_cluster_fill_rows), never
+        (see _spline_object_detail, _build_cluster_fill_rows), never
         for cross-referencing back to real OSM data.
         """
         return next_synthetic_osm_id(self._splines_features)
 
     _OBJECT_DOT_RADIUS_PX = 1  # -> a 2px-diameter dot, per the Objects tab's "Show objects" spec
     _OBJECT_LAYER_FILL_ALPHA = round(255 * 0.4)  # circle interior only -- center dot/outer stroke stay 100%
+    _PICK_TOLERANCE_PX = 12  # screen-space hit radius for a single viewport click (see _pick_single)
 
     def _get_cached_object_preview_layer(self, working_dir: Path):
         """
@@ -4306,7 +4663,7 @@ class PGAGenGUI:
 
         if objects_path.exists():
             try:
-                _, cluster_records, collection_objects = load_objects(objects_path)
+                _, cluster_records, collection_objects, _, _ = load_objects(objects_path)
                 for record in cluster_records:
                     category = record.get("category")
                     if category not in _OBJECT_LAYER_STYLE:
@@ -4320,6 +4677,41 @@ class PGAGenGUI:
         self._cached_object_layer = points
         self._cached_object_layer_key = cache_key
         return points
+
+    def _get_cached_object_spline_fill_layer(self, working_dir: Path):
+        """
+        Lazily built (waypoints, category) list -- one entry per object-
+        spline fill piece currently in objects.json (course_output/
+        object_clusters.py's pack_spline_records output, mode="spline"
+        fills only) -- same mtime-keyed caching idiom as
+        _get_cached_object_preview_layer, kept separate from it since an
+        object-spline fill covers an AREA (no single meaningful radius,
+        unlike a cluster stamp) and _composite_objects_layer renders it
+        as a filled polygon outline instead of a circle.
+        """
+        objects_path = working_dir / OBJECTS_FILE
+        obj_mtime = objects_path.stat().st_mtime if objects_path.exists() else None
+        cache_key = (str(working_dir), obj_mtime)
+        if getattr(self, "_cached_object_spline_layer_key", None) == cache_key:
+            return self._cached_object_spline_layer
+
+        pieces: list[tuple[list[tuple[float, float]], int]] = []
+        if objects_path.exists():
+            try:
+                _, _, _, spline_fill_records, _ = load_objects(objects_path)
+                for record in spline_fill_records:
+                    category = record.get("category")
+                    if category not in _OBJECT_LAYER_STYLE:
+                        continue
+                    waypoints = [(float(x), float(z)) for x, z in record.get("waypoints", [])]
+                    if len(waypoints) >= 3:
+                        pieces.append((waypoints, category))
+            except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
+                pass
+
+        self._cached_object_spline_layer = pieces
+        self._cached_object_spline_layer_key = cache_key
+        return pieces
 
     @staticmethod
     def _float_field(var: "tk.StringVar", default: float) -> float:
@@ -4439,7 +4831,8 @@ class PGAGenGUI:
         """
         points = self._get_cached_object_preview_layer(working_dir)
         water_rects = self._get_water_preview_rects(working_dir)
-        if not points and not water_rects:
+        spline_fill_pieces = self._get_cached_object_spline_fill_layer(working_dir)
+        if not points and not water_rects and not spline_fill_pieces:
             return img
 
         left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
@@ -4477,6 +4870,16 @@ class PGAGenGUI:
             draw.line(corners_px + [corners_px[0]], fill=(*_WATER_LAYER_COLOR, 255), width=2)
 
         used_categories: set[int] = set()
+        for waypoints, category in spline_fill_pieces:
+            style = _OBJECT_LAYER_STYLE.get(category)
+            if style is None:
+                continue
+            used_categories.add(category)
+            color = style[1]
+            ring_px = [_to_px(x, z) for x, z in waypoints]
+            draw.polygon(ring_px, fill=(*color, self._OBJECT_LAYER_FILL_ALPHA))
+            draw.line(ring_px + [ring_px[0]], fill=(*color, 255), width=2)
+
         for x, z, radius, category in points:
             style = _OBJECT_LAYER_STYLE.get(category)
             if style is None:
@@ -4887,6 +5290,581 @@ class PGAGenGUI:
         if mtime != self._splines_features_mtime:
             self._refresh_splines_list()
 
+    # ------------------------------------------------------------------
+    # Viewport picking / marquee-select
+    #
+    # Left-click a spline or object marker on the preview to select its
+    # row in the Splines/Objects tree (in place -- no tab switch); those
+    # <<TreeviewSelect>> handlers already drive the cyan highlight and
+    # every Mask/Clear/Delete action. Left-drag a box to marquee-select
+    # everything inside it (Shift/Ctrl to add to the current selection).
+    # Alt+left-drag a box instead cuts that region out of a selected
+    # GUI-authored border ring / "Use mask" fill (never a real OSM
+    # feature) -- see _marquee_subtract. Right-drag stays pan.
+    #
+    # Only *visible* layers take part: splines are pickable only while
+    # "Overlay OSM" (Splines tab) is on, objects only while "Show
+    # objects" (Objects tab) is on -- you can't click what you can't see.
+    # Turning either toggle off also drops that layer's current selection
+    # (see _on_overlay_osm_toggled / _on_show_objects_toggled).
+    # ------------------------------------------------------------------
+
+    def _canvas_xy_to_course(self, cx: float, cy: float):
+        """
+        Map a canvas point (already through canvasx()/canvasy(), i.e.
+        scroll-adjusted) to (x_m, z_m, m_per_px) in the course
+        [0, COURSE_SIZE_M] frame, or None when there's no pickable
+        preview or the point is outside the plot's data area.
+
+        The PhotoImage is drawn 1:1 on the canvas and every preview
+        reserves the identical viz._PLOT_RECT sub-rectangle (figure
+        fractions) for its 2000x2000 data area at any zoom, so inverting
+        is just: undo the image-item offset, then undo _PLOT_RECT.
+        """
+        meta = self._preview_render_meta
+        if meta is None or self._preview_canvas_image_id is None:
+            return None
+        if meta["base_kind"] in (
+            PREVIEW_LIDAR, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
+        ):
+            return None  # not in the course crop frame -- same exclusion the overlays use
+        try:
+            ox, oy = self.preview_canvas.coords(self._preview_canvas_image_id)
+        except (ValueError, tk.TclError):
+            return None
+        img_w, img_h = meta["img_w"], meta["img_h"]
+        left_frac, bottom_frac, width_frac, height_frac = viz._PLOT_RECT
+        data_left = img_w * left_frac
+        data_top = img_h * (1.0 - bottom_frac - height_frac)
+        data_w = img_w * width_frac
+        data_h = img_h * height_frac
+        if data_w <= 0 or data_h <= 0:
+            return None
+        fx = (cx - ox - data_left) / data_w
+        fy = (cy - oy - data_top) / data_h
+        if not (-0.02 <= fx <= 1.02 and -0.02 <= fy <= 1.02):
+            return None
+        x_m = min(max(fx, 0.0), 1.0) * COURSE_SIZE_M
+        z_m = (1.0 - min(max(fy, 0.0), 1.0)) * COURSE_SIZE_M  # row 0 = max z, same flip as the overlays
+        return (x_m, z_m, COURSE_SIZE_M / data_w)
+
+    def _on_preview_pick_press(self, event) -> None:
+        self._marquee_subtract_mode = False  # a plain left-press is always "select"
+        if self._preview_canvas_image_id is None:
+            self._marquee_anchor = None
+            return
+        self._marquee_anchor = (
+            self.preview_canvas.canvasx(event.x), self.preview_canvas.canvasy(event.y),
+        )
+        if self._marquee_rect_id is not None:
+            self.preview_canvas.delete(self._marquee_rect_id)
+            self._marquee_rect_id = None
+
+    def _on_preview_subtract_press(self, event) -> None:
+        # <Alt-Button-1>: same as a pick press, but latch subtract mode so
+        # the drag box (drawn by the generic <B1-Motion> handler) is
+        # applied as a geometry subtraction on release instead of a
+        # selection. More-specific binding, so the generic <Button-1>
+        # handler does not also fire for this press.
+        if self._preview_canvas_image_id is None:
+            self._marquee_anchor = None
+            self._marquee_subtract_mode = False
+            return
+        self._marquee_subtract_mode = True
+        self._marquee_anchor = (
+            self.preview_canvas.canvasx(event.x), self.preview_canvas.canvasy(event.y),
+        )
+        if self._marquee_rect_id is not None:
+            self.preview_canvas.delete(self._marquee_rect_id)
+            self._marquee_rect_id = None
+
+    def _on_preview_pick_motion(self, event) -> None:
+        if self._marquee_anchor is None:
+            return
+        ax, ay = self._marquee_anchor
+        cx = self.preview_canvas.canvasx(event.x)
+        cy = self.preview_canvas.canvasy(event.y)
+        if self._marquee_rect_id is None:
+            if abs(cx - ax) < 4 and abs(cy - ay) < 4:
+                return  # still within click slop -- don't start a box yet
+            outline = "#ff6a00" if self._marquee_subtract_mode else "#00b0ff"
+            self._marquee_rect_id = self.preview_canvas.create_rectangle(
+                ax, ay, cx, cy, outline=outline, width=1, dash=(3, 3),
+            )
+        else:
+            self.preview_canvas.coords(self._marquee_rect_id, ax, ay, cx, cy)
+
+    def _on_preview_pick_release(self, event) -> None:
+        anchor = self._marquee_anchor
+        self._marquee_anchor = None
+        subtract = self._marquee_subtract_mode
+        self._marquee_subtract_mode = False
+        was_drag = self._marquee_rect_id is not None
+        if self._marquee_rect_id is not None:
+            self.preview_canvas.delete(self._marquee_rect_id)
+            self._marquee_rect_id = None
+        if anchor is None:
+            return
+        release_pt = (self.preview_canvas.canvasx(event.x), self.preview_canvas.canvasy(event.y))
+        additive = bool(event.state & 0x0005)  # Shift (0x0001) or Control (0x0004) held
+        if was_drag:
+            if subtract:
+                self._marquee_subtract(anchor, release_pt)
+            else:
+                self._marquee_select(anchor, release_pt, additive)
+        elif not subtract:
+            self._pick_single(event, additive)
+
+    def _clear_tree_selection(self, tree: "ttk.Treeview") -> None:
+        sel = tree.selection()
+        if sel:
+            tree.selection_remove(*sel)  # fires <<TreeviewSelect>> -> highlight state clears
+
+    def _on_overlay_osm_toggled(self) -> None:
+        # Splines are only pickable while visible; turning the overlay
+        # off drops any spline selection so a now-hidden highlight
+        # doesn't linger.
+        if not self.overlay_osm_var.get():
+            self._clear_tree_selection(self.splines_tree)
+        self._show_preview()
+
+    def _on_show_objects_toggled(self) -> None:
+        if not self.show_objects_var.get():
+            self._clear_tree_selection(self.objects_tree)
+        self._show_preview()
+
+    def _select_tree_row(self, tree: "ttk.Treeview", iid: str, additive: bool) -> None:
+        if additive:
+            if iid in tree.selection():
+                tree.selection_remove(iid)
+            else:
+                tree.selection_add(iid)
+        else:
+            tree.selection_set(iid)
+        if tree.exists(iid):
+            tree.see(iid)
+            tree.focus(iid)
+
+    def _pick_single(self, event, additive: bool) -> None:
+        hit = self._canvas_xy_to_course(
+            self.preview_canvas.canvasx(event.x), self.preview_canvas.canvasy(event.y),
+        )
+        if hit is None:
+            return
+        x_m, z_m, m_per_px = hit
+        tol_m = self._PICK_TOLERANCE_PX * m_per_px
+        wd = self.working_dir.get().strip()
+        working_dir = Path(wd) if wd else None
+        objects_visible = self.show_objects_var.get()
+        splines_visible = self.overlay_osm_var.get()
+
+        # Objects first: small point targets, and a marker sitting on top
+        # of a large fairway polygon should win the click.
+        if objects_visible:
+            obj_iid = self._nearest_object_iid(x_m, z_m, tol_m, working_dir)
+            if obj_iid is not None:
+                self._select_tree_row(self.objects_tree, obj_iid, additive)
+                return
+
+        if splines_visible:
+            spline_iid = self._nearest_spline_iid(x_m, z_m, tol_m, working_dir)
+            if spline_iid is not None:
+                self._select_tree_row(self.splines_tree, spline_iid, additive)
+                return
+
+        # Plain click on empty space clears the selection -- but only for
+        # layers currently visible (you can't deselect what you can't see).
+        if not additive:
+            for tree, vis in (
+                (self.splines_tree, splines_visible), (self.objects_tree, objects_visible),
+            ):
+                if vis and tree.selection():
+                    tree.selection_remove(*tree.selection())
+
+    def _nearest_object_iid(self, x_m: float, z_m: float, tol_m: float, working_dir):
+        """Nearest currently-listed Objects-tab row to (x_m, z_m) within
+        tol_m, or None. Plain tree rows hit-test against their own point;
+        cluster-fill "group" rows hit-test against their packed scatter
+        points from objects.json (matched back by spline_id + category,
+        same cross-reference _on_object_selected uses)."""
+        children = self.objects_tree.get_children()
+        best_iid, best_d = None, tol_m
+        for iid in children:
+            if not iid.isdigit():
+                continue
+            idx = int(iid)
+            if 0 <= idx < len(self._objects_tree_list):
+                ox, oz, _tags = self._objects_tree_list[idx]
+                d = math.hypot(ox - x_m, oz - z_m)
+                if d < best_d:
+                    best_iid, best_d = iid, d
+
+        group_iids = [iid for iid in children if iid.startswith("c")]
+        if group_iids and working_dir is not None:
+            objects_path = working_dir / OBJECTS_FILE
+            records = []
+            if objects_path.exists():
+                try:
+                    _, records, _, _, _ = load_objects(objects_path)
+                except (json.JSONDecodeError, OSError, KeyError):
+                    records = []
+            for iid in group_iids:
+                try:
+                    j = int(iid[1:])
+                except ValueError:
+                    continue
+                if not (0 <= j < len(self._cluster_fill_rows)):
+                    continue
+                ids_str, _lbl, _r, _dns, _src, category, _type, _mode = self._cluster_fill_rows[j]
+                row_spline_ids = {int(s) for s in ids_str.split(",") if s}
+                for rec in records:
+                    if rec.get("category") != category or rec.get("spline_id") not in row_spline_ids:
+                        continue
+                    d = math.hypot(rec["x"] - x_m, rec["z"] - z_m)
+                    if d < best_d:
+                        best_iid, best_d = iid, d
+        return best_iid
+
+    def _nearest_spline_iid(self, x_m: float, z_m: float, tol_m: float, working_dir):
+        """Nearest currently-listed Splines-tab feature to (x_m, z_m)
+        within tol_m, or None. A polygon the point falls inside scores
+        distance 0; ties there break toward the smallest-area polygon so
+        a click inside overlapping fills picks the tightest one."""
+        if not self._splines_features or working_dir is None:
+            return None
+        visible = set(self.splines_tree.get_children())
+        if not visible:
+            return None
+        pt = Point(x_m, z_m)
+        best_iid, best_d, best_area = None, tol_m, float("inf")
+        for f in self._shift_and_crop_to_course(working_dir, self._splines_features):
+            if f.osm_id is None:
+                continue
+            iid = str(f.osm_id)
+            if iid not in visible:
+                continue
+            try:
+                d = f.geometry.distance(pt)
+                area = f.geometry.area
+            except Exception:
+                continue
+            if d < best_d or (d <= 0.0 and best_d <= 0.0 and area < best_area):
+                best_iid, best_d, best_area = iid, d, area
+        return best_iid
+
+    def _marquee_select(self, p0, p1, additive: bool) -> None:
+        c0 = self._canvas_xy_to_course(*p0)
+        c1 = self._canvas_xy_to_course(*p1)
+        if c0 is None or c1 is None:
+            return
+        x0, z0, _ = c0
+        x1, z1, _ = c1
+        region = shapely_box(min(x0, x1), min(z0, z1), max(x0, x1), max(z0, z1))
+        if region.area <= 0:
+            return
+        wd = self.working_dir.get().strip()
+        working_dir = Path(wd) if wd else None
+        objects_visible = self.show_objects_var.get()
+        splines_visible = self.overlay_osm_var.get()
+
+        if objects_visible:
+            obj_iids = []
+            for iid in self.objects_tree.get_children():
+                if not iid.isdigit():
+                    continue
+                idx = int(iid)
+                if 0 <= idx < len(self._objects_tree_list):
+                    ox, oz, _tags = self._objects_tree_list[idx]
+                    if region.contains(Point(ox, oz)):
+                        obj_iids.append(iid)
+            self._apply_marquee_selection(self.objects_tree, obj_iids, additive)
+
+        if splines_visible and self._splines_features and working_dir is not None:
+            spline_iids = []
+            listed = set(self.splines_tree.get_children())
+            for f in self._shift_and_crop_to_course(working_dir, self._splines_features):
+                if f.osm_id is None:
+                    continue
+                iid = str(f.osm_id)
+                if iid not in listed:
+                    continue
+                try:
+                    if region.intersects(f.geometry):
+                        spline_iids.append(iid)
+                except Exception:
+                    continue
+            self._apply_marquee_selection(self.splines_tree, spline_iids, additive)
+
+    @staticmethod
+    def _apply_marquee_selection(tree: "ttk.Treeview", iids: list, additive: bool) -> None:
+        if additive:
+            for iid in iids:
+                tree.selection_add(iid)
+        else:
+            tree.selection_set(*iids)  # no args clears the selection
+
+    _SUBTRACT_AREA_TYPES = ("Polygon", "MultiPolygon")
+    _SUBTRACT_LINE_TYPES = ("LineString", "MultiLineString", "LinearRing")
+    # Alt-subtract only ever edits GUI-authored cluster-fill geometry
+    # (border rings + their centerlines, "Use mask" clips). It deliberately
+    # will NOT cut a real OSM feature's geometry: that edit is destructive,
+    # persists to features.geojson, silently reshapes the height mask for a
+    # mask=False feature, and is only recoverable by re-running Ingest OSM.
+    _SUBTRACT_KINDS = (SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND)
+
+    @staticmethod
+    def _lines_only(geom):
+        """Line parts of `geom` (drop stray Points from a GeometryCollection
+        that shapely's difference can leave where a cut edge just grazes a
+        vertex). Returns the geometry unchanged when it's already a line
+        type or has no line parts to salvage."""
+        if geom.is_empty or geom.geom_type in PGAGenGUI._SUBTRACT_LINE_TYPES:
+            return geom
+        if geom.geom_type == "GeometryCollection":
+            parts = [
+                g for g in geom.geoms
+                if g.geom_type in PGAGenGUI._SUBTRACT_LINE_TYPES and not g.is_empty
+            ]
+            if parts:
+                return parts[0] if len(parts) == 1 else unary_union(parts)
+        return geom
+
+    @staticmethod
+    def _estimate_ring_half_width(ring_polygon, centerline) -> float:
+        """Half the band width of a border ring (build_border_ring_geometry
+        stroked its centerline by border_width, half each side). A point
+        sitting ON the centerline is at the band's middle, so its distance
+        to the band edge is that half-width -- median a few such samples,
+        falling back to area/(2*length) for a degenerate centerline."""
+        boundary = ring_polygon.boundary
+        dists = []
+        for t in (0.15, 0.35, 0.5, 0.65, 0.85):
+            try:
+                p = centerline.interpolate(t, normalized=True)
+            except Exception:
+                continue
+            if ring_polygon.contains(p):
+                dists.append(boundary.distance(p))
+        if dists:
+            dists.sort()
+            return dists[len(dists) // 2]
+        length = centerline.length
+        return ring_polygon.area / (2.0 * length) if length > 0 else 0.0
+
+    def _marquee_subtract(self, p0, p1) -> None:
+        """
+        Alt+left-drag box -> cut the box region out of every currently-
+        selected GUI-authored cluster-fill row. Real OSM features are
+        skipped (with a log note): cutting their geometry is destructive,
+        persists to features.geojson, silently reshapes the height mask,
+        and only Ingest OSM can undo it -- not worth the footgun.
+
+        For a border ring the cut is centerline-driven: the box trims the
+        ring's own centerline (an "o" becomes a "c"), then the ring
+        polygon is rebuilt as that trimmed line re-stroked to the band's
+        original width and clipped back to the original outline -- so the
+        removed span disappears cleanly instead of the band just detouring
+        inward at full width. A "Use mask" clip (SYNTHETIC_MASKED_KIND)
+        is a straight geometry difference against the box.
+
+        Mutates self._splines_features in place, persists to
+        features.geojson, and refreshes exactly as a Fill would. Reports
+        through the log pane -- no dialog.
+        """
+        wd = self.working_dir.get().strip()
+        if not wd:
+            self._append_log("\n[Alt-subtract: set a working directory first]\n")
+            return
+        working_dir = Path(wd)
+
+        c0 = self._canvas_xy_to_course(*p0)
+        c1 = self._canvas_xy_to_course(*p1)
+        if c0 is None or c1 is None:
+            self._append_log(
+                "\n[Alt-subtract: box was outside the course data area "
+                "(or this preview isn't in the course frame)]\n"
+            )
+            return
+        x0, z0, _ = c0
+        x1, z1, _ = c1
+        box_course = shapely_box(min(x0, x1), min(z0, z1), max(x0, x1), max(z0, z1))
+        if box_course.area <= 0:
+            return
+
+        # course frame -> features.geojson's full/uncropped frame.
+        # _shift_and_crop_to_course goes full->course with dx=-shift_x,
+        # dz=-shift_z; the inverse is dx=+shift_x, dz=+shift_z (pure
+        # translation, no Z flip). Reuse shift_features via a throwaway
+        # Feature so the translation matches that path exactly.
+        project = load_project(working_dir)
+        shift_x = project.get("course_crop_origin_in_full_frame_x")
+        shift_z = project.get("course_crop_origin_in_full_frame_z")
+        if shift_x is None or shift_z is None:
+            box_full = box_course  # pre-dates the saved origin; treat as course frame
+        else:
+            box_full = shift_features(
+                [Feature(geometry=box_course, kind="__tmp__", tags={}, osm_id=None, mask=False)],
+                dx=shift_x, dz=shift_z,
+            )[0].geometry
+
+        self._ensure_splines_features_fresh(working_dir)
+        selected_ids = {int(s) for s in self.splines_tree.selection()}
+        if not selected_ids:
+            self._append_log(
+                "\n[Alt-subtract: no Splines rows selected -- select the feature(s) to "
+                "cut from first (Overlay OSM must be on to pick them)]\n"
+            )
+            return
+
+        by_id = {f.osm_id: f for f in self._splines_features if f.osm_id is not None}
+        changed = 0
+        skipped_real = []
+        for osm_id in selected_ids:
+            f = by_id.get(osm_id)
+            if f is None:
+                continue
+            if f.kind not in self._SUBTRACT_KINDS:
+                skipped_real.append(f)
+                continue
+
+            centerline_feat = None
+            if f.kind == SYNTHETIC_BORDER_KIND:
+                ref = f.tags.get(PGA_CLUSTER_CENTERLINE_REF_TAG)
+                if ref is not None:
+                    try:
+                        centerline_feat = by_id.get(ref) or by_id.get(int(ref))
+                    except (TypeError, ValueError):
+                        centerline_feat = by_id.get(ref)
+
+            if (
+                centerline_feat is not None
+                and not centerline_feat.geometry.is_empty
+                and f.geometry.geom_type in self._SUBTRACT_AREA_TYPES
+            ):
+                if self._subtract_from_border(f, centerline_feat, box_full):
+                    changed += 1
+                continue
+
+            # Non-border: straight difference against the box.
+            try:
+                new_geom = f.geometry.difference(box_full)
+            except Exception as exc:  # pragma: no cover -- defensive against odd geometries
+                self._append_log(f"\n[Alt-subtract: skipped #{f.osm_id} ({f.kind}): {exc}]\n")
+                continue
+            accept = self._SUBTRACT_AREA_TYPES + self._SUBTRACT_LINE_TYPES
+            if new_geom.is_empty:
+                self._append_log(
+                    f"\n[Alt-subtract: box covers all of #{f.osm_id} ({f.kind}) -- skipped "
+                    f"(use Clear/Delete to remove a whole feature)]\n"
+                )
+                continue
+            if not new_geom.is_valid:
+                new_geom = new_geom.buffer(0)
+            if new_geom.is_empty or new_geom.geom_type not in accept:
+                self._append_log(
+                    f"\n[Alt-subtract: cut of #{f.osm_id} ({f.kind}) produced "
+                    f"{new_geom.geom_type or 'nothing usable'} -- skipped]\n"
+                )
+                continue
+            f.geometry = new_geom
+            changed += 1
+
+        if skipped_real:
+            ids = ", ".join(f"#{f.osm_id} ({f.kind})" for f in skipped_real)
+            self._append_log(
+                f"\n[Alt-subtract: won't cut real OSM feature(s) {ids} -- it only trims "
+                f"GUI-authored border rings / 'Use mask' fills. Nothing was changed on those.]\n"
+            )
+
+        if changed == 0:
+            if not skipped_real:
+                self._append_log(
+                    "\n[Alt-subtract: nothing changed -- drag the box across the part of the "
+                    "selected border ring / mask fill you want removed]\n"
+                )
+            return
+
+        save_features(self._splines_features, working_dir / FEATURES_FILE)
+        self._cached_mask_merged_geom = None
+        self._cached_mask_geom_key = None
+        self._cached_geo_overlay = None
+        self._cached_geo_overlay_key = None
+        self._regenerate_height_mask(working_dir)
+        self._regenerate_packed_objects(working_dir)
+        self._refresh_splines_list()
+        self._refresh_objects_list()
+        restorable = [str(i) for i in selected_ids if self.splines_tree.exists(str(i))]
+        if restorable:
+            self.splines_tree.selection_set(restorable)
+        self._show_preview()
+        self._append_log(f"\n[Alt-subtract: cut box region from {changed} feature(s)]\n")
+
+    def _subtract_from_border(self, border_feat, centerline_feat, box_full) -> bool:
+        """
+        Trim a border ring by its centerline: cut `box_full` out of the
+        centerline, then rebuild the ring polygon as the trimmed line
+        re-stroked to the band's original half-width and clipped back to
+        the original outline. Mutates both Features in place. Returns True
+        if the geometry actually changed, False (with a log note) if the
+        box missed the centerline or swallowed the whole ring.
+        """
+        cl_geom = centerline_feat.geometry
+        try:
+            trimmed = self._lines_only(cl_geom.difference(box_full))
+            # difference() splits a closed ring at its own seam vertex, so a
+            # single cut yields a MultiLineString of two pieces meeting at
+            # that vertex. Buffering that gives each piece a (flat) end cap
+            # there instead of a proper join -> a notch bitten out of the
+            # band's outer corner well away from the cut. linemerge stitches
+            # the contiguous pieces back into one LineString so the seam
+            # vertex is an interior corner again; genuinely disjoint pieces
+            # (two cuts, or several rings) correctly stay separate.
+            if trimmed.geom_type == "MultiLineString":
+                trimmed = linemerge(trimmed)
+        except Exception as exc:  # pragma: no cover -- defensive
+            self._append_log(f"\n[Alt-subtract: skipped #{border_feat.osm_id} (border): {exc}]\n")
+            return False
+
+        if trimmed.is_empty:
+            self._append_log(
+                f"\n[Alt-subtract: box covers the whole border ring #{border_feat.osm_id} -- "
+                f"use Clear/Delete to remove it]\n"
+            )
+            return False
+        if trimmed.geom_type not in self._SUBTRACT_LINE_TYPES:
+            self._append_log(
+                f"\n[Alt-subtract: border #{border_feat.osm_id} centerline cut produced "
+                f"{trimmed.geom_type} -- skipped]\n"
+            )
+            return False
+        if trimmed.length >= cl_geom.length - 1e-6:
+            self._append_log(
+                f"\n[Alt-subtract: box didn't reach border #{border_feat.osm_id}'s centerline -- "
+                f"drag the box across the middle of the band]\n"
+            )
+            return False
+
+        half_w = self._estimate_ring_half_width(border_feat.geometry, cl_geom)
+        new_ring = border_feat.geometry.difference(box_full)  # sane fallback
+        if half_w > 0:
+            # cap_style=2 (flat) ends the band square at the cut rather
+            # than bulging a rounded cap half_w past it.
+            rebuilt = trimmed.buffer(half_w, cap_style=2).intersection(border_feat.geometry)
+            if not rebuilt.is_valid:
+                rebuilt = rebuilt.buffer(0)
+            if not rebuilt.is_empty and rebuilt.geom_type in self._SUBTRACT_AREA_TYPES:
+                new_ring = rebuilt
+
+        if new_ring.is_empty or new_ring.geom_type not in self._SUBTRACT_AREA_TYPES:
+            self._append_log(
+                f"\n[Alt-subtract: border #{border_feat.osm_id} rebuild came out empty -- skipped]\n"
+            )
+            return False
+
+        centerline_feat.geometry = trimmed
+        border_feat.geometry = new_ring
+        return True
+
     def _show_preview(self) -> None:
         wd = self.working_dir.get().strip()
         if not wd:
@@ -5211,8 +6189,22 @@ class PGAGenGUI:
             ):
                 img = self._composite_objects_layer(img, Path(wd))
 
+            # Record what a viewport click needs to invert the transform:
+            # the final displayed image size (PhotoImage is drawn 1:1 on
+            # the canvas, so course->pixel uses viz._PLOT_RECT fractions
+            # of exactly this size) and the base kind (LIDAR/full-frame
+            # OSM previews aren't in the course [0, COURSE_SIZE_M] frame,
+            # so picking is disabled on them -- same exclusion the
+            # highlight/objects overlays already use).
+            self._preview_render_meta = {
+                "img_w": img.width,
+                "img_h": img.height,
+                "base_kind": base_kind,
+            }
+
             self._set_preview_image(img)
         except Exception as e:
+            self._preview_render_meta = None
             self._set_preview_text(f"(couldn't load {path.name}: {e})")
 
 

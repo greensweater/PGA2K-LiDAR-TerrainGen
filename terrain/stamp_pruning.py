@@ -144,8 +144,8 @@ def prune_overwritten_stamps(
     kernels: dict[int, TerrainKernel] = {}
     for s in stamps:
         if s.brush not in kernels:
-            if s.brush not in BRUSH_PROFILES:
-                raise ValueError(f"No BrushProfile registered for brush type {s.brush}")
+            # BRUSH_PROFILES synthesizes a fallback for un-ingested brush
+            # ids (see terrain/brush_profiles.py) rather than raising.
             kernels[s.brush] = TerrainKernel(BRUSH_PROFILES[s.brush])
 
     reaches = [_reach(s) for s in stamps]

@@ -81,6 +81,7 @@ import numpy as np
 from terrain.bounding_box import BoundingBox
 from terrain.stamp import TOOL_FLATTEN, TOOL_RAISE, Stamp
 from terrain.terrain_model import TerrainModel
+from course_output.game_versions import DEFAULT_GAME_VERSION, schema_for
 
 HOLE_ID_NONE = -1
 UNUSED_RADIUS_FIELD = 0.0  # see module docstring: sizing is via `scale`
@@ -371,10 +372,20 @@ def normalize_stamp_heights_by_value_shift(
     return [replace(s, value=s.value + shift) for s in stamps]
 
 
-def stamp_to_entry(stamp: Stamp) -> dict:
-    """Convert a single Stamp into one "height" array entry."""
+def stamp_to_entry(stamp: Stamp, game_version: str = DEFAULT_GAME_VERSION) -> dict:
+    """
+    Convert a single Stamp into one "height" array entry.
+
+    game_version=2021+ (schema_for(...).has_orientation_fields) adds
+    "_orientation" (right after "rotation") and "orientation" (right
+    after "radius"), both 0.0 -- confirmed by diffing a real course
+    saved from each version (see course_output/game_versions.py);
+    v2019 has neither. water[] entries already carry these in both
+    versions (unlike height[]), so build_water_objects needs no
+    equivalent change.
+    """
     rotation_y = _round(stamp.rotation)
-    return {
+    entry = {
         "tool": stamp.tool,
         "position": {
             "x": _round(stamp.x - GRID_ORIGIN_OFFSET),
@@ -382,6 +393,10 @@ def stamp_to_entry(stamp: Stamp) -> dict:
             "z": _round(stamp.z - GRID_ORIGIN_OFFSET),
         },
         "rotation": {"x": 0.0, "y": rotation_y, "z": 0.0},
+    }
+    if schema_for(game_version).has_orientation_fields:
+        entry["_orientation"] = 0.0
+    entry.update({
         "scale": {
             "x": _round(stamp.scale_x),
             "y": 1.0,
@@ -391,11 +406,15 @@ def stamp_to_entry(stamp: Stamp) -> dict:
         "value": _round(stamp.value),
         "holeId": HOLE_ID_NONE,
         "radius": UNUSED_RADIUS_FIELD,
-    }
+    })
+    if schema_for(game_version).has_orientation_fields:
+        entry["orientation"] = 0.0
+    return entry
 
 
 def write_user_layers(
     path: Path, stamps: Optional[Sequence[Stamp]] = None, water: Optional[Sequence[dict]] = None,
+    game_version: str = DEFAULT_GAME_VERSION,
 ) -> None:
     """
     Write into the userLayers.json at `path`, preserving every other
@@ -421,7 +440,7 @@ def write_user_layers(
         data = dict(_BLANK_USER_LAYERS_SCHEMA)
 
     if stamps is not None:
-        data["height"] = [stamp_to_entry(s) for s in stamps]
+        data["height"] = [stamp_to_entry(s, game_version) for s in stamps]
     if water is not None:
         data["water"] = list(water)
 

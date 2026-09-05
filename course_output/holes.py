@@ -41,6 +41,7 @@ from typing import Optional
 
 from ingest.osm import Feature
 from course_output.userLayers import GRID_ORIGIN_OFFSET
+from course_output.game_versions import DEFAULT_GAME_VERSION, schema_for
 
 _HOLE_JSON_TEMPLATE = {
     "waypoints": [],
@@ -89,16 +90,31 @@ def _add_halfway_point(points: list[tuple[float, float]]) -> list[tuple[float, f
     return [first, mid, last]
 
 
-def new_hole(userpar: int, points: list[tuple[float, float]]) -> Optional[dict]:
+def new_hole(
+    userpar: int, points: list[tuple[float, float]], game_version: str = DEFAULT_GAME_VERSION,
+) -> Optional[dict]:
     """
     Build one holes.json entry from a hole's routing points (x, z) --
     equivalent to Chad's TGC-Designer-Tools OSMTGC.py newHole().
 
     Returns None if points has fewer than 2 entries (matching Chad's
     own "minimum needed points" check) -- not enough to route a hole.
+
+    game_version=2021+ (schema_for(...).has_pins_field): the template
+    default pin position moves from "pinPositions" (v2019 shape) into a
+    new "pins": [{"position": ..., "description": 0}] array, alongside
+    an emptied "pinPositions": [] -- confirmed by diffing a real course
+    saved from each version (see course_output/game_versions.py). This
+    tool never computes a REAL pin position for either version (Chad's
+    own tool doesn't either -- OSM has no pin-location concept for a
+    hole), so both are just the same template-default point in a
+    different place in the schema.
     """
     hole = copy.deepcopy(_HOLE_JSON_TEMPLATE)
     hole["creatorDefinedPar"] = userpar
+    if schema_for(game_version).has_pins_field:
+        hole["pins"] = [{"position": hole["pinPositions"][0], "description": 0}]
+        hole["pinPositions"] = []
 
     if len(points) < 2:
         return None
@@ -117,7 +133,7 @@ def new_hole(userpar: int, points: list[tuple[float, float]]) -> Optional[dict]:
     return hole
 
 
-def build_holes(features: list[Feature]) -> list[dict]:
+def build_holes(features: list[Feature], game_version: str = DEFAULT_GAME_VERSION) -> list[dict]:
     """
     Build the ordered holes.json list from every "hole" Feature with
     mask=False (i.e. NOT excluded -- see ingest/osm.py's Feature
@@ -146,7 +162,7 @@ def build_holes(features: list[Feature]) -> list[dict]:
         # [0, 2000] like our local frame. Without this, hole waypoints
         # would be off by +1000 in both x and z, same bug as splines.
         points = [(x - GRID_ORIGIN_OFFSET, z - GRID_ORIGIN_OFFSET) for x, z in f.geometry.coords]
-        hole = new_hole(userpar, points)
+        hole = new_hole(userpar, points, game_version)
         if hole is None:
             continue
 

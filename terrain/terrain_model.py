@@ -78,10 +78,9 @@ class TerrainModel:
         self._kernels: dict[int, TerrainKernel] = {}
         for stamp in self.stamps:
             if stamp.brush not in self._kernels:
-                if stamp.brush not in BRUSH_PROFILES:
-                    raise ValueError(
-                        f"No BrushProfile registered for brush type {stamp.brush}"
-                    )
+                # BRUSH_PROFILES synthesizes a flat circular fallback for
+                # any brush id with no measured profile (see
+                # terrain/brush_profiles.py) rather than raising.
                 self._kernels[stamp.brush] = TerrainKernel(BRUSH_PROFILES[stamp.brush])
 
     @staticmethod

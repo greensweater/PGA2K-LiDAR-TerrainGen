@@ -9,7 +9,9 @@ directory, running one pipeline step at a time:
     PGA2k_gen.py <working_dir> --step init
     PGA2k_gen.py <working_dir> --step ingest-laz [--projection <EPSG>] [--no-fill-heightmap-gaps]
     PGA2k_gen.py <working_dir> --step ingest-osm
-    PGA2k_gen.py <working_dir> --step ingest-course --course-file <path>
+    PGA2k_gen.py <working_dir> --step ingest-course [--course-theme <name>]
+                                 (optional -- resets course/ from the bundled template;
+                                 every other write/repack step provisions it automatically)
     PGA2k_gen.py <working_dir> --step dig-water [--dig-depth M] [--dig-buffer M]
     PGA2k_gen.py <working_dir> --step generate-terrain
     PGA2k_gen.py <working_dir> --step generate-streams
@@ -32,6 +34,12 @@ directory, running one pipeline step at a time:
                                  [--tree-asset-path <path>]...
                                  [--tree-type-asset-path <TAG=path>]... [--stake-asset-path <path>]  (2021+)
     PGA2k_gen.py <working_dir> --step repack --repack-filename <name>
+    PGA2k_gen.py <working_dir> --step import-ingame-edits --edited-course <path.course> [--commit]
+                                 [--import-group <label>]
+                                 (reconciles a saved, hand-edited .course against what this tool
+                                 currently tracks -- dry-run by default, prints a diff summary;
+                                 --commit appends new objects to ingame_objects.json and new
+                                 terrain stamps as the next stamps_N.json layer)
 
 Each step reads/writes plain-file artifacts in <working_dir> instead of
 holding state in memory across invocations -- this is a CLI today, a
@@ -55,8 +63,15 @@ independently resumable and inspectable, never a black box.
                              snapshot), and later layers take precedence
                              over earlier ones wherever they overlap;
                              deleting the highest N undoes that pass
-    course/                  extracted blank .course, always at this
-                             fixed path (see ingest-course / write-terrain / write-water)
+    course/                  extracted blank .course, always at this fixed
+                             path -- auto-provisioned from the bundled
+                             templates/{game_version}_{theme}.course on first
+                             write/repack (see _ensure_course_baseline);
+                             --step ingest-course resets it explicitly
+    ingame_objects.json       objects a user placed by hand-editing an
+                             exported .course in the game's own editor,
+                             captured back via --step import-ingame-edits;
+                             read (not overwritten) by pack-objects
 
 Step ordering is enforced with clear errors (e.g. generate-terrain
 without a pointcloud.npz on disk yet) rather than letting a later step
@@ -68,9 +83,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -107,22 +125,33 @@ from course_output.splines import (
 )
 from course_output.holes import build_holes, save_holes
 from course_output.object_clusters import (
-    CLUSTER_FILL_SOURCE_STREAM, PGA_CLUSTER_FILLS_TAG, SYNTHETIC_MASKED_KIND,
-    cluster_records_to_v2019_groups, next_synthetic_osm_id, pack_cluster_records,
+    CLUSTER_FILL_SOURCE_STREAM, PGA_CLUSTER_FILLS_TAG, SYNTHETIC_BORDER_CENTERLINE_KIND,
+    SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND,
+    cluster_records_to_v2019_groups, next_synthetic_osm_id, pack_cluster_records, pack_spline_records,
 )
 from course_output.objects import (
     DEFAULT_GAME_VERSION, GAME_VERSIONS, IMPLEMENTED_GAME_VERSIONS, THEMES_V2019, TREE_TYPE_TAG,
-    WATERFALL_DEFAULT_ASSET_PATH, apply_area_tree_type_hints, build_building_stake_objects_v2019,
+    WATERFALL_DEFAULT_ASSET_PATH, WATERSPLASH_DEFAULT_ASSET_PATH, apply_area_tree_type_hints,
+    build_building_stake_objects_v2019,
     build_building_stake_objects_v2021, build_tree_objects_v2019, build_tree_objects_v2021,
-    build_waterfall_objects_v2019, build_waterfall_objects_v2021, lidar_trees_to_tagged, load_object_list,
-    load_objects, merge_object_groups, move_trees_off_cartpaths, object_counts, parse_osm_trees,
+    build_waterfall_objects_v2019, build_waterfall_objects_v2021,
+    build_watersplash_objects_v2019, build_watersplash_objects_v2021, cluster_records_to_v2021_groups,
+    lidar_trees_to_tagged, load_object_list,
+    load_objects, load_placed_objects, load_tree_theme_species, merge_object_groups, move_trees_off_cartpaths,
+    object_counts, object_spline_fill_records_to_v2021_groups, parse_osm_trees, schema_for,
     save_object_list, save_objects, save_placed_objects,
 )
+from course_output.course_templates import resolve_course_template
 from course_output.collection_library import default_library_dir, load_library
 from course_output.collections import (
     _bearing_deg as _collection_bearing_deg,
-    build_collection_objects_v2019, build_collection_objects_v2021, build_collection_splines,
-    iter_collection_objects, load_collection_records, resolve_collection, save_collection_records,
+    apply_terrain_heights, build_collection_objects_v2019, build_collection_objects_v2021,
+    build_collection_splines, build_collection_stamps, iter_collection_objects, load_collection_records,
+    resolve_collection, save_collection_records,
+)
+from course_output.ingame_objects import (
+    build_ingame_objects_v2019, build_ingame_objects_v2021, load_ingame_objects, remove_ingame_object_groups,
+    save_ingame_objects, summarize_ingame_object_groups,
 )
 from terrain.adaptive_refine import (
     DEFAULT_CLAIM_RADIUS_FRACTION,
@@ -197,8 +226,8 @@ from terrain.streams import (
     load_stream_records, save_stream_records,
 )
 from course_output.userLayers import (
-    build_baseline_flatten_stamp, build_registration_mark_stamps, normalize_stamp_heights,
-    normalize_stamp_heights_by_value_shift, write_user_layers,
+    GRID_ORIGIN_OFFSET, build_baseline_flatten_stamp, build_registration_mark_stamps,
+    normalize_stamp_heights, normalize_stamp_heights_by_value_shift, stamp_to_entry, write_user_layers,
 )
 from course_output.water import (
     build_water_objects, build_stream_water_objects,
@@ -213,11 +242,11 @@ FEATURES_FILE = "features.geojson"
 HEIGHT_MASK_FILE = "height_mask.geojson"
 HEIGHTMAP_FILE = "heightmap.npz"
 STAMPS_PATTERN = "stamps_{n}.json"
-PLACED_OBJECTS_FILE = "placedObjects2.json"
 OBJECT_LIST_FILE = "object_list.json"
 OBJECTS_FILE = "objects.json"
 STREAMS_FILE = "streams.json"
 COLLECTIONS_FILE = "collections.json"
+INGAME_OBJECTS_FILE = "ingame_objects.json"
 
 # This project's own OSM tag (not an OSM standard) on a 2-node way that
 # places a reusable object/spline collection -- value is the template
@@ -291,6 +320,31 @@ def load_all_stamps(working_dir: Path) -> list[Stamp]:
         more_stamps, _ = load_stamp_file(path)
         stamps.extend(more_stamps)
     return stamps
+
+
+def _load_all_stamps_incl_collections(working_dir: Path, verbose: bool = True) -> tuple[list[Stamp], bool]:
+    """(stamps, added_collection_stamps) -- load_all_stamps plus every
+    placed object-collection's raise-tool terrain stamps (collections.json
+    -- see step_generate_collections / course_output/collections.py).
+    Appended last, so they compose on top of the generated terrain, and
+    formatted at write time rather than persisted as a stamps_N.json layer
+    -- re-running generate-collections never double-applies them. Shared by
+    _load_normalized_stamps (write-terrain / write-water),
+    step_write_objects' elevation lookup, and step_visualize so they all
+    agree on the same terrain.
+    NOTE deliberately NOT used by step_refine_terrain -- collection berms
+    aren't in the LIDAR target, so the refiner shouldn't try to fit them."""
+    stamps = load_all_stamps(working_dir)
+    collections_path = working_dir / COLLECTIONS_FILE
+    added = False
+    if collections_path.exists():
+        coll_stamps = build_collection_stamps(load_collection_records(collections_path))
+        if coll_stamps:
+            if verbose:
+                print(f"  + {len(coll_stamps)} terrain stamp(s) from placed collections")
+            stamps = list(stamps) + coll_stamps
+            added = True
+    return stamps, added
 
 
 def load_latest_stamp_metadata(working_dir: Path) -> dict | None:
@@ -502,7 +556,7 @@ def step_visualize(
               "hex/stamps/height/error previews. Stopping after the LIDAR previews.")
         return
 
-    stamps = load_all_stamps(working_dir)
+    stamps, _ = _load_all_stamps_incl_collections(working_dir, verbose=False)
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
     model = TerrainModel(stamps)
 
@@ -818,6 +872,7 @@ def step_ingest_laz(
 def step_ingest_osm(
     working_dir: Path, height_mask_buffer_px: float,
     hole_corridor_buffer_px: float = DEFAULT_HOLE_CORRIDOR_BUFFER_PX,
+    preserve_synthetic: bool = True,
 ) -> None:
     osm_path = working_dir / "map.osm"
     if not osm_path.exists():
@@ -851,15 +906,41 @@ def step_ingest_osm(
         full_cloud.horizontal_unit_factor, bounds=full_cloud.bounds,
     )
 
+    # Re-parsing map.osm rebuilds every OSM-derived Feature from scratch,
+    # but features.geojson also holds GUI-authored content that has no OSM
+    # way behind it (cluster-fill border rings + their centerline
+    # companions, "Use mask" clipped fills, generate-streams bank
+    # vegetation) plus GUI edits layered onto real OSM Features (a flipped
+    # mask flag, a pga_cluster_fills spec list). Fold all of that back in
+    # so a re-ingest doesn't silently wipe it -- unless --no-preserve-
+    # synthetic asked for the old clean-slate rebuild. `features` stays
+    # OSM-only for the counts/previews/mask below (mask & fill overrides
+    # are re-applied to it in place); the synthetic Features are appended
+    # only to what's written to disk -- they have no viz style, so drawing
+    # them into the OSM overlay PNG would bake in an un-toggleable magenta
+    # blob.
+    out_path = working_dir / FEATURES_FILE
+    preserved_synthetic: list = []
+    if preserve_synthetic and out_path.exists():
+        preserved_synthetic, preserved = _preserved_synthetic_features(
+            features, load_features(out_path)
+        )
+        if any(preserved.values()):
+            print(f"  preserved {preserved['synthetic']} synthetic feature(s), re-applied "
+                  f"{preserved['mask_reapplied']} mask override(s) and "
+                  f"{preserved['fills_reapplied']} cluster-fill edit(s) from the existing "
+                  f"{FEATURES_FILE} (--no-preserve-synthetic rebuilds purely from map.osm)")
+
     counts: dict[str, int] = {}
     for f in features:
         counts[f.kind] = counts.get(f.kind, 0) + 1
     for kind, n in sorted(counts.items()):
         print(f"  {kind}: {n}")
 
-    out_path = working_dir / FEATURES_FILE
-    save_features(features, out_path)
-    print(f"  wrote {out_path} (full point cloud frame, uncropped)")
+    save_features(features + preserved_synthetic, out_path)
+    print(f"  wrote {out_path} (full point cloud frame, uncropped"
+          + (f"; {len(preserved_synthetic)} preserved synthetic feature(s) appended)"
+             if preserved_synthetic else ")"))
 
     # The course crop's own (0, 0), expressed in the full cloud's
     # frame -- both this shift (full-frame position of the course
@@ -927,6 +1008,96 @@ def step_ingest_osm(
         "course_crop_origin_in_full_frame_x": course_origin_in_full_x,
         "course_crop_origin_in_full_frame_z": course_origin_in_full_z,
     })
+
+
+_SYNTHETIC_FEATURE_KINDS = (
+    SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND, SYNTHETIC_BORDER_CENTERLINE_KIND,
+)
+
+
+def _is_synthetic_feature(f) -> bool:
+    """
+    A GUI/generate-streams-authored Feature with no OSM way behind it --
+    identified purely by its `kind` (every synthetic Feature is created
+    with one of `_SYNTHETIC_FEATURE_KINDS`: cluster-fill border rings and
+    their centerline companions, "Use mask" clipped fills, generate-
+    streams bank vegetation).
+
+    Deliberately NOT keyed off a negative osm_id: an OSM editor (JOSM,
+    Level0, ...) gives every not-yet-uploaded way a negative id, so a
+    hand-authored `pga_collection` / `pga_scatter` marker way legitimately
+    carries one. Treating those as synthetic made every re-ingest
+    *preserve the old copy AND re-parse a fresh one*, compounding the
+    feature list on each run.
+    """
+    return f.kind in _SYNTHETIC_FEATURE_KINDS
+
+
+def _preserved_synthetic_features(parsed: list, previous: list) -> tuple[list, dict]:
+    """
+    Reconcile GUI/generate-streams-authored edits from a prior
+    features.geojson (`previous`) against a freshly parsed OSM list
+    (`parsed`):
+
+      * `parsed` is mutated IN PLACE -- for each real OSM Feature that
+        still exists (matched by osm_id), a saved mask override is
+        re-applied and a GUI-added pga_cluster_fills spec list is copied
+        back;
+      * the purely synthetic Features (cluster-fill border rings + their
+        centerline companions, "Use mask" clipped fills, generate-
+        streams bank vegetation -- identified by `_is_synthetic_feature`,
+        i.e. a synthetic `kind`) are returned as a SEPARATE list, verbatim
+        (ids unchanged, so a border ring's PGA_CLUSTER_CENTERLINE_REF_TAG
+        back-reference to its companion stays valid).
+
+    A hand-authored `pga_collection` / `pga_scatter` marker way is a real
+    OSM way (even with a JOSM negative id) -- it is NOT synthetic, so it
+    is re-parsed fresh from map.osm every ingest, never preserved-and-
+    duplicated, and its mask / pga_cluster_fills edits transplant via
+    prev_by_id like any other real way.
+
+    Returned separately rather than concatenated so the caller can write
+    the synthetic Features to features.geojson but keep them OUT of the
+    OSM preview renders (they have no viz feature style -> would draw as
+    a magenta unknown-kind blob baked into the overlay PNG, with no way
+    to toggle it off) and the OSM feature-kind counts. Both lists are in
+    the same full uncropped point-cloud frame, so the caller just
+    appends -- no shift/crop.
+
+    Accepted heuristics: any difference between the old and freshly
+    parsed `mask` is treated as a deliberate user override (if a way is
+    re-tagged in OSM so its default mask flips, the stale override still
+    transplants -- re-toggle in the GUI). pga_cluster_fills is only
+    copied when the fresh Feature has none, so a spec coming straight
+    from OSM tags wins and GUI-only spec lists (always written whole)
+    never get duplicated.
+
+    Returns (synthetic_features, {"synthetic", "mask_reapplied", "fills_reapplied"}).
+    """
+    synthetic = [f for f in previous if _is_synthetic_feature(f)]
+
+    prev_by_id = {
+        f.osm_id: f for f in previous
+        if f.osm_id is not None and not _is_synthetic_feature(f)
+    }
+    mask_reapplied = fills_reapplied = 0
+    for f in parsed:
+        old = prev_by_id.get(f.osm_id)
+        if old is None:
+            continue
+        if old.mask != f.mask:
+            f.mask = old.mask
+            mask_reapplied += 1
+        old_fills = old.tags.get(PGA_CLUSTER_FILLS_TAG)
+        if old_fills and not f.tags.get(PGA_CLUSTER_FILLS_TAG):
+            f.tags[PGA_CLUSTER_FILLS_TAG] = old_fills
+            fills_reapplied += 1
+
+    return synthetic, {
+        "synthetic": len(synthetic),
+        "mask_reapplied": mask_reapplied,
+        "fills_reapplied": fills_reapplied,
+    }
 
 
 def _crop_features_to_course(working_dir: Path, features: list) -> list:
@@ -1000,9 +1171,8 @@ def step_write_splines(working_dir: Path, registration_marks: bool = False) -> N
     print(f"Generated {len(splines)} splines from {len(features)} features "
           f"({sum(unsupported.values())} unsupported kind: {unsupported})")
 
+    _ensure_course_baseline(working_dir)
     nodes_dir = working_dir / "course" / "CourseDescription_nodes"
-    if not nodes_dir.is_dir():
-        raise StepError(f"No {nodes_dir} found under {working_dir}. Run --step ingest-course first.")
 
     out_path = nodes_dir / "surfaceSplines.json"
     save_surface_splines(splines, out_path)
@@ -1033,9 +1203,10 @@ def step_write_holes(working_dir: Path) -> None:
     if not features_path.exists():
         raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
 
+    game_version = load_project(working_dir).get("game_version", DEFAULT_GAME_VERSION)
     features = load_features(features_path)
     features = _crop_features_to_course(working_dir, features)
-    holes = build_holes(features)
+    holes = build_holes(features, game_version)
 
     total_hole_features = sum(1 for f in features if f.kind == "hole")
     excluded_count = sum(1 for f in features if f.kind == "hole" and f.mask)
@@ -1045,9 +1216,8 @@ def step_write_holes(working_dir: Path) -> None:
         print(f"  WARNING: {len(holes)} holes exceeds PGA's 18-hole limit -- "
               "mask off (exclude) the extras in the GUI's Splines tab before importing")
 
+    _ensure_course_baseline(working_dir)
     nodes_dir = working_dir / "course" / "CourseDescription_nodes"
-    if not nodes_dir.is_dir():
-        raise StepError(f"No {nodes_dir} found under {working_dir}. Run --step ingest-course first.")
 
     out_path = nodes_dir / "holes.json"
     save_holes(holes, out_path)
@@ -1296,11 +1466,24 @@ def step_pack_objects(working_dir: Path) -> None:
     collections.json (see step_generate_collections) as
     kind="collection_object" records -- deterministic, no RNG.
 
+    Also packs object-spline-fill records (see
+    course_output/object_clusters.py's pack_spline_records) from every
+    mode="spline" PGA_CLUSTER_FILLS_TAG spec -- v2021+-only, no RNG
+    (there's nothing to pack, just an already-subdivided polygon per
+    piece), formatted at write-objects time same as cluster fills.
+
+    Also passes ingame_objects.json through unchanged (see
+    course_output/ingame_objects.py / step_import_ingame_edits) as
+    kind="ingame_object" records -- this step only READS that file,
+    never writes it, so objects a user imported from an in-game edit
+    survive every re-pack (a re-ingest, a fresh Generate Trees run, a
+    Fill/Clear) automatically.
+
     Requires object_list.json to exist (same convention
     step_write_objects used before this step existed) -- an empty tree
-    list still needs the file to be there. features.geojson and
-    collections.json are both optional: a missing file just means zero
-    records of that kind, not an error.
+    list still needs the file to be there. features.geojson,
+    collections.json, and ingame_objects.json are all optional: a
+    missing file just means zero records of that kind, not an error.
 
     This overwrites objects.json wholesale.
     """
@@ -1310,13 +1493,17 @@ def step_pack_objects(working_dir: Path) -> None:
     trees = load_object_list(object_list_path)
 
     cluster_records: list[dict] = []
+    object_spline_fill_records: list[dict] = []
     features_path = working_dir / FEATURES_FILE
     if features_path.exists():
         features = _crop_features_to_course(working_dir, load_features(features_path))
         tagged = [f for f in features if f.tags.get(PGA_CLUSTER_FILLS_TAG)]
         if tagged:
             cluster_records = pack_cluster_records(features)
-            print(f"  packed {len(cluster_records)} cluster stamp(s) across {len(tagged)} tagged spline(s)")
+            object_spline_fill_records = pack_spline_records(features)
+            print(f"  packed {len(cluster_records)} cluster stamp(s) + "
+                  f"{len(object_spline_fill_records)} object-spline fill piece(s) "
+                  f"across {len(tagged)} tagged spline(s)")
 
     # Resolved collection member placements (see step_generate_collections
     # -- run that first). Deterministic, no RNG: just flattened out of
@@ -1329,10 +1516,22 @@ def step_pack_objects(working_dir: Path) -> None:
         if collection_objects:
             print(f"  {len(collection_objects)} collection object(s) across {len(records)} placement(s)")
 
+    ingame_object_records: list[dict] = []
+    ingame_objects_path = working_dir / INGAME_OBJECTS_FILE
+    if ingame_objects_path.exists():
+        ingame_object_records = load_ingame_objects(ingame_objects_path)
+        if ingame_object_records:
+            print(f"  {len(ingame_object_records)} imported in-game object(s) from {INGAME_OBJECTS_FILE}")
+
     out_path = working_dir / OBJECTS_FILE
-    save_objects(trees, cluster_records, out_path, collection_objects)
+    save_objects(
+        trees, cluster_records, out_path, collection_objects, object_spline_fill_records,
+        ingame_object_records,
+    )
     print(f"Wrote {out_path} ({len(trees)} tree(s), {len(cluster_records)} cluster stamp(s), "
-          f"{len(collection_objects)} collection object(s))")
+          f"{len(object_spline_fill_records)} object-spline fill piece(s), "
+          f"{len(collection_objects)} collection object(s), "
+          f"{len(ingame_object_records)} imported in-game object(s))")
 
 
 def step_write_objects(
@@ -1345,6 +1544,8 @@ def step_write_objects(
     stake_asset_path: str | None = None,
     stake_buildings: bool | None = None,
     waterfall_asset_path: str | None = None,
+    splash_asset_path: str | None = None,
+    tree_theme_config: str | None = None,
 ) -> None:
     """
     Generate placedObjects2.json -- formats objects.json (see
@@ -1401,14 +1602,61 @@ def step_write_objects(
     This overwrites placedObjects2.json wholesale, same as
     step_write_splines/step_write_holes do for their own files.
     """
-    objects_path = working_dir / OBJECTS_FILE
-    if not objects_path.exists():
-        raise StepError(
-            f"No {OBJECTS_FILE} found under {working_dir}. Run --step pack-objects first "
-            "(after --step generate-trees)."
-        )
-
     project = load_project(working_dir)
+    (game_version, theme, tree_variety, tree_theme_config, tree_asset_paths, tree_type_asset_paths,
+     stake_asset_path, stake_buildings, waterfall_asset_path, splash_asset_path) = _resolve_write_objects_params(
+        project, game_version, theme, tree_variety, tree_theme_config, tree_asset_paths,
+        tree_type_asset_paths, stake_asset_path, stake_buildings, waterfall_asset_path, splash_asset_path,
+    )
+
+    placed_objects = _build_placed_objects(
+        working_dir, game_version, theme, tree_variety, tree_theme_config, tree_asset_paths,
+        tree_type_asset_paths, stake_asset_path, stake_buildings, waterfall_asset_path, splash_asset_path,
+        project,
+    )
+
+    _ensure_course_baseline(working_dir)
+    nodes_dir = working_dir / "course" / "CourseDescription_nodes"
+
+    out_path = nodes_dir / schema_for(game_version).objects_filename
+    save_placed_objects(placed_objects, out_path)
+    print(f"Wrote {out_path}")
+
+    save_project(working_dir, {
+        "game_version": game_version,
+        "objects_theme": theme,
+        "objects_tree_variety": tree_variety,
+        "objects_tree_theme_config": tree_theme_config,
+        "objects_tree_asset_paths": tree_asset_paths,
+        "objects_tree_type_asset_paths": tree_type_asset_paths,
+        "objects_stake_asset_path": stake_asset_path,
+        "objects_stake_buildings": stake_buildings,
+        "streams_waterfall_asset_path": waterfall_asset_path,
+        "streams_splash_asset_path": splash_asset_path,
+    })
+
+
+def _resolve_write_objects_params(
+    project: dict,
+    game_version: str | None,
+    theme: int | None,
+    tree_variety: bool | None,
+    tree_theme_config: str | None,
+    tree_asset_paths: list[str] | None,
+    tree_type_asset_paths: dict[str, str] | None,
+    stake_asset_path: str | None,
+    stake_buildings: bool | None,
+    waterfall_asset_path: str | None,
+    splash_asset_path: str | None,
+) -> tuple:
+    """
+    Resolve every step_write_objects/_build_placed_objects parameter
+    against project.json, exactly like step_write_objects always did --
+    factored out so step_import_ingame_edits can recompute the same
+    "expected" placed-objects build (against whatever's currently
+    saved) without duplicating this resolution logic. Raises StepError
+    if the resolved game_version isn't implemented.
+    """
     if game_version is None:
         game_version = project.get("game_version", DEFAULT_GAME_VERSION)
     if game_version not in IMPLEMENTED_GAME_VERSIONS:
@@ -1421,6 +1669,8 @@ def step_write_objects(
         theme = project.get("objects_theme")
     if tree_variety is None:
         tree_variety = project.get("objects_tree_variety", True)
+    if tree_theme_config is None:
+        tree_theme_config = project.get("objects_tree_theme_config")
     if tree_asset_paths is None:
         tree_asset_paths = project.get("objects_tree_asset_paths", [])
     if tree_type_asset_paths is None:
@@ -1431,17 +1681,100 @@ def step_write_objects(
         stake_buildings = project.get("objects_stake_buildings", False)
     if waterfall_asset_path is None:
         waterfall_asset_path = project.get("streams_waterfall_asset_path", WATERFALL_DEFAULT_ASSET_PATH)
+    if splash_asset_path is None:
+        splash_asset_path = project.get("streams_splash_asset_path", WATERSPLASH_DEFAULT_ASSET_PATH)
+    return (game_version, theme, tree_variety, tree_theme_config, tree_asset_paths, tree_type_asset_paths,
+            stake_asset_path, stake_buildings, waterfall_asset_path, splash_asset_path)
 
-    trees, cluster_records, collection_objects = load_objects(objects_path)
+
+def _build_placed_objects(
+    working_dir: Path,
+    game_version: str,
+    theme: int | None,
+    tree_variety: bool,
+    tree_theme_config: str | None,
+    tree_asset_paths: list[str],
+    tree_type_asset_paths: dict[str, str],
+    stake_asset_path: str | None,
+    stake_buildings: bool,
+    waterfall_asset_path: str,
+    splash_asset_path: str,
+    project: dict,
+) -> list[dict]:
+    """
+    Build the full, merged placedObjects2/3.json group list in memory,
+    WITHOUT writing anything to disk -- the exact construction
+    step_write_objects used to do inline (trees, cluster fills,
+    object-spline fills, collections, imported in-game objects,
+    building stakes, stream waterfalls/splashes, then
+    merge_object_groups). Factored out so step_write_objects and
+    step_import_ingame_edits's "expected" recomputation can never
+    silently drift apart -- there is exactly one place this
+    construction happens.
+
+    All parameters are assumed ALREADY RESOLVED (see
+    _resolve_write_objects_params) -- this never reads project.json
+    for a default itself, only for things that aren't step_write_objects
+    parameters at all (output_height_shift_m, a stamp-derived
+    TerrainModel for elevated collection objects).
+    """
+    objects_path = working_dir / OBJECTS_FILE
+    if not objects_path.exists():
+        raise StepError(
+            f"No {OBJECTS_FILE} found under {working_dir}. Run --step pack-objects first "
+            "(after --step generate-trees)."
+        )
+
+    trees, cluster_records, collection_objects, object_spline_fill_records, ingame_object_records = (
+        load_objects(objects_path)
+    )
     print(f"game_version={game_version}  loaded {len(trees)} tree(s), {len(cluster_records)} cluster "
-          f"stamp(s), {len(collection_objects)} collection object(s) from {OBJECTS_FILE}")
+          f"stamp(s), {len(object_spline_fill_records)} object-spline fill piece(s), "
+          f"{len(collection_objects)} collection object(s), {len(ingame_object_records)} imported "
+          f"in-game object(s) from {OBJECTS_FILE}")
+
+    # Collection members with a designed elevation (`dy` -- see
+    # course_output/collections.py) need an absolute y = target terrain
+    # height at (x, z) + output_height_shift_m + dy. Evaluated here, at
+    # write time, against the final stamp list -- same "format against
+    # the terrain as it stands now" approach as stream waterfalls below.
+    elevated = [o for o in collection_objects if o.get("dy") is not None]
+    if elevated:
+        if _stamps_files(working_dir):
+            shift_m = project.get("output_height_shift_m")
+            if shift_m is None:
+                print("  NOTE: no output_height_shift_m in project.json yet -- run write-terrain so "
+                      "elevated collection objects sit at the right height. Using 0 for now.")
+                shift_m = 0.0
+            stamps_for_height, _ = _load_all_stamps_incl_collections(working_dir)
+            model = TerrainModel(stamps_for_height)
+            apply_terrain_heights(collection_objects, model.evaluate, shift_m)
+            print(f"  resolved terrain height for {len(elevated)} elevated collection object(s)")
+        else:
+            print(f"  NOTE: {len(elevated)} collection object(s) have a designed elevation but no "
+                  "terrain stamps exist yet -- run generate-terrain/write-terrain. They'll "
+                  "ground-snap ('-Infinity') for now.")
 
     placed_objects: list[dict] = []
 
     if game_version == "2019":
         if trees:
-            print(f"  theme={theme}  tree_variety={tree_variety}")
-            placed_objects += build_tree_objects_v2019(trees, theme=theme, tree_variety=tree_variety)
+            species = load_tree_theme_species(theme, tree_theme_config)
+            if species is not None:
+                bucket_sizes = {name: len(ids) for name, ids in species.species.items()}
+                tagged = {tg.get(TREE_TYPE_TAG) for _, _, tg in trees if tg.get(TREE_TYPE_TAG)}
+                unknown = sorted(t for t in tagged if not species.is_known(t))
+                print(f"  theme={theme}  species buckets={bucket_sizes}  "
+                      f"default={species.default_species!r} (course_output/tree_themes.json)")
+                if unknown:
+                    print(f"  NOTE: pga_tree_type {unknown} has no bucket for this theme -- "
+                          f"those trees use the {species.default_species!r} bucket")
+            else:
+                print(f"  theme={theme}  tree_variety={tree_variety}  "
+                      "(no tree_themes.json entry -- random-pool trees)")
+            placed_objects += build_tree_objects_v2019(
+                trees, theme=theme, tree_variety=tree_variety, species=species,
+            )
 
         if cluster_records:
             cluster_groups = cluster_records_to_v2019_groups(cluster_records)
@@ -1455,6 +1788,12 @@ def step_write_objects(
             placed_count = sum(len(g["Value"]["items"]) for g in collection_groups)
             print(f"  {placed_count} collection object(s) in {len(collection_groups)} group(s)")
             placed_objects += collection_groups
+
+        if ingame_object_records:
+            ingame_groups = build_ingame_objects_v2019(ingame_object_records)
+            placed_count = sum(len(g["Value"]["items"]) for g in ingame_groups)
+            print(f"  {placed_count} imported in-game object(s) in {len(ingame_groups)} group(s)")
+            placed_objects += ingame_groups
 
         if stake_buildings:
             features_path = working_dir / FEATURES_FILE
@@ -1474,6 +1813,11 @@ def step_write_objects(
             print("  NOTE: --stake-asset-path is set but ignored for game_version=2019 -- "
                   "that's a v2021+-only scheme (see objects.py's build_building_stake_objects_v2021 "
                   "docstring). Use --stake-buildings for v2019 instead.")
+
+        if object_spline_fill_records:
+            print(f"  NOTE: dropped {len(object_spline_fill_records)} object-spline fill piece(s) -- "
+                  "v2019 has no object-spline schema (see the Fill dialog's mode option; use "
+                  "mode=stamps fills for a v2019 target).")
     else:  # 2021+ (only "2021" itself is in IMPLEMENTED_GAME_VERSIONS right now)
         if trees:
             if not tree_asset_paths and not tree_type_asset_paths:
@@ -1485,6 +1829,22 @@ def step_write_objects(
                 )
             print(f"  tree_asset_paths={tree_asset_paths}  tree_type_asset_paths={tree_type_asset_paths}")
             placed_objects += build_tree_objects_v2021(trees, tree_asset_paths, tree_type_asset_paths)
+
+        if cluster_records:
+            cluster_groups = cluster_records_to_v2021_groups(cluster_records)
+            cluster_count_total = sum(len(g["Value"]["clusters"]) for g in cluster_groups)
+            spline_count = len({r["spline_id"] for r in cluster_records})
+            print(f"  {cluster_count_total} cluster(s) across {spline_count} tagged spline(s) "
+                  "(mode=stamps)")
+            placed_objects += cluster_groups
+
+        if object_spline_fill_records:
+            spline_groups = object_spline_fill_records_to_v2021_groups(object_spline_fill_records)
+            spline_count_total = sum(len(g["Value"]["splines"]) for g in spline_groups)
+            spline_id_count = len({r["spline_id"] for r in object_spline_fill_records})
+            print(f"  {spline_count_total} object-spline fill piece(s) across {spline_id_count} "
+                  "tagged spline(s) (mode=spline)")
+            placed_objects += spline_groups
 
         if stake_asset_path:
             features_path = working_dir / FEATURES_FILE
@@ -1507,6 +1867,12 @@ def step_write_objects(
             print(f"  {placed_count} collection object(s) in {len(collection_groups)} group(s)")
             placed_objects += collection_groups
 
+        if ingame_object_records:
+            ingame_groups = build_ingame_objects_v2021(ingame_object_records)
+            placed_count = sum(len(g["Value"]["items"]) for g in ingame_groups)
+            print(f"  {placed_count} imported in-game object(s) in {len(ingame_groups)} group(s)")
+            placed_objects += ingame_groups
+
     # Waterfall prefabs from streams.json (see step_generate_streams).
     # y needs project.json's output_height_shift_m (persisted by
     # write-terrain) to land in the normalized frame -- warn if it looks
@@ -1521,36 +1887,23 @@ def step_write_objects(
                 print("  NOTE: no output_height_shift_m in project.json yet -- run write-terrain "
                       "so stream waterfalls sit at the right elevation. Using 0 for now.")
                 height_shift_m = 0.0
+            n_splash = sum(len(r.get("splashes", [])) for r in stream_records)
             if game_version == "2019":
                 falls = build_waterfall_objects_v2019(stream_records, height_shift_m)
+                splashes = build_watersplash_objects_v2019(stream_records, height_shift_m)
             else:
                 falls = build_waterfall_objects_v2021(stream_records, waterfall_asset_path, height_shift_m)
-            print(f"  {n_falls} stream waterfall(s)")
+                splashes = build_watersplash_objects_v2021(stream_records, splash_asset_path, height_shift_m)
+            print(f"  {n_falls} stream waterfall(s), {n_splash} splash(es)")
             placed_objects += falls
+            placed_objects += splashes
 
     placed_objects = merge_object_groups(placed_objects)
 
     for label, item_count, cluster_count, spline_count in object_counts(placed_objects):
         print(f"    {label}: {item_count} item(s), {cluster_count} cluster(s), {spline_count} spline(s)")
 
-    nodes_dir = working_dir / "course" / "CourseDescription_nodes"
-    if not nodes_dir.is_dir():
-        raise StepError(f"No {nodes_dir} found under {working_dir}. Run --step ingest-course first.")
-
-    out_path = nodes_dir / PLACED_OBJECTS_FILE
-    save_placed_objects(placed_objects, out_path)
-    print(f"Wrote {out_path}")
-
-    save_project(working_dir, {
-        "game_version": game_version,
-        "objects_theme": theme,
-        "objects_tree_variety": tree_variety,
-        "objects_tree_asset_paths": tree_asset_paths,
-        "objects_tree_type_asset_paths": tree_type_asset_paths,
-        "objects_stake_asset_path": stake_asset_path,
-        "objects_stake_buildings": stake_buildings,
-        "streams_waterfall_asset_path": waterfall_asset_path,
-    })
+    return placed_objects
 
 
 def step_dig_water(
@@ -2455,10 +2808,14 @@ def step_generate_streams(working_dir: Path) -> None:
     (so a re-run's extra stamp layer is idempotent, just redundant --
     delete an older generate-streams layer by hand if they pile up),
     and this step first strips any stream-bank Features a previous run
-    added (STREAM_BANK_MARKER_TAG) before adding fresh ones. NOTE:
-    re-running ingest-osm rewrites features.geojson from scratch and
-    drops the synthetic bank Features -- re-run generate-streams
-    afterwards (same wrinkle as the GUI's border rings).
+    added (STREAM_BANK_MARKER_TAG) before adding fresh ones. The bank
+    Features are synthetic (SYNTHETIC_MASKED_KIND), so
+    a later ingest-osm now carries them over by default (same as the
+    GUI's border rings) -- only ingest-osm --no-preserve-synthetic
+    drops them, in which case re-run generate-streams afterwards.
+    Re-running generate-streams after any ingest-osm stays correct
+    regardless: it strips its own prior bank Features before re-adding,
+    so the count can't double.
     """
     heightmap_path = working_dir / HEIGHTMAP_FILE
     if not heightmap_path.exists():
@@ -2573,12 +2930,16 @@ def step_generate_collections(working_dir: Path, library_dir: Path | None = None
 
     "compile once, format at write" split, same as streams.json:
       - the object members ride pack-objects -> write-objects (folded
-        into objects.json as kind="collection_object"), and
+        into objects.json as kind="collection_object"),
       - the spline members ride write-splines (appended to
-        surfaceSplines.json).
-    So run this before pack-objects / write-splines. Re-runnable;
-    overwrites collections.json wholesale. Re-run after any fresh
-    ingest-osm (which rewrites features.geojson) or library edit.
+        surfaceSplines.json), and
+      - the terrain-stamp members (raised flowerbed beds / berms --
+        raise-tool only, never flatten) ride write-terrain / write-water
+        (folded into the stamp list by _load_normalized_stamps, not
+        persisted as a stamps_N.json layer).
+    So run this before pack-objects / write-splines / write-terrain.
+    Re-runnable; overwrites collections.json wholesale. Re-run after any
+    fresh ingest-osm (which rewrites features.geojson) or library edit.
     """
     features_path = working_dir / FEATURES_FILE
     if not features_path.exists():
@@ -2628,8 +2989,9 @@ def step_generate_collections(working_dir: Path, library_dir: Path | None = None
     save_collection_records(records, working_dir / COLLECTIONS_FILE)
     n_obj = sum(len(r["objects"]) for r in records)
     n_spl = sum(len(r["splines"]) for r in records)
+    n_stamp = sum(len(r.get("stamps", [])) for r in records)
     print(f"  wrote {working_dir / COLLECTIONS_FILE} ({len(records)} placement(s), {n_obj} object(s), "
-          f"{n_spl} spline(s); {skipped} skipped)")
+          f"{n_spl} spline(s), {n_stamp} terrain stamp(s); {skipped} skipped)")
 
     save_project(working_dir, {"collections_library_dir": str(library_dir)})
 
@@ -3015,6 +3377,41 @@ def _set_json_key_in_file(path: Path, value, key: str, label: str) -> None:
     print(f"Set {label} to {value!r} in {path}")
 
 
+def _apply_course_theme(course_dir: Path, project: dict) -> None:
+    """
+    Write the selected theme (the File tab's Theme selector / the
+    objects_theme project.json field) into the extracted course/ JSON.
+    No-ops if no theme has been picked, or if game_version isn't 2019.
+
+    v2019 ONLY: v2019's theme is a numeric id living directly in
+    CourseDescription.json/CourseMetadata.json's root, patched here.
+    v2021+ has no numeric theme id at all (see objects.py's module
+    docstring) -- its course-wide look/theme is whatever the bundled
+    template (course_output/course_templates.py) already encodes, so
+    there's nothing to patch; live-patching objects_theme's v2019 id
+    into a v2021+ course's root would just corrupt whatever real theme
+    the template shipped with.
+
+    Called from step_write_terrain AND step_repack -- the latter so a
+    theme change made in the Theme selector after the last Write
+    Terrain still lands in the packed .course, rather than silently
+    shipping a stale theme.
+
+    ASSUMPTION: writing the integer theme id (matching THEMES_V2019 /
+    objects_theme's existing representation) into both files' root --
+    unconfirmed against a real CourseDescription.json/CourseMetadata.json
+    sample. If the game doesn't pick up the theme after this, check
+    whether it expects the theme *name* instead (see THEMES_V2019).
+    """
+    if project.get("game_version", DEFAULT_GAME_VERSION) != "2019":
+        return
+    theme_id = project.get("objects_theme")
+    if theme_id is None:
+        return
+    _set_json_key_in_file(course_dir / "CourseDescription.json", theme_id, "theme", "theme")
+    _set_json_key_in_file(course_dir / "CourseMetadata.json", theme_id, "courseTheme", "theme")
+
+
 def _load_normalized_stamps(
     working_dir: Path, registration_marks: bool, direct_height_shift: bool,
     prune_overlapped_stamps: bool,
@@ -3031,8 +3428,19 @@ def _load_normalized_stamps(
     output_height_range_m.
     """
     print(f"Loading stamps from {working_dir} (all layers)...")
-    stamps = load_all_stamps(working_dir)
+    stamps, added_collection_stamps = _load_all_stamps_incl_collections(working_dir)
     print(f"  {len(stamps)} stamps")
+
+    # The value-shift normalization adds `shift` to EVERY stamp's value,
+    # which corrupts a raise stamp's relative delta (it's not an absolute
+    # height). Collection terrain stamps are all raise, so force the
+    # shim-stamp method when any are present -- it leaves individual
+    # values untouched and appends one course-wide raise instead.
+    if added_collection_stamps and direct_height_shift:
+        print("  NOTE: placed collections contributed raise-tool terrain stamps -- using the "
+              "shim-stamp height normalization (not --direct-height-shift) so their relative "
+              "deltas survive.")
+        direct_height_shift = False
 
     if prune_overlapped_stamps:
         stamps, pruned_count = prune_overwritten_stamps(stamps)
@@ -3068,20 +3476,18 @@ def step_write_terrain(
     prune_overlapped_stamps: bool = True,
 ) -> None:
     course_dir = working_dir / "course"
+    project = load_project(working_dir)
+    game_version = project.get("game_version", DEFAULT_GAME_VERSION)
 
     stamps, _bounds, true_min, true_max = _load_normalized_stamps(
         working_dir, registration_marks, direct_height_shift, prune_overlapped_stamps,
     )
 
+    _ensure_course_baseline(working_dir)
     nodes_dir = course_dir / "CourseDescription_nodes"
-    if not nodes_dir.is_dir():
-        raise StepError(
-            f"{nodes_dir} doesn't exist. Run --step ingest-course to extract a blank "
-            f"starting .course into {course_dir} first."
-        )
 
     out_path = nodes_dir / "userLayers.json"
-    write_user_layers(out_path, stamps=stamps)
+    write_user_layers(out_path, stamps=stamps, game_version=game_version)
     print(f"Wrote {out_path}")
 
     # If a course name has been set (see the GUI's "Course name" field /
@@ -3091,7 +3497,6 @@ def step_write_terrain(
     # CourseDescription.json believed to be what later versions (2K21+)
     # use instead. Writing both covers either case rather than guessing
     # which version a given course targets.
-    project = load_project(working_dir)
     course_name = project.get("course_name")
     if course_name:
         _set_json_key_in_file(course_dir / "CourseDescription.json", course_name, "name", "course name")
@@ -3103,15 +3508,7 @@ def step_write_terrain(
     # Same idea for the selected theme (see the GUI's Objects tab / the
     # objects_theme project.json field, set by --step write-objects or
     # the GUI dropdown).
-    theme_id = project.get("objects_theme")
-    if theme_id is not None:
-        # ASSUMPTION: writing the integer theme id (matching THEMES_V2019 /
-        # objects_theme's existing representation) into both files' root --
-        # unconfirmed against a real CourseDescription.json/CourseMetadata.json
-        # sample. If the game doesn't pick up the theme after this, check
-        # whether it expects the theme *name* instead (see THEMES_V2019).
-        _set_json_key_in_file(course_dir / "CourseDescription.json", theme_id, "theme", "theme")
-        _set_json_key_in_file(course_dir / "CourseMetadata.json", theme_id, "courseTheme", "theme")
+    _apply_course_theme(course_dir, project)
 
     save_project(working_dir, {
         "output_height_shift_m": -true_min,
@@ -3165,12 +3562,8 @@ def step_write_water(
             "if this course has water hazards."
         )
 
+    _ensure_course_baseline(working_dir)
     nodes_dir = course_dir / "CourseDescription_nodes"
-    if not nodes_dir.is_dir():
-        raise StepError(
-            f"{nodes_dir} doesn't exist. Run --step ingest-course to extract a blank "
-            f"starting .course into {course_dir} first."
-        )
 
     stamps, _bounds, _true_min, _true_max = _load_normalized_stamps(
         working_dir, registration_marks, direct_height_shift, prune_overlapped_stamps,
@@ -3206,23 +3599,44 @@ def step_write_water(
     print(f"Wrote {out_path} ({len(water_entries)} water object(s))")
 
 
-def step_ingest_course(working_dir: Path, course_file: Path) -> None:
+def _extract_course_template(working_dir: Path) -> None:
     """
-    Extract a .course file into working_dir/course via util/course_extract.py,
-    invoked as a subprocess -- same "one place behavior lives" reasoning as
-    the GUI's own subprocess-per-step design (see PGA2k_gen_gui.py).
+    Extract the bundled template (course_output/course_templates.py)
+    matching project.json's game_version + theme into
+    working_dir/course/, OVERWRITING whatever's already there --
+    shared by _ensure_course_baseline (only called when course/ is
+    missing entirely) and step_ingest_course (an unconditional reset).
+
+    Wipes course/ first rather than extracting on top of it: a stale
+    node file from a previous game_version (e.g. placedObjects2.json
+    left over after switching from 2019 to 2021) would otherwise still
+    get picked up by course_repack.py's blind glob over
+    CourseDescription_nodes/*.json alongside the new placedObjects3.json,
+    shipping both.
     """
-    if not course_file.exists():
-        raise StepError(f"Course file not found: {course_file}")
+    project = load_project(working_dir)
+    game_version = project.get("game_version", DEFAULT_GAME_VERSION)
+    theme = project.get("theme")
+    if not theme:
+        raise StepError(
+            "No theme set for this project -- pick one on the File tab (GUI) or run "
+            "--step ingest-course --course-theme <name> (CLI) before running this step."
+        )
+    try:
+        course_file = resolve_course_template(SCRIPT_DIR, game_version, theme)
+    except FileNotFoundError as e:
+        raise StepError(str(e)) from e
 
     script = SCRIPT_DIR / "util" / "course_extract.py"
     if not script.exists():
         raise StepError(f"course_extract.py not found at {script}")
 
     course_dir = working_dir / "course"
-    course_dir.mkdir(parents=True, exist_ok=True)
+    if course_dir.exists():
+        shutil.rmtree(course_dir)
+    course_dir.mkdir(parents=True)
 
-    print(f"Extracting {course_file} -> {course_dir} ...")
+    print(f"Extracting template {course_file} -> {course_dir} ...")
     result = subprocess.run(
         [sys.executable, str(script), str(course_file), str(course_dir)],
         capture_output=True, text=True,
@@ -3235,7 +3649,42 @@ def step_ingest_course(working_dir: Path, course_file: Path) -> None:
         raise StepError(f"course_extract.py failed (exit {result.returncode})")
 
     print(f"Extracted to {course_dir}")
-    save_project(working_dir, {"source_course_file": str(course_file)})
+    save_project(working_dir, {"source_course_template": str(course_file)})
+
+
+def _ensure_course_baseline(working_dir: Path) -> None:
+    """
+    Make sure working_dir/course/ exists, auto-provisioning it from the
+    bundled template for this project's game_version + theme if it
+    doesn't -- called at the top of every writer/repack step so none of
+    them require an explicit "ingest" action first. No-op if course/ is
+    already populated (from a prior auto-provision, or a manual
+    --step ingest-course reset).
+    """
+    if (working_dir / "course").is_dir():
+        return
+    _extract_course_template(working_dir)
+
+
+def step_ingest_course(working_dir: Path, theme: str | None = None) -> None:
+    """
+    Reset working_dir/course/ from the bundled template matching this
+    project's game_version + theme, OVERWRITING whatever's already
+    there. Every other writer/repack step provisions course/
+    automatically on first need (_ensure_course_baseline) and never
+    requires this to be run first -- this is only needed explicitly
+    when game_version or theme changes AFTER course/ was already
+    populated from the old template. Kept as its own real, visible step
+    (not folded silently into a settings change) because it's
+    destructive to any accumulated course/ state.
+
+    If `theme` is given, saves it to project.json first (so a fresh
+    project's first "ingest" can set the theme in the same action the
+    GUI's File tab exposes as one combined control).
+    """
+    if theme is not None:
+        save_project(working_dir, {"theme": theme})
+    _extract_course_template(working_dir)
 
 
 def step_repack(working_dir: Path, filename: str) -> None:
@@ -3243,9 +3692,8 @@ def step_repack(working_dir: Path, filename: str) -> None:
     Repack working_dir/course into a .course file via util/course_repack.py,
     invoked as a subprocess (see step_ingest_course).
     """
+    _ensure_course_baseline(working_dir)
     course_dir = working_dir / "course"
-    if not course_dir.is_dir():
-        raise StepError(f"No course/ folder under {working_dir}. Run --step ingest-course first.")
 
     script = SCRIPT_DIR / "util" / "course_repack.py"
     if not script.exists():
@@ -3258,6 +3706,11 @@ def step_repack(working_dir: Path, filename: str) -> None:
         filename = filename[: -len(".course")]
 
     out_path = working_dir / f"{filename}.course"
+
+    # Make sure the theme selected in the Objects tab is baked into the
+    # course/ JSON before we pack -- it may have changed since the last
+    # Write Terrain (which is the only other place this is applied).
+    _apply_course_theme(course_dir, load_project(working_dir))
 
     print(f"Repacking {course_dir} -> {out_path} ...")
     result = subprocess.run(
@@ -3273,6 +3726,353 @@ def step_repack(working_dir: Path, filename: str) -> None:
 
     print(f"Wrote {out_path}")
     save_project(working_dir, {"repack_filename": filename})
+
+
+# ---------------------------------------------------------------------------
+# Import in-game edits -- reconcile a saved, hand-edited .course (exported
+# by this tool, opened and edited in PGA Tour 2K's own in-game editor, then
+# saved) against what this tool currently tracks. See the design notes this
+# was scoped from for the full rationale; summary in step_import_ingame_edits's
+# own docstring below.
+# ---------------------------------------------------------------------------
+
+def _canon_json_value(value):
+    """Round every float leaf to this project's usual 3-decimal
+    convention and recursively sort dict keys, so two structurally-
+    identical dicts that differ only in float precision or key order
+    canonicalize to the same value -- exact, rounded value-equality,
+    no fuzzy epsilon (see step_import_ingame_edits's docstring)."""
+    if isinstance(value, float):
+        return round(value, 3)
+    if isinstance(value, dict):
+        return {k: _canon_json_value(v) for k, v in sorted(value.items())}
+    if isinstance(value, list):
+        return [_canon_json_value(v) for v in value]
+    return value
+
+
+def _canon_json_key(value) -> str:
+    """A hashable, order/precision-independent key for one item/entry
+    dict -- used to build Counter multisets for the new-vs-expected diff."""
+    return json.dumps(_canon_json_value(value), sort_keys=True)
+
+
+def _group_key(key_dict: dict) -> tuple:
+    return tuple(sorted(key_dict.items()))
+
+
+def _group_label(key: dict) -> str:
+    """Same label convention as objects.object_counts: the asset path
+    for a v2021+ Key, or a category/type/theme string for v2019."""
+    if "path" in key:
+        return key["path"]
+    return f"category={key.get('category')}/type={key.get('type')}/theme={key.get('theme')}"
+
+
+def _flatten_group_field(groups: list[dict], field: str) -> tuple[dict[tuple, Counter], dict[tuple, dict]]:
+    """(counters, key_reprs) -- one Counter of canonicalized item
+    strings per distinct group Key, across every group's
+    Value[field] list (field is "items", "clusters", or "splines"),
+    plus each Key's own dict (for labeling later)."""
+    counters: dict[tuple, Counter] = {}
+    key_reprs: dict[tuple, dict] = {}
+    for g in groups:
+        gk = _group_key(g.get("Key", {}))
+        key_reprs[gk] = g.get("Key", {})
+        counter = counters.setdefault(gk, Counter())
+        for item in g.get("Value", {}).get(field, []):
+            counter[_canon_json_key(item)] += 1
+    return counters, key_reprs
+
+
+def _diff_placed_object_items(
+    expected_groups: list[dict], actual_groups: list[dict],
+) -> tuple[dict[tuple, list[dict]], dict[tuple, int], dict[tuple, dict]]:
+    """
+    (new_items_by_key, missing_counts_by_key, key_reprs) -- a Counter
+    multiset diff (not a plain set: two genuinely-identical placements
+    must not collapse into one) of every group's "items" list, keyed by
+    the group's own Key (asset identity). new_items_by_key holds the
+    actual decoded item dicts present in `actual_groups` beyond what
+    `expected_groups` accounts for, at the same multiplicity; missing_
+    counts_by_key is report-only (this tool's own generation is never
+    auto-removed just because it's absent from an imported course).
+    """
+    expected_counters, expected_reprs = _flatten_group_field(expected_groups, "items")
+    actual_counters, actual_reprs = _flatten_group_field(actual_groups, "items")
+    key_reprs = {**expected_reprs, **actual_reprs}
+
+    new_items: dict[tuple, list[dict]] = {}
+    missing_counts: dict[tuple, int] = {}
+    for gk in set(expected_counters) | set(actual_counters):
+        expected_c = expected_counters.get(gk, Counter())
+        actual_c = actual_counters.get(gk, Counter())
+        extra = actual_c - expected_c
+        if extra:
+            items = []
+            for item_json, count in extra.items():
+                items.extend([json.loads(item_json)] * count)
+            new_items[gk] = items
+        missing = expected_c - actual_c
+        if missing:
+            missing_counts[gk] = sum(missing.values())
+    return new_items, missing_counts, key_reprs
+
+
+def _diff_stamp_entries(expected_entries: list[dict], actual_entries: list[dict]) -> tuple[list[dict], int]:
+    """(new_entries, missing_count) -- same Counter-multiset diff as
+    _diff_placed_object_items, applied directly to userLayers.json
+    "height" entry dicts. No need to reverse them into Stamp objects
+    just to compare: stamp_to_entry(expected_stamp) already produces
+    the exact dict shape/rounding a real write-terrain run would, which
+    is exactly what's sitting in the imported course's own
+    userLayers.json if it's unedited."""
+    expected_c = Counter(_canon_json_key(e) for e in expected_entries)
+    actual_c = Counter(_canon_json_key(e) for e in actual_entries)
+    extra = actual_c - expected_c
+    new_entries = []
+    for entry_json, count in extra.items():
+        new_entries.extend([json.loads(entry_json)] * count)
+    missing = expected_c - actual_c
+    return new_entries, sum(missing.values())
+
+
+def _placed_item_to_ingame_object(key: dict, item: dict, group_name: str) -> dict:
+    """One ingame_objects.json record from a raw placedObjects2/3.json
+    group Key + one of its Value["items"] entries -- inverse of
+    objects._placed_item plus the Key's own asset identity. `y` is
+    captured VERBATIM (see course_output/ingame_objects.py's module
+    docstring) -- None if the source had the literal "-Infinity"."""
+    position = item["position"]
+    rotation = item.get("rotation", {})
+    scale = item.get("scale", {})
+    y = position.get("y")
+    return {
+        "path": key.get("path"),
+        "category": key.get("category"),
+        "type": key.get("type"),
+        "theme": key.get("theme"),
+        "x": round(position["x"] + GRID_ORIGIN_OFFSET, 3),
+        "z": round(position["z"] + GRID_ORIGIN_OFFSET, 3),
+        "rotation_deg": rotation.get("y", 0.0),
+        "scale": scale.get("x", 1.0),
+        "y": None if isinstance(y, str) else y,
+        "group": group_name,
+    }
+
+
+def _stamp_entry_to_stamp(entry: dict) -> Stamp:
+    """One terrain.stamp.Stamp from a raw userLayers.json "height"
+    entry -- inverse of course_output.userLayers.stamp_to_entry: x/z
+    from position + GRID_ORIGIN_OFFSET, scale_x/z from scale, value
+    from value, brush from type, rotation from rotation.y, tool from
+    tool -- every field directly recoverable, nothing inferred."""
+    position = entry["position"]
+    rotation = entry.get("rotation", {})
+    scale = entry.get("scale", {})
+    return Stamp(
+        x=position["x"] + GRID_ORIGIN_OFFSET,
+        z=position["z"] + GRID_ORIGIN_OFFSET,
+        scale_x=scale.get("x", 1.0),
+        scale_z=scale.get("z", 1.0),
+        value=entry.get("value", 0.0),
+        brush=entry.get("type"),
+        rotation=rotation.get("y", 0.0),
+        tool=entry.get("tool", TOOL_FLATTEN),
+    )
+
+
+def step_import_ingame_edits(
+    working_dir: Path,
+    edited_course_file: Path,
+    game_version: str | None = None,
+    commit: bool = False,
+    group_name: str | None = None,
+    registration_marks: bool = False,
+    direct_height_shift: bool = True,
+    prune_overlapped_stamps: bool = True,
+) -> None:
+    """
+    Reconcile a saved, EDITED .course (exported by this tool, then
+    hand-edited in PGA Tour 2K's own in-game object/terrain editor and
+    saved) against what this tool currently tracks. Never touches
+    `working_dir/course/` itself: `edited_course_file` is extracted
+    into a scratch temp dir, diffed, and discarded.
+
+    "Expected" -- what this tool's own pipeline currently believes
+    should be in the course -- is recomputed in memory via the exact
+    same construction a real write would produce (_build_placed_objects
+    for objects, _load_normalized_stamps for terrain, at whatever
+    settings are currently saved in project.json), NOT a second, hand-
+    maintained copy that could silently drift out of sync. "Actual" is
+    read straight out of the freshly-extracted edited course's own
+    placedObjects2/3.json / userLayers.json.
+
+    Matching is exact, rounded value-equality (this project's usual
+    3-decimal convention) via a Counter multiset diff -- two
+    legitimately-identical placements (or two identical-valued stamps)
+    must not collapse into one under a plain set difference. Anything
+    in the saved file with no match (at that multiplicity) in the
+    recomputed "expected" set is new -- added in the in-game editor.
+    Anything expected but missing from the saved file is reported only,
+    never auto-removed -- removing tracked generation automatically
+    would be surprising and hard to undo correctly. A small in-game
+    nudge to an existing object therefore reads as "new" (the moved
+    one) plus a "missing" note for the original, not "moved" -- there's
+    no stable id in the game's own JSON to track identity by.
+
+    commit=False (the default) only prints the diff summary -- counts
+    per asset/group, new stamp count -- and changes nothing on disk.
+    commit=True additionally: appends every new placed-object item as a
+    new ingame_objects.json record (group=`group_name`, default
+    "Imported <today's date>"), and, if any new terrain stamps were
+    found, reverses them back into Stamp objects and writes them as the
+    next stamps_N.json layer (same append idiom every other generation
+    step uses -- folds into TerrainModel and undo-by-delete for free).
+
+    registration_marks/direct_height_shift/prune_overlapped_stamps
+    default to exactly what step_write_terrain/step_write_water default
+    to -- neither step persists these to project.json (they're plain
+    CLI/GUI-checkbox flags, not project settings), so there's no
+    "saved" value to read here either; pass the same flags you used for
+    the write-terrain run that actually produced the course you're
+    importing if you overrode them there.
+
+    Importing a .course this tool never produced (or an old export)
+    isn't specially detected -- "expected" just won't line up with
+    anything, and everything reads as new. That's accepted as a
+    (deliberately unoptimized) valid way to bulk-import a foreign
+    course's objects; only object Keys this project's own asset catalog
+    can resolve will actually convert into ingame_objects.json records
+    at commit time (unresolvable ones are skipped with a note -- see
+    course_output/ingame_objects.py's build_ingame_objects_v20XX).
+    """
+    edited_course_file = Path(edited_course_file)
+    if not edited_course_file.is_file():
+        raise StepError(f"{edited_course_file} doesn't exist.")
+
+    project = load_project(working_dir)
+    if game_version is None:
+        game_version = project.get("game_version", DEFAULT_GAME_VERSION)
+    if game_version not in IMPLEMENTED_GAME_VERSIONS:
+        raise StepError(
+            f"game_version={game_version!r} isn't implemented yet (only {IMPLEMENTED_GAME_VERSIONS} "
+            "are) -- see objects.py's module docstring."
+        )
+    schema = schema_for(game_version)
+
+    script = SCRIPT_DIR / "util" / "course_extract.py"
+    if not script.exists():
+        raise StepError(f"course_extract.py not found at {script}")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pga2k_import_"))
+    try:
+        print(f"Extracting {edited_course_file} -> {tmp_dir} "
+              f"(scratch -- not touching {working_dir / 'course'}) ...")
+        result = subprocess.run(
+            [sys.executable, str(script), str(edited_course_file), str(tmp_dir)],
+            capture_output=True, text=True,
+        )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.returncode != 0:
+            if result.stderr:
+                print(result.stderr, end="", file=sys.stderr)
+            raise StepError(f"course_extract.py failed (exit {result.returncode})")
+
+        nodes_dir = tmp_dir / "CourseDescription_nodes"
+        objects_node_path = nodes_dir / schema.objects_filename
+        if not objects_node_path.exists():
+            raise StepError(
+                f"{edited_course_file} has no {schema.objects_filename} under "
+                f"CourseDescription_nodes/ -- this project targets game_version={game_version!r}, "
+                "so it expects that file. If the edited course was actually saved from a different "
+                "game version, pass --game-version explicitly to match it."
+            )
+        actual_groups = load_placed_objects(objects_node_path)
+
+        userlayers_path = nodes_dir / "userLayers.json"
+        actual_stamp_entries: list[dict] = []
+        if userlayers_path.exists():
+            with userlayers_path.open(encoding="utf-8") as f:
+                actual_stamp_entries = json.load(f).get("height", [])
+
+        # "Expected" -- the exact construction a real write-objects/
+        # write-terrain run would produce right now, against whatever
+        # this project currently has saved (no override here: this is
+        # a diff against the CURRENT tracked state, not a one-off run).
+        (r_game_version, r_theme, r_tree_variety, r_tree_theme_config, r_tree_asset_paths,
+         r_tree_type_asset_paths, r_stake_asset_path, r_stake_buildings, r_waterfall_asset_path,
+         r_splash_asset_path) = _resolve_write_objects_params(
+            project, game_version, None, None, None, None, None, None, None, None, None,
+        )
+        expected_groups = _build_placed_objects(
+            working_dir, r_game_version, r_theme, r_tree_variety, r_tree_theme_config,
+            r_tree_asset_paths, r_tree_type_asset_paths, r_stake_asset_path, r_stake_buildings,
+            r_waterfall_asset_path, r_splash_asset_path, project,
+        )
+
+        expected_stamps, _bounds, _true_min, _true_max = _load_normalized_stamps(
+            working_dir, registration_marks, direct_height_shift, prune_overlapped_stamps,
+        )
+        expected_stamp_entries = [stamp_to_entry(s, game_version) for s in expected_stamps]
+
+        new_items_by_key, missing_counts_by_key, key_reprs = _diff_placed_object_items(
+            expected_groups, actual_groups,
+        )
+        new_stamp_entries, missing_stamp_count = _diff_stamp_entries(
+            expected_stamp_entries, actual_stamp_entries,
+        )
+
+        total_new_items = sum(len(v) for v in new_items_by_key.values())
+        total_missing_items = sum(missing_counts_by_key.values())
+
+        print(f"\nDiff vs. {edited_course_file}:")
+        if not new_items_by_key and not new_stamp_entries and not total_missing_items and not missing_stamp_count:
+            print("  No differences -- the imported course matches what this tool currently tracks exactly.")
+        for gk, items in new_items_by_key.items():
+            print(f"  {len(items)} new item(s): {_group_label(key_reprs[gk])}")
+        for gk, count in missing_counts_by_key.items():
+            print(f"  NOTE: {count} tracked item(s) missing from the imported course "
+                  f"(left untouched, not removed): {_group_label(key_reprs[gk])}")
+        if new_stamp_entries:
+            print(f"  {len(new_stamp_entries)} new terrain stamp(s)")
+        if missing_stamp_count:
+            print(f"  NOTE: {missing_stamp_count} tracked terrain stamp(s) missing from the imported "
+                  "course (left untouched, not removed)")
+
+        if not commit:
+            print("\n(dry run -- pass --commit to apply. Nothing was written.)")
+            return
+
+        if group_name is None:
+            group_name = f"Imported {time.strftime('%Y-%m-%d')}"
+
+        if total_new_items:
+            new_records = []
+            for gk, items in new_items_by_key.items():
+                key = key_reprs[gk]
+                for item in items:
+                    new_records.append(_placed_item_to_ingame_object(key, item, group_name))
+            ingame_objects_path = working_dir / INGAME_OBJECTS_FILE
+            existing_records = load_ingame_objects(ingame_objects_path) if ingame_objects_path.exists() else []
+            save_ingame_objects(existing_records + new_records, ingame_objects_path)
+            print(f"\nAppended {len(new_records)} object(s) (group={group_name!r}) to {ingame_objects_path}")
+
+        if new_stamp_entries:
+            new_stamps = [_stamp_entry_to_stamp(e) for e in new_stamp_entries]
+            next_n = len(_stamps_files(working_dir)) + 1
+            stamps_path = _stamps_dir(working_dir) / STAMPS_PATTERN.format(n=next_n)
+            save_stamp_file(
+                new_stamps, stamps_path, step="import-ingame-edits",
+                parameters={"source_course": str(edited_course_file), "group": group_name},
+            )
+            print(f"Wrote {len(new_stamps)} new terrain stamp(s) -> {stamps_path}")
+
+        if not total_new_items and not new_stamp_entries:
+            print("\nNothing to commit.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3298,6 +4098,7 @@ STEPS = {
     "pack-objects": step_pack_objects,
     "write-objects": step_write_objects,
     "repack": step_repack,
+    "import-ingame-edits": step_import_ingame_edits,
     "visualize": step_visualize,
 }
 
@@ -3777,6 +4578,11 @@ def main(argv: list[str] | None = None) -> int:
                               "unbuffered centerline alone would leave most of the actual playing "
                               "corridor outside the mask. This is a BUFFER (roughly half the resulting "
                               f"corridor width), not the total width (default: {DEFAULT_HOLE_CORRIDOR_BUFFER_PX})")
+    parser.add_argument("--no-preserve-synthetic", action="store_true",
+                         help="ingest-osm: rebuild features.geojson purely from map.osm, discarding "
+                              "GUI-authored cluster-fill border rings / 'Use mask' fills / per-feature "
+                              "mask & cluster-fill edits and generate-streams bank vegetation (the "
+                              "pre-existing behavior). Default: preserve them across the re-parse.")
     parser.add_argument("--max-planar-rms", type=float, default=None,
                          help="refine-terrain: shrink a hotspot's radius (before claim_radius_fraction/ "
                               "brush_radius_spread_ratio apply) until the region's actual LIDAR heights "
@@ -3839,8 +4645,10 @@ def main(argv: list[str] | None = None) -> int:
                               "if never set.")
     parser.add_argument("--max-new-stamps", type=int, default=None,
                          help="refine-terrain: cap on new detail stamps per pass (default: no cap)")
-    parser.add_argument("--course-file", type=Path, default=None,
-                         help="ingest-course: path to the .course file to extract")
+    parser.add_argument("--course-theme", type=str, default=None,
+                         help="ingest-course: theme name for template resolution (e.g. 'rustic') -- "
+                              "saved to project.json's \"theme\" field. Optional: only needed on the "
+                              "first --step ingest-course for a project, or to change theme afterward.")
     parser.add_argument("--game-version", type=str, default=None, choices=GAME_VERSIONS,
                          help="Project-level target game version -- selects which of objects.py's "
                               f"placedObjects2 schemas write-objects writes (implemented: "
@@ -3857,7 +4665,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tree-variety", action=argparse.BooleanOptionalAction, default=None,
                          help="write-objects (game_version=2019 only): use the full set of the "
                               "theme's tree types (normal + skinny) instead of one generic type. "
-                              "Default: use whatever's saved in project.json, or ON if never set.")
+                              "Ignored when a tree_themes.json species table covers the theme (the "
+                              "buckets are the pools). Default: saved value, or ON if never set.")
+    parser.add_argument("--tree-theme-config", type=str, default=None, metavar="PATH",
+                         help="write-objects (game_version=2019 only): override the default "
+                              "course_output/tree_themes.json (per-theme species buckets that route "
+                              "trees by their pga_tree_type tag -- e.g. leaf_type=needleleaved -> the "
+                              "theme's 'pine' ids). Default: saved value, else the bundled file.")
     parser.add_argument("--tree-asset-path", dest="tree_asset_paths", action="append", default=None,
                          help="write-objects (game_version=2021+ only): a Unity asset path (e.g. "
                               "'Assets/Trees/OakA') to draw "
@@ -3889,6 +4703,11 @@ def main(argv: list[str] | None = None) -> int:
                               "waterfall prefab placed at each stream drop (see --step generate-streams "
                               "/ streams.json). Default: use whatever's saved in project.json, or "
                               f"'{WATERFALL_DEFAULT_ASSET_PATH}' if never set.")
+    parser.add_argument("--splash-asset-path", type=str, default=None,
+                         help="write-objects (game_version=2021+ only): Unity asset path for the "
+                              "'low splash' prefab placed on the tile each stream drop lands in. "
+                              "Default: use whatever's saved in project.json, or "
+                              f"'{WATERSPLASH_DEFAULT_ASSET_PATH}' (unverified) if never set.")
     parser.add_argument("--collection-library", type=Path, default=None,
                          help="generate-collections: directory of *.json collection templates (see "
                               "course_output/collection_library.py). Default: project.json's "
@@ -3911,6 +4730,19 @@ def main(argv: list[str] | None = None) -> int:
                               "used it; pass this flag explicitly every time you want it.")
     parser.add_argument("--repack-filename", type=str, default=None,
                          help="repack: output filename (without .course extension)")
+    parser.add_argument("--edited-course", type=Path, default=None,
+                         help="import-ingame-edits: path to a saved .course file (exported by this "
+                              "tool, then hand-edited in PGA Tour 2K's own in-game editor and saved) "
+                              "to reconcile against what this tool currently tracks. Required for "
+                              "this step.")
+    parser.add_argument("--commit", action="store_true",
+                         help="import-ingame-edits: apply the diff (append new objects to "
+                              "ingame_objects.json, write a new stamps_N.json layer for new terrain "
+                              "stamps) instead of just printing a summary (the default, dry-run).")
+    parser.add_argument("--import-group", type=str, default=None,
+                         help="import-ingame-edits, --commit only: label stored on every new "
+                              "ingame_objects.json record from this run (see the Objects tab / "
+                              "course_output/ingame_objects.py). Default: 'Imported <today's date>'.")
     args = parser.parse_args(argv)
 
     working_dir: Path = args.working_dir
@@ -3927,12 +4759,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.step == "ingest-laz":
             step_ingest_laz(working_dir, args.projection, args.fill_heightmap_gaps)
         elif args.step == "ingest-osm":
-            step_ingest_osm(working_dir, args.height_mask_buffer_px, args.hole_corridor_buffer_px)
+            step_ingest_osm(working_dir, args.height_mask_buffer_px, args.hole_corridor_buffer_px,
+                            preserve_synthetic=not args.no_preserve_synthetic)
         elif args.step == "ingest-course":
-            if args.course_file is None:
-                print("error: --step ingest-course requires --course-file <path>", file=sys.stderr)
-                return 1
-            step_ingest_course(working_dir, args.course_file)
+            step_ingest_course(working_dir, args.course_theme)
         elif args.step == "dig-water":
             step_dig_water(working_dir, args.dig_depth, args.dig_buffer)
         elif args.step == "generate-terrain":
@@ -4045,13 +4875,24 @@ def main(argv: list[str] | None = None) -> int:
             step_write_objects(
                 working_dir, args.game_version, _resolve_theme(args.theme), args.tree_variety,
                 args.tree_asset_paths, tree_type_asset_paths, args.stake_asset_path,
-                args.stake_buildings, args.waterfall_asset_path,
+                args.stake_buildings, args.waterfall_asset_path, args.splash_asset_path,
+                args.tree_theme_config,
             )
         elif args.step == "repack":
             if not args.repack_filename:
                 print("error: --step repack requires --repack-filename <name>", file=sys.stderr)
                 return 1
             step_repack(working_dir, args.repack_filename)
+        elif args.step == "import-ingame-edits":
+            if not args.edited_course:
+                print("error: --step import-ingame-edits requires --edited-course <path>", file=sys.stderr)
+                return 1
+            step_import_ingame_edits(
+                working_dir, args.edited_course, game_version=args.game_version, commit=args.commit,
+                group_name=args.import_group, registration_marks=args.registration_marks,
+                direct_height_shift=args.direct_height_shift,
+                prune_overlapped_stamps=args.prune_overlapped_stamps,
+            )
         elif args.step == "visualize":
             step_visualize(working_dir, overwrite_current_version=True, error_resolution=args.error_resolution)
     except StepError as e:

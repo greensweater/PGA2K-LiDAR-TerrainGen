@@ -1,6 +1,8 @@
 {
   "source_theme": "rustic (theme id 11)",
+  "source_theme_id": 11,
   "note": "category/type -> v2021+ asset path mapping, derived by matching item positions between a hand-placed v2019 placedObjects2.json and the same file re-saved from v2021 (placedObjects3.json). spacing (meters, center-to-center) is back-calculated per asset from a maxed-out cluster (spacing = radius / sqrt(count/pi)), taking the largest-radius sample seen across all maxed-cluster passes provided for that asset. Category 1 (rocks) types 1-6 borrow type 0's spacing and types 8-9 borrow type 7's spacing (not independently measured -- assigned per instruction). spacing is null where no maxed-cluster sample exists and no borrowed value was assigned. cluster_radius on each category is the largest cluster radius observed for any measured asset in that category (the apparent engine-side max radius cap); null for categories with no cluster samples at all.",
+  "native_size_note": "native_height_m / native_canopy_radius_m (meters) are per-prefab in-game measurements, category-0 only, valid ONLY for source_theme_id (type ids are per-theme). Method: place the asset at scale 1, flatten the ground under it to a known datum (the capture used flatten-to-1.0), drop a type-73 hard-round sculpt stamp whose scale.x you match to the crown radius, and a water plane whose surface Y you set to the crown top; native_height_m = water_Y - datum, native_canopy_radius_m = stamp scale.x. null = not measured -> course_output/objects.py._tree_scale falls back to the course-relative height remap for that prefab. Re-capture another theme with util/extract_tree_dimensions.py.",
   "missing_spacing_data": [],
   "categories": [
     {
@@ -60,168 +62,216 @@
       "type": 0,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Lombardy_Poplar/Prefabs/Lombardy_Popular_Desktop01",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 30.7,
+      "native_canopy_radius_m": 14.0
     },
     {
       "category": 0,
       "type": 1,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Lombardy_Poplar/Prefabs/Lombardy_Popular_Desktop02",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 28.1,
+      "native_canopy_radius_m": 11.9
     },
     {
       "category": 0,
       "type": 2,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/European_White_Birch/Prefabs/European_White_Birch_Desktop04",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 18.0,
+      "native_canopy_radius_m": 7.5
     },
     {
       "category": 0,
       "type": 4,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Green_Ash/Prefabs/Green_Ash_Desktop_101",
-      "spacing": 11.3943
+      "spacing": 11.3943,
+      "native_height_m": 31.5,
+      "native_canopy_radius_m": 15.3
     },
     {
       "category": 0,
       "type": 5,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Green_Ash/Prefabs/Green_Ash_Desktop_102",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 26.5,
+      "native_canopy_radius_m": 12.5
     },
     {
       "category": 0,
       "type": 6,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/American_Elm/Prefabs/American_Elm_Desktop02",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 20.5,
+      "native_canopy_radius_m": 12.7
     },
     {
       "category": 0,
       "type": 7,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/American_Elm/Prefabs/American_Elm_Desktop03",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 26.1,
+      "native_canopy_radius_m": 12.5
     },
     {
       "category": 0,
       "type": 8,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Red_Maple/Prefabs/Red_Maple_Desktop01",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 30.5,
+      "native_canopy_radius_m": 12.3
     },
     {
       "category": 0,
       "type": 9,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/American_Sycamore/Prefabs/American_Sycamore_Desktop02",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 29.8,
+      "native_canopy_radius_m": 9.7
     },
     {
       "category": 0,
       "type": 10,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/White_Oak/Prefabs/White_Oak_Desktop01",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 29.5,
+      "native_canopy_radius_m": 18.8
     },
     {
       "category": 0,
       "type": 11,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/White_Oak/Prefabs/White_Oak_Desktop02",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 28.4,
+      "native_canopy_radius_m": 21.7
     },
     {
       "category": 0,
       "type": 12,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/White_Oak/Prefabs/White_Oak_Desktop03",
-      "spacing": 11.3943
+      "spacing": 11.3943,
+      "native_height_m": 24.6,
+      "native_canopy_radius_m": 17.5
     },
     {
       "category": 0,
       "type": 13,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Douglas_Fir/Prefabs/DouglasFir_Desktop02",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 27.6,
+      "native_canopy_radius_m": 6.4
     },
     {
       "category": 0,
       "type": 14,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Alaska_Cedar/Prefabs/AlaskaCedar_Desktop02",
-      "spacing": 15.9521
+      "spacing": 15.9521,
+      "native_height_m": 34.4,
+      "native_canopy_radius_m": 8.1
     },
     {
       "category": 0,
       "type": 15,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Generic_Conifer/Prefabs/Generic_Conifer_Desktop02",
-      "spacing": 11.3943
+      "spacing": 11.3943,
+      "native_height_m": 22.1,
+      "native_canopy_radius_m": 7.8
     },
     {
       "category": 0,
       "type": 16,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Trees/Eastern_White_Pine/Prefabs/Eastern_White_Pine_Desktop02",
-      "spacing": 11.3943
+      "spacing": 11.3943,
+      "native_height_m": 24.5,
+      "native_canopy_radius_m": 7.9
     },
     {
       "category": 0,
       "type": 17,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Bushes/AutumnBushes/Prefabs/AutumnBush5A",
-      "spacing": 8.8623
+      "spacing": 8.8623,
+      "native_height_m": 2.3,
+      "native_canopy_radius_m": 2.3
     },
     {
       "category": 0,
       "type": 18,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Bushes/AutumnBushes/Prefabs/AutumnBush5B",
-      "spacing": 8.8623
+      "spacing": 8.8623,
+      "native_height_m": 3.2,
+      "native_canopy_radius_m": 1.8
     },
     {
       "category": 0,
       "type": 19,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Bushes/AutumnBushes/Prefabs/AutumnBush5C",
-      "spacing": 9.9701
+      "spacing": 9.9701,
+      "native_height_m": 2.1,
+      "native_canopy_radius_m": 1.4
     },
     {
       "category": 0,
       "type": 20,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Bushes/AutumnBushes/Prefabs/AutumnBush6A",
-      "spacing": 8.8623
+      "spacing": 8.8623,
+      "native_height_m": 3.8,
+      "native_canopy_radius_m": 3.8
     },
     {
       "category": 0,
       "type": 21,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Bushes/TropicalBushes/Prefabs/TropicalBush1A",
-      "spacing": 8.8623
+      "spacing": 8.8623,
+      "native_height_m": 3.2,
+      "native_canopy_radius_m": 3.6
     },
     {
       "category": 0,
       "type": 22,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Bushes/TropicalBushes/Prefabs/TropicalBush2A",
-      "spacing": 8.8623
+      "spacing": 8.8623,
+      "native_height_m": 2.8,
+      "native_canopy_radius_m": 2.7
     },
     {
       "category": 0,
       "type": 23,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Bushes/TropicalBushes/Prefabs/TropicalBush2B",
-      "spacing": 9.9701
+      "spacing": 9.9701,
+      "native_height_m": 3.2,
+      "native_canopy_radius_m": 2.9
     },
     {
       "category": 0,
       "type": 24,
       "theme": true,
       "path": "Assets/Foliage/SpeedTree/Bushes/TropicalBushes/Prefabs/TropicalBush4B",
-      "spacing": 8.8623
+      "spacing": 8.8623,
+      "native_height_m": 3.3,
+      "native_canopy_radius_m": 2.3
     },
     {
       "category": 1,
