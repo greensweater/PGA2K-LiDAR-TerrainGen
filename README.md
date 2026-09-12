@@ -1,4 +1,4 @@
-This is a PGA2k utility to generate .course files from USGS LiDAR and OpenStreetView OSM, based on Chad Rockey's excellent [TCG Designer Tools](https://github.com/chadrockey/TGC-Designer-Tools).
+This is a PGA2k utility to generate .course files from USGS LiDAR and OpenStreetView OSM, based on Chad Rockey's excellent [TCG Designer Tools](https://github.com/chadrockey/TGC-Designer-Tools). Built with Claude Code.
 
 ## How-To
 
@@ -32,7 +32,7 @@ Steps:
 14. Under "Splines", click "Write Splines" to generate course objects from OSM.
 15. Under "Splines", filter by "hole" to select up to 18 holes for your course (apply Mask to exclude holes from output). Click "Write Holes" to add holes.
 16. Click "Repack" to output the .course file to the working directory (give it a name first; ".course" suffix is not needed).
-17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. Only v2019 is supported but .course can be opened in v2021. (TODO: compatibility)
+17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. ~~Only v2019 is supported but .course can be opened in v2021.~~ Choose the game version and refresh all outputs to target v2019 or v2021. (TODO: v2023, v2025)
 
 ### Funsies
 
@@ -40,12 +40,13 @@ Steps:
 2. Apply a tight landscaping on cart paths so they line up nicely
 3. Import collections of objects & splines (e.g. house with landscaping, driveway, car, patio set, deck, pergola; hole marker with mulch, bench, ball washer, bin; custom combinations of fencing/bridges/objects) and place/orient it using OSM tags
 4. Create "borders" using splines filled with object clusters, e.g. water hazard edges, course O.B. areas
+5. Use alt-drag marquee to remove masked areas from borders
+6. Create streams on OSM water object splines (stream, creek, ditch) adds water tiles, low falls, low splash, plus rocks and vegetation
 
 ### TODO
-
 - ~~Trees from LiDAR~~ done
 - ~~Water bodies & streams with procedurally-generated natural features~~ done
 - ~~Assign tree types~~ done — a `natural=wood` polygon tagged `leaf_type=needleleaved` (or `broadleaved`) hints untyped trees inside it; per-theme species buckets in `course_output/tree_themes.json` map those to the theme's actual pine/deciduous asset ids (v2019) or `--tree-type-asset-path` (v2021+)
 - ~~Calibrate tree size~~ done — placed scale = LiDAR-detected canopy height ÷ the prefab's measured native height (`asset_catalog.json` `native_height_m`, captured with `util/extract_tree_dimensions.py`); falls back to a course-relative remap for un-measured prefabs / non-rustic themes
-- Assign vegetation using customized OSM ways
-- Assign heavy rough to clear built-in natural objects and create OB
+- ~~Assign vegetation using customized OSM ways~~ done
+- ~~Assign heavy rough to clear built-in natural objects and create OB~~ done
