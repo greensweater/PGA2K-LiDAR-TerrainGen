@@ -186,7 +186,7 @@ class _BrushProfileRegistry(dict):
     caches it, and warns once -- rather than raising KeyError. This is
     what lets a stamp carrying one of the un-ingested brush types (e.g. a
     collection berm captured with brush 76) still evaluate instead of
-    crashing TerrainModel / height_fit / stamp_pruning / the visualizer.
+    crashing TerrainModel / height_fit / the visualizer.
 
     ``.get()`` and ``in`` keep plain dict semantics (unregistered -> None
     / False) until something forces the synthesis via ``[]`` -- callers

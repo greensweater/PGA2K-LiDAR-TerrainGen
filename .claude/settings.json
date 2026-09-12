@@ -16,7 +16,18 @@
       "Bash(python -m py_compile PGA2k_gen.py PGA2k_gen_gui.py course_output/*.py)",
       "Bash(python -m py_compile PGA2k_gen.py PGA2k_gen_gui.py course_output/ingame_objects.py course_output/objects.py course_output/collections.py)",
       "Bash(mkdir -p /tmp/pga2k_test_wd 2>/dev/null; echo done)",
-      "Bash(python \"/c/Users/andy_/AppData/Local/Temp/claude/c--source-PGA2K-LiDAR-TerrainGen-PGA2K-LiDAR-TerrainGen/41eccdcd-fe9b-4971-b231-63dcdd1f9e0d/scratchpad/test_import_ingame_edits.py\")"
+      "Bash(python \"/c/Users/andy_/AppData/Local/Temp/claude/c--source-PGA2K-LiDAR-TerrainGen-PGA2K-LiDAR-TerrainGen/41eccdcd-fe9b-4971-b231-63dcdd1f9e0d/scratchpad/test_import_ingame_edits.py\")",
+      "Bash(python -m py_compile PGA2k_gen.py PGA2k_gen_gui.py)",
+      "Bash(python -c \"import PGA2k_gen; import PGA2k_gen_gui\")",
+      "Bash(python -c \"import PGA2k_gen; print\\('import OK'\\)\")",
+      "Bash(python -c \"import PGA2k_gen_gui; print\\('import OK'\\)\")",
+      "Bash(python \"C:\\\\Users\\\\andy_\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--source-PGA2K-LiDAR-TerrainGen-PGA2K-LiDAR-TerrainGen\\\\d96b97f2-fe9e-470e-8e91-a142e5934efa\\\\scratchpad\\\\test_blocked_by.py\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('PGA2k_gen.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "Bash(python -c \"import PGA2k_gen; print\\('import ok'\\); print\\('push-collection' in PGA2k_gen.STEPS\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('PGA2k_gen_gui.py'\\).read\\(\\)\\); print\\('syntax ok'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('PGA2k_gen_gui.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax ok'\\)\")",
+      "Bash(python -m py_compile PGA2k_gen_gui.py course_output/objects.py PGA2k_gen.py)",
+      "Bash(python -m py_compile terrain/streams.py course_output/water.py PGA2k_gen.py PGA2k_gen_gui.py)"
     ],
     "additionalDirectories": [
       "C:\\Users\\andy_\\AppData\\Local\\Temp\\pga2k_smoketest2",

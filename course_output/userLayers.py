@@ -414,18 +414,21 @@ def stamp_to_entry(stamp: Stamp, game_version: str = DEFAULT_GAME_VERSION) -> di
 
 def write_user_layers(
     path: Path, stamps: Optional[Sequence[Stamp]] = None, water: Optional[Sequence[dict]] = None,
+    oob: Optional[Sequence[dict]] = None,
     game_version: str = DEFAULT_GAME_VERSION,
 ) -> None:
     """
     Write into the userLayers.json at `path`, preserving every other
     key already there. If `stamps` is given, replaces the "height" key;
     if `water` is given (see water.py's build_water_objects), replaces
-    the "water" key -- each independently, so a caller can write just
-    one without disturbing the other (e.g. PGA2k_gen.py's
-    step_write_terrain writes only "height", step_write_water only
-    "water"). Either or both may be omitted (None), in which case that
-    key is left exactly as found -- same "only touch what you were
-    actually asked to write" principle throughout.
+    the "water" key; if `oob` is given (already-formatted
+    "outOfBounds" entries, see course_output/out_of_bounds.py), replaces
+    the "outOfBounds" key -- each independently, so a caller can write
+    just one without disturbing the others (e.g. PGA2k_gen.py's
+    step_write_terrain writes "height" + "outOfBounds", step_write_water
+    only "water"). Any omitted (None) key is left exactly as found --
+    same "only touch what you were actually asked to write" principle
+    throughout.
 
     If `path` doesn't exist yet, falls back to an all-empty schema
     (_BLANK_USER_LAYERS_SCHEMA) rather than writing a bare array --
@@ -443,6 +446,8 @@ def write_user_layers(
         data["height"] = [stamp_to_entry(s, game_version) for s in stamps]
     if water is not None:
         data["water"] = list(water)
+    if oob is not None:
+        data["outOfBounds"] = list(oob)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:

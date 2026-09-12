@@ -121,6 +121,17 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     if tags.get("pga_collection") is not None:
         return ("collection", False)
 
+    # pga_parking=<pool filter | "yes"> -- this project's own tag (not OSM
+    # standard) for a way (an aisle / service lane / kerb line) to be
+    # lined with parked-car props. Always a line, never an area: the
+    # value ("yes"/"all" or a comma list of colours and/or "car"/"van")
+    # stays in the Feature's tags for step_generate_parking to resolve
+    # against course_output/vehicle_catalog.json. No surface spline /
+    # hole / mask consumer matches "parking". A real amenity=parking
+    # polygon still paints pavement independently (handled below).
+    if tags.get("pga_parking") is not None:
+        return ("parking", False)
+
     # area:highway=footway -- the OSM convention for a closed way meant
     # to render as a filled AREA (a plaza-style wide path) rather than
     # a linear route, independent of (and not always accompanied by) a

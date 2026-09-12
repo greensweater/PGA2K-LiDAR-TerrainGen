@@ -296,7 +296,7 @@ high point." Four things changed to get here:
 
 This means water objects must be built AFTER terrain generation/
 refinement AND normalize_stamp_heights have both already run (see
-PGA2k_gen.py's step_write_water, which re-runs that same load/prune/
+PGA2k_gen.py's step_write_water, which re-runs that same load/
 normalize pipeline itself via _load_normalized_stamps rather than
 trusting whatever's already on disk) -- not before, and not against the
 pre-normalization stamp list. A water body whose footprint yields no
@@ -1392,7 +1392,15 @@ def build_water_objects(
 
 
 def build_stream_water_objects(
-    stream_records: Sequence[dict], height_shift_m: float = 0.0, printf=print,
+    stream_records: Sequence[dict], height_shift_m: float = 0.0,
+    *,
+    bed_sampler=None,
+    water_fill_depth_m: float | None = None,
+    water_base_width_m: float | None = None,
+    water_widen_per_depth: float | None = None,
+    water_widen_per_descent: float | None = None,
+    level_margin_m: float | None = None,
+    printf=print,
 ) -> list[dict]:
     """
     Flowing type-72 water tiles along every stream centerline (see
@@ -1407,10 +1415,15 @@ def build_stream_water_objects(
     spreads wider before the banks clip it). build_stream_records reuses
     the same helper to hang a waterfall + splash on each tile seam.
 
-    bed_h in streams.json is the pre-normalization absolute height;
+    `bed_sampler(points (N,2)) -> heights (N,)` fits each tile's level to
+    the ACTUAL carved terrain (percentile of centerline samples minus
+    level_margin_m), exactly like a pond -- step_write_water passes the
+    same already-normalized TerrainModel.evaluate_many the pond fit uses,
+    with height_shift_m=0. Without a sampler, tile level falls back to
+    streams.json's pre-normalization bed_h + STREAM_WATER_FILL_DEPTH_M and
     height_shift_m (project.json's output_height_shift_m, persisted by
-    write-terrain) lifts it into the written course's normalized frame.
-    Run write-terrain before write-water.
+    write-terrain) lifts it into the normalized frame. Either way, run
+    write-terrain before write-water.
 
     Kept a separate builder (not merged into build_water_objects) on
     purpose: streams stay their own collection so a later v2025 target
@@ -1424,6 +1437,20 @@ def build_stream_water_objects(
     """
     from terrain.streams import STREAM_WATER_FLOW_SPEED, stream_water_tiles
 
+    # Only forward the overrides that were actually given -- omitted ones
+    # fall through to stream_water_tiles' own module-constant defaults, so
+    # a bare call stays identical to before.
+    tile_kwargs = {
+        k: v for k, v in {
+            "bed_sampler": bed_sampler,
+            "fill_depth_m": water_fill_depth_m,
+            "base_width_m": water_base_width_m,
+            "widen_per_depth": water_widen_per_depth,
+            "widen_per_descent": water_widen_per_descent,
+            "level_margin_m": level_margin_m,
+        }.items() if v is not None
+    }
+
     entries: list[dict] = []
     tiles = 0
     for record in stream_records:
@@ -1435,7 +1462,7 @@ def build_stream_water_objects(
             continue
         source_bed = pearls[0][2]
 
-        for tile in stream_water_tiles(pearls, source_bed):
+        for tile in stream_water_tiles(pearls, source_bed, **tile_kwargs):
             # _water_entry mirrors rotation_deg into a compass bearing
             # (rotation.y = -rotation_deg % 360), so pre-negate the tile
             # bearing to land on it exactly; long axis (scale.z) then runs

@@ -390,6 +390,58 @@ def render_mask_preview(mask_geometry: Optional[BaseGeometry], bounds: BoundingB
     _save(fig, path)
 
 
+def render_oob_preview(
+    records: Sequence,
+    playable_geometry: Optional[BaseGeometry],
+    bounds: BoundingBox,
+    path: Path,
+) -> None:
+    """
+    Diagnostic PNG for step_generate_oob: the playable-area union
+    (green outline) plus every out-of-bounds brush footprint -- round
+    caps (type 8) as circles, stretched "smooth square" segments
+    (type 15) as rotated rectangles. Standalone (opaque), not an
+    overlay -- generate-oob writes no stamp layer, so this just gives
+    the step something to look at (the "never a black box" principle).
+
+    Each `record` is a course_output.out_of_bounds.OOBRecord or an
+    equivalent dict with x/z/scale_x/scale_z/rotation/brush.
+    """
+    fig, ax = _new_overlay_figure(bounds)
+    fig.patch.set_alpha(1.0)
+    fig.patch.set_facecolor("white")
+    ax.patch.set_alpha(1.0)
+    ax.set_facecolor("white")
+
+    if playable_geometry is not None and not playable_geometry.is_empty:
+        parts = (
+            playable_geometry.geoms if hasattr(playable_geometry, "geoms")
+            else [playable_geometry]
+        )
+        for part in parts:
+            if part.geom_type != "Polygon":
+                continue
+            ax.plot(*part.exterior.xy, color="#2E8B57", linewidth=0.8, alpha=0.8)
+
+    for rec in records:
+        x = getattr(rec, "x", None) if not isinstance(rec, dict) else rec["x"]
+        z = getattr(rec, "z", None) if not isinstance(rec, dict) else rec["z"]
+        sx = getattr(rec, "scale_x", None) if not isinstance(rec, dict) else rec["scale_x"]
+        sz = getattr(rec, "scale_z", None) if not isinstance(rec, dict) else rec["scale_z"]
+        rot = getattr(rec, "rotation", 0.0) if not isinstance(rec, dict) else rec.get("rotation", 0.0)
+        brush = getattr(rec, "brush", None) if not isinstance(rec, dict) else rec["brush"]
+        if brush == 8:
+            ax.add_patch(Circle((x, z), sx, facecolor="#B22222", edgecolor="none", alpha=0.35))
+        else:
+            a = math.radians(rot)
+            ca, sa = math.cos(a), math.sin(a)
+            corners = [(-sx, -sz), (sx, -sz), (sx, sz), (-sx, sz)]
+            world = [(x + px * ca + pz * sa, z - px * sa + pz * ca) for px, pz in corners]
+            ax.add_patch(Polygon(world, facecolor="#4169E1", edgecolor="none", alpha=0.30))
+
+    _save(fig, path)
+
+
 def render_lidar_preview(cloud: PointCloud, path: Path, max_points: int = 200_000) -> None:
     """
     Scatter the point cloud in the x/z plane, colored by elevation.

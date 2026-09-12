@@ -56,17 +56,28 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from constants import (  # noqa: E402
     COURSE_SIZE_M, PREVIEW_COMPOSITE, PREVIEW_DIR, PREVIEW_ERROR, PREVIEW_HEIGHT, PREVIEW_HEX,
     PREVIEW_LIDAR, PREVIEW_LIDAR_GROUND, PREVIEW_LIDAR_HEIGHTMAP, PREVIEW_OSM, PREVIEW_OSM_FULL,
-    PREVIEW_STAMPS, STAMPS_DIR,
+    PREVIEW_STAMPS, PROJECT_FILE, STAMPS_DIR,
 )
 from PGA2k_gen import (  # noqa: E402
-    COLLECTIONS_FILE, DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M, FEATURES_FILE,
-    HEIGHT_MASK_FILE, HEIGHTMAP_FILE, INGAME_OBJECTS_FILE, OBJECT_LIST_FILE, OBJECTS_FILE,
-    PGA_COLLECTION_TAG, load_all_stamps, load_project, save_project,
+    BLANK_TEMPLATE_COURSE_FILE, PUSH_COLLECTION_COURSE_FILE,
+    COLLECTIONS_FILE, DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M,
+    DEFAULT_REMOVE_COVERED_MARGIN_M, EXPORT_STATUS_FRESH, EXPORT_STATUS_MISSING, EXPORT_STATUS_STALE,
+    FEATURES_FILE, HEIGHT_MASK_FILE, HEIGHTMAP_FILE, INGAME_OBJECTS_FILE, OBJECT_LIST_FILE, OBJECTS_FILE,
+    OOB_FILE, PARKING_FILE, PGA_COLLECTION_TAG, export_status, load_all_stamps, load_project, save_project,
+)
+from course_output.out_of_bounds import (  # noqa: E402
+    OOB_BAND_WIDTH_M, OOB_CAP_SCALE_RATIO, OOB_INNER_BUFFER_M, OOB_MERGE_GAP_M, OOB_SIMPLIFY_TOL_M,
+)
+from course_output.parking import (  # noqa: E402
+    PARKING_ACCENT_COUNT, PARKING_COLOR_WEIGHTS, PARKING_MAX_VARIANTS, PARKING_OFFSET_M,
+    PARKING_ORIENTATION, PARKING_SIDES, PARKING_SKIP_PROB, PARKING_SPACING_M,
+    iter_parking_cars, load_parking_records,
 )
 from course_output.ingame_objects import (  # noqa: E402
     load_ingame_objects, remove_ingame_object_groups, save_ingame_objects, summarize_ingame_object_groups,
 )
 from course_output.collection_library import (  # noqa: E402
+    _slug as _collection_slug,
     capture_from_course, default_library_dir, load_library, save_collection,
 )
 from course_output.collections import (  # noqa: E402
@@ -81,8 +92,9 @@ from course_output.asset_catalog import (  # noqa: E402
     ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS,
 )
 from course_output.object_clusters import (  # noqa: E402
-    CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_STAMPS, CLUSTER_FILL_SOURCE_BORDER,
-    CLUSTER_FILL_SOURCE_MANUAL, DEFAULT_FILL_DENSITY, DEFAULT_RASTER_RATIO,
+    CLUSTER_FILL_MODE_AUTO, CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_STAMPS, CLUSTER_FILL_SOURCE_BORDER,
+    CLUSTER_FILL_SOURCE_MANUAL, DEFAULT_FILL_DENSITY, DEFAULT_RASTER_RATIO, DEFAULT_SPLINE_FILL_DENSITY,
+    DEFAULT_SPLINE_FILL_MAX_PCT, SPLINE_FILL_MAX_PCT_BY_CATEGORY,
     PGA_CLUSTER_CENTERLINE_REF_TAG, PGA_CLUSTER_FILLS_TAG, SYNTHETIC_BORDER_CENTERLINE_KIND,
     SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND, build_border_ring_geometry, next_synthetic_osm_id,
     pack_cluster_records, pack_spline_records,
@@ -107,6 +119,11 @@ from terrain.rastergrid import (  # noqa: E402
 )
 from terrain.cart_paths import (  # noqa: E402
     CART_PATH_STAMP_RADIUS, CART_PATH_SPACING_M, CART_PATH_HEIGHT_AVG_RADIUS_M,
+)
+from terrain.streams import (  # noqa: E402
+    BANK_VEG_WIDTH_M, STREAM_DEPTH_M, STREAM_HALF_WIDTH_M, STREAM_WATER_BASE_WIDTH_M,
+    STREAM_WATER_FILL_DEPTH_M, STREAM_WATER_LEVEL_MARGIN_M, STREAM_WATER_WIDEN_PER_DEPTH,
+    STREAM_WATER_WIDEN_PER_DESCENT,
 )
 from course_output.water import (  # noqa: E402
     fit_water_rectangle, fit_water_tiles, fit_water_stripes,
@@ -145,6 +162,7 @@ PREVIEW_FILES = [
     "preview_lidar_ground.png",
     "preview_height.png",
     "preview_composite.png",
+    "preview_oob.png",
 ]
 
 # Game version -> Courses folder name under .../AppData/LocalLow/2K/.
@@ -298,6 +316,7 @@ class PGAGenGUI:
         self._stop_requested = False
         self._step_start_time = 0.0
         self._step_on_done: Optional[Callable[[], None]] = None  # see _run_step's on_done param
+        self._last_step_ok = False  # set in _poll_log_queue before on_done fires; on_done runs win/lose
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
         self._cached_mask_merged_geom = None  # see _get_cached_mask_merged_geometry
         self._cached_mask_geom_key = None
@@ -305,9 +324,12 @@ class PGAGenGUI:
         self._cached_composited_base_key = None
         self._cached_geo_overlay = None  # see _show_preview's geo-overlay cache (mask buffer/spline highlight, also zoom-independent)
         self._cached_geo_overlay_key = None
+        self._cached_water_preview_rects = None  # see _get_water_preview_rects
+        self._cached_water_preview_rects_key = None
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
+        self.objects_tree_asset_paths: list[str] = []  # v2021+ placed-tree asset pool; [] = use bundled rustic catalog default (see _open_tree_assets_dialog)
         self._cluster_fill_rows = []  # (spline_osm_ids_str, asset_label, ratio, density, source, category, type_) -- see _build_cluster_fill_rows
         self._ingame_object_groups = []  # (group_name, count) -- see summarize_ingame_object_groups
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
@@ -327,8 +349,11 @@ class PGAGenGUI:
         self._suppress_repack_filename_save = False
         self._suppress_game_version_save = False
         self._suppress_objects_theme_save = False
+        self._suppress_tree_assets_save = False
+        self._ui_ready = False
 
         self._build_layout()
+        self._ui_ready = True
         self._poll_log_queue()
 
         self.working_dir.trace_add("write", lambda *a: self._on_working_dir_changed())
@@ -501,27 +526,55 @@ class PGAGenGUI:
         ttk.Entry(wd_row, textvariable=self.working_dir, width=26).pack(side="left", fill="x", expand=True)
         ttk.Button(wd_row, text="Browse...", command=self._browse_working_dir).pack(side="left")
 
-        ttk.Label(parent, text="Game version:").pack(anchor="w")
+        version_row = ttk.Frame(parent)
+        version_row.pack(fill="x", pady=(0, 8))
+        version_col = ttk.Frame(version_row)
+        version_col.pack(side="left")
+        ttk.Label(version_col, text="Game version:").pack(anchor="w")
         game_version_box = ttk.Combobox(
-            parent, textvariable=self.game_version, state="readonly", width=8, values=list(GAME_VERSIONS),
+            version_col, textvariable=self.game_version, state="readonly", width=8, values=list(GAME_VERSIONS),
         )
-        game_version_box.pack(anchor="w", pady=(2, 8))
+        game_version_box.pack(anchor="w", pady=(2, 0))
         _Tooltip(game_version_box, "PGA 2K's .course schema diverges across versions -- currently "
                  f"only {IMPLEMENTED_GAME_VERSIONS} are actually implemented (see objects.py's "
                  "module docstring); the others can be selected and saved, but write/repack steps "
                  "will raise a clear error until their schema is confirmed. Project-level, saved "
                  "immediately, used by write-objects and (eventually) write-splines/write-terrain/"
                  "repack.")
+        reset_baseline_btn = ttk.Button(
+            version_row, text="Reset Course Baseline", command=self._run_ingest_course, width=22,
+        )
+        reset_baseline_btn.pack(side="left", padx=(12, 0), pady=(0, 2), anchor="s")
+        _Tooltip(reset_baseline_btn, "Optional. course/ is auto-provisioned from the bundled "
+                 "templates/{game_version}_{theme}.course the first time any write/repack step needs "
+                 "it -- no manual ingest required. Only use this to explicitly re-extract course/ "
+                 "from scratch, e.g. after changing Game version or Theme once course/ already "
+                 "exists (which auto-provisioning won't do by itself, since it only fills in a "
+                 "missing course/, never overwrites an existing one).")
 
         ttk.Label(parent, text="Theme:").pack(anchor="w")
         self._theme_name_to_id = {"(not set)": None}
         self._theme_name_to_id.update({name: theme_id for theme_id, name in THEMES_V2019.items()})
         self.objects_theme_var = tk.StringVar(value="(not set)")
+        theme_row = ttk.Frame(parent)
+        theme_row.pack(fill="x", pady=(2, 8))
         theme_box = ttk.Combobox(
-            parent, textvariable=self.objects_theme_var, state="readonly", width=14,
+            theme_row, textvariable=self.objects_theme_var, state="readonly", width=14,
             values=list(self._theme_name_to_id.keys()),
         )
-        theme_box.pack(anchor="w", pady=(2, 8))
+        theme_box.pack(side="left")
+        push_blank_btn = ttk.Button(
+            theme_row, text="Push Blank to Game", command=self._run_push_blank_to_game,
+        )
+        push_blank_btn.pack(side="left", padx=(6, 0))
+        _Tooltip(push_blank_btn, "Build a fresh blank .course from the bundled template for the "
+                 "CURRENTLY selected Game version + Theme, give it a unique auto-generated name "
+                 "(a 'LIDAR-<version>-<timestamp>' serial) and course id, and copy it straight into "
+                 "this version's in-game Courses folder -- ready to open in the game's editor. "
+                 "Independent of the pipeline: it does NOT touch course/ or any Write/Repack "
+                 "output -- it just needs a working directory (for staging) plus Game version + "
+                 "Theme. The pushed course opens in-game under an auto serial name; push again "
+                 "for another fresh copy.")
         _Tooltip(theme_box, "Picked up front (not just an Objects-tab v2019 asset-id concern any "
                  "more) -- selects which bundled blank template (templates/{game_version}_{theme}."
                  "course) course/ is auto-provisioned from, so it has to be set before Ingest/Write "
@@ -554,7 +607,7 @@ class PGAGenGUI:
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.preserve_synthetic_var = tk.BooleanVar(value=True)
         preserve_cb = ttk.Checkbutton(
-            parent, text="Preserve GUI cluster-fill / mask edits on re-ingest",
+            parent, text="Preserve edits",
             variable=self.preserve_synthetic_var,
         )
         preserve_cb.pack(anchor="w")
@@ -597,21 +650,42 @@ class PGAGenGUI:
                  "terrain logic needed downstream.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        reset_baseline_btn = self._add_step_button(
-            parent, "Reset Course Baseline", self._run_ingest_course,
-        )
-        _Tooltip(reset_baseline_btn, "Optional. course/ is auto-provisioned from the bundled "
-                 "templates/{game_version}_{theme}.course the first time any write/repack step needs "
-                 "it -- no manual ingest required. Only use this to explicitly re-extract course/ "
-                 "from scratch, e.g. after changing Game version or Theme once course/ already "
-                 "exists (which auto-provisioning won't do by itself, since it only fills in a "
-                 "missing course/, never overwrites an existing one).")
 
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.repack_filename_var = tk.StringVar()
         self.repack_filename_var.trace_add("write", lambda *a: self._on_repack_filename_changed())
         ttk.Label(parent, text="Repack filename:").pack(anchor="w")
         ttk.Entry(parent, textvariable=self.repack_filename_var, width=20).pack(anchor="w")
+
+        status_row = ttk.Frame(parent)
+        status_row.pack(fill="x", pady=(0, 4))
+        _EXPORT_STATUS_EMOJI = {
+            "height": "⛰️",  # mountain
+            "water": "💦",  # sweat droplets
+            "splines": "🧩",  # puzzle piece
+            "holes": "⛳",  # flag in hole
+            "objects": "🌳",  # wood
+        }
+        self._export_status_lights: dict[str, tk.Label] = {}
+        for category in ("height", "water", "splines", "holes", "objects"):
+            cell = ttk.Frame(status_row)
+            cell.pack(side="left", padx=(6, 0))
+            light = tk.Label(cell, text="●", fg="gray", font=("TkDefaultFont", 10))
+            light.pack(side="top")
+            emoji_label = ttk.Label(cell, text=_EXPORT_STATUS_EMOJI[category], font=("TkDefaultFont", 11))
+            emoji_label.pack(side="top")
+            _Tooltip(emoji_label, category.capitalize())
+            self._export_status_lights[category] = light
+        _Tooltip(status_row, "Whether each course/CourseDescription_nodes/ output is caught up "
+                    "with what it's built from. Green = written and up to date. Red = an input "
+                    "(features.geojson, a stamp layer, objects.json) changed since the last write, "
+                    "or a leftover different-game_version file is sitting in course/ (Objects only "
+                    "-- see Reset Course Baseline) -- re-run that write step (or Reset Course "
+                    "Baseline) before repacking. Gray = never written yet. Refreshes after every "
+                    "step. Height/Water share one file (userLayers.json) so this can occasionally "
+                    "show a false green for one of the pair right after writing the other -- not a "
+                    "hard gate, just a status hint (Repack itself still refuses on the "
+                    "different-version-file case regardless of what these show).")
+
         self._add_step_button(parent, "Repack", self._run_repack)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -771,6 +845,38 @@ class PGAGenGUI:
                  "proportionally less work, not full-course work followed by discarding most of it "
                  "(the course-wide baseline-flatten stamp is never masked). Uses the same "
                  "Buffer (px) slider as Refine's Mask option, in the Splines tab.")
+
+        self.generate_terrain_remove_covered_stamps_var = tk.BooleanVar(value=False)
+        remove_covered_checkbox = ttk.Checkbutton(
+            parent, text="Remove covered stamps from previous layer",
+            variable=self.generate_terrain_remove_covered_stamps_var,
+        )
+        remove_covered_checkbox.pack(anchor="w")
+        _Tooltip(remove_covered_checkbox, "Flags stamps in the immediately-preceding stamps_N.json "
+                 "layer as blocked_by this new one wherever their whole footprint sits entirely inside "
+                 "this pass's own MASK, shrunk inward by the margin below (exact shapely polygon "
+                 "containment -- terrain/stamp_containment.py). Tests against the mask -- the area this "
+                 "pass INTENDS to cover -- not against verified brush coverage, so it's only as safe as "
+                 "this pass's own fill actually is solid there: a generous margin and a "
+                 "fully-tiling/high-density fill (e.g. raster + brush 72 + spread%>=1) leave no real "
+                 "gap; a sparse or gappy fill (hex mode, or raster with a soft/low-plateau brush) could "
+                 "leave a small hole where a blocked stamp used to show through, since nothing else "
+                 "painted over it. Requires 'Restrict to mask' above. Blocked stamps aren't deleted -- "
+                 "the older layer file gains one annotation field, undo/redo of this new layer toggles "
+                 "it automatically.")
+        margin_frame = ttk.Frame(parent)
+        margin_frame.pack(anchor="w", pady=(0, 4))
+        ttk.Label(margin_frame, text="    Margin (m):").pack(side="left")
+        self.generate_terrain_remove_covered_margin_var = tk.StringVar(
+            value=str(DEFAULT_REMOVE_COVERED_MARGIN_M)
+        )
+        margin_entry = ttk.Entry(
+            margin_frame, textvariable=self.generate_terrain_remove_covered_margin_var, width=6,
+        )
+        margin_entry.pack(side="left")
+        _Tooltip(margin_entry, "Inward safety margin (m): a previous-layer stamp must be fully inside "
+                 "the mask minus this distance from its boundary to get flagged. Larger = more "
+                 "conservative (fewer stamps flagged).")
 
         gen_notebook = ttk.Notebook(parent)
         gen_notebook.pack(fill="x", pady=(0, 4))
@@ -1340,6 +1446,36 @@ class PGAGenGUI:
         refine_notebook.bind("<<NotebookTabChanged>>", lambda _e: self._autosize_notebook(refine_notebook))
         self._autosize_notebook(refine_notebook)
 
+        self.refine_remove_covered_stamps_var = tk.BooleanVar(value=False)
+        refine_remove_covered_checkbox = ttk.Checkbutton(
+            parent, text="Remove covered stamps from previous layer",
+            variable=self.refine_remove_covered_stamps_var,
+        )
+        refine_remove_covered_checkbox.pack(anchor="w", pady=(4, 0))
+        _Tooltip(refine_remove_covered_checkbox, "Flags stamps in the immediately-preceding "
+                 "stamps_N.json layer as blocked_by this new one wherever their whole footprint sits "
+                 "entirely inside this pass's own MASK, shrunk inward by the margin below (exact "
+                 "shapely polygon containment -- terrain/stamp_containment.py). Tests against the mask "
+                 "-- the area this pass is allowed to place hotspots in -- not against verified brush "
+                 "coverage there, so it's only as safe as this pass's own placements actually turn out "
+                 "to be dense/solid: refine's hotspot placement can legitimately leave gaps inside the "
+                 "mask (it only refines where error already exceeds tolerance), so a blocked stamp "
+                 "could show through a spot nothing else painted over. Use a generous margin, and "
+                 "expect to re-run refine a few times over the same mask before trusting this. "
+                 "Requires 'Mask' above. Blocked stamps aren't deleted -- the older layer file gains "
+                 "one annotation field, undo/redo of this new layer toggles it automatically.")
+        refine_margin_frame = ttk.Frame(parent)
+        refine_margin_frame.pack(anchor="w", pady=(0, 4))
+        ttk.Label(refine_margin_frame, text="    Margin (m):").pack(side="left")
+        self.refine_remove_covered_margin_var = tk.StringVar(value=str(DEFAULT_REMOVE_COVERED_MARGIN_M))
+        refine_margin_entry = ttk.Entry(
+            refine_margin_frame, textvariable=self.refine_remove_covered_margin_var, width=6,
+        )
+        refine_margin_entry.pack(side="left")
+        _Tooltip(refine_margin_entry, "Inward safety margin (m): a previous-layer stamp must be fully "
+                 "inside the mask minus this distance from its boundary to get flagged. Larger = more "
+                 "conservative (fewer stamps flagged).")
+
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.registration_marks_var = tk.BooleanVar(value=False)
         reg_marks_checkbox = ttk.Checkbutton(
@@ -1350,22 +1486,13 @@ class PGAGenGUI:
                  "circle spline (cart path surface) at each of the 4 course corners -- for visually "
                  "confirming in-game that terrain and splines land exactly where expected. Shared "
                  "with the same checkbox in the Splines tab (one setting, both places).")
-        self.prune_overlapped_stamps_var = tk.BooleanVar(value=True)
-        prune_checkbox = ttk.Checkbutton(
-            parent, text="Delete overlapped stamps", variable=self.prune_overlapped_stamps_var,
-        )
-        prune_checkbox.pack(anchor="w")
-        _Tooltip(prune_checkbox, "Drop stamps fully overwritten by later stamps before writing/fitting "
-                 "water (terrain/stamp_pruning.py) -- pure cleanup with no effect on the resolved "
-                 "terrain, just fewer stamps in the output. On by default; uncheck to keep every stamp "
-                 "as-is (e.g. while debugging pruning itself).")
         write_terrain_btn = self._add_step_button(parent, "Write Terrain", self._run_write_terrain)
         _Tooltip(write_terrain_btn, "Writes userLayers.json's \"height\" key (the terrain stamps) -- "
                  "leaves \"water\" exactly as it was found (see the separate Write Water button below, "
                  "which is slower and only needs re-running when water levels should track a terrain "
                  "change).")
 
-        self.multi_tile_water_var = tk.BooleanVar(value=False)
+        self.multi_tile_water_var = tk.BooleanVar(value=True)
         multi_tile_checkbox = ttk.Checkbutton(
             parent, text="Multi-tile water fill", variable=self.multi_tile_water_var,
             command=self._show_preview,
@@ -1375,24 +1502,52 @@ class PGAGenGUI:
                  "possibly-overlapping rectangular tiles hugging its real boundary, instead of one "
                  "single minimum-rotated-rectangle -- reduces visible water-over-land overshoot on "
                  "non-rectangular ponds (overlap between tiles is fine, renders with a clean seam "
-                 "in-game). Also affects the \"Show objects\" water preview immediately. Off by "
-                 "default -- single-rectangle behavior.")
+                 "in-game). Also affects the \"Show objects\" water preview immediately. On by "
+                 "default; uncheck for single-rectangle behavior.")
 
-        self.water_fill_mode_var = tk.StringVar(value="edge")
-        mode_grid = ttk.Frame(parent)
-        mode_grid.pack(anchor="w")
-        mode_entry = self._add_grid_field(
-            mode_grid, 0, 0, self.water_fill_mode_var, "FILL MODE",
-            "Multi-tile water fill only: 'edge' (default) fits one rectangle per boundary edge with "
-            "a redundancy-dedup pass; 'stripe' seeds one tile at the pond's own center and walks "
-            "outward in independently-sized stripes -- avoids edge-fill's dedup pass unpredictably "
-            "leaving gaps on complex pond shapes, at the cost of possibly more overshoot on very "
-            "irregular boundaries.",
-            combobox_values=["edge", "stripe"],
-        )
-        mode_entry.bind("<<ComboboxSelected>>", lambda _e: self._show_preview())
+        # Fill mode is a tabbed interface -- the visible tab IS the selected
+        # mode (water_fill_mode_var); Stripe first / default.
+        self.water_fill_mode_var = tk.StringVar(value="stripe")
+        water_mode_nb = ttk.Notebook(parent)
+        water_mode_nb.pack(anchor="w", fill="x", pady=(4, 0))
+        stripe_tab = ttk.Frame(water_mode_nb, padding=4)
+        edge_tab = ttk.Frame(water_mode_nb, padding=4)
+        water_mode_nb.add(stripe_tab, text="Stripe")
+        water_mode_nb.add(edge_tab, text="Edge")
 
-        water_tile_grid = ttk.Frame(parent)
+        def _on_water_mode_tab(_e=None):
+            if not getattr(self, "_ui_ready", False):
+                return
+            self.water_fill_mode_var.set(
+                "edge" if water_mode_nb.index("current") == 1 else "stripe"
+            )
+            self._show_preview()
+        water_mode_nb.bind("<<NotebookTabChanged>>", _on_water_mode_tab)
+
+        # --- Stripe fill (first tab / default) ---
+        # Layout: row 1 = TOL, OVERLAP ; row 2 = MIN w, MAX L
+        water_stripe_grid = ttk.Frame(stripe_tab)
+        water_stripe_grid.pack(anchor="w", fill="x")
+        self.water_stripe_tolerance_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_TOLERANCE_M))
+        self._add_grid_field(water_stripe_grid, 0, 0, self.water_stripe_tolerance_var, "TOL",
+                 "Stripe water fill only: optional boundary-simplify tolerance (m) before probing -- "
+                 "perf/noise-reduction only, not structural (unlike the edge-fill TOL field). "
+                 "Defaults off (0).")
+        self.water_stripe_overlap_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_OVERLAP_M))
+        self._add_grid_field(water_stripe_grid, 0, 1, self.water_stripe_overlap_var, "OVERLAP",
+                 "Stripe water fill only: the single knob controlling both how far a stripe may "
+                 "overshoot the true polygon boundary and how much consecutive stripes overlap along "
+                 "the stacking axis.")
+        self.water_stripe_min_edge_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_MIN_EDGE_M))
+        self._add_grid_field(water_stripe_grid, 1, 0, self.water_stripe_min_edge_var, "MIN w",
+                 "Stripe water fill only: floor (m) for a stripe's found width/depth.")
+        self.water_stripe_max_stripes_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE))
+        self._add_grid_field(water_stripe_grid, 1, 1, self.water_stripe_max_stripes_var, "MAX L",
+                 "Stripe water fill only: safety cap on stripes walked outward in each of the +/- "
+                 "stacking directions -- defensive only, not expected to bind on a real pond.")
+
+        # --- Edge fill ---
+        water_tile_grid = ttk.Frame(edge_tab)
         water_tile_grid.pack(anchor="w", fill="x")
         self.water_tile_tolerance_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_TOLERANCE_M))
         self._add_grid_field(water_tile_grid, 0, 0, self.water_tile_tolerance_var, "TOL m",
@@ -1422,32 +1577,12 @@ class PGAGenGUI:
                  "BOTH ends, centered the same as before -- without it, adjacent tiles meet exactly "
                  "corner-to-corner and can look visibly inset once real rounding is involved.")
 
-        water_stripe_grid = ttk.Frame(parent)
-        water_stripe_grid.pack(anchor="w", fill="x")
-        self.water_stripe_overlap_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_OVERLAP_M))
-        self._add_grid_field(water_stripe_grid, 0, 0, self.water_stripe_overlap_var, "STRIPE OVERLAP m",
-                 "Stripe water fill only: the single knob controlling both how far a stripe may "
-                 "overshoot the true polygon boundary and how much consecutive stripes overlap along "
-                 "the stacking axis.")
-        self.water_stripe_min_edge_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_MIN_EDGE_M))
-        self._add_grid_field(water_stripe_grid, 0, 1, self.water_stripe_min_edge_var, "STRIPE MIN m",
-                 "Stripe water fill only: floor (m) for a stripe's found width/depth.")
-        self.water_stripe_tolerance_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_TOLERANCE_M))
-        self._add_grid_field(water_stripe_grid, 0, 2, self.water_stripe_tolerance_var, "STRIPE TOL m",
-                 "Stripe water fill only: optional boundary-simplify tolerance (m) before probing -- "
-                 "perf/noise-reduction only, not structural (unlike the edge-fill TOL m field). "
-                 "Defaults off (0).")
-        self.water_stripe_max_stripes_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE))
-        self._add_grid_field(water_stripe_grid, 1, 0, self.water_stripe_max_stripes_var, "MAX/SIDE",
-                 "Stripe water fill only: safety cap on stripes walked outward in each of the +/- "
-                 "stacking directions -- defensive only, not expected to bind on a real pond.")
-
         write_water_btn = self._add_step_button(parent, "Write Water", self._run_write_water)
         _Tooltip(write_water_btn, "Writes userLayers.json's \"water\" key -- leaves \"height\" exactly "
                  "as it was found (see course_output/water.py). Water objects are built from "
                  "features.geojson's water polygons (natural=water, golf=water_hazard, waterway=* "
                  "areas -- run Ingest OSM first if none show up) fitted to the CURRENT stamp list's "
-                 "low points (re-loaded/pruned/normalized the same way as Write Terrain, using the "
+                 "low points (re-loaded/normalized the same way as Write Terrain, using the "
                  "same checkboxes above), so this can be slow -- only run it when water levels need "
                  "to catch up with a terrain change, not after every terrain iteration.")
 
@@ -1568,12 +1703,26 @@ class PGAGenGUI:
         self.brush_types_menubutton.config(text=text)
 
     def _build_log_panel(self, paned: ttk.PanedWindow) -> None:
+        # The console/log lives in its own pane of the horizontal
+        # preview|log PanedWindow. "Window shade" collapse: we drop the
+        # whole frame out of the PanedWindow (paned.forget) rather than
+        # just hiding the text, so the preview gets the full width back;
+        # re-opening re-adds it and restores the remembered sash width.
+        # Collapsed by default -- most steps don't need the console, and
+        # the "◂ Console" button in the preview header brings it back.
+        self._log_paned = paned
         frame = ttk.Frame(paned)
+        self._log_frame = frame
+        self._log_collapsed = False
+        self._log_pane_width = 340
+        self._log_unread = False
         paned.add(frame, weight=1)
         header = ttk.Frame(frame)
         header.pack(fill="x")
         ttk.Label(header, text="Output log").pack(side="left")
-        ttk.Button(header, text="Clear", command=self._clear_log).pack(side="right")
+        ttk.Button(header, text="Hide ▸", width=7,
+                   command=self._toggle_log_panel).pack(side="right")
+        ttk.Button(header, text="Clear", command=self._clear_log).pack(side="right", padx=(0, 4))
 
         text_row = ttk.Frame(frame)
         text_row.pack(fill="both", expand=True)
@@ -1585,6 +1734,49 @@ class PGAGenGUI:
         scroll = ttk.Scrollbar(text_row, command=self.log_text.yview)
         scroll.pack(side="left", fill="y")
         self.log_text["yscrollcommand"] = scroll.set
+
+        # Start collapsed. Defer one tick so the PanedWindow is realized
+        # first (a forget() before the initial layout can leave the sash
+        # in a weird spot on some Tk builds).
+        self.root.after(0, lambda: self._toggle_log_panel(force_collapse=True))
+
+    def _toggle_log_panel(self, force_collapse: bool = False) -> None:
+        if not self._log_collapsed or force_collapse:
+            # Collapse: remember the current width, then drop the pane.
+            if not self._log_collapsed:
+                try:
+                    total = self._log_paned.winfo_width()
+                    pos = self._log_paned.sashpos(0)
+                    if total > 1 and pos > 0:
+                        self._log_pane_width = max(160, total - pos)
+                except Exception:
+                    pass
+            try:
+                self._log_paned.forget(self._log_frame)
+            except Exception:
+                pass
+            self._log_collapsed = True
+            self._show_log_button.pack(side="right", padx=(6, 0))
+            self._refresh_log_button_label()
+        else:
+            # Expand: re-add the pane and push the sash left so it gets
+            # back roughly the width it had.
+            try:
+                self._log_paned.add(self._log_frame, weight=1)
+                self._log_paned.update_idletasks()
+                total = self._log_paned.winfo_width()
+                if total > 1:
+                    self._log_paned.sashpos(0, max(0, total - self._log_pane_width))
+            except Exception:
+                pass
+            self._log_collapsed = False
+            self._log_unread = False
+            self._show_log_button.pack_forget()
+
+    def _refresh_log_button_label(self) -> None:
+        self._show_log_button.config(
+            text="◂ Console ●" if self._log_unread else "◂ Console"
+        )
 
     def _build_preview_panel(self, paned: ttk.PanedWindow) -> None:
         frame = ttk.Frame(paned)
@@ -1603,7 +1795,7 @@ class PGAGenGUI:
                  "pickable only while 'Overlay OSM' is on, objects only while 'Show objects' is on. "
                  "Right-drag pans; scroll zooms, Ctrl+scroll steps versions, Shift+scroll changes "
                  "preview type. Picking is off on the LIDAR / full-frame OSM previews.")
-        self.preview_choice = tk.StringVar(value=PREVIEW_FILES[0])
+        self.preview_choice = tk.StringVar(value="preview_height.png")
         dropdown = ttk.Combobox(
             header, textvariable=self.preview_choice, values=PREVIEW_FILES,
             state="readonly", width=30,
@@ -1651,6 +1843,15 @@ class PGAGenGUI:
         self.preview_zoom_label = ttk.Label(header, text="100%", width=5)
         self.preview_zoom_label.pack(side="left")
         ttk.Button(header, text="Reset", width=6, command=self._reset_preview_zoom).pack(side="left", padx=(2, 0))
+
+        # Re-opens the collapsed console/log pane (see _build_log_panel).
+        # Packed on the right so it stays clear of the left-packed row of
+        # preview controls; hidden whenever the log pane is expanded.
+        self._show_log_button = ttk.Button(
+            header, text="◂ Console", width=10, command=self._toggle_log_panel,
+        )
+        # Packed/unpacked by _toggle_log_panel -- visible only while the
+        # console pane is collapsed (which is the default).
 
         canvas_frame = ttk.Frame(frame)
         canvas_frame.pack(fill="both", expand=True)
@@ -1730,7 +1931,7 @@ class PGAGenGUI:
 
         overlay_row = ttk.Frame(parent)
         overlay_row.pack(fill="x", pady=(4, 0))
-        self.overlay_osm_var = tk.BooleanVar(value=False)
+        self.overlay_osm_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             overlay_row, text="Overlay OSM", variable=self.overlay_osm_var,
             command=self._on_overlay_osm_toggled,
@@ -1767,7 +1968,7 @@ class PGAGenGUI:
             command=self._show_preview,
         ).pack(side="left", padx=(8, 0))
         ttk.Label(mask_row1, text="Source:").pack(side="left", padx=(8, 0))
-        self.mask_source_var = tk.StringVar(value="marked")
+        self.mask_source_var = tk.StringVar(value="selected")
         mask_source_combo = ttk.Combobox(
             mask_row1, textvariable=self.mask_source_var, state="readonly", width=8,
             values=("marked", "selected"),
@@ -1788,8 +1989,8 @@ class PGAGenGUI:
             mask_row2, from_=0.0, to=400.0, orient="horizontal",
             variable=self.mask_buffer_preview_var, command=lambda _v: self._show_preview(),
         ).pack(side="left", fill="x", expand=True, padx=4)
-        self.mask_buffer_preview_label = ttk.Label(mask_row2, text="50", width=4)
-        self.mask_buffer_preview_label.pack(side="left")
+        self.mask_buffer_preview_text = tk.StringVar(value="50")
+        self._add_slider_entry(mask_row2, self.mask_buffer_preview_var, self.mask_buffer_preview_text)
 
         mask_row3 = ttk.Frame(mask_section)
         mask_row3.pack(fill="x", pady=(2, 0))
@@ -1799,8 +2000,8 @@ class PGAGenGUI:
             mask_row3, from_=0.0, to=400.0, orient="horizontal",
             variable=self.border_width_var, command=lambda _v: self._show_preview(),
         ).pack(side="left", fill="x", expand=True, padx=4)
-        self.border_width_preview_label = ttk.Label(mask_row3, text="10", width=4)
-        self.border_width_preview_label.pack(side="left")
+        self.border_width_preview_text = tk.StringVar(value="10")
+        self._add_slider_entry(mask_row3, self.border_width_var, self.border_width_preview_text)
 
         filter_row = ttk.Frame(parent)
         filter_row.pack(fill="x")
@@ -1833,6 +2034,7 @@ class PGAGenGUI:
         tree_scroll.pack(side="left", fill="y")
         self.splines_tree["yscrollcommand"] = tree_scroll.set
         self.splines_tree.bind("<<TreeviewSelect>>", lambda e: self._on_spline_selected())
+        self.splines_tree.bind("<Double-1>", self._on_spline_row_double_click)
 
         button_row = ttk.Frame(parent)
         button_row.pack(fill="x", pady=(6, 0))
@@ -1891,6 +2093,99 @@ class PGAGenGUI:
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._build_cart_paths_section(parent)
 
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._build_oob_section(parent)
+
+    def _build_oob_section(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Out of Bounds", font=("TkDefaultFont", 10, "bold")).pack(
+            anchor="w", pady=(0, 2))
+        ttk.Label(
+            parent,
+            text="Auto-paint an OOB band (brush stamps -- round caps + smooth squares) just "
+                 "outside the playable area.",
+            wraplength=360, foreground="#555",
+        ).pack(anchor="w", pady=(0, 2))
+
+        oob_grid = ttk.Frame(parent)
+        oob_grid.pack(fill="x", pady=2)
+
+        def add_oob_field(row, col, var, label, tooltip):
+            cell = ttk.Frame(oob_grid)
+            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+            lbl = ttk.Label(cell, text=label)
+            lbl.pack(anchor="w")
+            entry = ttk.Entry(cell, textvariable=var, width=10)
+            entry.pack(anchor="w")
+            _Tooltip(lbl, tooltip)
+            _Tooltip(entry, tooltip)
+
+        self.oob_inner_buffer_var = tk.StringVar(value=f"{OOB_INNER_BUFFER_M}")
+        self.oob_band_width_var = tk.StringVar(value=f"{OOB_BAND_WIDTH_M}")
+        self.oob_merge_gap_var = tk.StringVar(value=f"{OOB_MERGE_GAP_M}")
+        self.oob_simplify_tol_var = tk.StringVar(value=f"{OOB_SIMPLIFY_TOL_M}")
+        self.oob_cap_ratio_var = tk.StringVar(value=f"{OOB_CAP_SCALE_RATIO}")
+        self.oob_include_caps_var = tk.BooleanVar(value=True)
+
+        add_oob_field(0, 0, self.oob_inner_buffer_var, "INNER BUFFER m",
+                       "Gap (m) between the playable area and where the OOB band starts.")
+        add_oob_field(0, 1, self.oob_band_width_var, "BAND WIDTH m",
+                       "Painted width (m) of the OOB band across the boundary.")
+        add_oob_field(1, 0, self.oob_merge_gap_var, "MERGE GAP m",
+                       "Morphological-closing radius (m) -- bridges gaps up to ~2x this between "
+                       "playfield pieces so the OOB line follows the outer course boundary, not "
+                       "every fairway fragment. 0 disables.")
+        add_oob_field(1, 1, self.oob_simplify_tol_var, "SIMPLIFY m",
+                       "Douglas-Peucker tolerance (m) on the boundary curve -- higher = fewer, "
+                       "longer square stamps and a coarser OOB line that cuts corners.")
+        add_oob_field(2, 0, self.oob_cap_ratio_var, "CAP RATIO",
+                       "Round-cap (type 8) half-extent as a fraction of the square's across-path "
+                       "half-extent. ~0.8 matches the reference course.")
+
+        caps_cb = ttk.Checkbutton(parent, text="Include round caps at boundary vertices",
+                                   variable=self.oob_include_caps_var)
+        caps_cb.pack(anchor="w", pady=2)
+        _Tooltip(caps_cb, "Place a round type-8 stamp at each boundary vertex to round the "
+                 "corners between straight square segments.")
+
+        oob_btn_row = ttk.Frame(parent)
+        oob_btn_row.pack(anchor="w", pady=2)
+        ttk.Button(oob_btn_row, text="Generate OOB", width=22,
+                    command=self._run_generate_oob).pack(side="left")
+        clear_oob_btn = ttk.Button(oob_btn_row, text="Clear OOB", width=12,
+                                    command=self._run_clear_oob)
+        clear_oob_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(clear_oob_btn, "Delete the generated OOB band (oob.json + previews) and mark "
+                 "the layer empty. Re-run Write Terrain + Repack to apply.")
+        ttk.Label(
+            parent,
+            text="Then run Write Terrain (Terrain tab) + Repack to ship it.",
+            foreground="#555",
+        ).pack(anchor="w")
+
+    def _run_generate_oob(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = ["--step", "generate-oob"]
+        for flag, var in (
+            ("--oob-inner-buffer", self.oob_inner_buffer_var),
+            ("--oob-band-width", self.oob_band_width_var),
+            ("--oob-merge-gap", self.oob_merge_gap_var),
+            ("--oob-simplify-tol", self.oob_simplify_tol_var),
+            ("--oob-cap-ratio", self.oob_cap_ratio_var),
+        ):
+            val = var.get().strip()
+            if val:
+                args += [flag, val]
+        if not self.oob_include_caps_var.get():
+            args.append("--oob-no-caps")
+        self._run_step(args, wd)
+
+    def _run_clear_oob(self) -> None:
+        wd = self._require_working_dir()
+        if wd:
+            self._run_step(["--step", "generate-oob", "--oob-clear"], wd)
+
     def _run_write_splines(self) -> None:
         wd = self._require_working_dir()
         if wd:
@@ -1921,7 +2216,7 @@ class PGAGenGUI:
 
         show_objects_row = ttk.Frame(parent)
         show_objects_row.pack(fill="x")
-        self.show_objects_var = tk.BooleanVar(value=False)
+        self.show_objects_var = tk.BooleanVar(value=True)
         show_objects_checkbox = ttk.Checkbutton(
             show_objects_row, text="Show objects", variable=self.show_objects_var,
             command=self._on_show_objects_toggled,
@@ -2010,10 +2305,11 @@ class PGAGenGUI:
         stake_btn = ttk.Button(stake_grid, text="Place", command=self._run_stake_buildings)
         stake_btn.grid(row=0, column=0, sticky="w", padx=(0, 4), pady=2)
         _Tooltip(stake_btn, "Places a subtle 0.5x-scale stake at every corner of every 'building' "
-                 "feature (features.geojson) and re-writes placedObjects2.json -- same fence-post prop "
-                 "used oversized for the cart-path debug marker. Needs Write Objects to have been run "
-                 "at least once first (object_list.json). Persists as the default for future Write "
-                 "Objects runs too -- use Clear Building Stakes to turn it back off.")
+                 "feature (features.geojson) and re-writes placedObjects2.json -- the fence-post prop "
+                 "used oversized for the cart-path debug marker (v2019) or the matching WoodFences "
+                 "post (v2021+). Needs Write Objects to have been run at least "
+                 "once first (object_list.json). Persists as the default for future Write Objects "
+                 "runs too -- use Clear Building Stakes to turn it back off.")
         clear_stakes_btn = ttk.Button(stake_grid, text="Clear", command=self._run_clear_building_stakes)
         clear_stakes_btn.grid(row=0, column=1, sticky="w", padx=(4, 0), pady=2)
         _Tooltip(clear_stakes_btn, "Re-writes placedObjects2.json without building stakes. Not "
@@ -2022,6 +2318,55 @@ class PGAGenGUI:
         
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(parent, text="Streams", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+
+        streams_grid = ttk.Frame(parent)
+        streams_grid.pack(fill="x", pady=2)
+
+        def add_stream_field(row, col, var, label, tooltip):
+            cell = ttk.Frame(streams_grid)
+            cell.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+            lbl = ttk.Label(cell, text=label)
+            lbl.pack(anchor="w")
+            entry = ttk.Entry(cell, textvariable=var, width=10)
+            entry.pack(anchor="w")
+            _Tooltip(lbl, tooltip)
+            _Tooltip(entry, tooltip)
+
+        self.stream_depth_var = tk.StringVar(value=f"{STREAM_DEPTH_M}")
+        self.stream_half_width_var = tk.StringVar(value=f"{STREAM_HALF_WIDTH_M}")
+        self.stream_water_fill_depth_var = tk.StringVar(value=f"{STREAM_WATER_FILL_DEPTH_M}")
+        self.stream_water_base_width_var = tk.StringVar(value=f"{STREAM_WATER_BASE_WIDTH_M}")
+        self.stream_water_widen_per_depth_var = tk.StringVar(value=f"{STREAM_WATER_WIDEN_PER_DEPTH}")
+        self.stream_water_widen_per_descent_var = tk.StringVar(value=f"{STREAM_WATER_WIDEN_PER_DESCENT}")
+        self.stream_water_level_margin_var = tk.StringVar(value=f"{STREAM_WATER_LEVEL_MARGIN_M}")
+        self.stream_bank_veg_width_var = tk.StringVar(value=f"{BANK_VEG_WIDTH_M}")
+
+        add_stream_field(0, 0, self.stream_depth_var, "DEPTH m",
+                         "Streambed carve depth (m) below original grade. "
+                         f"Default {STREAM_DEPTH_M}.")
+        add_stream_field(0, 1, self.stream_half_width_var, "HALF-WIDTH m",
+                         "Trench stamp radius (m, center-to-edge); carved channel reads about "
+                         f"twice this wide. Also the heightmap probe radius. Default {STREAM_HALF_WIDTH_M}.")
+        add_stream_field(0, 2, self.stream_bank_veg_width_var, "BANK VEG m",
+                         "Half-width (m) of the stream-bank vegetation buffer polygon tagged for "
+                         f"cluster fills. Default {BANK_VEG_WIDTH_M}.")
+        add_stream_field(1, 0, self.stream_water_fill_depth_var, "WATER FILL m",
+                         "Water film depth (m) at a water tile's shallow (upstream) end. "
+                         f"Default {STREAM_WATER_FILL_DEPTH_M}.")
+        add_stream_field(1, 1, self.stream_water_base_width_var, "WATER WIDTH m",
+                         "Flowing-water cross-flow span (m) at zero extra depth. "
+                         f"Default {STREAM_WATER_BASE_WIDTH_M}.")
+        add_stream_field(1, 2, self.stream_water_widen_per_depth_var, "WIDEN / DEPTH",
+                         "Extra water width (m) per m of water depth at a tile's deep end. "
+                         f"Default {STREAM_WATER_WIDEN_PER_DEPTH}.")
+        add_stream_field(2, 0, self.stream_water_widen_per_descent_var, "WIDEN / DESCENT",
+                         "Extra water width (m) per m of total bed descent from the stream source. "
+                         f"Default {STREAM_WATER_WIDEN_PER_DESCENT}.")
+        add_stream_field(2, 1, self.stream_water_level_margin_var, "WATER LEVEL MARGIN m",
+                         "How far (m) below the fitted carved streambed the flowing-water surface "
+                         "sits. Write Water / Write Objects fit each tile's level to the real "
+                         f"terrain (like a pond), then subtract this. Default {STREAM_WATER_LEVEL_MARGIN_M}.")
+
         streams_btn = ttk.Button(parent, text="Generate", command=self._run_generate_streams)
         streams_btn.pack(anchor="w", pady=2)
         _Tooltip(streams_btn, "Turns every OSM waterway=stream / waterway=ditch line (a water "
@@ -2031,6 +2376,79 @@ class PGAGenGUI:
                  "fill. Needs Ingest OSM + a terrain layer already. Re-run Write Terrain, Write "
                  "Water AND Write Objects afterwards to render it. Re-runnable; re-run after any "
                  "fresh Ingest OSM (that drops the bank tags).")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Parking", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+
+        parking_grid = ttk.Frame(parent)
+        parking_grid.pack(fill="x", pady=2)
+        self.parking_spacing_var = tk.StringVar(value=f"{PARKING_SPACING_M}")
+        self.parking_offset_var = tk.StringVar(value=f"{PARKING_OFFSET_M}")
+        self.parking_skip_prob_var = tk.StringVar(value=f"{PARKING_SKIP_PROB}")
+        self.parking_max_variants_var = tk.StringVar(value=f"{PARKING_MAX_VARIANTS}")
+        self.parking_accent_count_var = tk.StringVar(value=f"{PARKING_ACCENT_COUNT}")
+        self.parking_color_weights_var = tk.StringVar(
+            value=",".join(f"{k}={v:g}" for k, v in PARKING_COLOR_WEIGHTS.items()))
+        self.parking_sides_var = tk.StringVar(value=PARKING_SIDES)
+        self.parking_orientation_var = tk.StringVar(value=PARKING_ORIENTATION)
+
+        def _pk_field(col, var, label, tip, values=None):
+            cell = ttk.Frame(parking_grid)
+            cell.grid(row=col // 3, column=col % 3, sticky="w", padx=3, pady=2)
+            lbl = ttk.Label(cell, text=label)
+            lbl.pack(anchor="w")
+            w = (ttk.Combobox(cell, textvariable=var, values=values, width=12, state="readonly")
+                 if values else ttk.Entry(cell, textvariable=var, width=10))
+            w.pack(anchor="w")
+            _Tooltip(lbl, tip)
+            _Tooltip(w, tip)
+
+        _pk_field(0, self.parking_spacing_var, "SPACING m",
+                  f"Along-row centre-to-centre car spacing. Default {PARKING_SPACING_M}.")
+        _pk_field(1, self.parking_offset_var, "OFFSET m",
+                  f"Perpendicular distance from the aisle line to the car row. Default {PARKING_OFFSET_M}.")
+        _pk_field(2, self.parking_skip_prob_var, "SKIP PROB",
+                  f"Fraction of stalls left empty (0-1). Default {PARKING_SKIP_PROB}.")
+        _pk_field(3, self.parking_max_variants_var, "MAX MODELS",
+                  "Cap on the number of distinct car prefabs used across the whole course -- "
+                  "keeps parked cars off the game's placed-object type budget. 0 = no cap. "
+                  f"Default {PARKING_MAX_VARIANTS}. >= 1 prefab is kept per active colour. Vans "
+                  "are excluded unless a pga_parking tag explicitly asks for 'van'.")
+        _pk_field(4, self.parking_accent_count_var, "ACCENTS",
+                  "How many accent colours (from red/green/blue/yellow) to add to the base mix, "
+                  f"chosen once per course at 0.10 weight each. Default {PARKING_ACCENT_COUNT}.")
+        _pk_field(5, self.parking_sides_var, "SIDES",
+                  "Which side of the DIRECTIONAL aisle line to fill. Default 'left' -- draw the "
+                  "line the other way to put cars on the other side.",
+                  values=["left", "right", "both"])
+        _pk_field(6, self.parking_orientation_var, "ORIENTATION",
+                  "'perpendicular' nose-in stalls, or 'parallel' kerbside parking.",
+                  values=["perpendicular", "parallel"])
+
+        cw_row = ttk.Frame(parent)
+        cw_row.pack(anchor="w", fill="x", pady=(2, 0))
+        cw_lbl = ttk.Label(cw_row, text="COLOUR MIX")
+        cw_lbl.pack(side="left")
+        cw_entry = ttk.Entry(cw_row, textvariable=self.parking_color_weights_var)
+        cw_entry.pack(side="left", fill="x", expand=True, padx=4)
+        _cw_tip = ("Car colour weights as 'colour=weight,...' (normalised; percentages fine). A "
+                   "colour not listed here and not an accent never spawns. Catalogue colours: "
+                   "black, gray, white, red, green, blue, yellow, plus a few rare ones. "
+                   f"Default '{self.parking_color_weights_var.get()}' + {PARKING_ACCENT_COUNT} accents.")
+        _Tooltip(cw_lbl, _cw_tip)
+        _Tooltip(cw_entry, _cw_tip)
+
+        parking_btn = ttk.Button(parent, text="Generate", command=self._run_generate_parking)
+        parking_btn.pack(anchor="w", pady=2)
+        _Tooltip(parking_btn, "Lines every OSM way tagged pga_parking=<pool> (an aisle / service "
+                 "lane) with parked-car props from course_output/vehicle_catalog.json, frozen into "
+                 "parking.json. The line is DIRECTIONAL -- cars go on its LEFT side by default "
+                 "(draw it the other way, or set SIDES, to flip). Tag value picks the pool: "
+                 "'yes'/'all' = whole catalogue, or a comma list of colours and/or 'car'/'van' "
+                 "(e.g. pga_parking=black,white,van). A 'ref' tag on the way (0..1) scales that "
+                 "aisle's occupancy: populated = (1 - SKIP PROB) * ref. Cars bank pitch/roll to "
+                 "the ground slope (needs Ingest LAZ). Needs Ingest OSM. v2021+ only. Re-run after "
+                 "any fresh Ingest OSM; re-pack objects afterwards (this does it).")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(parent, text="Collections", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
@@ -2060,7 +2478,7 @@ class PGAGenGUI:
                  "Ingest OSM.")
 
         self.collections_templates_tree = ttk.Treeview(
-            parent, columns=("objects", "splines"), show="tree headings", height=5, selectmode="none",
+            parent, columns=("objects", "splines"), show="tree headings", height=5, selectmode="browse",
         )
         self.collections_templates_tree.heading("#0", text="Template")
         self.collections_templates_tree.heading("objects", text="Obj")
@@ -2069,9 +2487,106 @@ class PGAGenGUI:
         self.collections_templates_tree.column("objects", width=44, anchor="center")
         self.collections_templates_tree.column("splines", width=44, anchor="center")
         self.collections_templates_tree.pack(fill="x", pady=(4, 0))
+        self.collections_templates_tree.bind(
+            "<<TreeviewSelect>>", lambda _e: self._sync_push_collection_btn()
+        )
+
+        self._push_collection_btn = ttk.Button(
+            parent, text="Push to Game for Editing", state="disabled",
+            command=self._run_push_collection_to_game,
+        )
+        self._push_collection_btn.pack(anchor="w", pady=(4, 0))
+        _Tooltip(self._push_collection_btn,
+                 "Build a fresh .course holding the SELECTED template's objects, surface splines and "
+                 "raise-tool terrain stamps at the course centre (heading 0), give it a unique "
+                 "'COLL-<name>-<timestamp>' serial + course id, and copy it into this Game version's "
+                 "in-game Courses folder -- open it in the game's editor to tweak the collection, then "
+                 "re-run 'Capture from .course...' with the same template name to fold the edits back "
+                 "in. The inverse of Capture. Independent of the pipeline: does NOT touch course/. "
+                 "Needs a working directory (for staging) + Game version + Theme.")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Tree assets (v2021+)", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        tree_assets_row = ttk.Frame(parent)
+        tree_assets_row.pack(anchor="w", fill="x", pady=(0, 2))
+        self._tree_assets_summary = ttk.Label(tree_assets_row, text="")
+        self._tree_assets_summary.pack(side="left")
+        self._tree_assets_edit_btn = ttk.Button(
+            tree_assets_row, text="Edit…", command=self._open_tree_assets_dialog,
+        )
+        self._tree_assets_edit_btn.pack(side="right")
+        _Tooltip(self._tree_assets_edit_btn,
+                 "Which Unity tree prefabs v2021+ Write Objects plants (v2019 uses numeric theme ids "
+                 "instead, so this is ignored there). Leave empty to use the bundled rustic catalog "
+                 "(course_output/asset_catalog.json) -- it also routes pine/deciduous by the "
+                 "pga_tree_type hints, matching v2019. Pick assets here to override with your own "
+                 "pool. Persisted as 'objects_tree_asset_paths'.")
+        self._refresh_tree_assets_summary()
+        self._sync_tree_assets_enabled()
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._add_step_button(parent, "Write Objects", self._run_write_objects)
+
+    def _refresh_tree_assets_summary(self) -> None:
+        n = len(self.objects_tree_asset_paths)
+        self._tree_assets_summary.configure(
+            text=f"{n} custom asset(s) selected" if n else "Using bundled rustic catalog default"
+        )
+
+    def _sync_tree_assets_enabled(self) -> None:
+        """v2021+ only -- grey the picker on a v2019 project (the CLI flag
+        is silently ignored there, see step_write_objects)."""
+        is_v2021 = self.game_version.get() != "2019"
+        state = "normal" if is_v2021 else "disabled"
+        self._tree_assets_edit_btn.configure(state=state)
+        self._tree_assets_summary.configure(foreground="" if is_v2021 else "grey")
+
+    def _open_tree_assets_dialog(self) -> None:
+        """Multi-select picker over the catalog's category-0 tree prefabs
+        (mirrors _open_cluster_fill_dialog). Empty selection => fall back
+        to the bundled rustic catalog default at write-objects time."""
+        wd = self.working_dir.get().strip()
+        if not wd or not Path(wd).is_dir():
+            messagebox.showwarning("No working directory", "Set a working directory first.")
+            return
+        entries = sorted(
+            (e for e in ASSET_ENTRIES if e.category == 0 and "/Trees/" in e.path),
+            key=lambda e: e.label,
+        )
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Tree assets")
+        dlg.transient(self.root)
+        ttk.Label(dlg, text="Prefabs v2021+ Write Objects may plant. Select none to use the "
+                  "bundled rustic catalog default.", wraplength=420).pack(anchor="w", padx=8, pady=(8, 4))
+        tree = ttk.Treeview(dlg, columns=("native_h",), show="tree headings", height=16, selectmode="extended")
+        tree.heading("#0", text="Asset")
+        tree.heading("native_h", text="Native height (m)")
+        tree.column("#0", width=280)
+        tree.column("native_h", width=120, anchor="center")
+        tree.pack(fill="both", expand=True, padx=8)
+        iid_to_path = {}
+        for e in entries:
+            iid = tree.insert("", "end", text=e.label,
+                              values=(f"{e.native_height_m:.1f}" if e.native_height_m else "-",))
+            iid_to_path[iid] = e.path
+            if e.path in self.objects_tree_asset_paths:
+                tree.selection_add(iid)
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(fill="x", padx=8, pady=8)
+
+        def _save() -> None:
+            self.objects_tree_asset_paths = [iid_to_path[i] for i in tree.selection()]
+            self._suppress_tree_assets_save = True
+            try:
+                save_project(Path(wd), {"objects_tree_asset_paths": self.objects_tree_asset_paths})
+            finally:
+                self._suppress_tree_assets_save = False
+            self._refresh_tree_assets_summary()
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="OK", command=_save).pack(side="right")
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="right", padx=(0, 4))
 
     def _collection_library_dir(self) -> Path:
         text = self.collections_library_var.get().strip()
@@ -2097,11 +2612,27 @@ class PGAGenGUI:
             library = {}
         for name, collection in sorted(library.items()):
             tree.insert("", "end", text=name, values=(len(collection.objects), len(collection.splines)))
+        self._sync_push_collection_btn()
+
+    def _selected_collection_name(self) -> Optional[str]:
+        """The template name of the highlighted Collections-tree row, or None."""
+        tree = getattr(self, "collections_templates_tree", None)
+        if tree is None:
+            return None
+        sel = tree.selection()
+        return tree.item(sel[0], "text") if sel else None
+
+    def _sync_push_collection_btn(self) -> None:
+        """Enable 'Push to Game for Editing' only while a template row is selected."""
+        btn = getattr(self, "_push_collection_btn", None)
+        if btn is not None:
+            btn.config(state="normal" if self._selected_collection_name() else "disabled")
 
     def _capture_collection_dialog(self) -> None:
         course_file = filedialog.askopenfilename(
             title="Select a .course file to capture a collection from",
             filetypes=[(".course files", "*.course"), ("All files", "*.*")],
+            **self._courses_dir_dialog_kwarg(),
         )
         if not course_file:
             return
@@ -2259,7 +2790,18 @@ class PGAGenGUI:
         theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
         if theme_id is not None:
             args += ["--theme", str(theme_id)]
+        args += self._tree_asset_path_args()
         self._run_step(args, wd, on_done=lambda: self._refresh_objects_list())
+
+    def _tree_asset_path_args(self) -> list[str]:
+        """--tree-asset-path flags for the v2021+ picker (see
+        _open_tree_assets_dialog). Empty when nothing's selected -- the
+        CLI then falls back to the bundled rustic catalog, or errors for
+        a non-rustic theme."""
+        args: list[str] = []
+        for p in self.objects_tree_asset_paths:
+            args += ["--tree-asset-path", p]
+        return args
 
     def _run_stake_buildings(self) -> None:
         self._run_write_objects_with_stakes(True)
@@ -2278,8 +2820,50 @@ class PGAGenGUI:
         wd = self._require_working_dir()
         if not wd:
             return
+        args = ["--step", "generate-streams"]
+        for flag, var in (
+            ("--stream-depth", self.stream_depth_var),
+            ("--stream-half-width", self.stream_half_width_var),
+            ("--stream-water-fill-depth", self.stream_water_fill_depth_var),
+            ("--stream-water-base-width", self.stream_water_base_width_var),
+            ("--stream-water-widen-per-depth", self.stream_water_widen_per_depth_var),
+            ("--stream-water-widen-per-descent", self.stream_water_widen_per_descent_var),
+            ("--stream-water-level-margin", self.stream_water_level_margin_var),
+            ("--stream-bank-veg-width", self.stream_bank_veg_width_var),
+        ):
+            val = var.get().strip()
+            if val:
+                args += [flag, val]
         self._run_step(
-            ["--step", "generate-streams"], wd,
+            args, wd,
+            on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True),
+        )
+
+    def _run_generate_parking(self) -> None:
+        """Objects / Parking / Generate -- runs the generate-parking CLI
+        step (parking.json from OSM pga_parking lines + vehicle_catalog).
+        on_done re-packs objects.json so the cars show in the preview and
+        refreshes the Objects list; still needs a Write Objects + Repack
+        to reach the game."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = ["--step", "generate-parking"]
+        for flag, var in (
+            ("--parking-spacing", self.parking_spacing_var),
+            ("--parking-offset", self.parking_offset_var),
+            ("--parking-skip-prob", self.parking_skip_prob_var),
+            ("--parking-max-variants", self.parking_max_variants_var),
+            ("--parking-accent-count", self.parking_accent_count_var),
+            ("--parking-color-weights", self.parking_color_weights_var),
+            ("--parking-sides", self.parking_sides_var),
+            ("--parking-orientation", self.parking_orientation_var),
+        ):
+            val = var.get().strip()
+            if val:
+                args += [flag, val]
+        self._run_step(
+            args, wd,
             on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True),
         )
 
@@ -2287,10 +2871,12 @@ class PGAGenGUI:
         """Shared by the Stake Buildings / Clear Building Stakes buttons --
         both are just a Write Objects run with --stake-buildings /
         --no-stake-buildings tacked on (see objects.py's
-        build_building_stake_objects_v2019 / PGA2k_gen.py's
+        build_building_stake_objects_v2019 /
+        build_building_stake_objects_v2021 / PGA2k_gen.py's
         step_write_objects), so building corners stay in lockstep with
         whatever's currently in features.geojson rather than needing
-        separate placedObjects2.json surgery."""
+        separate placedObjects2.json surgery. Works for both game
+        versions -- v2021+ uses objects.DEFAULT_STAKE_ASSET_PATH_V2021."""
         wd = self._require_working_dir()
         if not wd:
             return
@@ -2302,6 +2888,7 @@ class PGAGenGUI:
         theme_id = self._theme_name_to_id.get(self.objects_theme_var.get())
         if theme_id is not None:
             args += ["--theme", str(theme_id)]
+        args += self._tree_asset_path_args()
         self._run_step(args, wd, on_done=lambda: self._refresh_objects_list())
 
     @staticmethod
@@ -2336,8 +2923,9 @@ class PGAGenGUI:
         collected together -- so a single Fill action (which can target
         many splines and several assets at once) shows as one row per
         asset/ratio/density/source/mode combo, not one row per spline.
-        `source` defaults to "manual", `density` to DEFAULT_FILL_DENSITY,
-        and `mode` to CLUSTER_FILL_MODE_STAMPS for specs saved before
+        `source` defaults to "manual", `density` to DEFAULT_FILL_DENSITY
+        (or DEFAULT_SPLINE_FILL_DENSITY for a spline-mode spec), and
+        `mode` to CLUSTER_FILL_MODE_STAMPS for specs saved before
         those fields existed -- mode is part of the grouping key (not
         just display) so a stamps-mode and spline-mode spec that
         otherwise match never merge into one row (they're functionally
@@ -2354,9 +2942,14 @@ class PGAGenGUI:
             for spec in f.tags.get(PGA_CLUSTER_FILLS_TAG) or []:
                 source = spec.get("source", CLUSTER_FILL_SOURCE_MANUAL)
                 mode = spec.get("mode", CLUSTER_FILL_MODE_STAMPS)
+                default_density = (
+                    DEFAULT_SPLINE_FILL_DENSITY
+                    if mode in (CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_AUTO)
+                    else DEFAULT_FILL_DENSITY
+                )
                 key = (
                     spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO),
-                    spec.get("density", DEFAULT_FILL_DENSITY), source, mode,
+                    spec.get("density", default_density), source, mode,
                 )
                 groups.setdefault(key, []).append(f.osm_id)
 
@@ -2432,7 +3025,9 @@ class PGAGenGUI:
             if filter_val not in ("All", source.capitalize()):
                 continue
             if mode == CLUSTER_FILL_MODE_SPLINE:
-                detail = f"splines={spline_ids} fill={asset_label} [spline] fillPct={density / 100:g}"
+                ceiling = SPLINE_FILL_MAX_PCT_BY_CATEGORY.get(_category, DEFAULT_SPLINE_FILL_MAX_PCT)
+                detail = (f"splines={spline_ids} fill={asset_label} [spline] "
+                          f"{density:g}% of max -> fillPct={ceiling * density / 100:g}")
             else:
                 detail = f"splines={spline_ids} fill={asset_label} [stamps] ratio={ratio:g} density={density:g}%"
             self.objects_tree.insert("", "end", iid=f"c{j}", values=("", "", source, detail))
@@ -2500,13 +3095,19 @@ class PGAGenGUI:
             specs = f.tags.get(PGA_CLUSTER_FILLS_TAG)
             if not specs:
                 continue
-            kept = [
-                spec for spec in specs
-                if (spec.get("category"), spec.get("type"), spec.get("ratio", DEFAULT_RASTER_RATIO),
-                    spec.get("density", DEFAULT_FILL_DENSITY),
-                    spec.get("source", CLUSTER_FILL_SOURCE_MANUAL),
-                    spec.get("mode", CLUSTER_FILL_MODE_STAMPS)) not in match_keys
-            ]
+            def _spec_key(spec):
+                mode = spec.get("mode", CLUSTER_FILL_MODE_STAMPS)
+                default_density = (
+                    DEFAULT_SPLINE_FILL_DENSITY
+                    if mode in (CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_AUTO)
+                    else DEFAULT_FILL_DENSITY
+                )
+                return (spec.get("category"), spec.get("type"),
+                        spec.get("ratio", DEFAULT_RASTER_RATIO),
+                        spec.get("density", default_density),
+                        spec.get("source", CLUSTER_FILL_SOURCE_MANUAL), mode)
+
+            kept = [spec for spec in specs if _spec_key(spec) not in match_keys]
             if len(kept) == len(specs):
                 continue
             changed = True
@@ -2811,8 +3412,12 @@ class PGAGenGUI:
 
         self._ensure_splines_features_fresh(working_dir)
         course_features = self._shift_and_crop_to_course(working_dir, self._splines_features)
-        cluster_records = pack_cluster_records(course_features)
-        object_spline_fill_records = pack_spline_records(course_features)
+        # "auto"/"spline" fill specs resolve against game_version at pack
+        # time (object_clusters.resolve_fill_mode), so re-pack on a version
+        # switch too (see _on_game_version_changed).
+        gv = self.game_version.get()
+        cluster_records = pack_cluster_records(course_features, game_version=gv)
+        object_spline_fill_records = pack_spline_records(course_features, game_version=gv)
 
         # Preserve resolved collection placements -- they're owned by
         # collections.json (written by the generate-collections step),
@@ -2825,6 +3430,16 @@ class PGAGenGUI:
                 collection_objects = list(iter_collection_objects(load_collection_records(collections_path)))
             except (json.JSONDecodeError, OSError, KeyError):
                 collection_objects = []
+
+        # Parked cars (parking.json, owned by the generate-parking step) --
+        # same "preserve, don't drop until the next CLI run" idea; folded in
+        # as collection_object-shaped records (see course_output/parking.py).
+        parking_path = working_dir / PARKING_FILE
+        if parking_path.exists():
+            try:
+                collection_objects += list(iter_parking_cars(load_parking_records(parking_path)))
+            except (json.JSONDecodeError, OSError, KeyError):
+                pass
 
         # Same "preserve, don't drop until the next CLI run" idea as
         # collection_objects above -- ingame_objects.json is owned by
@@ -2980,6 +3595,127 @@ class PGAGenGUI:
             self.splines_tree.selection_set(restorable_ids)
         self._show_preview()
 
+    def _on_spline_row_double_click(self, event) -> None:
+        """
+        Double-click a Splines-tab row that carries one or more object-
+        spline fills (mode="spline" specs in PGA_CLUSTER_FILLS_TAG) to
+        adjust each fill's "Fill % of max" in place -- the same knob the
+        Fill dialog sets at creation time, without having to Clear and
+        re-Fill. One entry per spline-mode spec on that feature (an
+        asset can legitimately appear more than once).
+
+        A row with nothing spline-mode to edit (untagged, stamps-mode
+        fills only, or a pga_collection marker) is a no-op.
+        """
+        wd = self.working_dir.get().strip()
+        iid = self.splines_tree.identify_row(event.y)
+        if not wd or not iid:
+            return
+        try:
+            osm_id = int(iid)
+        except ValueError:
+            return
+        feature = next((f for f in self._splines_features if f.osm_id == osm_id), None)
+        if feature is None:
+            return
+        spline_specs = [
+            s for s in (feature.tags.get(PGA_CLUSTER_FILLS_TAG) or [])
+            if s.get("mode", CLUSTER_FILL_MODE_STAMPS)
+            in (CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_AUTO)
+        ]
+        if not spline_specs:
+            return
+        self._open_spline_fill_pct_dialog(Path(wd), feature, spline_specs)
+
+    def _open_spline_fill_pct_dialog(self, working_dir: Path, feature, spline_specs: list) -> None:
+        """
+        Popup from _on_spline_row_double_click: one Fill %-of-max entry
+        per mode="spline" spec on `feature`, seeded from the spec's
+        current `density` (see course_output/object_clusters.py's
+        pack_spline_records -- fillPct = category ceiling x density/100).
+        Save writes the new percents straight back into the same spec
+        dicts, persists features.geojson, and re-packs objects.json so
+        the preview updates without a Write Objects run.
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Object-spline fill %")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(
+            dialog,
+            text=f"Spline {feature.osm_id} ({feature.kind}) -- percent (0 < % <= 100, linear) of "
+                 "the asset category's max renderable fillPct. Trees & bushes cap at fillPct 0.03, "
+                 "grass / ground-cover are 1:1.",
+            wraplength=380, justify="left",
+        ).pack(anchor="w", padx=8, pady=(8, 6))
+
+        rows = []
+        for spec in spline_specs:
+            row = ttk.Frame(dialog)
+            row.pack(fill="x", padx=8, pady=2)
+            label = _ASSET_LABEL_BY_KEY.get((spec.get("category"), spec.get("type")), "?")
+            ttk.Label(row, text=label, width=24).pack(side="left")
+            var = tk.StringVar(
+                value=f"{float(spec.get('density', DEFAULT_SPLINE_FILL_DENSITY)):g}"
+            )
+            ttk.Entry(row, textvariable=var, width=8).pack(side="left", padx=4)
+            ttk.Label(row, text="%").pack(side="left")
+            ceiling = SPLINE_FILL_MAX_PCT_BY_CATEGORY.get(spec.get("category"), DEFAULT_SPLINE_FILL_MAX_PCT)
+            hint = ttk.Label(row, text="")
+            hint.pack(side="left", padx=(8, 0))
+
+            def _update_hint(*_a, v=var, h=hint, c=ceiling):
+                try:
+                    d = float(v.get())
+                except ValueError:
+                    h.configure(text="→ fillPct ?")
+                    return
+                h.configure(text=f"→ fillPct {c * d / 100:g}")
+
+            var.trace_add("write", _update_hint)
+            _update_hint()
+            rows.append((spec, var))
+
+        def do_save() -> None:
+            updated = []
+            for spec, var in rows:
+                try:
+                    d = float(var.get())
+                    if not 0.0 < d <= 100.0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showwarning(
+                        "Invalid fill %",
+                        "Every Fill % must be a number greater than 0 and at most 100.",
+                        parent=dialog,
+                    )
+                    return
+                updated.append((spec, d))
+            for spec, d in updated:
+                spec["density"] = d
+            save_features(self._splines_features, working_dir / FEATURES_FILE)
+            dialog.destroy()
+            self._regenerate_packed_objects(working_dir)
+            self._refresh_splines_list()
+            self._refresh_objects_list()
+            if self.splines_tree.exists(str(feature.osm_id)):
+                self.splines_tree.selection_set(str(feature.osm_id))
+            self._show_preview()
+            self._append_log(
+                f"\n[updated object-spline fill % on spline {feature.osm_id}: "
+                + ", ".join(
+                    f"{_ASSET_LABEL_BY_KEY.get((s.get('category'), s.get('type')), '?')}={d:g}%"
+                    for s, d in updated
+                )
+                + "]\n"
+            )
+
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(fill="x", padx=8, pady=(8, 8))
+        ttk.Button(btn_row, text="Save", command=do_save).pack(side="right")
+        ttk.Button(btn_row, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 4))
+
     def _open_cluster_fill_dialog(self) -> None:
         """
         "Fill with Clusters...": pick one or more nature assets (see
@@ -3095,18 +3831,18 @@ class PGAGenGUI:
         category_box.bind("<<ComboboxSelected>>", lambda e: refresh_asset_tree())
         refresh_asset_tree()
 
-        # Stamps (client-side circle-packed scatter, every game_version) vs
-        # Spline (v2021+ engine-auto-scattered object-spline fill region,
-        # no packing) -- see the conversation. Defaults to spline for
-        # 2021+ projects, stamps for 2019 (which has no spline-fill
-        # schema at all -- see step_write_objects).
+        # Auto (default) -> object-spline fill on v2021+ for a vegetation
+        # category, circle-scatter otherwise / on v2019 (see
+        # object_clusters.resolve_fill_mode). Stamps / Spline force one.
         mode_row = ttk.Frame(dialog)
         mode_row.pack(fill="x", padx=8, pady=(0, 4))
         ttk.Label(mode_row, text="Fill mode:").pack(side="left")
-        default_mode = (
-            CLUSTER_FILL_MODE_STAMPS if self.game_version.get() == "2019" else CLUSTER_FILL_MODE_SPLINE
-        )
+        default_mode = CLUSTER_FILL_MODE_AUTO
         mode_var = tk.StringVar(value=default_mode)
+        auto_radio = ttk.Radiobutton(
+            mode_row, text="Auto", value=CLUSTER_FILL_MODE_AUTO, variable=mode_var,
+        )
+        auto_radio.pack(side="left", padx=(4, 0))
         stamps_radio = ttk.Radiobutton(
             mode_row, text="Stamps", value=CLUSTER_FILL_MODE_STAMPS, variable=mode_var,
         )
@@ -3115,11 +3851,14 @@ class PGAGenGUI:
             mode_row, text="Spline", value=CLUSTER_FILL_MODE_SPLINE, variable=mode_var,
         )
         spline_radio.pack(side="left")
-        _Tooltip(stamps_radio, "Client-side circle-packed scatter stamps (Value.clusters) -- works for "
-                 "every game version, but density/placement is this tool's own approximation.")
-        _Tooltip(spline_radio, "An object-spline fill region (Value.splines, v2021+ only) -- the game "
-                 "engine itself auto-scatters the asset at the given density, no packing here. Dropped "
-                 "with a note if this project's game_version is 2019.")
+        _Tooltip(auto_radio, "Recommended: an object-spline fill on v2021+ for vegetation "
+                 "(trees/bushes, grass, ground-cover, detail plants), circle-scatter for rocks/"
+                 "hardscape and on v2019. Resolved at pack time against the project's game version.")
+        _Tooltip(stamps_radio, "Force client-side circle-packed scatter stamps (Value.clusters) -- works "
+                 "for every game version, but density/placement is this tool's own approximation.")
+        _Tooltip(spline_radio, "Force an object-spline fill region (Value.splines) -- the game engine "
+                 "itself auto-scatters the asset at the given density, no packing here. Falls back to "
+                 "circle-scatter if this project's game_version is 2019.")
 
         ratio_row = ttk.Frame(dialog)
         ratio_row.pack(fill="x", padx=8, pady=(0, 4))
@@ -3134,22 +3873,47 @@ class PGAGenGUI:
                  "them further apart. Applies to every asset picked in this dialog, across all 3 "
                  "packing passes. Ignored in spline mode.")
 
+        # Stamps mode: a percent-of-catalog-density knob (default 100).
+        # Spline mode: "% of the max fill this asset CATEGORY renders at",
+        # linear (default 50). The game's density slider maps linearly to
+        # fillPct, but trees & bushes cap at fillPct 0.03 however hard you
+        # push -- pack_spline_records applies SPLINE_FILL_MAX_PCT_BY_
+        # CATEGORY, so 100% here means "as dense as that category goes".
+        _SPLINE_FILL_PCT_DEFAULT = str(DEFAULT_SPLINE_FILL_DENSITY)  # "50.0"
+        _STAMPS_DENSITY_DEFAULT = str(DEFAULT_FILL_DENSITY)  # "100.0"
         density_label = ttk.Label(ratio_row, text="Fill density (%):")
         density_label.pack(side="left", padx=(12, 0))
-        density_var = tk.StringVar(value=str(DEFAULT_FILL_DENSITY))
+        density_var = tk.StringVar(value=(
+            _STAMPS_DENSITY_DEFAULT if default_mode == CLUSTER_FILL_MODE_STAMPS
+            else _SPLINE_FILL_PCT_DEFAULT  # auto + spline both read density as "% of max"
+        ))
         density_entry = ttk.Entry(ratio_row, textvariable=density_var, width=6)
         density_entry.pack(side="left", padx=4)
         _Tooltip(density_entry, "Stamps mode: how many instances render inside each placed stamp circle, "
                  "as a percent of the asset's own measured planting density -- 100 is the catalog's real "
                  "density, 50 is half as many instances at the same stamp size/positions, 200 is double. "
                  "Doesn't change stamp size, count, or placement (see Raster ratio for that). Spline "
-                 "mode: fed straight to the engine as fillPct = density / 100 (so 25% -> fillPct 0.25).")
+                 "mode: percent (0-100) of the maximum fill this asset's CATEGORY renders at -- linear. "
+                 "Trees & bushes top out at fillPct 0.03, so 100% on a tree spline = 0.03; grass / "
+                 "ground-cover are 1:1, so 100% = fillPct 1.0.")
 
         def _update_mode_widgets(*_args) -> None:
-            spline = mode_var.get() == CLUSTER_FILL_MODE_SPLINE
-            ratio_entry.configure(state="disabled" if spline else "normal")
-            ratio_label.configure(text="Raster ratio (stamps only):" if spline else "Raster ratio:")
-            density_label.configure(text="Fill %:" if spline else "Fill density (%):")
+            mode = mode_var.get()
+            pct_of_max = mode in (CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_AUTO)
+            # Ratio only bites for a real stamp pack; Auto might still fall
+            # back to scatter, so keep it editable there.
+            ratio_entry.configure(state="disabled" if mode == CLUSTER_FILL_MODE_SPLINE else "normal")
+            ratio_label.configure(
+                text="Raster ratio (stamps only):" if pct_of_max else "Raster ratio:")
+            density_label.configure(text="Fill % of max:" if pct_of_max else "Fill density (%):")
+            # Re-seed to the new mode's default, but only when the field
+            # still holds the OTHER mode's default (user hasn't typed
+            # their own): the two families want different numbers.
+            cur = density_var.get().strip()
+            if pct_of_max and cur in ("", _STAMPS_DENSITY_DEFAULT):
+                density_var.set(_SPLINE_FILL_PCT_DEFAULT)
+            elif not pct_of_max and cur in ("", _SPLINE_FILL_PCT_DEFAULT):
+                density_var.set(_STAMPS_DENSITY_DEFAULT)
 
         mode_var.trace_add("write", _update_mode_widgets)
         _update_mode_widgets()
@@ -3189,15 +3953,31 @@ class PGAGenGUI:
                         "Invalid ratio", "Raster ratio must be a positive number.", parent=dialog,
                     )
                     return
-            try:
-                density = float(density_var.get())
-                if density <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showwarning(
-                    "Invalid density", "Fill density (%) must be a positive number.", parent=dialog,
-                )
-                return
+            # Both modes store `density` as a percent. Spline (and Auto,
+            # which becomes spline on v2021+) read it as "% of the asset
+            # category's max fillPct" (0-100, see pack_spline_records);
+            # stamps mode as "% of catalog planting density" (can exceed 100).
+            if mode in (CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_AUTO):
+                try:
+                    density = float(density_var.get())
+                    if not 0.0 < density <= 100.0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showwarning(
+                        "Invalid fill %", "Fill % of max must be a number greater than 0 and at "
+                        "most 100.", parent=dialog,
+                    )
+                    return
+            else:
+                try:
+                    density = float(density_var.get())
+                    if density <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showwarning(
+                        "Invalid density", "Fill density (%) must be a positive number.", parent=dialog,
+                    )
+                    return
 
             chosen_entries = [CLUSTERABLE_ENTRIES[int(i)] for i in selected_rows]
 
@@ -3344,6 +4124,30 @@ class PGAGenGUI:
         btn.pack(anchor="w", pady=2)
         return btn
 
+    def _add_slider_entry(self, parent, double_var: tk.DoubleVar, text_var: tk.StringVar,
+                          lo: float = 0.0, hi: float = 400.0) -> ttk.Entry:
+        """A small editable text box that mirrors a slider's DoubleVar both ways:
+        the slider keeps text_var in sync (see _show_preview), and committing the
+        entry (Return / focus-out) parses + clamps the value back into double_var
+        and refreshes the preview."""
+        entry = ttk.Entry(parent, textvariable=text_var, width=5)
+        entry.pack(side="left")
+
+        def _commit(_evt=None):
+            try:
+                val = float(text_var.get())
+            except (TypeError, ValueError):
+                text_var.set(f"{double_var.get():.0f}")
+                return
+            val = max(lo, min(hi, val))
+            double_var.set(val)
+            text_var.set(f"{val:.0f}")
+            self._show_preview()
+
+        entry.bind("<Return>", _commit)
+        entry.bind("<FocusOut>", _commit)
+        return entry
+
     # ------------------------------------------------------------------
     # Working directory / course name: load & persist via project.json
     # ------------------------------------------------------------------
@@ -3386,6 +4190,9 @@ class PGAGenGUI:
             self.objects_theme_var.set(theme_name)
         finally:
             self._suppress_objects_theme_save = False
+        self.objects_tree_asset_paths = list(project.get("objects_tree_asset_paths") or [])
+        self._refresh_tree_assets_summary()
+        self._sync_tree_assets_enabled()
         saved_libdir = project.get("collections_library_dir")
         self.collections_library_var.set(saved_libdir or str(default_library_dir()))
         self._refresh_collection_templates()
@@ -3418,12 +4225,21 @@ class PGAGenGUI:
         same pattern as course_name, rather than only being passed as
         a per-step CLI flag.
         """
+        self._sync_tree_assets_enabled()
         if self._suppress_game_version_save:
             return
         wd = self.working_dir.get().strip()
         if not wd or not Path(wd).is_dir():
             return
         save_project(Path(wd), {"game_version": self.game_version.get()})
+        # mode="auto" / mode="spline" cluster fills resolve differently per
+        # version (object_clusters.resolve_fill_mode), so objects.json + the
+        # "Show objects" preview need a re-pack now, not just at the next
+        # Fill/Clear.
+        try:
+            self._regenerate_packed_objects(Path(wd))
+        except Exception as exc:  # preview refresh must never break a version switch
+            self._append_log(f"[warn] objects re-pack after version change failed: {exc}")
 
     def _on_objects_theme_changed(self) -> None:
         """
@@ -3653,6 +4469,15 @@ class PGAGenGUI:
             )
             if self.generate_terrain_use_height_mask_var.get():
                 args += ["--generate-terrain-mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}"]
+            args.append(
+                "--generate-terrain-remove-covered-stamps"
+                if self.generate_terrain_remove_covered_stamps_var.get()
+                else "--no-generate-terrain-remove-covered-stamps"
+            )
+            if self.generate_terrain_remove_covered_stamps_var.get():
+                margin = self.generate_terrain_remove_covered_margin_var.get().strip()
+                if margin:
+                    args += ["--generate-terrain-remove-covered-margin-m", margin]
             n_workers = self.n_workers_var.get().strip()
             if n_workers:
                 args += ["--n-workers", n_workers]
@@ -3754,6 +4579,14 @@ class PGAGenGUI:
         ]
         if self.use_height_mask_var.get():
             args += ["--mask-buffer-px", f"{self.mask_buffer_preview_var.get():.0f}"]
+        args.append(
+            "--remove-covered-stamps" if self.refine_remove_covered_stamps_var.get()
+            else "--no-remove-covered-stamps"
+        )
+        if self.refine_remove_covered_stamps_var.get():
+            refine_margin = self.refine_remove_covered_margin_var.get().strip()
+            if refine_margin:
+                args += ["--remove-covered-margin-m", refine_margin]
         selected_brushes = [b for b in self.BRUSH_TYPE_ORDER if self.brush_type_vars[b].get()]
         args += ["--candidate-brushes", ",".join(str(b) for b in selected_brushes)]
         max_new = self.max_new_var.get().strip()
@@ -3833,8 +4666,6 @@ class PGAGenGUI:
             args.append("--registration-marks")
         args.append("--direct-height-shift" if self.direct_height_shift_var.get()
                      else "--no-direct-height-shift")
-        args.append("--prune-overlapped-stamps" if self.prune_overlapped_stamps_var.get()
-                     else "--no-prune-overlapped-stamps")
         if step == "write-water":
             if self.multi_tile_water_var.get():
                 args.append("--multi-tile-water")
@@ -3880,6 +4711,7 @@ class PGAGenGUI:
         course_file = filedialog.askopenfilename(
             title="Select a saved, hand-edited .course file to import",
             filetypes=[(".course files", "*.course"), ("All files", "*.*")],
+            **self._courses_dir_dialog_kwarg(),
         )
         if course_file:
             self.import_ingame_course_var.set(course_file)
@@ -3897,8 +4729,6 @@ class PGAGenGUI:
             args.append("--registration-marks")
         args.append("--direct-height-shift" if self.direct_height_shift_var.get()
                      else "--no-direct-height-shift")
-        args.append("--prune-overlapped-stamps" if self.prune_overlapped_stamps_var.get()
-                     else "--no-prune-overlapped-stamps")
         return args
 
     def _run_import_ingame_preview(self) -> None:
@@ -3946,6 +4776,152 @@ class PGAGenGUI:
             if error_resolution:
                 args += ["--error-resolution", error_resolution]
             self._run_step(args, wd)
+
+    # ------------------------------------------------------------------
+    # Push Blank to Game -- the "push-blank-template" CLI step builds a
+    # fresh named blank .course (from the current Game version + Theme
+    # template) into working_dir/blank_template.course; this then copies
+    # that straight into the game's Courses folder. Same CLI-builds /
+    # GUI-copies split as Repack -> "Copy to Game Folder" below.
+    # ------------------------------------------------------------------
+
+    def _game_courses_dir(self, version: Optional[str] = None) -> Optional[Path]:
+        """
+        The in-game Courses folder for `version` (default: the selected
+        Game version), or None if that version has no known folder
+        mapping (see GAME_VERSION_FOLDERS). Doesn't check existence --
+        callers that just want a dialog's starting point should.
+        """
+        folder_name = GAME_VERSION_FOLDERS.get(version or self.game_version.get())
+        if folder_name is None:
+            return None
+        return Path.home() / "AppData" / "LocalLow" / "2K" / folder_name / "Courses"
+
+    def _courses_dir_dialog_kwarg(self) -> dict:
+        """
+        {"initialdir": <selected version's in-game Courses folder>} if
+        that folder exists, else {} -- so a .course open dialog starts
+        where the game keeps its saves. Empty (dialog's own default)
+        when the version is unmapped or the folder isn't there.
+        """
+        courses_dir = self._game_courses_dir()
+        if courses_dir is not None and courses_dir.is_dir():
+            return {"initialdir": str(courses_dir)}
+        return {}
+
+    def _run_push_blank_to_game(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+
+        version = self.game_version.get()
+        if version not in GAME_VERSION_FOLDERS:
+            messagebox.showerror(
+                "Unknown game folder for this version",
+                f"No Courses-folder mapping is known yet for game_version={version!r} "
+                f"(only {list(GAME_VERSION_FOLDERS)} are wired up). Set Game version to one "
+                "of those first.",
+            )
+            return
+        if self.objects_theme_var.get() == "(not set)":
+            messagebox.showwarning(
+                "No theme selected",
+                "Pick a Theme first -- it selects which bundled blank template gets pushed.",
+            )
+            return
+
+        # Serial name is generated GUI-side so the on-disk filename in the
+        # game folder can match the in-game name without parsing step
+        # output; the step stamps this same string inside the .course.
+        serial = f"LIDAR-{version}-{time.strftime('%Y%m%d%H%M%S')}"
+        self._run_step(
+            ["--step", "push-blank-template", "--blank-course-name", serial], wd,
+            on_done=lambda: self._copy_blank_to_game(wd, version, serial),
+        )
+
+    def _copy_blank_to_game(self, wd: Path, version: str, serial: str) -> None:
+        if not self._last_step_ok:
+            return  # the build step failed/was stopped -- nothing to push
+        source = wd / BLANK_TEMPLATE_COURSE_FILE
+        if not source.exists():
+            self._append_log(f"Push Blank: expected {source}, but it doesn't exist.\n")
+            return
+
+        dest_dir = self._game_courses_dir(version)
+        dest_path = dest_dir / f"{serial}.course"
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest_path)
+            self._append_log(f"Pushed blank template -> {dest_path}\n")
+            self.status_label.config(text=f"Blank '{serial}' pushed to game", foreground="green")
+        except OSError as e:
+            messagebox.showerror("Copy failed", str(e))
+            self.status_label.config(text="Push blank failed", foreground="red")
+
+    # ------------------------------------------------------------------
+    # Push to Game for Editing -- the inverse of "Capture from .course..."
+    # The "push-collection" CLI step builds a fresh .course holding one
+    # library template's objects/splines/stamps into
+    # working_dir/pushed_collection.course; this copies it into the game's
+    # Courses folder. Same CLI-builds / GUI-copies split as Push Blank.
+    # ------------------------------------------------------------------
+
+    def _run_push_collection_to_game(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+
+        name = self._selected_collection_name()
+        if not name:
+            messagebox.showwarning(
+                "No template selected",
+                "Select a collection template in the list first.",
+            )
+            return
+
+        version = self.game_version.get()
+        if version not in GAME_VERSION_FOLDERS:
+            messagebox.showerror(
+                "Unknown game folder for this version",
+                f"No Courses-folder mapping is known yet for game_version={version!r} "
+                f"(only {list(GAME_VERSION_FOLDERS)} are wired up). Set Game version to one "
+                "of those first.",
+            )
+            return
+        if self.objects_theme_var.get() == "(not set)":
+            messagebox.showwarning(
+                "No theme selected",
+                "Pick a Theme first -- it selects which bundled blank template the collection "
+                "is built into.",
+            )
+            return
+
+        serial = f"COLL-{_collection_slug(name)}-{time.strftime('%Y%m%d%H%M%S')}"
+        self._run_step(
+            ["--step", "push-collection", "--collection-name", name,
+             "--collection-library", str(self._collection_library_dir()),
+             "--blank-course-name", serial], wd,
+            on_done=lambda: self._copy_pushed_collection_to_game(wd, version, serial),
+        )
+
+    def _copy_pushed_collection_to_game(self, wd: Path, version: str, serial: str) -> None:
+        if not self._last_step_ok:
+            return  # the build step failed/was stopped -- nothing to push
+        source = wd / PUSH_COLLECTION_COURSE_FILE
+        if not source.exists():
+            self._append_log(f"Push Collection: expected {source}, but it doesn't exist.\n")
+            return
+
+        dest_dir = self._game_courses_dir(version)
+        dest_path = dest_dir / f"{serial}.course"
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, dest_path)
+            self._append_log(f"Pushed collection -> {dest_path}\n")
+            self.status_label.config(text=f"Collection '{serial}' pushed to game", foreground="green")
+        except OSError as e:
+            messagebox.showerror("Copy failed", str(e))
+            self.status_label.config(text="Push collection failed", foreground="red")
 
     # ------------------------------------------------------------------
     # Copy to Game Folder -- a plain file copy, not a pipeline step, so
@@ -4170,6 +5146,7 @@ class PGAGenGUI:
                             text=f"Failed (exit {payload}, {elapsed:.1f}s)", foreground="red"
                         )
                         self._append_log(f"\n[finished in {elapsed:.1f}s]\n")
+                    self._last_step_ok = (not self._stop_requested) and payload == 0
                     on_done, self._step_on_done = self._step_on_done, None
                     if on_done is not None:
                         on_done()
@@ -4242,6 +5219,11 @@ class PGAGenGUI:
         self.log_text.insert("end", text)
         self.log_text.see("end")
         self.log_text.config(state="disabled")
+        # Flag unread output on the "◂ Console" button while collapsed so
+        # a running step still signals activity without popping the pane open.
+        if getattr(self, "_log_collapsed", False) and text.strip() and not self._log_unread:
+            self._log_unread = True
+            self._refresh_log_button_label()
 
     def _clear_log(self) -> None:
         self.log_text.config(state="normal")
@@ -4393,6 +5375,28 @@ class PGAGenGUI:
         self.preview_version.set(0)
         self._update_version_label()
         self._show_preview()
+        self._refresh_export_status_lights()
+
+    _EXPORT_STATUS_COLORS = {
+        EXPORT_STATUS_FRESH: "#2ea043",  # green
+        EXPORT_STATUS_STALE: "#d1242f",  # red
+        EXPORT_STATUS_MISSING: "gray",
+    }
+
+    def _refresh_export_status_lights(self) -> None:
+        """
+        Repaint the Repack section's export-status lights (see
+        _build_file_tab) from PGA2k_gen.export_status -- called from
+        _refresh_preview_and_slider, i.e. on working-dir change and
+        after every step finishes, same as the preview redraw. Cheap
+        (a project.json read + a handful of file stats), safe to call
+        this often.
+        """
+        wd = self.working_dir.get().strip()
+        statuses = export_status(Path(wd)) if wd and Path(wd).is_dir() else {}
+        for category, light in self._export_status_lights.items():
+            status = statuses.get(category, EXPORT_STATUS_MISSING)
+            light.configure(fg=self._EXPORT_STATUS_COLORS.get(status, "gray"))
 
     def _on_preview_choice_changed(self) -> None:
         self._refresh_preview_and_slider()
@@ -4415,8 +5419,52 @@ class PGAGenGUI:
             step = 0.1 if event.delta > 0 else -0.1
 
         new_zoom = max(0.25, min(3.0, self.preview_zoom_var.get() + step))
+        if new_zoom == self.preview_zoom_var.get():
+            return
+        self._zoom_preview_keeping_point_under_cursor(event.x, event.y, new_zoom)
+
+    def _zoom_preview_keeping_point_under_cursor(self, pointer_x: int, pointer_y: int, new_zoom: float) -> None:
+        """
+        Re-anchor the scroll position so whatever data point was under
+        the pointer before the zoom step is still under it afterward --
+        the usual "zoom toward cursor" behavior of image editors/maps.
+        Without this, a zoom step re-centers the image (or leaves the
+        scroll position untouched) and the point the user was actually
+        looking at drifts out from under the pointer on every scroll
+        tick.
+        """
+        canvas = self.preview_canvas
+        frac_x = frac_y = 0.5
+        if self._preview_canvas_image_id is not None and self._preview_imgtk is not None:
+            canvas_x = canvas.canvasx(pointer_x)
+            canvas_y = canvas.canvasy(pointer_y)
+            offset_x, offset_y = canvas.coords(self._preview_canvas_image_id)
+            img_w = self._preview_imgtk.width()
+            img_h = self._preview_imgtk.height()
+            if img_w and img_h:
+                frac_x = (canvas_x - offset_x) / img_w
+                frac_y = (canvas_y - offset_y) / img_h
+
         self.preview_zoom_var.set(new_zoom)
         self._show_preview()
+
+        if self._preview_canvas_image_id is None or self._preview_imgtk is None:
+            return
+        new_offset_x, new_offset_y = canvas.coords(self._preview_canvas_image_id)
+        new_img_w = self._preview_imgtk.width()
+        new_img_h = self._preview_imgtk.height()
+        target_canvas_x = new_offset_x + frac_x * new_img_w
+        target_canvas_y = new_offset_y + frac_y * new_img_h
+
+        region = canvas.cget("scrollregion").split()
+        if len(region) != 4:
+            return
+        region_w = float(region[2]) - float(region[0])
+        region_h = float(region[3]) - float(region[1])
+        if region_w > 0:
+            canvas.xview_moveto(max(0.0, min(1.0, (target_canvas_x - pointer_x) / region_w)))
+        if region_h > 0:
+            canvas.yview_moveto(max(0.0, min(1.0, (target_canvas_y - pointer_y) / region_h)))
 
     def _reset_preview_zoom(self) -> None:
         self.preview_zoom_var.set(1.0)
@@ -4742,17 +5790,40 @@ class PGAGenGUI:
         not an elevation, so it never needs normalized stamps and never
         skips a pond just because refine-terrain hasn't reached it yet.
 
-        Not cached like _get_cached_object_preview_layer: self.
-        _splines_features already carries its own mtime-freshness check
-        (_ensure_splines_features_fresh), and a course typically has few
-        enough water bodies that re-fitting each redraw is cheap -- same
-        "compute directly, no extra cache" choice as _get_selected_mask_
-        merged_geometry above.
+        Cached (mtime + params keyed, same idiom as
+        _get_cached_object_preview_layer): the stripe/edge boundary
+        probes fit_water_stripes/fit_water_tiles run per pond are NOT
+        cheap on a course with many water bodies, and _show_preview
+        re-runs this on every zoom tick / every water-param change (via
+        _composite_objects_layer). Without the cache that made zooming
+        and slider drags with "Show objects" on visibly stutter, and
+        looked from the console like Write Water was re-running. The key
+        covers features.geojson + project.json mtime (crop origin) and
+        every water fill field that feeds the fit -- the only inputs the
+        fit has -- so any real change still invalidates it. (Nothing a
+        Write Water run produces feeds back into this footprint fit, so
+        that run needs no explicit invalidation.)
         """
         self._ensure_splines_features_fresh(working_dir)
-        features = self._shift_and_crop_to_course(working_dir, self._splines_features)
         multi_tile = self.multi_tile_water_var.get()
         fill_mode = self.water_fill_mode_var.get()
+
+        project_path = working_dir / PROJECT_FILE
+        cache_key = (
+            str(working_dir),
+            self._splines_features_mtime,
+            project_path.stat().st_mtime if project_path.exists() else None,
+            multi_tile, fill_mode,
+            self.water_stripe_overlap_var.get(), self.water_stripe_min_edge_var.get(),
+            self.water_stripe_tolerance_var.get(), self.water_stripe_max_stripes_var.get(),
+            self.water_tile_tolerance_var.get(), self.water_tile_min_edge_var.get(),
+            self.water_tile_max_search_var.get(), self.water_tile_width_samples_var.get(),
+            self.water_tile_redundancy_var.get(), self.water_tile_overlap_var.get(),
+        )
+        if getattr(self, "_cached_water_preview_rects_key", None) == cache_key:
+            return self._cached_water_preview_rects
+
+        features = self._shift_and_crop_to_course(working_dir, self._splines_features)
         rects = []
         for f in features:
             if f.kind != "water" or f.geometry.geom_type != "Polygon":
@@ -4789,6 +5860,9 @@ class PGAGenGUI:
                 fit = fit_water_rectangle(f.geometry)
                 if fit is not None:
                     rects.append(fit)
+
+        self._cached_water_preview_rects = rects
+        self._cached_water_preview_rects_key = cache_key
         return rects
 
     def _composite_objects_layer(self, img: "Image.Image", working_dir: Path) -> "Image.Image":
@@ -5975,8 +7049,9 @@ class PGAGenGUI:
             border_on = self.mask_border_var.get() if mask_buffer_on else None
             border_width_raw = self.border_width_var.get() if mask_buffer_on else None
             if mask_buffer_on:
-                self.mask_buffer_preview_label.config(text=f"{buffer_px:.0f}")
-                self.border_width_preview_label.config(text=f"{border_width_raw:.0f}")
+                # keep the editable boxes in step with the sliders
+                self.mask_buffer_preview_text.set(f"{buffer_px:.0f}")
+                self.border_width_preview_text.set(f"{border_width_raw:.0f}")
                 # _get_cached_mask_merged_geometry can source the mask
                 # geometry from features.geojson's marked fairway/green
                 # features OR (mask_source_var == "selected") from
@@ -6089,6 +7164,41 @@ class PGAGenGUI:
                         highlight_full = Image.new("RGBA", (geo_img.width, geo_img.height), (0, 0, 0, 0))
                         highlight_full.paste(highlight_img, (data_left, data_top), highlight_img)
                         geo_img = Image.alpha_composite(geo_img, highlight_full)
+
+                        # Bright cyan outline traced over the translucent
+                        # fill -- the same crisp "selected" cue the Objects
+                        # tab's marker gets from its selection ring, so a
+                        # picked spline reads as selected at a glance
+                        # rather than just faintly tinted.
+                        def _course_to_px(x: float, z: float) -> tuple[float, float]:
+                            return (
+                                (x / COURSE_SIZE_M) * data_width,
+                                (1.0 - z / COURSE_SIZE_M) * data_height,
+                            )
+
+                        def _iter_boundary_rings(geom):
+                            if geom.is_empty:
+                                return
+                            gt = geom.geom_type
+                            if gt == "Polygon":
+                                yield list(geom.exterior.coords)
+                                for interior in geom.interiors:
+                                    yield list(interior.coords)
+                            elif gt in ("LineString", "LinearRing"):
+                                yield list(geom.coords)
+                            elif gt in ("MultiPolygon", "MultiLineString", "GeometryCollection"):
+                                for part in geom.geoms:
+                                    yield from _iter_boundary_rings(part)
+
+                        outline_layer = Image.new("RGBA", (data_width, data_height), (0, 0, 0, 0))
+                        outline_draw = ImageDraw.Draw(outline_layer)
+                        for ring in _iter_boundary_rings(highlight_geom):
+                            pts = [_course_to_px(x, z) for x, z in ring]
+                            if len(pts) >= 2:
+                                outline_draw.line(pts, fill=(0, 255, 255, 255), width=3)
+                        outline_full = Image.new("RGBA", (geo_img.width, geo_img.height), (0, 0, 0, 0))
+                        outline_full.paste(outline_layer, (data_left, data_top), outline_layer)
+                        geo_img = Image.alpha_composite(geo_img, outline_full)
 
                 self._cached_geo_overlay = geo_img
                 self._cached_geo_overlay_key = geo_overlay_key

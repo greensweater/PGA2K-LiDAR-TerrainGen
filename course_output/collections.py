@@ -21,7 +21,11 @@ A collections.json record:
      "heading_deg": float,             # 0 = +Z, 90 = +X (see _bearing_deg)
      "objects": [{"x","z","rotation_deg","scale",
                   "category","type","theme","path",
-                  "dy"?}, ...],   # dy present => designed elevation
+                  "dy"?, "pitch"?, "roll"?}, ...],   # dy present => designed elevation;
+                                                     # pitch/roll (deg) => rotation.x/z
+                                                     # (used by course_output/parking.py's
+                                                     # slope-banked parked cars, which ride
+                                                     # this same collection_object path)
      "splines": [ <surfaceSplines.json spline dict, points in course-local frame> ],
      "stamps": [{"x","z","scale_x","scale_z","value","brush","rotation_deg","tool"}, ...]}
 
@@ -36,8 +40,24 @@ member carries an optional `"variants"` map (keyed by parameter value,
 with a `"default"` fallback) whose chosen entry is overlaid on the base
 member (any field: category/type/theme/path/scale/dx/dz/rotation_deg),
 and/or a `"{param}"` token in its asset `path` that's substituted with
-the parameter value. A member with neither is placed identically
-regardless of the parameter. Spline members are always static.
+the parameter value, and/or a `"param_option"` mapping the parameter to
+the game's per-item `options` variant selector. A member with none of
+those is placed identically regardless of the parameter. Spline members
+are always static.
+
+A `"{param}"` token falls back to the member's optional `"param_default"`
+when the placement way carries no `pga_parameter` tag; if that's also
+absent the unresolved token survives and `step_generate_collections`
+prints a WARNING naming the offending way (a forgotten tag would
+otherwise write a broken asset path with no complaint).
+
+`"param_option"` (e.g. `"OffsetIndex"`) is for signs: the ONE
+`HoleSign0N`/`MessageSign`/`DirectionSign` prefab picks WHICH sign it
+renders via `options.OffsetIndex` (0-based) -- the asset path only picks
+the sign STYLE, never the number. The member keeps a fixed path and the
+resolved `options[param_option] = int(pga_parameter or param_default) +
+param_option_base` (base default 0; set `-1` for a 1-based OSM hole
+number). An unresolvable param_option also draws a WARNING.
 
 VERTICAL: object members carrying a `"dy"` (captured from a prop placed
 at a designed elevation -- see collection_library.py's VERTICAL
@@ -97,9 +117,29 @@ def _resolve_member(member: dict, parameter: Optional[str]) -> dict:
     """Apply a `pga_parameter` value to one object member (see the module
     docstring's PARAMETER section): overlay the matching entry from the
     member's optional "variants" map (keyed by the parameter value, with
-    a "default" fallback) onto the base member, then substitute a
-    "{param}" token in the asset path. A member with no "variants" and
-    no "{param}" in its path comes back unchanged."""
+    a "default" fallback) onto the base member, substitute a "{param}"
+    token in the asset path, and/or map the parameter onto a per-item
+    "options" variant selector. A member with none of those comes back
+    unchanged.
+
+    A "{param}" token is filled from the placement way's `pga_parameter`
+    tag; if the way has no such tag the member's optional "param_default"
+    is used instead. With neither, the literal "{param}" is left in the
+    path -- step_generate_collections warns about that (a forgotten tag
+    would otherwise ship a broken asset path silently).
+
+    "param_option" (a string, e.g. "OffsetIndex") maps the parameter to
+    the game's per-item `options` variant selector instead of the path:
+    the ONE hole/message/direction-sign prefab picks WHICH sign it shows
+    via `options.OffsetIndex` (0-based), the asset path only picks the
+    sign style. The stored value is int(parameter or param_default) +
+    "param_option_base" (default 0 -- set it to -1 for a 1-based
+    `pga_parameter` like an OSM hole number). If neither a tag nor a
+    param_default gives an integer, "options" is left off and
+    "options_unresolved" flags it for step_generate_collections to warn.
+
+    "param_default", "param_option", "param_option_base" are all stripped
+    from the returned member."""
     effective = dict(member)
     variants = member.get("variants")
     if isinstance(variants, dict):
@@ -111,9 +151,23 @@ def _resolve_member(member: dict, parameter: Optional[str]) -> dict:
         if isinstance(chosen, dict):
             effective.update(chosen)
     effective.pop("variants", None)
+
+    token = parameter if parameter is not None else effective.get("param_default")
+
     path = effective.get("path")
-    if path and parameter is not None and "{param}" in path:
-        effective["path"] = path.replace("{param}", str(parameter))
+    if path and "{param}" in path and token is not None:
+        effective["path"] = path.replace("{param}", str(token))
+
+    option_key = effective.get("param_option")
+    if isinstance(option_key, str) and option_key:
+        try:
+            base = int(effective.get("param_option_base", 0))
+            effective["options"] = {option_key: int(str(token)) + base}
+        except (TypeError, ValueError):
+            effective["options_unresolved"] = option_key
+
+    for k in ("param_default", "param_option", "param_option_base"):
+        effective.pop(k, None)
     return effective
 
 
@@ -146,6 +200,13 @@ def resolve_collection(
         # position.y = "-Infinity" (game ground-snap).
         if m.get("dy") is not None:
             obj["dy"] = _round(m["dy"])
+        # Per-item variant selector (e.g. a sign's options.OffsetIndex --
+        # see _resolve_member's "param_option"). Rides through unrotated;
+        # write-objects hands it to objects._placed_item verbatim.
+        if m.get("options") is not None:
+            obj["options"] = m["options"]
+        if m.get("options_unresolved"):
+            obj["options_unresolved"] = m["options_unresolved"]
         objects.append(obj)
 
     splines: list[dict] = []
@@ -277,7 +338,8 @@ def build_collection_objects_v2019(objects: list[dict]) -> list[dict]:
         })
         group["Value"]["items"].append(_placed_item(
             obj["x"], obj["z"], obj.get("scale", 1.0), obj.get("rotation_deg", 0.0),
-            y=obj.get("y", "-Infinity"),
+            y=obj.get("y", "-Infinity"), options=obj.get("options"),
+            pitch_degrees=obj.get("pitch", 0.0), roll_degrees=obj.get("roll", 0.0),
         ))
     if skipped:
         print(f"  NOTE: {skipped} collection object(s) skipped -- no v2019 category/type "
@@ -299,7 +361,8 @@ def build_collection_objects_v2021(objects: list[dict]) -> list[dict]:
         group = groups.setdefault(path, _placed_object_group_v2021(path))
         group["Value"]["items"].append(_placed_item(
             obj["x"], obj["z"], obj.get("scale", 1.0), obj.get("rotation_deg", 0.0),
-            y=obj.get("y", "-Infinity"),
+            y=obj.get("y", "-Infinity"), options=obj.get("options"),
+            pitch_degrees=obj.get("pitch", 0.0), roll_degrees=obj.get("roll", 0.0),
         ))
     if skipped:
         print(f"  NOTE: {skipped} collection object(s) skipped -- no v2021 asset path "

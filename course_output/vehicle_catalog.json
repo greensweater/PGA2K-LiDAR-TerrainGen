@@ -1,0 +1,148 @@
+{
+  "note": "Catalog of the PGA 2K 'Land' vehicle prefabs (parked-car props) and their colour variants, plus the editor's tilt clamp limits. Derived from the hand-authored reference capture at C:/Users/andy_/Desktop/golf/py/cars -- a v2021 course (theme 11, placedObjects3.json) with one prop of every car placed in a single left-to-right row, the user annotating each by colour (revised 2026-09-08: Car25PrefabD and Car16BPrefab, first read as black, are a dark grey -- folded into colour \"gray\" with \"shade\":\"dark\" per the user). Intended for the parking-lot auto-fill feature (line an OSM service road / amenity=parking with cars). Asset paths are game-version-agnostic Vehicles/Land prefab paths (category 10 = vehicles in asset_catalog.json); they carry no catalog spacing/native-size entry there.",
+
+  "tilt_limits_deg": {
+    "pitch_x": [-10.0, 10.0],
+    "roll_z": [-10.0, 10.0],
+    "yaw_y": "free (0-360)",
+    "source": "user set the four Car56 variants to the editor's max/min in the reference capture: rot.z=+10 / rot.z=-10 / rot.x=-10 / rot.x=+10. Use this range to bank parked cars to the local ground slope instead of leaving them axis-flat on a graded lot.",
+    "position_y": "-Infinity (ground-snap); every car in the capture snaps to terrain"
+  },
+
+  "measured": {
+    "capture_path": "C:/Users/andy_/Desktop/golf/py/cars",
+    "game_version": "v2021 (placedObjects3.json)",
+    "theme_id": 11,
+    "side_by_side_center_spacing_m": {
+      "car": 2.25,
+      "van": 2.70,
+      "note": "mean consecutive x-delta within each model group in the capture; cars ~2.1-2.35 m, Van01 ~2.65-2.74 m. This is nose-to-tail-parking lateral pitch, i.e. cars parked shoulder-to-shoulder facing the same way."
+    },
+    "vehicle_length_m": "NOT measured -- single-row capture, every car on the same heading with near-constant z. Assume ~4.5 m sedan / ~5.5 m van until captured with util/extract_tree_dimensions.py-style method."
+  },
+
+  "models": [
+    {
+      "group": "1",
+      "model_id": 56,
+      "class": "car",
+      "base_path": "Assets/CourseProps/Vehicles/Land/Car56Prefab",
+      "variant_suffix_pattern": "Prefab / PrefabB / PrefabC / PrefabD",
+      "variants": [
+        { "color": "purple", "suffix": "",  "path": "Assets/CourseProps/Vehicles/Land/Car56Prefab"  },
+        { "color": "green",  "suffix": "B", "path": "Assets/CourseProps/Vehicles/Land/Car56PrefabB" },
+        { "color": "white",  "suffix": "C", "path": "Assets/CourseProps/Vehicles/Land/Car56PrefabC" },
+        { "color": "black",  "suffix": "D", "path": "Assets/CourseProps/Vehicles/Land/Car56PrefabD" }
+      ]
+    },
+    {
+      "group": "2",
+      "model_id": 51,
+      "class": "car",
+      "base_path": "Assets/CourseProps/Vehicles/Land/Car51Prefab",
+      "variant_suffix_pattern": "Prefab / PrefabB / PrefabC / PrefabD",
+      "variants": [
+        { "color": "white",   "suffix": "",  "path": "Assets/CourseProps/Vehicles/Land/Car51Prefab"  },
+        { "color": "red",     "suffix": "B", "path": "Assets/CourseProps/Vehicles/Land/Car51PrefabB" },
+        { "color": "magenta", "suffix": "C", "path": "Assets/CourseProps/Vehicles/Land/Car51PrefabC" },
+        { "color": "cyan",    "suffix": "D", "path": "Assets/CourseProps/Vehicles/Land/Car51PrefabD" }
+      ]
+    },
+    {
+      "group": "3",
+      "model_id": 35,
+      "class": "car",
+      "base_path": "Assets/CourseProps/Vehicles/Land/Car35Prefab",
+      "variant_suffix_pattern": "Prefab / PrefabB / PrefabC / PrefabD",
+      "variants": [
+        { "color": "black",  "suffix": "",  "path": "Assets/CourseProps/Vehicles/Land/Car35Prefab"  },
+        { "color": "white",  "suffix": "B", "path": "Assets/CourseProps/Vehicles/Land/Car35PrefabB" },
+        { "color": "blue",   "suffix": "C", "path": "Assets/CourseProps/Vehicles/Land/Car35PrefabC" },
+        { "color": "maroon", "suffix": "D", "path": "Assets/CourseProps/Vehicles/Land/Car35PrefabD" }
+      ]
+    },
+    {
+      "group": "4",
+      "model_id": 32,
+      "class": "car",
+      "base_path": "Assets/CourseProps/Vehicles/Land/Car32Prefab",
+      "variant_suffix_pattern": "Prefab / PrefabB / PrefabC / PrefabD",
+      "variants": [
+        { "color": "fuschia", "suffix": "",  "path": "Assets/CourseProps/Vehicles/Land/Car32Prefab"  },
+        { "color": "gray",    "suffix": "B", "path": "Assets/CourseProps/Vehicles/Land/Car32PrefabB" },
+        { "color": "teal",    "suffix": "C", "path": "Assets/CourseProps/Vehicles/Land/Car32PrefabC" },
+        { "color": "yellow",  "suffix": "D", "path": "Assets/CourseProps/Vehicles/Land/Car32PrefabD" }
+      ]
+    },
+    {
+      "group": "5",
+      "model_id": 30,
+      "class": "car",
+      "base_path": "Assets/CourseProps/Vehicles/Land/Car30Prefab",
+      "variant_suffix_pattern": "Prefab / PrefabB / PrefabC / PrefabD",
+      "variants": [
+        { "color": "blue",  "suffix": "",  "path": "Assets/CourseProps/Vehicles/Land/Car30Prefab"  },
+        { "color": "white", "suffix": "B", "path": "Assets/CourseProps/Vehicles/Land/Car30PrefabB" },
+        { "color": "brown", "suffix": "C", "path": "Assets/CourseProps/Vehicles/Land/Car30PrefabC" },
+        { "color": "green", "suffix": "D", "path": "Assets/CourseProps/Vehicles/Land/Car30PrefabD" }
+      ]
+    },
+    {
+      "group": "6",
+      "model_id": 25,
+      "class": "car",
+      "base_path": "Assets/CourseProps/Vehicles/Land/Car25Prefab",
+      "variant_suffix_pattern": "Prefab / PrefabB / PrefabC / PrefabD",
+      "variants": [
+        { "color": "yellow",  "suffix": "",  "path": "Assets/CourseProps/Vehicles/Land/Car25Prefab"  },
+        { "color": "gray",    "suffix": "B", "path": "Assets/CourseProps/Vehicles/Land/Car25PrefabB" },
+        { "color": "fuschia", "suffix": "C", "path": "Assets/CourseProps/Vehicles/Land/Car25PrefabC" },
+        { "color": "gray",    "suffix": "D", "path": "Assets/CourseProps/Vehicles/Land/Car25PrefabD", "shade": "dark" }
+      ]
+    },
+    {
+      "group": "7",
+      "model_id": 16,
+      "class": "car",
+      "base_path": "Assets/CourseProps/Vehicles/Land/Car16Prefab",
+      "variant_suffix_pattern": "Prefab / BPrefab / CPrefab / DPrefab  (prefix letter, unlike groups 1-6)",
+      "variants": [
+        { "color": "red",    "suffix": "",  "path": "Assets/CourseProps/Vehicles/Land/Car16Prefab"  },
+        { "color": "gray",   "suffix": "B", "path": "Assets/CourseProps/Vehicles/Land/Car16BPrefab", "shade": "dark" },
+        { "color": "white",  "suffix": "C", "path": "Assets/CourseProps/Vehicles/Land/Car16CPrefab" },
+        { "color": "hunter", "suffix": "D", "path": "Assets/CourseProps/Vehicles/Land/Car16DPrefab" }
+      ]
+    },
+    {
+      "group": "v",
+      "model_id": "Van01",
+      "class": "van",
+      "base_path": "Assets/CourseProps/Vehicles/Land/Van01APrefab",
+      "variant_suffix_pattern": "APrefab / BPrefab / CPrefab / DPrefab  (no bare Van01Prefab)",
+      "variants": [
+        { "color": "white",  "suffix": "A", "path": "Assets/CourseProps/Vehicles/Land/Van01APrefab" },
+        { "color": "black",  "suffix": "B", "path": "Assets/CourseProps/Vehicles/Land/Van01BPrefab" },
+        { "color": "blue",   "suffix": "C", "path": "Assets/CourseProps/Vehicles/Land/Van01CPrefab" },
+        { "color": "maroon", "suffix": "D", "path": "Assets/CourseProps/Vehicles/Land/Van01DPrefab" }
+      ]
+    }
+  ],
+
+  "colors_index": {
+    "black":   ["Car56PrefabD", "Car35Prefab", "Van01BPrefab"],
+    "white":   ["Car56PrefabC", "Car51Prefab", "Car35PrefabB", "Car30PrefabB", "Car16CPrefab", "Van01APrefab"],
+    "green":   ["Car56PrefabB", "Car30PrefabD"],
+    "purple":  ["Car56Prefab"],
+    "cyan":    ["Car51PrefabD"],
+    "magenta": ["Car51PrefabC"],
+    "red":     ["Car51PrefabB", "Car16Prefab"],
+    "maroon":  ["Car35PrefabD", "Van01DPrefab"],
+    "blue":    ["Car35PrefabC", "Car30Prefab", "Van01CPrefab"],
+    "yellow":  ["Car32PrefabD", "Car25Prefab"],
+    "teal":    ["Car32PrefabC"],
+    "gray":    ["Car32PrefabB", "Car25PrefabB", "Car25PrefabD", "Car16BPrefab"],
+    "fuschia": ["Car32Prefab", "Car25PrefabC"],
+    "brown":   ["Car30PrefabC"],
+    "hunter":  ["Car16DPrefab"]
+  }
+}

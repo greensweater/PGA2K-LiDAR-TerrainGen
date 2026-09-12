@@ -150,6 +150,17 @@ whatever the packer above produced). Deliberately a separate knob from
 `ratio`: ratio changes how many/how large the circles are (packing
 geometry), density changes how many instances render inside a given
 circle (measured-density scale), independent of each other.
+
+For mode="spline" (pack_spline_records) the SAME `density` field is
+reused as a percent (0-100), "% of the maximum fill this asset CATEGORY
+supports". In-game data (util/extract_object_spline_fills.py, four
+assets x four slider positions) showed the density slider maps LINEARLY
+to fillPct, but category 0 (trees & bushes) tops out at fillPct 0.03
+however far you push it -- a 31 m ash and a 1 m bush hit the identical
+0.03 ceiling, so it's an engine constant per category, not a per-plant
+thing. Every other category is 1:1 (100% -> fillPct 1.0). So
+fillPct = SPLINE_FILL_MAX_PCT_BY_CATEGORY.get(category, 1.0) * density/100.
+Default DEFAULT_SPLINE_FILL_DENSITY (50 -> half of the category max).
 """
 
 from __future__ import annotations
@@ -162,6 +173,7 @@ from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 from shapely.ops import unary_union
 
 from course_output.asset_catalog import ASSET_CATEGORIES, ASSET_ENTRIES, AssetCategory, AssetEntry, cluster_count
+from course_output.game_versions import DEFAULT_GAME_VERSION
 from course_output.userLayers import GRID_ORIGIN_OFFSET
 from ingest.osm import Feature
 
@@ -237,15 +249,61 @@ def next_synthetic_osm_id(features) -> int:
 
 DEFAULT_RASTER_RATIO = 1.0
 DEFAULT_FILL_DENSITY = 100.0  # percent; scales cluster_count(...) -- see DENSITY in the module docstring
+DEFAULT_SPLINE_FILL_DENSITY = 50.0  # percent of the category max; mode="spline" default (see DENSITY)
+
+# mode="spline" only: the highest fillPct a given asset CATEGORY will
+# actually render at in-game, no matter how far the density slider is
+# pushed (measured -- see DENSITY in the module docstring and
+# util/extract_object_spline_fills.py). A spec's `density` percent is
+# taken as a percent OF THIS, linearly. Any category not listed is 1:1
+# (100% -> fillPct 1.0).
+SPLINE_FILL_MAX_PCT_BY_CATEGORY = {
+    0: 0.03,  # trees & bushes -- Green Ash (31 m), Scots Pine, NPBush03B all capped here
+}
+DEFAULT_SPLINE_FILL_MAX_PCT = 1.0  # grass, ground-cover, rocks, detail plants, ...
 
 # Fill spec dicts' "mode" field -- "stamps" (default, back-compat with
 # every spec predating this field) packs circle-scatter stamps into
 # Value.clusters (see pack_cluster_records); "spline" instead emits an
 # engine-auto-scattered object-spline fill region into Value.splines,
-# v2021+ only (see pack_spline_records). One Feature can carry both --
-# each fill spec picks its own mode independently.
+# v2021+ only (see pack_spline_records); "auto" resolves to "spline" on
+# v2021+ for a vegetation category (AUTO_SPLINE_CATEGORIES) and "stamps"
+# everywhere else -- the default for new fills and stream-bank veg. One
+# Feature can carry several specs, each picking its own mode. Resolution
+# happens at pack time (see resolve_fill_mode) -- objects.json therefore
+# depends on game_version for "auto"/"spline" specs, so a version switch
+# re-packs (the GUI does this automatically; CLI: re-run pack-objects).
 CLUSTER_FILL_MODE_STAMPS = "stamps"
 CLUSTER_FILL_MODE_SPLINE = "spline"
+CLUSTER_FILL_MODE_AUTO = "auto"
+
+# Asset categories a mode="auto" fill renders as an object-spline region
+# on v2021+ (see asset_catalog.json "categories"): 0 trees & bushes,
+# 2 grass, 3 ground-cover plants, 12 detail plants. Everything else
+# (rocks, signs, walls, ...) stays circle-scatter even under "auto".
+AUTO_SPLINE_CATEGORIES = frozenset({0, 2, 3, 12})
+
+# game_version strings that CAN'T render an object-spline fill (Value.splines
+# object-scatter regions) -- an "auto" or explicit "spline" spec falls back
+# to circle-scatter for these (see resolve_fill_mode / step_write_objects).
+_NO_SPLINE_FILL_VERSIONS = frozenset({"2019"})
+
+
+def resolve_fill_mode(spec: dict, game_version: str) -> str:
+    """Concrete "stamps" or "spline" for one fill spec against a target
+    game_version. "auto" -> "spline" only on a spline-capable version AND
+    an AUTO_SPLINE_CATEGORIES category, else "stamps". An explicit
+    "spline" on a version that can't render one (v2019) also falls back
+    to "stamps" rather than being dropped."""
+    mode = spec.get("mode", CLUSTER_FILL_MODE_STAMPS)
+    spline_ok = str(game_version) not in _NO_SPLINE_FILL_VERSIONS
+    if mode == CLUSTER_FILL_MODE_AUTO:
+        if spline_ok and int(spec.get("category", -1)) in AUTO_SPLINE_CATEGORIES:
+            return CLUSTER_FILL_MODE_SPLINE
+        return CLUSTER_FILL_MODE_STAMPS
+    if mode == CLUSTER_FILL_MODE_SPLINE and not spline_ok:
+        return CLUSTER_FILL_MODE_STAMPS
+    return mode
 
 # The engine appears to cap a single object-spline's bounding box --
 # see ref/generate_rough_border_v2.py's MAX_SPLINE_BOUNDS (100m there).
@@ -1148,7 +1206,10 @@ def _pack_spec(
     ]
 
 
-def fill_feature_with_clusters(feature: Feature, rng: Optional[random.Random] = None) -> list[dict]:
+def fill_feature_with_clusters(
+    feature: Feature, rng: Optional[random.Random] = None,
+    game_version: str = DEFAULT_GAME_VERSION,
+) -> list[dict]:
     """
     Schema-neutral packed records (see _pack_spec) covering
     `feature.geometry`'s area, one packing run per
@@ -1178,8 +1239,8 @@ def fill_feature_with_clusters(feature: Feature, rng: Optional[random.Random] = 
 
     records: list[dict] = []
     for spec in specs:
-        if spec.get("mode", CLUSTER_FILL_MODE_STAMPS) != CLUSTER_FILL_MODE_STAMPS:
-            continue  # mode="spline" -- see pack_spline_records, not this stamp packer
+        if resolve_fill_mode(spec, game_version) != CLUSTER_FILL_MODE_STAMPS:
+            continue  # renders as an object-spline fill -- see pack_spline_records
         resolved = _resolve_spec(spec)
         if resolved is None:
             print(f"  NOTE: skipping unresolvable cluster fill spec "
@@ -1194,7 +1255,10 @@ def fill_feature_with_clusters(feature: Feature, rng: Optional[random.Random] = 
     return records
 
 
-def pack_cluster_records(features: list[Feature], rng: Optional[random.Random] = None) -> list[dict]:
+def pack_cluster_records(
+    features: list[Feature], rng: Optional[random.Random] = None,
+    game_version: str = DEFAULT_GAME_VERSION,
+) -> list[dict]:
     """
     Schema-neutral packed cluster records (see _pack_spec) for every
     Feature carrying PGA_CLUSTER_FILLS_TAG -- the pack-objects step's
@@ -1236,8 +1300,8 @@ def pack_cluster_records(features: list[Feature], rng: Optional[random.Random] =
         if not specs:
             continue
         for spec in specs:
-            if spec.get("mode", CLUSTER_FILL_MODE_STAMPS) != CLUSTER_FILL_MODE_STAMPS:
-                continue  # mode="spline" -- see pack_spline_records, not this stamp packer
+            if resolve_fill_mode(spec, game_version) != CLUSTER_FILL_MODE_STAMPS:
+                continue  # renders as an object-spline fill -- see pack_spline_records
             resolved = _resolve_spec(spec)
             if resolved is None:
                 print(f"  NOTE: skipping unresolvable cluster fill spec "
@@ -1293,11 +1357,16 @@ def subdivide_polygon(poly: Polygon, max_size: float = MAX_SPLINE_FILL_PIECE_SIZ
     return pieces
 
 
-def pack_spline_records(features: list[Feature]) -> list[dict]:
+def pack_spline_records(
+    features: list[Feature], game_version: str = DEFAULT_GAME_VERSION,
+) -> list[dict]:
     """
     Schema-neutral object-spline-fill records -- {"category", "type",
-    "waypoints", "fill_pct", "spline_id"} -- for every mode="spline"
-    fill spec (see pack_cluster_records's mode="stamps" counterpart).
+    "waypoints", "fill_pct", "spline_id"} -- for every fill spec that
+    resolves to spline mode for `game_version` (see resolve_fill_mode:
+    explicit mode="spline", or mode="auto" on a spline-capable version
+    with a vegetation category). Returns [] on v2019 (no spline-fill
+    schema -- those specs go through pack_cluster_records instead).
 
     Unlike stamp-mode packing, there's no circle placement here and
     nothing to freeze via RNG: an object-spline fill is just the
@@ -1306,16 +1375,20 @@ def pack_spline_records(features: list[Feature]) -> list[dict]:
     same geometry _pack_spec's dart-throw/ring-walk packing consumes
     for stamp mode) chopped into <= MAX_SPLINE_FILL_PIECE_SIZE_M pieces
     (subdivide_polygon) and reported as-is. fill_pct is the spec's
-    existing density percent / 100 -- reusing the same knob stamp-mode
-    already exposes rather than adding a second one (see the
-    conversation's decision).
+    `density` percent taken as a percent of the asset category's max
+    renderable fillPct: SPLINE_FILL_MAX_PCT_BY_CATEGORY.get(cat, 1.0)
+    * density / 100 (see DENSITY in the module docstring -- trees &
+    bushes cap at 0.03, everything else is 1:1).
 
-    waypoints are the piece's exterior ring, course-local frame, closed
-    point dropped (shapely repeats the first point at the end) --
+    waypoints are the piece's exterior ring, course-local frame, kept
+    CLOSED (first point repeated as the last, the way shapely hands it
+    back) -- the PGA 2K21 designer keeps the closing point when it
+    re-saves an object-scatter spline, so we emit it too.
     course_output/objects.py's object_spline_fill_records_to_v2021_groups
-    turns these into the game's degenerate-handle waypoint dicts and
-    applies GRID_ORIGIN_OFFSET at write time, same "freeze at pack,
-    format at write" split as pack_cluster_records.
+    turns these into the game's degenerate-handle waypoint dicts (state=1,
+    isFilled=False -- see there for why NOT isFilled=True) and applies
+    GRID_ORIGIN_OFFSET at write time, same "freeze at pack, format at
+    write" split as pack_cluster_records.
     """
     records: list[dict] = []
     for feature in features:
@@ -1329,7 +1402,7 @@ def pack_spline_records(features: list[Feature]) -> list[dict]:
             else [feature.geometry]
         )
         for spec in specs:
-            if spec.get("mode", CLUSTER_FILL_MODE_STAMPS) != CLUSTER_FILL_MODE_SPLINE:
+            if resolve_fill_mode(spec, game_version) != CLUSTER_FILL_MODE_SPLINE:
                 continue
             resolved = _resolve_spec(spec)
             if resolved is None:
@@ -1338,13 +1411,14 @@ def pack_spline_records(features: list[Feature]) -> list[dict]:
                       "(stale tag or asset_catalog.json no longer has it)")
                 continue
             category, entry = resolved
-            fill_pct = spec.get("density", DEFAULT_FILL_DENSITY) / 100.0
+            ceiling = SPLINE_FILL_MAX_PCT_BY_CATEGORY.get(category.id, DEFAULT_SPLINE_FILL_MAX_PCT)
+            fill_pct = ceiling * spec.get("density", DEFAULT_SPLINE_FILL_DENSITY) / 100.0
             for poly in polys:
                 for piece in subdivide_polygon(poly, MAX_SPLINE_FILL_PIECE_SIZE_M):
                     if piece.is_empty or not isinstance(piece, Polygon):
                         continue
-                    waypoints = list(piece.exterior.coords[:-1])
-                    if len(waypoints) < 3:
+                    waypoints = [(float(x), float(y)) for x, y in piece.exterior.coords]
+                    if len(waypoints) < 4:  # 3 distinct vertices + repeated closing point
                         continue
                     records.append({
                         "category": category.id, "type": entry.type,

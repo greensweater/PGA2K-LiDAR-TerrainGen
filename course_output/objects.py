@@ -85,6 +85,15 @@ tree_type_asset_paths, v2019 via a per-theme species-bucket table
 (tree_themes.json / TreeThemeSpecies / build_tree_objects_v2019's
 `species` arg).
 
+v2021+ placed objects are keyed by real Unity asset paths, not a numeric
+id this project could guess at, so build_tree_objects_v2021 needs
+caller-supplied paths -- BUT for the rustic theme (CATALOG_SOURCE_THEME_ID)
+asset_catalog.json already carries the full tree set, so
+default_tree_asset_paths_v2021 synthesizes both the general pool and a
+pine/deciduous tree_type_asset_paths map from it + tree_themes.json (same
+species buckets build_tree_objects_v2019 uses). Any other theme still has
+no bundled v2021 paths, so it stays caller-supplied-or-error there.
+
 Deliberately still NOT built (see conversation, pending v2021+ schema
 confirmation beyond what generate_rough_border_v2.py already reverse-
 engineered): a generalized object-spline "scatter template" builder
@@ -100,7 +109,7 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence, Union
 
 import overpy
 import pyproj
@@ -109,7 +118,9 @@ from shapely.geometry import Point
 from ingest.osm import Feature, latlon_to_local
 from terrain.bounding_box import BoundingBox
 from terrain.cart_paths import CART_PATH_WIDTH_M
-from course_output.asset_catalog import ASSET_ENTRIES, NATIVE_TREE_HEIGHT_BY_PATH, native_tree_height_v2019
+from course_output.asset_catalog import (
+    ASSET_ENTRIES, CATALOG_SOURCE_THEME_ID, NATIVE_TREE_HEIGHT_BY_PATH, native_tree_height_v2019,
+)
 from course_output.userLayers import GRID_ORIGIN_OFFSET
 # Re-exported for existing callers (PGA2k_gen.py, PGA2k_gen_gui.py) -- the
 # version registry itself now lives in game_versions.py, see its docstring.
@@ -633,6 +644,7 @@ def move_trees_off_cartpaths(
 
 def _placed_item(
     x: float, z: float, scale: float, rotation_degrees: float = 0.0, y: "float | str" = "-Infinity",
+    options: Optional[dict] = None, pitch_degrees: float = 0.0, roll_degrees: float = 0.0,
 ) -> dict:
     """One placed-object instance, position shifted into the game's
     origin-centered grid (see module docstring), scale.x = scale.y =
@@ -643,16 +655,31 @@ def _placed_item(
     onto the terrain (with each prefab's own built-in vertical "bleed")
     on load. Pass a real number for an object that carries a designed
     elevation instead (a deck/railing built at a set height; see
-    course_output/collections.py's terrain-relative collection members)."""
-    return {
+    course_output/collections.py's terrain-relative collection members).
+
+    `pitch_degrees` / `roll_degrees` set rotation.x / rotation.z (both
+    default 0 -- an object sitting flat). The game clamps a vehicle
+    prop's tilt to +-10 deg on each; course_output/parking.py banks
+    parked cars to the local ground slope within that range.
+
+    `options`, if given, is emitted verbatim as the item's "options"
+    dict -- the game hangs a per-prefab variant selector there (e.g. a
+    hole/message/direction sign's "OffsetIndex", which picks WHICH sign
+    the one shared prefab shows; the asset path only picks the sign
+    style). Left off entirely when None, matching how the game writes
+    an item with no variant."""
+    item = {
         "position": {
             "x": _round(x - GRID_ORIGIN_OFFSET),
             "y": y if isinstance(y, str) else _round(y),
             "z": _round(z - GRID_ORIGIN_OFFSET),
         },
-        "rotation": {"x": 0.0, "y": _round(rotation_degrees), "z": 0.0},
+        "rotation": {"x": _round(pitch_degrees), "y": _round(rotation_degrees), "z": _round(roll_degrees)},
         "scale": {"x": _round(scale), "y": _round(scale), "z": _round(scale)},
     }
+    if options:
+        item["options"] = dict(options)
+    return item
 
 
 def _height_scale_lookup(
@@ -895,6 +922,13 @@ BUILDING_STAKE_CATEGORY_V2019 = CARTPATH_DEBUG_MARKER_CATEGORY_V2019
 BUILDING_STAKE_TYPE_V2019 = CARTPATH_DEBUG_MARKER_TYPE_V2019
 BUILDING_STAKE_SCALE_V2019 = 0.5  # subtle -- just enough to mark a corner, not call attention to itself
 
+# v2021+ default stake prop: the exact same fence post as the v2019
+# category=13/type=34 above, per asset_catalog.json's measured
+# v2019->v2021 mapping for that (category, type) -- so a building
+# staked for v2019 and re-written for v2021 gets the identical prop.
+# Overridable via write-objects' --stake-asset-path.
+DEFAULT_STAKE_ASSET_PATH_V2021 = "Assets/CourseGen/Detail/Walls/WoodFencesBPostCPrefab"
+
 
 def build_building_stake_objects_v2019(features: list[Feature]) -> list[dict]:
     """
@@ -1001,13 +1035,21 @@ def object_spline_fill_records_to_v2021_groups(records: list[dict]) -> list[dict
     v2021+ ONLY -- placedObjects2 groups (Key {"path": ...}) from
     object_clusters.pack_spline_records' schema-neutral output, one
     group per distinct asset path. Each record becomes one
-    Value.splines[] entry: a closed, filled object spline around the
-    record's (already <= MAX_SPLINE_FILL_PIECE_SIZE_M) polygon piece,
-    density fillPct -- see the module docstring and
-    ref/generate_rough_border_v2.py's polygon_to_object_spline, which
-    this mirrors exactly (state=0, ClosedPath/isClosed/isFilled=True,
-    width=1.0 -- the width of a FILLED spline doesn't bound the fill
-    area, just the corner rounding, so a fixed value is fine here).
+    Value.splines[] entry: a CLOSED (not "filled") object-scatter spline
+    around the record's (already <= MAX_SPLINE_FILL_PIECE_SIZE_M) polygon
+    piece, density fillPct.
+
+    Schema confirmed by round-tripping our own output through the PGA
+    2K21 designer (hhills3_2021): the game normalizes an object-scatter
+    fill to state=1, ClosedPath/isClosed=True, isFilled=FALSE, width=1.0,
+    fillPct preserved. ref/generate_rough_border_v2.py's
+    polygon_to_object_spline used state=0/isFilled=True -- that was
+    wrong: isFilled=True makes the engine treat the polygon as a solidly
+    painted surface region (every instance, fillPct ignored -> a dense
+    wall) until it's re-saved in-game. So we write what the game itself
+    writes: state=1, isFilled=False. The record's waypoints are the
+    CLOSED exterior ring (first point repeated last), which the game
+    also keeps -- an unclosed ring is rejected/degenerate.
     v2019 has no object-spline concept at all -- there is no v2019
     counterpart to this function (see step_write_objects: those records
     are dropped with a printed note for that game_version instead).
@@ -1026,20 +1068,57 @@ def object_spline_fill_records_to_v2021_groups(records: list[dict]) -> list[dict
             "path": {
                 "waypoints": waypoints,
                 "width": 1.0,
-                "state": 0,
+                "state": 1,
                 "ClosedPath": True,
                 "isClosed": True,
-                "isFilled": True,
+                "isFilled": False,
             },
             "fillPct": _round(record["fill_pct"]),
         })
     return list(groups.values())
 
 
+def default_tree_asset_paths_v2021(
+    theme: Optional[int], tree_theme_config: "str | Path | None" = None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """
+    (general_pool, tree_type_asset_paths) synthesized from the bundled
+    asset_catalog.json for `theme`, so a v2021 write-objects run needs no
+    hand-supplied --tree-asset-path when the project is rustic.
+
+    Returns ([], {}) for any theme other than CATALOG_SOURCE_THEME_ID --
+    asset_catalog.json only covers that one theme (see its own "note"),
+    so there's nothing to synthesize elsewhere and the caller must fall
+    back to explicit paths or an error.
+
+    When tree_themes.json has a block for `theme` (it does for rustic),
+    the type map is that theme's pine/deciduous species buckets resolved
+    through the catalog's per-type asset paths -- the exact same buckets
+    build_tree_objects_v2019 routes by -- and the general pool is the
+    `default_species` bucket, so an untagged tree behaves identically
+    across the two versions. Without a tree_themes.json block the general
+    pool is every catalog tree and the type map is empty.
+    """
+    if theme is None or theme != CATALOG_SOURCE_THEME_ID:
+        return [], {}
+    tree_paths = [e.path for e in ASSET_ENTRIES if e.category == 0 and "/Trees/" in e.path]
+    species = load_tree_theme_species(theme, tree_theme_config)
+    if species is None:
+        return tree_paths, {}
+    path_by_type = {e.type: e.path for e in ASSET_ENTRIES if e.category == 0}
+    type_map = {
+        name: [path_by_type[t] for t in ids if t in path_by_type]
+        for name, ids in species.species.items()
+    }
+    type_map = {name: paths for name, paths in type_map.items() if paths}
+    general = type_map.get(species.default_species) or tree_paths
+    return general, type_map
+
+
 def build_tree_objects_v2021(
     trees: list[tuple[float, float, dict]],
     tree_asset_paths: list[str],
-    tree_type_asset_paths: Optional[dict[str, str]] = None,
+    tree_type_asset_paths: Optional[dict[str, Union[str, Sequence[str]]]] = None,
     rng: Optional[random.Random] = None,
 ) -> list[dict]:
     """
@@ -1049,14 +1128,17 @@ def build_tree_objects_v2021(
     tree_asset_paths is the general pool a tree is randomly assigned
     from when it has no more specific pick -- REQUIRED and must be
     non-empty (or tree_type_asset_paths must cover every tree that
-    needs one); there's no generic fallback path to invent (see module
-    docstring), so this raises ValueError if neither is usable.
+    needs one); there's no generic fallback path to invent here (a
+    rustic project can get one from default_tree_asset_paths_v2021, but
+    that's the caller's job -- see the module docstring), so this raises
+    ValueError if neither is usable.
 
     tree_type_asset_paths, if given, maps a tree node's TREE_TYPE_TAG
-    value to a specific asset path, overriding the random pool pick
-    for just that tree -- e.g. a hand-tagged pga_tree_type=oak node
-    always gets whatever path tree_type_asset_paths["oak"] is, while
-    untagged trees still draw from tree_asset_paths.
+    value to either one asset path or a pool of them (one is drawn),
+    overriding the random general-pool pick for just that tree -- e.g. a
+    hand-tagged pga_tree_type=oak node always gets tree_type_asset_paths
+    ["oak"] (or a draw from it), while untagged trees still draw from
+    tree_asset_paths.
 
     Scale is uniform x=y=z (see _tree_scale / module docstring):
     calibrated as detected_height / the prefab's measured native height
@@ -1082,9 +1164,9 @@ def build_tree_objects_v2021(
     if not tree_asset_paths and not tree_type_asset_paths:
         raise ValueError(
             "build_tree_objects_v2021 needs at least one real asset path -- pass tree_asset_paths "
-            "(a general pool) and/or tree_type_asset_paths (per pga_tree_type tag). There's no "
-            "built-in catalog to fall back to; v2021+ placed objects are keyed by real Unity asset "
-            "paths, not a numeric id this project could guess at."
+            "(a general pool) and/or tree_type_asset_paths (per pga_tree_type tag), or synthesize "
+            "them for a rustic project with default_tree_asset_paths_v2021. v2021+ placed objects "
+            "are keyed by real Unity asset paths, not a numeric id this project could guess at."
         )
 
     heights, min_h, min_scale, scale_multiplier = _height_scale_lookup(trees)
@@ -1100,7 +1182,8 @@ def build_tree_objects_v2021(
         tree_rng = rng if rng is not None else _deterministic_tree_rng(x, z)
         tree_type = tags.get(TREE_TYPE_TAG)
         if tree_type is not None and tree_type in tree_type_asset_paths:
-            path = tree_type_asset_paths[tree_type]
+            pick = tree_type_asset_paths[tree_type]
+            path = pick if isinstance(pick, str) else tree_rng.choice(list(pick))
         elif tree_asset_paths:
             path = tree_rng.choice(tree_asset_paths)
         else:
@@ -1122,12 +1205,13 @@ def build_building_stake_objects_v2021(features: list[Feature], stake_asset_path
     One stake instance at every exterior vertex of every "building"
     Feature (see ingest/osm.py) -- a single placedObjects2.json group
     (one asset path, so one group covers every building). No rotation
-    (a stake has no meaningful facing), scale left at 1.0.
+    (a stake has no meaningful facing), scaled to BUILDING_STAKE_SCALE_V2019
+    (0.5x -- subtle, matching the v2019 stake).
 
-    v2021+ ONLY: this needs an arbitrary asset path, which only
-    v2021+'s Key.path scheme supports -- v2019's numeric category/type
-    catalog has no known "stake" (or generic decorative object) id, so
-    there's currently no way to do this for a v2019 target at all.
+    v2021+ ONLY: this needs an arbitrary asset path (default
+    DEFAULT_STAKE_ASSET_PATH_V2021), which only v2021+'s Key.path scheme
+    supports -- the v2019 target uses build_building_stake_objects_v2019
+    with its numeric category/type prop instead.
 
     Only Polygon-geometry building features contribute vertices --
     matches how splines.py's feature_to_spline already only handles
@@ -1141,7 +1225,7 @@ def build_building_stake_objects_v2021(features: list[Feature], stake_asset_path
         if f.kind != "building" or f.geometry.geom_type != "Polygon":
             continue
         for x, z in f.geometry.exterior.coords[:-1]:  # [:-1] drops the closing repeat of the first point
-            group["Value"]["items"].append(_placed_item(x, z, scale=1.0))
+            group["Value"]["items"].append(_placed_item(x, z, scale=BUILDING_STAKE_SCALE_V2019))
 
     return [group] if group["Value"]["items"] else []
 
@@ -1380,7 +1464,9 @@ def save_objects(
     time so they don't reroll on every read), `collection_objects`
     (course_output/collections.py -- resolved collection member
     placements, {"x","z","rotation_deg","scale","category","type",
-    "theme","path","source_id"}, deterministic, no RNG),
+    "theme","path","source_id"} plus an optional "dy" (terrain-relative
+    grounding) and "options" (a per-item variant selector like a sign's
+    OffsetIndex), deterministic, no RNG),
     `object_spline_fill_records` (object_clusters.py's
     pack_spline_records output -- v2021+-only object-spline fills, no
     RNG either, just an already-subdivided polygon per record), and
