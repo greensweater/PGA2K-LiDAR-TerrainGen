@@ -27,8 +27,8 @@ Steps:
 9. Click "Ingest Course" to unpack a .course file. Start from a blank that you created in TCG 2019. (TODO: add template to source)
 10. Click "Generate Terrain" to do a coarse (~500 stamp) hex grid to roughly match LAZ.
 11. Click "Refine Terrain" to create smaller stamps to add detail. Play with the settings for best results; rollover for details. Use the mask to refine selected areas, and adjust buffer to include or exclude areas. Select mask objects under "Splines" tab.
-12. Shortcuts: mouse wheel toggles preview versions; shift-wheel changes preview selection; ctrl-wheel zooms; wheel click-hold moves map.
-13. Click "Write Terrain" to create the heightmap.
+12. Shortcuts: mouse wheel zooms; right-click-hold moves map; ctrl-wheel scrolls preview versions; shift-wheel changes preview selection.
+13. Click "Write Terrain" to create the heightmap. Click "Write Water" to create water tiles for bodies & streams.
 14. Under "Splines", click "Write Splines" to generate course objects from OSM.
 15. Under "Splines", filter by "hole" to select up to 18 holes for your course (apply Mask to exclude holes from output). Click "Write Holes" to add holes.
 16. Click "Repack" to output the .course file to the working directory (give it a name first; ".course" suffix is not needed).
@@ -39,9 +39,10 @@ Steps:
 1. Place "stakes" at the corners of buildings for easier placement, clear when done
 2. Apply a tight landscaping on cart paths so they line up nicely
 3. Import collections of objects & splines (e.g. house with landscaping, driveway, car, patio set, deck, pergola; hole marker with mulch, bench, ball washer, bin; custom combinations of fencing/bridges/objects) and place/orient it using OSM tags
-4. Create "borders" using splines filled with object clusters, e.g. water hazard edges, course O.B. areas
-5. Use alt-drag marquee to remove masked areas from borders
-6. Create streams on OSM water object splines (stream, creek, ditch) adds water tiles, low falls, low splash, plus rocks and vegetation
+4. Import changes generated in-game and keep them as you make changes here
+5. Create "borders" using splines filled with object clusters, e.g. water hazard edges, course O.B. areas
+6. Use alt-drag marquee to remove masked areas from borders
+7. Create streams on OSM water object splines (stream, creek, ditch) adds water tiles, low falls, low splash, plus rocks and vegetation
 
 ### TODO
 - ~~Trees from LiDAR~~ done
