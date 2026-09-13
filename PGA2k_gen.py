@@ -2638,15 +2638,6 @@ def step_generate_terrain(
     if n_workers is None:
         n_workers = project.get("generate_terrain_n_workers", DEFAULT_N_WORKERS)
 
-    print(f"Loading {pointcloud_path}...")
-    full_cloud = PointCloud.load(pointcloud_path)
-
-    print(f"Cropping to the center {COURSE_SIZE_M:.0f} x {COURSE_SIZE_M:.0f} m...")
-    try:
-        course_cloud = recentered_crop(full_cloud, size_m=COURSE_SIZE_M)
-    except LazReadError as e:
-        raise StepError(f"Couldn't crop to a {COURSE_SIZE_M:.0f} m course: {e}") from e
-
     bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
 
     heightmap_path = working_dir / HEIGHTMAP_FILE
@@ -2831,8 +2822,6 @@ def step_generate_terrain(
     print(f"  wrote {out_path}")
 
     save_project(working_dir, {
-        "course_origin_x": course_cloud.origin_x,
-        "course_origin_y": course_cloud.origin_y,
         "stamp_count": len(fitted),
         "generate_terrain_pitch_m": pitch,
         "generate_terrain_hex_spread_ratio": hex_spread_ratio,
