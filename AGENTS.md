@@ -1,7 +1,7 @@
-# Agent working notes — PGA2K-LiDAR-TerrainGen
+# AGENTS.md — project memory for AI agents working in this repo
 
-Project memory for AI agents working in this repo (Claude Code, Hermes, etc.).
-Human-facing docs: `README.md`. Optimization findings: `OPTIMIZATION_AUDIT.md`.
+Working notes for agents (Claude Code, Hermes, etc.). Human-facing docs are
+`README.md`; optimization findings live in `OPTIMIZATION_AUDIT.md`.
 
 ## Repo layout (what actually matters)
 
@@ -28,9 +28,9 @@ Pipeline hot path = the `step_*` functions in `PGA2k_gen.py` plus the
 
 ## Key conventions
 
-- **Work on a dedicated branch, not main.** The `hermes-experiment` branch is
-  the isolated sandbox for agent changes. Don't push experimental work to
-  `main`/`master` without an explicit ask.
+- **Work on a dedicated branch, not main.** The `hermes-experiment` branch was
+  created as an isolated sandbox for agent changes. Do not push experimental
+  work to `main`/`master` without explicit ask.
 - **`project.json` is the cross-step state bus.** Steps persist derived values
   (e.g. `course_crop_origin_in_full_frame_x/z`) here and re-read them, so a step
   does NOT need to reload the full point cloud to get a value an earlier step
@@ -58,8 +58,8 @@ The hot path has been audited (see `OPTIMIZATION_AUDIT.md`); these are known
 
 **Fixed (F1):** `step_generate_terrain` used to load the entire point cloud
 just to write `course_origin_x`/`course_origin_y` into `project.json` — values
-with zero readers. Removed. If you see a similar "load everything to write a
-value" pattern, the win is deleting it (verify the value is truly unread
+with zero readers. Removed. If you ever see a similar "load everything to write
+a value" pattern, the win is deleting it (verify the value is truly unread
 repo-wide first).
 
 ## How to audit this repo (short version)
