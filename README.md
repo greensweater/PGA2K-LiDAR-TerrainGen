@@ -2,7 +2,7 @@ This is a PGA2k utility to generate .course files from USGS LiDAR and OpenStreet
 
 ## How-To
 
-This Python app needs the following libs: (TODO: VENV with all deps)
+This Python app needs the following libs (pinned in `requirements.txt`):
 
 - numpy (math)
 - scipy (math)
@@ -11,8 +11,18 @@ This Python app needs the following libs: (TODO: VENV with all deps)
 - laspy (LiDAR)
 - overpy (OSM)
 - shapely (vector)
-- PIL (image)
-- tkinter (GUI)
+- Pillow → `PIL` (image)
+- scikit-image → `skimage` (tree detection)
+- tkinter (GUI) — stdlib; on Linux install the distro package (e.g. `sudo apt install python3-tk`)
+
+Set up a venv (**Python 3.10+ required** — the code uses `@dataclass(slots=True)` and `X | None` unions):
+
+```
+python3 -m venv .venv              # Windows: py -3.11 -m venv .venv
+source .venv/bin/activate          # or .venv\Scripts\activate on Windows
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
 
 Steps:
 

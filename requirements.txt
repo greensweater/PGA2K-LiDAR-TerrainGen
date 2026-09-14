@@ -1,0 +1,26 @@
+# PGA2K LiDAR TerrainGen — Python dependencies
+#
+# REQUIRES Python 3.10+ (uses @dataclass(slots=True) and PEP 604 `X | None`
+# unions). On a fresh clone pick the right interpreter explicitly, e.g.:
+#   Windows:   py -3.11 -m venv .venv
+#   Linux/mac: python3 -m venv .venv
+#
+# Install:  python3 -m venv .venv && source .venv/bin/activate \
+#           && python -m pip install --upgrade pip \
+#           && pip install -r requirements.txt
+#
+# Note: `PIL` is provided by the `Pillow` package (NOT `pip install PIL`).
+# `tkinter` (GUI only, PGA2k_gen_gui.py) is stdlib but on Linux install the
+# distro package separately, e.g. `sudo apt install python3-tk` (or
+# `dnf install python3-tkinter`). `winsound` is Windows-stdlib and guarded
+# behind a platform check — nothing to install anywhere.
+
+numpy
+scipy
+pyproj
+matplotlib
+laspy
+overpy
+shapely
+Pillow
+scikit-image
