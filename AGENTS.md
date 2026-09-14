@@ -3,6 +3,16 @@
 Working notes for agents (Claude Code, Hermes, etc.). Human-facing docs are
 `README.md`; optimization findings live in `OPTIMIZATION_AUDIT.md`.
 
+## Start here (do these first, in a fresh session)
+
+1. `git branch --show-current` → must be `hermes-experiment` (not main).
+2. Read `OPTIMIZATION_AUDIT.md` → what's already been found/fixed/verified clean.
+3. Skim the rest of this file → repo layout + conventions.
+
+Context is limited in this setup: keep reads targeted (offset/limit windows,
+`grep`/`awk` for scanning, not whole-file reads), and append findings to
+`OPTIMIZATION_AUDIT.md` incrementally so progress survives a context reset.
+
 ## Repo layout (what actually matters)
 
 Python golf-course terrain generator: ingests LAZ LiDAR + OpenStreetMap, emits
