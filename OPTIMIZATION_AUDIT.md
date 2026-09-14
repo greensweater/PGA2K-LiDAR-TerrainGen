@@ -1,6 +1,7 @@
 # PGA2K-LiDAR-TerrainGen — Low-Hanging-Fruit Optimization Audit
 
-Branch: `hermes-experiment` (read-only audit; no code modified)
+Branch: `hermes-experiment` (findings appended per pass; applied fixes
+marked FIXED).
 Method: cheap AST pre-scan (repeated heavy loads, deep-nested loops) → targeted
 verification by reading actual code. Findings appended per pass.
 
@@ -33,6 +34,35 @@ verification by reading actual code. Findings appended per pass.
   - Keep the pointcloud existence guard at :2523-2527 (useful "run ingest-laz first"
     hint) — only the load+crop at 2641-2648 go.
 
+### F2 — preview re-rendered at full zoomed resolution on every zoom tick  [BIG — FIXED]
+- **Location:** `PGA2k_gen_gui.py` `_show_preview` (resize block) + `_set_preview_image`.
+- **What happened:** every scroll tick ran the *entire* render tail —
+  `geo_img.resize(w*zoom, h*zoom, LANCZOS)` + optional elevation-band
+  numpy/composite + objects-layer composite + a fresh `ImageTk.PhotoImage`
+  — at the zoomed pixel size, all on the Tk mainloop. Measured on the
+  1959x1780 composite: LANCZOS alone ~170ms at 100%, ~490ms at 200%,
+  ~930ms at 300%; with PhotoImage encode the 300% tick hit ~1.5s.
+  The earlier zoom bugs (zoom in the composite/geo-overlay cache keys)
+  were already fixed — this was the remaining per-tick cost.
+- **Fix (applied, `hermes-experiment`):** per-zoom-level render cache.
+  Zoom is quantized to ¼ steps; the finished RGBA for a
+  `(geo_overlay_key, quantized-zoom, overlay-inputs)` pair is cached
+  (LRU, capped at 3 entries / ~45MP so a 300% render can't dominate
+  memory), and `_set_preview_image` reuses the `PhotoImage` when it
+  gets the same PIL object back (identity-keyed). LANCZOS is kept for
+  downscaling only; upscaling uses BICUBIC (faster, adds nothing).
+  Cursor-anchored zoom, scrollregion, centering and course picking are
+  unchanged — they operate on the actually-rendered image size.
+- **Verified headless (xvfb, real GUI instance, synthetic 1959x1780
+  preview):** steady-state zoom tick (cache hit) ~9ms with a PIL
+  resize counter proving 0 resizes; all level-crossing renders,
+  cursor anchoring (data point under pointer identical before/after),
+  scrollregion, and course-metre picking pass.
+- **Note:** a Tk-native `canvas.itemconfigure(zoom=)` was tried first
+  and is NOT possible on this system's Tk 9.0.4 (canvas `-zoom`/`-scale`
+  options are unknown even at item-creation time), hence the
+  quantized-level cache instead.
+
 ### Verified clean (no low-hanging fruit)
 Checked the core hot-path functions; none have redundant I/O or avoidable recompute:
 - `step_generate_terrain` — other I/O (heightmap, height mask) is single-shot and
@@ -51,7 +81,10 @@ Checked the core hot-path functions; none have redundant I/O or avoidable recomp
 scripts, not on the main generation pipeline — out of scope for this pass.
 
 ## Bottom line
-One real win: **F1** — drop the redundant full point-cloud load in
-`step_generate_terrain` (~8 lines + 2 dead `save_project` entries). Everything else on
-the hot path is already carefully optimized; no other mechanical low-hanging fruit found.
+Two real wins found: **F1** (dead full point-cloud load in
+`step_generate_terrain` — applied earlier, `91d6c77`) and **F2**
+(per-tick full-resolution preview re-render on zoom — applied,
+quantized per-level render cache + PhotoImage reuse). Everything else
+on the hot path is already carefully optimized; no other mechanical
+low-hanging fruit found.
 

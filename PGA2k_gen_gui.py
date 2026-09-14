@@ -318,6 +318,8 @@ class PGAGenGUI:
         self._step_on_done: Optional[Callable[[], None]] = None  # see _run_step's on_done param
         self._last_step_ok = False  # set in _poll_log_queue before on_done fires; on_done runs win/lose
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
+        self._preview_photo_cached = None  # see _show_preview's PhotoImage cache (identity-keyed)
+        self._preview_photo_src = None  # the PIL image _preview_photo_cached was built from
         self._cached_mask_merged_geom = None  # see _get_cached_mask_merged_geometry
         self._cached_mask_geom_key = None
         self._cached_composited_base = None  # see _show_preview's static-part cache (zoom-independent)
@@ -6308,7 +6310,23 @@ class PGAGenGUI:
         self._preview_canvas_image_id = None
 
     def _set_preview_image(self, pil_image) -> None:
-        self._preview_imgtk = ImageTk.PhotoImage(pil_image)
+        # PhotoImage creation (the full PIL->X pixel upload) is the
+        # second most expensive per-tick cost after the resize. When
+        # the caller hands back the exact PIL object we already
+        # encoded (see _show_preview's per-zoom-level render cache --
+        # a zoom tick inside one level reuses the cached final image
+        # untouched), reuse the PhotoImage: the tick then costs only
+        # a canvas item swap, no re-encode. Identity-keyed: any
+        # re-render that composites fresh (overlay change, new zoom
+        # level) yields a new PIL object and gets a new PhotoImage.
+        # _preview_imgtk always references the live PhotoImage.
+        cached = self._preview_photo_cached
+        if cached is not None and self._preview_photo_src is pil_image:
+            self._preview_imgtk = cached
+        else:
+            self._preview_imgtk = ImageTk.PhotoImage(pil_image)
+            self._preview_photo_cached = self._preview_imgtk
+            self._preview_photo_src = pil_image
         self.preview_canvas.delete("all")
         self._preview_canvas_image_id = self.preview_canvas.create_image(
             0, 0, anchor="nw", image=self._preview_imgtk,
@@ -7203,17 +7221,56 @@ class PGAGenGUI:
                 self._cached_geo_overlay = geo_img
                 self._cached_geo_overlay_key = geo_overlay_key
 
-            # zoom=1.0 shows the image at its actual native resolution
-            # (1959x1780) rather than the old fixed 900x900 cap --
-            # nearly 80% of the real pixel area was being thrown away
-            # before the user ever saw it. Scrollbars (see
-            # _build_preview_panel) handle the case where the zoomed
-            # image no longer fits the visible area. This resize runs
-            # fresh every call (cheap, in-memory) -- only the composite
-            # and geo-overlay stages above are cached.
-            target_w = max(1, round(geo_img.width * zoom))
-            target_h = max(1, round(geo_img.height * zoom))
-            base_thumb = geo_img.resize((target_w, target_h), Image.LANCZOS)
+            # Per-zoom-level render cache. Everything from here down
+            # (resize + elevation band + objects layer + PhotoImage)
+            # used to run on every single zoom tick at the zoomed
+            # pixel size -- LANCZOS alone was ~170ms at 100%, ~490ms at
+            # 200%, ~930ms at 300% on a 1959x1780 composite, all on
+            # the Tk mainloop, which is what made scroll-zooming feel
+            # frozen. Zooming in adds no information, so: (a) the zoom
+            # fed to the renderer is quantized to 1/4 steps -- the
+            # cursor-anchored scroll reposition below keeps the point
+            # under the pointer exact regardless, and (b) the finished
+            # image for a (content, zoom-level) pair is cached, so a
+            # tick that stays within one level costs only a canvas
+            # item swap (and _set_preview_image reuses the PhotoImage
+            # when it gets the same PIL object back). Content changes
+            # bust the cache through geo_overlay_key (which already
+            # covers the base PNG mtime, OSM overlay, mask buffer and
+            # spline highlight); the elevation-band and objects-toggle
+            # inputs applied AFTER the cache check are added to the
+            # key explicitly.
+            qz = max(0.25, round(zoom * 4) / 4)
+            render_key = (
+                geo_overlay_key, qz,
+                self.show_elevation_contour_var.get(),
+                self.elevation_contour_var.get(), self.elevation_contour_width_var.get(),
+                self.show_stamp_coverage_var.get(),
+                self.show_objects_var.get(),
+                tuple(self._highlighted_object_points),
+            )
+            render_cache = getattr(self, "_preview_render_cache", None)
+            if render_cache is None:
+                render_cache = self._preview_render_cache = {}
+            cached_img = render_cache.pop(render_key, None)
+            if cached_img is not None:
+                # LRU: re-insert at the end (most recent).
+                render_cache[render_key] = cached_img
+                self._preview_render_meta = {
+                    "img_w": cached_img.width,
+                    "img_h": cached_img.height,
+                    "base_kind": base_kind,
+                }
+                self._set_preview_image(cached_img)
+                return
+
+            # LANCZOS only for downsampling (the one case where the
+            # resampling is quality-relevant); BICUBIC for upscaling --
+            # LANCZOS is ~1.5x slower there and magnifies nothing.
+            target_w = max(1, round(geo_img.width * qz))
+            target_h = max(1, round(geo_img.height * qz))
+            resample = Image.LANCZOS if qz < 1.0 else Image.BICUBIC
+            base_thumb = geo_img.resize((target_w, target_h), resample)
 
             img = base_thumb
 
@@ -7311,6 +7368,17 @@ class PGAGenGUI:
                 "img_h": img.height,
                 "base_kind": base_kind,
             }
+
+            render_cache[render_key] = img
+            # LRU cap: at most 3 entries AND at most ~45MP of cached
+            # RGBA (~180MB) -- a single 300%-zoom render is ~31MP, so
+            # the pixel cap lets the expensive top levels stay cached
+            # alone while bounding worst-case memory (an uncapped 3x3
+            # entry LRU could hold ~380MB of 300%-zoom renders).
+            def _cache_pixels() -> int:
+                return sum(e.width * e.height for e in render_cache.values())
+            while len(render_cache) > 3 or _cache_pixels() > 45_000_000:
+                render_cache.pop(next(iter(render_cache)))
 
             self._set_preview_image(img)
         except Exception as e:
