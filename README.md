@@ -8,7 +8,7 @@ This Python app needs the following libs (pinned in `requirements.txt`):
 - scipy (math)
 - pyproj (geo)
 - matplotlib (viz)
-- laspy (LiDAR)
+- laspy[lazrs] (LiDAR — the `[lazrs]` extra is required to decompress `.laz` tiles; plain `laspy` fails with "No LazBackend selected")
 - overpy (OSM)
 - shapely (vector)
 - Pillow → `PIL` (image)

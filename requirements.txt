@@ -19,7 +19,11 @@ numpy
 scipy
 pyproj
 matplotlib
-laspy
+# [lazrs] extra = LAZ decompression backend. Plain `laspy` cannot read
+# .laz (compressed) tiles and raises "No LazBackend selected" on the
+# full point load. lazrs is the recommended backend (prebuilt wheels,
+# no external DLL). Alternative: laspy[laszip] (needs the LASzip lib).
+laspy[lazrs]
 overpy
 shapely
 Pillow
