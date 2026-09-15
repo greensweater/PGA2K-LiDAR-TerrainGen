@@ -64,6 +64,7 @@ from PGA2k_gen import (  # noqa: E402
     DEFAULT_REMOVE_COVERED_MARGIN_M, EXPORT_STATUS_FRESH, EXPORT_STATUS_MISSING, EXPORT_STATUS_STALE,
     FEATURES_FILE, HEIGHT_MASK_FILE, HEIGHTMAP_FILE, INGAME_OBJECTS_FILE, OBJECT_LIST_FILE, OBJECTS_FILE,
     OOB_FILE, PARKING_FILE, PGA_COLLECTION_TAG, export_status, load_all_stamps, load_project, save_project,
+    DEFAULT_LIDAR_TREE_MIN_HEIGHT_M,
 )
 from course_output.out_of_bounds import (  # noqa: E402
     OOB_BAND_WIDTH_M, OOB_CAP_SCALE_RATIO, OOB_INNER_BUFFER_M, OOB_MERGE_GAP_M, OOB_SIMPLIFY_TOL_M,
@@ -2298,6 +2299,42 @@ class PGAGenGUI:
                  "procedural vegetation fill is expected to handle everywhere else. Needs "
                  "heightmap.npz and pointcloud.npz (Ingest LAZ). On by default: OSM alone typically "
                  "finds few or no individually-tagged trees on a real course.")
+
+        # Minimum detected canopy height (m above ground) for a crown to
+        # count as a tree -- the single biggest lever on how many trees
+        # come out (see ingest/tree_detection.py's DEFAULT_MIN_HEIGHT_M).
+        # Persists to project.json (objects_tree_min_height_m) on every
+        # Generate Trees run; loaded back when the working directory
+        # changes (see _on_working_dir_changed).
+        min_height_row = ttk.Frame(parent)
+        min_height_row.pack(anchor="w", fill="x", pady=(0, 4))
+        ttk.Label(min_height_row, text="Min tree height (m):").pack(side="left")
+        self.tree_min_height_var = tk.DoubleVar(value=float(DEFAULT_LIDAR_TREE_MIN_HEIGHT_M))
+        ttk.Scale(
+            min_height_row, from_=0.0, to=20.0, orient="horizontal",
+            variable=self.tree_min_height_var,
+        ).pack(side="left", fill="x", expand=True, padx=4)
+        self.tree_min_height_text = tk.StringVar(value=f"{DEFAULT_LIDAR_TREE_MIN_HEIGHT_M:.0f}")
+
+        def _commit_tree_min_height(_evt=None):
+            try:
+                val = float(self.tree_min_height_text.get())
+            except (TypeError, ValueError):
+                val = self.tree_min_height_var.get()
+            val = max(0.0, min(20.0, val))
+            self.tree_min_height_var.set(val)
+            self.tree_min_height_text.set(f"{val:.1f}")
+
+        entry = ttk.Entry(min_height_row, textvariable=self.tree_min_height_text, width=5)
+        entry.pack(side="left")
+        entry.bind("<Return>", _commit_tree_min_height)
+        entry.bind("<FocusOut>", _commit_tree_min_height)
+        _Tooltip(entry, "Minimum detected canopy height (meters above ground) for a LIDAR-detected "
+                 "crown to count as a tree. Higher = fewer, bigger trees (cuts low understory/hedges); "
+                 "lower = more detections, including small young trees that render tiny in-game "
+                 "(scale = detected height / asset native height). Applies to 'Detect trees from LIDAR "
+                 "canopy' only; OSM natural=tree nodes are unaffected. Persists as the default for "
+                 "this working directory.")
         self._add_step_button(parent, "Generate Trees", self._run_generate_trees)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
@@ -2765,9 +2802,14 @@ class PGAGenGUI:
                     "before generate-trees]\n"
                 )
 
+        # Persist the current min-height slider as this working
+        # directory's sticky default (the CLI reads the same
+        # project.json key), so a later CLI run matches the GUI.
+        save_project(Path(wd), {"objects_tree_min_height_m": float(self.tree_min_height_var.get())})
         args = [
             "--step", "generate-trees",
             "--detect-lidar-trees" if self.detect_lidar_trees_var.get() else "--no-detect-lidar-trees",
+            f"--tree-min-height={self.tree_min_height_var.get()}",
         ]
         # regenerate objects.json (which embeds a COPY of whatever
         # object_list.json holds -- see _regenerate_packed_objects) as
@@ -4166,6 +4208,12 @@ class PGAGenGUI:
             self.course_name.set(project.get("course_name", ""))
         finally:
             self._suppress_course_name_save = False
+        # Restore the last-used LIDAR tree minimum height for this working
+        # directory (see the slider's comment in the Objects tab's Generate
+        # Trees section), so a GUI run matches the CLI's sticky default.
+        saved_min_height = project.get("objects_tree_min_height_m", DEFAULT_LIDAR_TREE_MIN_HEIGHT_M)
+        self.tree_min_height_var.set(float(saved_min_height))
+        self.tree_min_height_text.set(f"{float(saved_min_height):.1f}")
         self._suppress_repack_filename_save = True
         try:
             self.repack_filename_var.set(project.get("repack_filename", ""))

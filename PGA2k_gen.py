@@ -1467,6 +1467,7 @@ def _resolve_theme(theme_arg: str | None) -> int | None:
 
 def step_generate_trees(
     working_dir: Path, detect_lidar_trees: bool | None = None, mark_cartpath_trees: bool | None = None,
+    tree_min_height_m: float | None = None,
 ) -> None:
     """
     Generate the intermediate, VERSION-AGNOSTIC object_list.json (see
@@ -1526,6 +1527,18 @@ def step_generate_trees(
     watershed would otherwise mistake for a crown and place a "tree"
     on the roof.
 
+    tree_min_height_m overrides ingest/tree_detection.py's
+    DEFAULT_MIN_HEIGHT_M for this run (the minimum detected canopy
+    height above ground for a crown to count as a tree). Same
+    None-means-use-saved pattern as detect_lidar_trees: None reads
+    project.json's objects_tree_min_height_m (the GUI slider persists
+    there), falling back to the default; an explicit value is used
+    this run AND saved back as the new default. Useful because a
+    LAZ source that never ran fine vegetation sub-classification
+    (see ingest/tree_detection.py's fallback to classes 0/1) makes
+    the detector work from dense low understory, and the height
+    floor is the single biggest lever for how many trees come out.
+
     This overwrites object_list.json wholesale.
     """
     osm_path = working_dir / "map.osm"
@@ -1537,6 +1550,9 @@ def step_generate_trees(
         detect_lidar_trees = project.get("objects_detect_lidar_trees", True)
     if mark_cartpath_trees is None:
         mark_cartpath_trees = False
+    if tree_min_height_m is None:
+        tree_min_height_m = project.get(
+            "objects_tree_min_height_m", DEFAULT_LIDAR_TREE_MIN_HEIGHT_M)
 
     required = ["crs_wkt", "origin_x", "origin_y", "horizontal_unit_factor", "merged_bounds_local"]
     missing = [k for k in required if k not in project]
@@ -1618,6 +1634,7 @@ def step_generate_trees(
 
         lidar_trees = detect_trees_from_lidar(
             ground_heights, canopy_heights, course_bounds, mask_geometry=mask_geometry,
+            min_height_m=tree_min_height_m,
         )
         trees += lidar_trees_to_tagged(lidar_trees)
         print(f"  {len(lidar_trees)} LIDAR-detected tree(s) added "
@@ -1658,6 +1675,7 @@ def step_generate_trees(
     save_project(working_dir, {
         "objects_detect_lidar_trees": detect_lidar_trees,
         "objects_mark_cartpath_trees_debug": mark_cartpath_trees,
+        "objects_tree_min_height_m": tree_min_height_m,
         "objects_tree_count": len(trees),
     })
 
@@ -6104,6 +6122,13 @@ def main(argv: list[str] | None = None) -> int:
                               "instead of a real tree, so you can see in-game exactly which trees are "
                               "being flagged. NOT sticky -- always OFF by default even if a previous run "
                               "used it; pass this flag explicitly every time you want it.")
+    parser.add_argument("--tree-min-height", type=float, default=None,
+                         help="generate-trees: minimum detected canopy height (meters above ground) for "
+                              "a LIDAR-detected crown to count as a tree. Higher = fewer, bigger trees "
+                              "(cuts low understory/hedges); lower = more detections, including small "
+                              "young trees that may render tiny in-game (scale = detected height / asset "
+                              "native height). Default: use whatever's saved in project.json from the "
+                              f"GUI's slider, or {DEFAULT_LIDAR_TREE_MIN_HEIGHT_M:.0f} m if never set.")
     parser.add_argument("--repack-filename", type=str, default=None,
                          help="repack: output filename (without .course extension)")
     parser.add_argument("--edited-course", type=Path, default=None,
@@ -6281,7 +6306,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.step == "write-holes":
             step_write_holes(working_dir)
         elif args.step == "generate-trees":
-            step_generate_trees(working_dir, args.detect_lidar_trees, args.mark_cartpath_trees)
+            step_generate_trees(working_dir, args.detect_lidar_trees, args.mark_cartpath_trees,
+                                tree_min_height_m=args.tree_min_height)
         elif args.step == "pack-objects":
             step_pack_objects(working_dir)
         elif args.step == "write-objects":

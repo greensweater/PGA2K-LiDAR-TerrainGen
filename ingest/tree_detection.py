@@ -115,8 +115,18 @@ FALLBACK_VEGETATION_CLASSIFICATIONS = (CLASS_NEVER_CLASSIFIED, CLASS_UNCLASSIFIE
 # count only means the same thing at a fixed resolution, meters don't.
 DEFAULT_BLUR_SIGMA_M = 1.5  # approximate real-world equivalent of Chad's kernel-size-5 Gaussian blur
 DEFAULT_THRESHOLD_BLOCK_M = 20.0  # approximate real-world equivalent of his adaptiveThreshold blockSize=101
-DEFAULT_MIN_TREE_DISTANCE_M = 2.0
-DEFAULT_MIN_HEIGHT_M = 3.5
+DEFAULT_MIN_TREE_DISTANCE_M = 4.0  # ~1x typical mature-crown radius; 2.0 over-seeded dense understory
+DEFAULT_MIN_HEIGHT_M = 6.0  # 3.5 kept ~20k understory "trees" from a class-0/1 fallback CHM on a 2 km^2 course; 6.0 filters low understory while still catching real (often 8-15 m) trees
+# Equivalent-area crown radius (m) a detected blob must reach to be kept as a
+# tree, independent of its height -- see detect_trees_from_lidar's per-region
+# filter. The height floor alone can't separate "real short tree" from
+# "speckle/shrub just above the floor" when the canopy raster is built from a
+# fallback classification (see FALLBACK_VEGETATION_CLASSIFICATIONS's own
+# docstring): both clear the height floor, but only the real tree has a crown
+# wide enough to matter. 2.0 m ~ a small young tree's crown; well below the
+# ~6-15 m radii the asset_catalog.json trees were measured at, so genuine
+# mature trees are never dropped by this.
+DEFAULT_MIN_CROWN_RADIUS_M = 2.0
 DEFAULT_OUTLIER_HEIGHT_M = 40.0
 # Absolute CHM floor (m) a cell must clear before it's even eligible to
 # be a threshold candidate, independent of the relative/local
@@ -237,6 +247,7 @@ def detect_trees_from_lidar(
     threshold_block_m: float = DEFAULT_THRESHOLD_BLOCK_M,
     min_tree_distance_m: float = DEFAULT_MIN_TREE_DISTANCE_M,
     min_height_m: float = DEFAULT_MIN_HEIGHT_M,
+    min_crown_radius_m: float = DEFAULT_MIN_CROWN_RADIUS_M,
     outlier_height_m: float = DEFAULT_OUTLIER_HEIGHT_M,
     candidate_floor_m: float = DEFAULT_CANDIDATE_FLOOR_M,
     printf=print,
@@ -353,12 +364,17 @@ def detect_trees_from_lidar(
            + (" and mask" if mask_geometry is not None else "") + "...")
 
     trees: list[tuple[float, float, float, float]] = []
+    kept_by_height = 0
+    kept_by_radius = 0
     for region in regionprops(labels):
         row, col = region.centroid
         # equivalent-area radius -- see module docstring on why this
         # (not Chad's smallest-enclosing-circle) is used here.
         radius_px = np.sqrt(region.area / np.pi)
         radius_m = radius_px * cell_size
+        if radius_m < min_crown_radius_m:
+            continue
+        kept_by_radius += 1
 
         row_i, col_i = int(round(row)), int(round(col))
         row_i = min(max(row_i, 0), resolution - 1)
@@ -366,6 +382,7 @@ def detect_trees_from_lidar(
         height = float(chm[row_i, col_i])
         if height < min_height_m:
             continue
+        kept_by_height += 1
 
         x, z = _to_world(row, col)
         if mask_geometry is not None:
@@ -375,5 +392,9 @@ def detect_trees_from_lidar(
 
         trees.append((x, z, radius_m, height))
 
-    printf(f"{len(trees)} tree(s) kept after height/mask filtering.")
+    printf(f"{len(trees)} tree(s) kept after height/mask filtering "
+           f"({labels.max()} candidates; {kept_by_radius} cleared the {min_crown_radius_m} m crown-radius floor, "
+           f"of which {kept_by_height} also cleared the {min_height_m} m height floor, "
+           f"{kept_by_radius - kept_by_height} dropped there, "
+           f"{len(trees)} surviving the mask too).")
     return trees
