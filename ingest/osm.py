@@ -59,12 +59,15 @@ GOLF_OBJECT_KINDS = ("fairway", "green", "tee", "hole")  # mask (=excluded) defa
 # Standard OSM vehicular-road highway= values -- classified as
 # "roadway" (the widest of the three road widths; see splines.py's
 # _ROAD_KIND_WIDTHS), distinct from "service_road" (highway=service)
-# and "cartpath"/"path" (golf-cart or foot access). Deliberately
-# excludes motorway/trunk (and their _link variants) even though
-# they're real roads -- those already return no-foot-access by default
-# above (implicit_foot_access) and aren't the kind of road a golf
-# course would ever actually cross/border in a way worth rendering.
+# and "cartpath"/"path" (golf-cart or foot access). Includes the
+# motorway/trunk family (and their _link variants) -- those are real
+# roads and get the same "roadway" treatment as every other entry
+# here, including the paved surface-3 texture and full road width.
+# (They used to be deliberately excluded as "not worth rendering",
+# but that dropped them from the course entirely -- a motorway
+# bordering the course should still render as a road.)
 ROADWAY_HIGHWAY_TYPES = (
+    "motorway", "motorway_link", "trunk", "trunk_link",
     "primary", "primary_link", "secondary", "secondary_link",
     "tertiary", "tertiary_link", "unclassified", "residential", "living_street",
 )

@@ -1347,7 +1347,10 @@ def step_write_splines(working_dir: Path, registration_marks: bool = False) -> N
     Generate PGA surface splines from features.geojson (see splines.py)
     and write them to course/CourseDescription_nodes/surfaceSplines.json.
 
-    Scope: green/tee/fairway/rough/bunker/cartpath/path/building/wood.
+    Scope: green/tee/fairway/rough/bunker/cartpath/path/building.
+    Wood (natural=wood) is intentionally excluded -- it's a tree-type
+    hint region, not a visible surface (see splines.py's
+    feature_to_spline).
     Water and hole are deliberately excluded (see splines.py's module
     docstring) -- neither is handled by this generic writer yet. mask
     is NOT checked here -- every feature feature_to_spline can handle

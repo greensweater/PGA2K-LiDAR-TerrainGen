@@ -10,7 +10,7 @@ engineered/tuned against real in-game testing:
 https://github.com/chadrockey/TGC-Designer-Tools
 
 Scope: green/tee/fairway/rough/heavyrough/bunker/cartpath/service_road/
-roadway/driveway/path/building/wood/pavement/mulch.
+roadway/driveway/path/building/pavement/mulch.
 
 Water is deliberately excluded here -- Chad's own approach fills water
 hazards with a placeholder "mulch" surface spline (confirmed directly
@@ -77,6 +77,12 @@ FEATURES_TO_SURFACES = {
 # Per-kind spline parameters, matching Chad's own newBunker/newGreen/
 # newTeeBox/newFairway/newRough/newBuilding/newForest exactly (surface
 # name here refers to FEATURES_TO_SURFACES keys, not our own Feature.kind).
+# NOTE: natural=wood deliberately has NO entry here anymore -- a wood
+# polygon is a tree-type hint region (see feature_to_spline and
+# course_output/objects.py's apply_area_tree_type_hints), not a visible
+# ground surface. It used to paint a filled surface1 (cartpath) area,
+# which rendered as an unwanted filled patch; it now contributes only
+# its leaf_type hint and no spline at all.
 _STATIC_SPLINE_PARAMS: dict[str, dict] = {
     "bunker": dict(surface="bunker", path_width=0.01, handle_length=1.0,
                    tight_splines=True, secondary_surface="heavyrough", secondary_width=2.5),
@@ -95,8 +101,6 @@ _STATIC_SPLINE_PARAMS: dict[str, dict] = {
                         tight_splines=False, secondary_surface="", secondary_width=0.0),
     "building": dict(surface="surface2", path_width=0.01, handle_length=0.2,
                       tight_splines=True, secondary_surface="", secondary_width=0.0),
-    "wood": dict(surface="surface1", path_width=0.01, handle_length=0.2,
-                  tight_splines=True, secondary_surface="", secondary_width=0.0),
     # Surface 3 (pavement texture) -- see FEATURES_TO_SURFACES.
     "pavement": dict(surface="surface3", path_width=0.01, handle_length=0.2,
                       tight_splines=True, secondary_surface="", secondary_width=0.0),
@@ -339,19 +343,22 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
     feature's kind isn't handled by this writer (water, hole -- see
     module docstring) -- or is deliberately hint-only (see below).
 
-    "wood" Features carrying a leaf_type tag (natural=wood polygons
-    tagged e.g. leaf_type=needleleaved -- see course_output/objects.py's
-    apply_area_tree_type_hints) are hint-only: their sole purpose is
-    telling tree generation what species to assume for trees inside
-    them, not painting a visible ground spline. A plain natural=wood
-    polygon WITHOUT a leaf_type tag still gets its usual ground spline
-    -- this only suppresses the ones being used specifically as tree-
-    type hints. Distinct from the upcoming "object splines" (density-
-    fill vegetation scatter, v2021+ only) mentioned in prior
-    conversation: those will be real, visible splines too, just written
-    under placedObjects2.json's "objects" node, not here.
+    "wood" Features (natural=wood polygons) are ALWAYS hint-only: their
+    sole purpose is telling tree generation what species to assume for
+    trees inside them (see course_output/objects.py's
+    apply_area_tree_type_hints, which reads the polygon's leaf_type
+    tag), not painting a visible ground spline. They emit NO spline --
+    this used to paint a filled surface1 (cartpath) area for wood,
+    which rendered as an unwanted filled patch, so the ground-spline
+    entry was removed from _STATIC_SPLINE_PARAMS entirely. The leaf_type
+    hint itself is unaffected -- it's read straight off the Feature's
+    tags in objects.py, independent of this writer. Distinct from the
+    upcoming "object splines" (density-fill vegetation scatter, v2021+
+    only) mentioned in prior conversation: those will be real, visible
+    splines too, just written under placedObjects2.json's "objects"
+    node, not here.
     """
-    if feature.kind == "wood" and feature.tags.get("leaf_type"):
+    if feature.kind == "wood":
         return None
 
     geom = feature.geometry
