@@ -63,7 +63,7 @@ from PGA2k_gen import (  # noqa: E402
     COLLECTIONS_FILE, DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M,
     DEFAULT_REMOVE_COVERED_MARGIN_M, EXPORT_STATUS_FRESH, EXPORT_STATUS_MISSING, EXPORT_STATUS_STALE,
     FEATURES_FILE, HEIGHT_MASK_FILE, HEIGHTMAP_FILE, INGAME_OBJECTS_FILE, OBJECT_LIST_FILE, OBJECTS_FILE,
-    OOB_FILE, PARKING_FILE, PGA_COLLECTION_TAG, export_status, load_all_stamps, load_project, save_project,
+    OOB_FILE, PARKING_FILE, PGA_COLLECTION_TAG, RANGE_NETS_FILE, export_status, load_all_stamps, load_project, save_project,
     DEFAULT_LIDAR_TREE_MIN_HEIGHT_M,
 )
 from course_output.out_of_bounds import (  # noqa: E402
@@ -73,6 +73,9 @@ from course_output.parking import (  # noqa: E402
     PARKING_ACCENT_COUNT, PARKING_COLOR_WEIGHTS, PARKING_MAX_VARIANTS, PARKING_OFFSET_M,
     PARKING_ORIENTATION, PARKING_SIDES, PARKING_SKIP_PROB, PARKING_SPACING_M,
     iter_parking_cars, load_parking_records,
+)
+from course_output.range_nets import (  # noqa: E402
+    iter_range_net_objects, load_range_net_records,
 )
 from course_output.ingame_objects import (  # noqa: E402
     load_ingame_objects, remove_ingame_object_groups, save_ingame_objects, summarize_ingame_object_groups,
@@ -2490,6 +2493,21 @@ class PGAGenGUI:
                  "any fresh Ingest OSM; re-pack objects afterwards (this does it).")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Range Nets", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        range_nets_btn = ttk.Button(parent, text="Generate", command=self._run_generate_range_nets)
+        range_nets_btn.pack(anchor="w", pady=2)
+        _Tooltip(range_nets_btn, "Tiles the built-in range-net module (course_output/"
+                  "range_net_module.py -- 4 stacked wire panels + a post each end + the buried "
+                  "brick anchor, one 8 m section) along every OSM way tagged barrier=range_nets, "
+                  "in a string of posts at exact 8 m increments with shared seam posts (no "
+                  "doubled posts). Connected ways are grouped into chains and the inner corner "
+                  "points are repositioned so every side is an exact multiple of 8 m (your "
+                  "box-shaped, one-side-missing layout). Each object carries a dy (y = terrain "
+                  "height + 1 m stamp datum, resolved at Write Objects), not a frozen y. Needs "
+                  "Ingest OSM. v2021+ only. Re-run after any fresh Ingest OSM; re-pack objects "
+                  "afterwards (this does it).")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(parent, text="Collections", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
 
         lib_row = ttk.Frame(parent)
@@ -2906,6 +2924,21 @@ class PGAGenGUI:
             val = var.get().strip()
             if val:
                 args += [flag, val]
+        self._run_step(
+            args, wd,
+            on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True),
+        )
+
+    def _run_generate_range_nets(self) -> None:
+        """Objects / Range Nets / Generate -- runs the generate-range-nets
+        CLI step (range_nets.json from OSM barrier=range_nets ways + the
+        built-in module). on_done re-packs objects.json so the nets show
+        in the preview and refreshes the Objects list; still needs a
+        Write Objects + Repack to reach the game."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = ["--step", "generate-range-nets"]
         self._run_step(
             args, wd,
             on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True),
@@ -3482,6 +3515,17 @@ class PGAGenGUI:
         if parking_path.exists():
             try:
                 collection_objects += list(iter_parking_cars(load_parking_records(parking_path)))
+            except (json.JSONDecodeError, OSError, KeyError):
+                pass
+
+        # Range-net objects (range_nets.json, owned by the
+        # generate-range-nets step) -- same "preserve, don't drop until the
+        # next CLI run" idea; folded in as collection_object-shaped records
+        # (see course_output/range_nets.py).
+        range_nets_path = working_dir / RANGE_NETS_FILE
+        if range_nets_path.exists():
+            try:
+                collection_objects += list(iter_range_net_objects(load_range_net_records(range_nets_path)))
             except (json.JSONDecodeError, OSError, KeyError):
                 pass
 

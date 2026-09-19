@@ -135,6 +135,18 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     if tags.get("pga_parking") is not None:
         return ("parking", False)
 
+    # barrier=range_nets -- an OSM-standard tag (barrier=* is a real OSM
+    # key; "range_nets" is this project's own value for a driving-range
+    # netting run) for an UNCLOSED way (a line, never an area) to be
+    # filled with a string of 8 m range-net modules (see
+    # course_output/range_nets.py). Always a line: the tiling runs along
+    # the way's length, and connected range_nets ways are grouped into
+    # chains (a box of nets with a side missing is one chain). No
+    # surface spline / hole / mask consumer matches "range_net" -- the
+    # kind rides features.geojson for step_generate_range_nets to tile.
+    if tags.get("barrier") == "range_nets":
+        return ("range_net", False)
+
     # area:highway=footway -- the OSM convention for a closed way meant
     # to render as a filled AREA (a plaza-style wide path) rather than
     # a linear route, independent of (and not always accompanied by) a

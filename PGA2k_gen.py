@@ -33,6 +33,14 @@ directory, running one pipeline step at a time:
                                  [--parking-max-variants N] [--no-parking-bank]
                                  (lines every OSM pga_parking=<pool> way with parked-car props
                                  -> parking.json; folded into objects.json by pack-objects)
+    PGA2k_gen.py <working_dir> --step generate-range-nets
+                                 [--range-net-endpoint-tol M] [--range-net-min-length M]
+                                 [--range-net-no-snap]
+                                 (tiles the built-in 8 m range-net module along every OSM
+                                 barrier=range_nets spline as a "string of pearls" -- a post
+                                 per 8 m node (shared at corners, never doubled) and one
+                                 4-high span of panels per 8 m interval -> range_nets.json;
+                                 folded into objects.json by pack-objects)
     PGA2k_gen.py <working_dir> --step push-collection --collection-name <name>
                                  [--collection-library <dir>] [--blank-course-name <name>]
                                  (builds a fresh .course holding one collection template's
@@ -188,6 +196,11 @@ from course_output.parking import (
     ParkingAisle, build_parking_records, iter_parking_cars, load_parking_records,
     parse_color_weights, resolve_pool, save_parking_records,
 )
+from course_output.range_nets import (
+    RANGE_NET_ENDPOINT_TOL_M, RANGE_NET_MIN_LENGTH_M, RANGE_NET_SNAP,
+    RangeNetLine, build_range_net_records, iter_range_net_objects,
+    load_range_net_records, save_range_net_records,
+)
 from course_output.ingame_objects import (
     build_ingame_objects_v2019, build_ingame_objects_v2021, load_ingame_objects, remove_ingame_object_groups,
     save_ingame_objects, summarize_ingame_object_groups,
@@ -317,6 +330,15 @@ PGA_PARKING_TAG = "pga_parking"
 # populated fraction of that aisle is (1 - parking_skip_prob) * ref
 # (default 1.0). Named `ref` (not pga_-prefixed) at the user's request.
 PGA_PARKING_REF_TAG = "ref"
+
+# OSM-standard barrier tag value (the "range_nets" value is this
+# project's own) on an unclosed way to be filled with a string of 8 m
+# range-net modules (see course_output/range_nets.py and the "range_net"
+# kind in ingest/osm.py's classify_way). step_generate_range_nets tiles
+# connected range_net ways into chains and writes range_nets.json.
+RANGE_NET_TAG = "barrier"
+RANGE_NET_TAG_VALUE = "range_nets"
+RANGE_NETS_FILE = "range_nets.json"
 
 # OSM waterway tag values treated as linear streams (carved bed + flowing
 # water + bank vegetation), as opposed to filled water bodies.
@@ -1773,6 +1795,19 @@ def step_pack_objects(working_dir: Path) -> None:
         if parking_cars:
             collection_objects += parking_cars
             print(f"  {len(parking_cars)} parked car(s) across {len(parking_records)} aisle(s)")
+
+    # Range-net objects from range_nets.json (see step_generate_range_nets)
+    # -- folded in as kind="collection_object" records too (same shape,
+    # carrying `dy` so write-objects resolves each to an absolute y via
+    # apply_terrain_heights), so write-objects formats them with no extra
+    # branch.
+    range_nets_path = working_dir / RANGE_NETS_FILE
+    if range_nets_path.exists():
+        range_net_records = load_range_net_records(range_nets_path)
+        range_net_objects = list(iter_range_net_objects(range_net_records))
+        if range_net_objects:
+            collection_objects += range_net_objects
+            print(f"  {len(range_net_objects)} range-net object(s) across {len(range_net_records)} chain(s)")
 
     ingame_object_records: list[dict] = []
     ingame_objects_path = working_dir / INGAME_OBJECTS_FILE
@@ -3649,6 +3684,81 @@ def step_generate_parking(
     # "Show objects" overlay reads parking.json / objects.json live.
 
 
+def step_generate_range_nets(
+    working_dir: Path, *,
+    endpoint_tol_m: float | None = None,
+    snap: bool | None = None,
+    min_length_m: float | None = None,
+) -> None:
+    """
+    Tile range-net modules (course_output/range_net_module.py) along every
+    OSM way tagged barrier=range_nets (features.geojson "range_net"
+    Features -- see ingest/osm.py) into range_nets.json, the frozen
+    version-agnostic per-project record.
+
+    Connected range_net ways are grouped into CHAINS (ways that share an
+    endpoint within endpoint_tol_m), and each chain's inner corners are
+    repositioned (snap=True, the default -- the user's "reposition
+    corners") so every segment is an exact multiple of the 8 m module
+    length. The chain's endpoints stay fixed. Each solved chain emits one
+    post per 8 m node (shared at the seams, never doubled) and one
+    4-panel span + brick anchor per interval. A chain shorter than one
+    module (min_length_m, default 8 m) is skipped.
+
+    Every placed object carries `dy` (the module member's height above
+    the template course's 1 m ground datum). At write-objects time,
+    course_output/collections.py:apply_terrain_heights resolves dy -> y =
+    target terrain height at (x, z) + output_height_shift_m + dy, so the
+    net re-grounds itself on the carved terrain. No heightmap is needed
+    here -- same "compile once, format at write" split as parking.
+
+    "compile once, format at write": the objects ride pack-objects ->
+    write-objects (folded into objects.json as kind="collection_object").
+    Run this before pack-objects. Re-runnable; overwrites range_nets.json
+    wholesale. Re-run after any fresh ingest-osm (which rewrites
+    features.geojson). No preview refresh -- the net is objects only.
+    """
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
+
+    project = load_project(working_dir)
+
+    def _setting(arg, key, const):
+        return arg if arg is not None else project.get(key, const)
+
+    endpoint_tol = _setting(endpoint_tol_m, "range_net_endpoint_tol_m", RANGE_NET_ENDPOINT_TOL_M)
+    snap = _setting(snap, "range_net_snap", RANGE_NET_SNAP)
+    min_length = _setting(min_length_m, "range_net_min_length_m", RANGE_NET_MIN_LENGTH_M)
+
+    features = _crop_features_to_course(working_dir, load_features(features_path))
+    lines = [
+        RangeNetLine(line=f.geometry, source_id=f.osm_id)
+        for f in features
+        if f.kind == "range_net" and f.geometry.geom_type == "LineString"
+        and len(f.geometry.coords) >= 2
+    ]
+    if not lines:
+        print(f"No range-net lines in {FEATURES_FILE} "
+              f"(a way tagged barrier=range_nets) -- nothing to do.")
+        save_range_net_records([], working_dir / RANGE_NETS_FILE)
+        return
+
+    print(f"  {len(lines)} range-net way(s)  endpoint_tol={endpoint_tol} m  snap={snap}")
+    records = build_range_net_records(
+        lines, endpoint_tol_m=endpoint_tol, snap=snap, min_length_m=min_length,
+    )
+    save_range_net_records(records, working_dir / RANGE_NETS_FILE)
+    n_obj = sum(len(r["objects"]) for r in records)
+    print(f"  wrote {working_dir / RANGE_NETS_FILE} ({len(records)} chain(s), {n_obj} object(s))")
+
+    save_project(working_dir, {
+        "range_net_endpoint_tol_m": endpoint_tol,
+        "range_net_snap": snap,
+        "range_net_min_length_m": min_length,
+    })
+
+
 def step_refine_terrain(
     working_dir: Path,
     tolerance: float,
@@ -5362,6 +5472,7 @@ STEPS = {
     "generate-oob": step_generate_oob,
     "generate-collections": step_generate_collections,
     "generate-parking": step_generate_parking,
+    "generate-range-nets": step_generate_range_nets,
     "push-collection": step_push_collection,
     "refine-terrain": step_refine_terrain,
     "write-terrain": step_write_terrain,
@@ -5792,6 +5903,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-parking-bank", action="store_true",
                          help="generate-parking: keep cars flat instead of banking pitch/roll to "
                               "the ground slope.")
+    parser.add_argument("--range-net-endpoint-tol", type=float, default=None,
+                         help="generate-range-nets: two range-net ways within this distance (m) "
+                              "share an endpoint and are grouped into one chain. Default: "
+                              f"project.json, or {RANGE_NET_ENDPOINT_TOL_M}.")
+    parser.add_argument("--range-net-min-length", type=float, default=None,
+                         help="generate-range-nets: a chain shorter than this (m) is skipped "
+                              f"(can't hold even one full module). Default: project.json, or "
+                              f"{RANGE_NET_MIN_LENGTH_M}.")
+    parser.add_argument("--range-net-no-snap", action="store_true",
+                         help="generate-range-nets: do NOT reposition inner corners to the 8 m "
+                              "grid (keep corners exactly where drawn; segment lengths stay "
+                              "non-multiple-of-8 and no post falls on a corner). Off by default.")
     parser.add_argument("--error-resolution", type=int, default=None,
                          help="visualize: grid resolution for preview_error.png, overriding the "
                               "default of inheriting whatever --resolution refine-terrain last used "
@@ -6263,6 +6386,13 @@ def main(argv: list[str] | None = None) -> int:
                 accent_count=args.parking_accent_count,
                 seed=args.parking_seed,
                 no_bank=args.no_parking_bank,
+            )
+        elif args.step == "generate-range-nets":
+            step_generate_range_nets(
+                working_dir,
+                endpoint_tol_m=args.range_net_endpoint_tol,
+                snap=(False if args.range_net_no_snap else None),
+                min_length_m=args.range_net_min_length,
             )
         elif args.step == "push-collection":
             if not args.collection_name:
