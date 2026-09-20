@@ -74,6 +74,7 @@ from course_output.collections import _bearing_deg, _rotate
 from course_output.range_net_module import (
     MODULE_LENGTH_M,
     far_post,
+    post_anchor,
     span_members,
     start_post,
 )
@@ -196,39 +197,49 @@ def _order_chain(ways: list[RangeNetLine],
     or a branch) -- the caller then reports the group as unsolvable."""
     if not ways:
         return RangeNetChain()
+
+    def _way_coords(ln: RangeNetLine) -> list[tuple[float, float]]:
+        # The way's FULL vertex list, not just its two endpoints -- a way
+        # tagged barrier=range_nets can (and typically does) have interior
+        # nodes (a bend drawn as one way), and those must stay in the
+        # chain's polyline or tiling degenerates to a straight line
+        # between the way's first and last node.
+        return [(float(x), float(y)) for x, y in ln.line.coords]
+
     if len(ways) == 1:
-        a, b = _chain_endpoints(ways[0].line)
-        return RangeNetChain(nodes=[a, b], source_ids=[ways[0].source_id])
+        return RangeNetChain(nodes=_way_coords(ways[0]), source_ids=[ways[0].source_id])
 
     # Walk from the first way's first endpoint to the other free end,
     # extending at each step by the one unused way that shares the
-    # current node. The first way contributes node0->node1.
+    # current node. Each way contributes its full vertex list (reversed
+    # if it's being walked from its "far" end), with the shared joint
+    # point deduplicated.
     first = ways[0]
-    a, b = _chain_endpoints(first.line)
-    nodes: list[tuple[float, float]] = [a, b]
+    nodes: list[tuple[float, float]] = _way_coords(first)
     source_ids: list[Optional[int]] = [first.source_id]
     used = {0}
-    cur = b
+    cur = nodes[-1]
     prev_idx = 0
     for _ in range(len(ways) - 1):
         nxt_idx: Optional[int] = None
-        nxt: Optional[tuple[float, float]] = None
+        nxt_coords: Optional[list[tuple[float, float]]] = None
         for j in range(len(ways)):
             if j in used or j == prev_idx:
                 continue
-            ja, jb = _chain_endpoints(ways[j].line)
+            coords = _way_coords(ways[j])
+            ja, jb = coords[0], coords[-1]
             if math.hypot(ja[0] - cur[0], ja[1] - cur[1]) <= tol_m:
-                nxt_idx, nxt = j, jb
+                nxt_idx, nxt_coords = j, coords
                 break
             if math.hypot(jb[0] - cur[0], jb[1] - cur[1]) <= tol_m:
-                nxt_idx, nxt = j, ja
+                nxt_idx, nxt_coords = j, list(reversed(coords))
                 break
-        if nxt_idx is None or nxt is None:
+        if nxt_idx is None or nxt_coords is None:
             return None  # dead end before using every way -> not a path
         used.add(nxt_idx)
-        nodes.append(nxt)
+        nodes.extend(nxt_coords[1:])  # [0] is the shared joint, already in nodes
         source_ids.append(ways[nxt_idx].source_id)
-        cur = nxt
+        cur = nodes[-1]
         prev_idx = nxt_idx
     if len(used) != len(ways):
         return None
@@ -327,19 +338,62 @@ def _solve_corners(nodes: list[tuple[float, float]],
 # tiling
 # ---------------------------------------------------------------------------
 
-def _node_at(line: LineString, d: float) -> tuple[float, float, float]:
-    """(x, z, bearing_deg) at arc-length `d` along `line` -- the tangent
-    direction (a forward point a small epsilon ahead, a backward one a
-    small epsilon behind, averaged) gives the bearing."""
-    eps = min(0.5, max(0.01, line.length * 1e-4))
-    d_fwd = min(line.length, d + eps)
-    d_bwd = max(0.0, d - eps)
-    p = line.interpolate(d)
-    pf = line.interpolate(d_fwd)
-    pb = line.interpolate(d_bwd)
-    dx, dz = pf.x - pb.x, pf.y - pb.y
-    bearing = _bearing_deg(dx, dz) if math.hypot(dx, dz) > 1e-9 else 0.0
-    return (p.x, p.y, bearing)
+def _cumulative_lengths(nodes: list[tuple[float, float]]) -> list[float]:
+    """Cumulative arc length at each node of a polyline, `cum[0] == 0.0`."""
+    cum = [0.0]
+    for i in range(1, len(nodes)):
+        ax, az = nodes[i - 1]
+        bx, bz = nodes[i]
+        cum.append(cum[-1] + math.hypot(bx - ax, bz - az))
+    return cum
+
+
+def _segment_bearing(nodes: list[tuple[float, float]], i: int) -> float:
+    ax, az = nodes[i]
+    bx, bz = nodes[i + 1]
+    return _bearing_deg(bx - ax, bz - az)
+
+
+def _point_and_heading_at(nodes: list[tuple[float, float]], cum: list[float],
+                          d: float) -> tuple[float, float, float]:
+    """(x, z, bearing_deg) at arc-length `d` along the polyline `nodes`.
+
+    The bearing is the FORWARD direction of the segment that starts at or
+    just before `d` -- when `d` lands exactly on an interior node (every
+    post/span anchor does, since posts sit on nodes and spans are
+    anchored at their interval's start node), that's the segment leaving
+    the node, never an average with the segment arriving at it. Averaging
+    the two (as an earlier version of this function did, by sampling a
+    small epsilon ahead of and behind `d` and taking the tangent) makes a
+    90 degree turn in the OSM way come out as a 45 degree rotation on the
+    tiled post/span -- see tile_range_net_chain's closed-loop seam post
+    for the one case that legitimately wants that average."""
+    n = len(nodes)
+    d = max(0.0, min(d, cum[-1]))
+    i = 0
+    for j in range(n - 1):
+        if cum[j] <= d + 1e-9:
+            i = j
+        else:
+            break
+    ax, az = nodes[i]
+    bx, bz = nodes[i + 1]
+    seg_len = cum[i + 1] - cum[i]
+    t = 0.0 if seg_len < 1e-9 else (d - cum[i]) / seg_len
+    x = ax + t * (bx - ax)
+    z = az + t * (bz - az)
+    return (x, z, _segment_bearing(nodes, i))
+
+
+def _bisector_bearing_deg(bearing_in: float, bearing_out: float) -> float:
+    """The bearing bisecting a turn from `bearing_in` to `bearing_out`
+    (sum of the two heading unit vectors) -- used only for a closed
+    loop's shared seam post, which has no single well-defined "next"
+    segment to face."""
+    rad_in, rad_out = math.radians(bearing_in), math.radians(bearing_out)
+    dx = math.sin(rad_in) + math.sin(rad_out)
+    dz = math.cos(rad_in) + math.cos(rad_out)
+    return _bearing_deg(dx, dz) if math.hypot(dx, dz) > 1e-9 else bearing_out
 
 
 def _resolve_members_at(members: list[dict], ax: float, az: float, heading_deg: float) -> list[dict]:
@@ -395,8 +449,8 @@ def tile_range_net_chain(chain: RangeNetChain,
         _solve_corners(chain.nodes, module_len) if snap else (list(chain.nodes), [])
     )
     chain.nodes = nodes
-    line = chain.line
-    total = line.length
+    cum = _cumulative_lengths(nodes)
+    total = cum[-1]
     n_segments = max(0, int(round(total / module_len)))
     # Guard: the solved length should be an exact multiple of the module
     # length; if the solver left a residual (it shouldn't -- the
@@ -420,13 +474,27 @@ def tile_range_net_chain(chain: RangeNetChain,
     for k in range(n_segments + 1):
         if is_closed and k == n_segments:
             continue  # the seam node's post is the start post (k=0)
-        x, z, bearing = _node_at(line, k * module_len)
+        x, z, bearing = _point_and_heading_at(nodes, cum, k * module_len)
+        if is_closed and k == 0:
+            # the seam post faces two different segments (the loop's
+            # last and first) -- bisect, rather than arbitrarily facing
+            # only the outgoing one.
+            bearing = _bisector_bearing_deg(_segment_bearing(nodes, len(nodes) - 2),
+                                            _segment_bearing(nodes, 0))
         post = start_post()
         objects += _resolve_members_at([post], x, z, bearing)
     # Spans: one per interval (anchored at the interval start).
     for k in range(n_segments):
-        x, z, bearing = _node_at(line, k * module_len)
+        x, z, bearing = _point_and_heading_at(nodes, cum, k * module_len)
         objects += _resolve_members_at(span_members(), x, z, bearing)
+    # The chain's terminal post (open chains only -- a closed loop's seam
+    # post is the start of interval 0, so it already got one above) isn't
+    # the start of any interval, so span_members() never anchors one
+    # there -- give it its own post_anchor(), same as the metal post is
+    # explicitly placed at every node above.
+    if n_segments > 0 and not is_closed:
+        x, z, bearing = _point_and_heading_at(nodes, cum, n_segments * module_len)
+        objects += _resolve_members_at([post_anchor()], x, z, bearing)
 
     objects = _dedup_same_node_posts(objects)
 

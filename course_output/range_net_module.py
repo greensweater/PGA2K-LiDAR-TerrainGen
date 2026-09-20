@@ -42,6 +42,11 @@ from __future__ import annotations
 # 8 m fence segment (4 wire panels stacked 4-high at 4.2 m spacing).
 MODULE_LENGTH_M = 8.0
 
+# In-game, the whole module was landing 1 m too high relative to the
+# ground -- subtracted from every member's dy below, on top of the 1 m
+# ground datum.
+GROUND_DROP_M = 2.4
+
 # The two RivieraCC fence posts -- one at each end of the module.
 # rotation_deg is RELATIVE TO THE MODULE HEADING (0 = +Z). The template
 # has them at rotation 0 and 90; the 90 on the far post is the
@@ -49,7 +54,7 @@ MODULE_LENGTH_M = 8.0
 # either reads the same).
 POST_PATH = "Assets/CourseGen/Detail/Walls/RivieraCC_Fence01AAPostAPrefab"
 POST_SCALE = 5.0
-POST_DY = 5.0  # y=6.0 in the template, minus the 1 m ground datum.
+POST_DY = 5.0 - GROUND_DROP_M  # y=6.0 in the template, minus the 1 m ground datum.
 
 POSTS = [
     {"path": POST_PATH, "dz": 0.0,  "rotation_deg": 0.0, "scale": POST_SCALE, "dy": POST_DY},
@@ -65,10 +70,10 @@ WIRE_ROTATION_DEG = 90.0  # the template's 90 deg yaw (model's long axis -> +Z)
 # (dy, label) for the 4 stacked panels -- y = 3.0/7.2/11.4/15.6 in the
 # template, minus the 1 m ground datum. 4.2 m vertical spacing.
 WIRE_PANELS = [
-    (2.0,  "L1"),
-    (6.2,  "L2"),
-    (10.4, "L3"),
-    (14.6, "L4"),
+    (2.0  - GROUND_DROP_M, "L1"),
+    (6.2  - GROUND_DROP_M, "L2"),
+    (10.4 - GROUND_DROP_M, "L3"),
+    (14.6 - GROUND_DROP_M, "L4"),
 ]
 
 # The buried brick anchor at the module's start (a post anchor --
@@ -77,7 +82,18 @@ WIRE_PANELS = [
 BRICK_PATH = "Assets/CourseGen/Detail/Walls/BrickWallsHighRailsAPostAPrefab"
 BRICK_SCALE = 3.0
 BRICK_ROTATION_DEG = 0.0
-BRICK_DY = -2.5
+BRICK_DY = -2.5 - GROUND_DROP_M
+
+
+def post_anchor() -> dict:
+    """The buried brick/concrete post anchor, on its own -- one belongs
+    at every post, not just an interval's start. span_members() places
+    one per interval (anchored alongside that interval's start post);
+    the tiler places one more of these at a chain's terminal post (the
+    end of the last interval), which span_members() never reaches since
+    it isn't the start of any interval."""
+    return {"path": BRICK_PATH, "dz": 0.0, "rotation_deg": BRICK_ROTATION_DEG,
+            "scale": BRICK_SCALE, "dy": BRICK_DY}
 
 
 def span_members() -> list[dict]:
@@ -89,8 +105,7 @@ def span_members() -> list[dict]:
          "scale": WIRE_SCALE, "dy": dy}
         for dy, _label in WIRE_PANELS
     ]
-    out.append({"path": BRICK_PATH, "dz": 0.0, "rotation_deg": BRICK_ROTATION_DEG,
-                "scale": BRICK_SCALE, "dy": BRICK_DY})
+    out.append(post_anchor())
     return out
 
 
