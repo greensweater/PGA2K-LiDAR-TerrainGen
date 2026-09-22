@@ -156,6 +156,29 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     if tags.get("area:highway") == "footway":
         return ("pavement", True)
 
+    # surface=paving_stones -- a standalone surface tag (not paired with
+    # area:highway=footway or amenity=parking) for a paved area drawn
+    # directly with this surface value. Same "pavement" kind/treatment
+    # as area:highway=footway and amenity=parking above (surface 3, see
+    # splines.py's FEATURES_TO_SURFACES) -- always an area: like those
+    # two, "pavement" is one of the _STATIC_SPLINE_PARAMS kinds, which
+    # splines.py always renders closed+filled regardless of the source
+    # geometry, so this must be True here too or a non-ring way would
+    # render as a stray closing edge instead of a filled patch. Checked
+    # ahead of the golf_type/highway_type dispatch below so it wins
+    # even when a way also carries a highway=* tag (e.g. a footway
+    # tagged surface=paving_stones renders as pavement, not cartpath-
+    # textured "path").
+    if tags.get("surface") == "paving_stones":
+        return ("pavement", True)
+
+    # leisure=garden -- a planted/landscaped area, not the overall
+    # course boundary. Filled mulch texture, same treatment as
+    # natural=fell/landuse=flowerbed below (not a golf surface, just a
+    # filled ground texture).
+    if tags.get("leisure") == "garden":
+        return ("mulch", True)
+
     # leisure=golf_course -- the overall course property boundary
     # (typically one large polygon/multipolygon underneath everything
     # else). Rendered as heavy rough: a catch-all background that more
@@ -165,6 +188,7 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
 
     golf_type = tags.get("golf")
     waterway_type = tags.get("waterway")
+    railway_type = tags.get("railway")
     building_type = tags.get("building")
     natural_type = tags.get("natural")
     highway_type = tags.get("highway")
@@ -203,6 +227,16 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
         # centerline, not a filled polygon, unless explicitly tagged
         # area=yes -- matches Chad's area=area (not area=True) here.
         return ("water", explicit_area)
+
+    if railway_type == "rail":
+        # A real rail line, not a golf feature -- same "roadway" kind/
+        # treatment (surface 3, full road width; see splines.py's
+        # _ROAD_KIND_STYLES) as the vehicular ROADWAY_HIGHWAY_TYPES
+        # above, since PGA has no dedicated rail surface. The raw
+        # railway=rail tag survives on the Feature (see
+        # PGA2k_gen_gui.py's _spline_tag_detail) so it still reads as
+        # "rail" rather than an ordinary road in the Splines tab list.
+        return ("roadway", explicit_area)
 
     if building_type is not None:
         return ("building", True)
@@ -390,6 +424,15 @@ def parse_osm_features(
         ]
         if len(coords) < 2:
             continue
+
+        # A plain highway=footway way (no area:highway=footway, no
+        # explicit area=yes) that's still drawn as a closed ring --
+        # i.e. genuinely filled, not a route with an open start/end --
+        # should render filled rather than fall back to an unfilled
+        # line just because the area tag wasn't set explicitly.
+        if (not is_area and kind == "path" and way.tags.get("highway") == "footway"
+                and len(coords) >= 4 and coords[0] == coords[-1]):
+            is_area = True
 
         if is_area and len(coords) >= 3:
             if coords[0] != coords[-1]:

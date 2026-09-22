@@ -185,19 +185,20 @@ fill's ~3%) -- prefer "edge" for a fairly regular pond shape where
 tight overshoot matters most, "stripe" whenever guaranteed complete
 coverage matters more than how tightly the tiles hug the shape.
 
-Water level: the 5th PERCENTILE (not the true minimum -- see point 5
-below) of the actual rendered terrain anywhere along the water body's
-own real OUTLINE (the boundary of the union of every tile/stripe
-actually fitted for it, not just the raw OSM polygon -- tiles can
-overshoot the polygon somewhat, especially in stripe mode, and the
-real requirement is "never floats anywhere the water plane's EDGE
-actually renders"), minus a small fixed safety margin
-(DEFAULT_WATER_LEVEL_SAFETY_MARGIN_M). Deliberately the OUTLINE, not
-the whole interior area -- see point 4 below, a real correction, not
-just a design choice made right the first time. Computed by sampling
-TerrainModel densely (TerrainModel.evaluate_many) at points spaced
-along the footprint polygon's own boundary curve (DEFAULT_WATER_LEVEL_
-BOUNDARY_SPACING_M apart) -- see _water_level_from_footprint.
+Water level: the MEAN (not a low percentile or the true minimum -- see
+point 6 below) of the actual rendered terrain anywhere along the water
+body's own real OUTLINE (the boundary of the raw OSM water WAY polygon
+itself, not the union of tiles/stripes fitted to it -- see point 6;
+that fitted footprint is deliberately inflated past the way's own edge,
+e.g. WATER_RECT_MARGIN, so sampling it instead of the way undershoots
+the real requirement of tracking the actual, tagged shoreline), minus
+a small fixed safety margin (DEFAULT_WATER_LEVEL_SAFETY_MARGIN_M).
+Deliberately the OUTLINE, not the whole interior area -- see point 4
+below, a real correction, not just a design choice made right the
+first time. Computed by sampling TerrainModel densely (TerrainModel.
+evaluate_many) at points spaced along the water way polygon's own
+boundary curve (DEFAULT_WATER_LEVEL_BOUNDARY_SPACING_M apart) -- see
+_water_level_from_way_boundary.
 
 This replaced an earlier version (still worth understanding, since the
 lessons generalize) that only evaluated at STAMP CENTERS falling
@@ -294,6 +295,39 @@ high point." Four things changed to get here:
      shifting slightly under a global percentile) but was more code for
      the same practical result on the one pond that actually needed it.
 
+  6. Confirmed in practice (direct report): even after all of the
+     above, ponds still rendered a bit too low across the board -- not
+     one outlier pond, most of them, by a modest but consistent amount.
+     Two more things were wrong, independent of each other: (a) the
+     boundary being sampled was the FITTED footprint (the union of the
+     actual rectangle(s)/tile(s) placed for the pond, deliberately
+     inflated past the raw OSM polygon by WATER_RECT_MARGIN/tile
+     overlap -- see fit_water_rectangle), not the real OSM water WAY
+     itself -- so every sample point sat outside the pond's true tagged
+     edge, on surrounding bank/dig-collar terrain that has no reason to
+     track the real water height as closely as the way's own traced
+     boundary does; (b) the 5th PERCENTILE from point 5, while a real
+     fix for the single-outlier problem, is still a statistic that
+     deliberately reaches toward the low tail of the sampled
+     distribution on EVERY pond, not just the rare one with an
+     artifact -- a small systematic downward bias applied uniformly,
+     exactly matching "every pond a bit too low" rather than "one pond
+     very wrong." Fixed by switching to (a) the raw way polygon
+     (`f.geometry`, before any tile-fitting inflation) as the boundary
+     sampled, and (b) the MEAN of those dense boundary samples instead
+     of a low percentile: a real water way's traced boundary is,
+     definitionally, drawn at the actual shoreline, so the large
+     majority of dense samples along it already cluster tightly around
+     the true water height, and a mean uses that whole clustered
+     distribution instead of deliberately discarding it in favor of the
+     low tail. This also improves on point 5's own single-artifact-
+     point concern rather than reintroducing it: one outlier sample
+     pulls a mean of many dense points proportionally less than it
+     pulls a percentile that's already anchored near the tail where
+     outliers live. Renamed _water_level_from_footprint ->
+     _water_level_from_way_boundary to match (the function's argument
+     is no longer a "footprint" at all).
+
 This means water objects must be built AFTER terrain generation/
 refinement AND normalize_stamp_heights have both already run (see
 PGA2k_gen.py's step_write_water, which re-runs that same load/
@@ -312,7 +346,6 @@ from typing import Optional, Sequence
 import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 from shapely.geometry.polygon import orient
-from shapely.ops import unary_union
 
 from ingest.osm import Feature
 from course_output.userLayers import GRID_ORIGIN_OFFSET
@@ -409,19 +442,18 @@ WATER_MESH_BASE_SIZE_M = 1.8 / (1.0 - WATER_EDGE_BORDER_FRACTION)
 # not an exact zero-tolerance fit -- see module docstring.
 WATER_RECT_MARGIN = 1.02
 
-# _water_level_from_footprint's tunables -- see module docstring's
+# _water_level_from_way_boundary's tunables -- see module docstring's
 # "Water level" and that function's own docstring. Not exposed as CLI/
 # GUI parameters: internal, well-reasoned defaults, matching this
 # module's other non-tunable internal constants (e.g. _WS_SEAM_
 # OVERLAP_M) rather than proliferating knobs with no strong reason to
 # differ per-course.
 DEFAULT_WATER_LEVEL_BOUNDARY_SPACING_M = 0.25  # arc-length spacing between sampled boundary points
-DEFAULT_WATER_LEVEL_PERCENTILE = 5.0       # low percentile of boundary samples, not the strict min --
-                                             # see module docstring's "Water level" point 5
-DEFAULT_WATER_LEVEL_SAFETY_MARGIN_M = 0.15  # subtracted from the found percentile -- sits slightly
-                                              # BELOW the sampled value, not just at it (even dense
-                                              # sampling can still miss the exact true minimum between
-                                              # sample points)
+DEFAULT_WATER_LEVEL_SAFETY_MARGIN_M = 0.15  # subtracted from the mean of the boundary samples --
+                                              # sits slightly BELOW the sampled value, not just at it
+                                              # (even dense sampling can still miss the exact true
+                                              # minimum between sample points) -- see module
+                                              # docstring's "Water level" point 6
 
 # fit_water_tiles' tunables -- see that function's docstring. Follows
 # the same plain DEFAULT_*_M module constant + matching keyword-arg
@@ -471,6 +503,22 @@ DEFAULT_WATER_STRIPE_TOLERANCE_M = 0.0
 # problem), so this is set generously and not expected to ever bind on
 # a real pond.
 DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE = 200
+
+# Fudge-factor buffer (m) applied to the pond's OWN polygon before any
+# fitting happens (fit_water_rectangle's center/rotation, then every
+# stripe's own probe against the resulting shape) -- NOT the same thing
+# as DEFAULT_WATER_STRIPE_OVERLAP_M's overshoot-past-the-boundary knob,
+# which only bounds how far a stripe may extend past whatever polygon
+# it's given. This instead grows the polygon itself first. Exists
+# because the real OSM way and the real LIDAR-derived terrain don't
+# always line up exactly -- confirmed in practice on a real course,
+# stripes ending visibly short of the actual terrain intersection at
+# the pond edge, consistent with the OSM trace sitting slightly inside
+# where the ground actually starts sloping into the water. Defaults to
+# 0.0 (byte-identical output to before this existed) since most ponds
+# don't need it -- a per-course dial for the ones that do, not a
+# blanket correction.
+DEFAULT_WATER_STRIPE_BUFFER_M = 0.0
 
 
 def _round(value: float) -> float:
@@ -527,52 +575,49 @@ def _water_entry(
     }
 
 
-def _water_level_from_footprint(
-    footprint_polygon, model: TerrainModel,
+def _water_level_from_way_boundary(
+    way_polygon, model: TerrainModel,
     spacing_m: float = DEFAULT_WATER_LEVEL_BOUNDARY_SPACING_M,
-    percentile: float = DEFAULT_WATER_LEVEL_PERCENTILE,
     safety_margin_m: float = DEFAULT_WATER_LEVEL_SAFETY_MARGIN_M,
 ) -> Optional[float]:
     """
     The water level (Y) that keeps the water plane close to the ACTUAL
-    rendered terrain along `footprint_polygon`'s own OUTLINE, without
+    rendered terrain along `way_polygon`'s own OUTLINE, without
     floating over most of it -- see module docstring's "Water level".
-    Deliberately NOT the minimum over the footprint's whole INTERIOR: a
-    real pond's basin is typically deepest in the middle (real digging,
-    or just natural bowl shape), so a whole-interior minimum would sink
+    Deliberately NOT the minimum over the way's whole INTERIOR: a real
+    pond's basin is typically deepest in the middle (real digging, or
+    just natural bowl shape), so a whole-interior minimum would sink
     the plane far below the shoreline instead of just below it (module
-    docstring point 4). Also deliberately NOT the strict minimum over
-    the outline either -- a single boundary point can read an
-    artificially low height (a coarse-stamp/dig-collar fitting
-    artifact, not real terrain -- module docstring point 5) and, taken
-    as a strict min, would single-handedly sink the whole pond by
-    meters even though the rest of the boundary is fine.
+    docstring point 4).
 
     Computed by sampling TerrainModel.evaluate_many at points spaced
-    spacing_m apart along `footprint_polygon.boundary` (every rung of
-    a MultiLineString/LinearRing walked in curve order), then taking
-    the `percentile`-th percentile of those heights, minus
-    safety_margin_m. A low percentile (not the median -- tried and
-    rejected, see module docstring point 5) stays robust to the rare
-    single-point artifact while still tracking real, legitimate rim
-    relief on ponds whose boundary genuinely varies by meters.
+    spacing_m apart along `way_polygon.boundary` (every rung of a
+    MultiLineString/LinearRing walked in curve order), then taking the
+    MEAN of those heights, minus safety_margin_m. A real water way's
+    traced boundary is drawn at the actual shoreline, so the large
+    majority of dense samples along it already cluster tightly around
+    the true water height -- the mean uses that whole distribution
+    directly instead of reaching for a low percentile or the strict
+    minimum (both tried and rejected; see module docstring points 5
+    and 6).
 
-    `footprint_polygon` should be the UNION of every tile/stripe
-    actually fitted for this water body (not just the raw OSM polygon)
-    -- that's the real edge the water plane(s) will render, and tiles
-    can overshoot the raw polygon somewhat (see fit_water_tiles/
-    fit_water_stripes). Both `footprint_polygon` and `model` must
-    already be in the same local [0, COURSE_SIZE_M] frame (neither is
+    `way_polygon` should be the raw OSM water way's own polygon
+    geometry (`Feature.geometry`, before any rectangle/tile fitting) --
+    NOT the fitted footprint actually rendered (the union of tiles/
+    stripes), which is deliberately inflated past the way's own edge
+    and so doesn't track the real, tagged shoreline as closely (module
+    docstring point 6). `way_polygon` and `model` must already be in
+    the same local [0, COURSE_SIZE_M] frame (neither is
     GRID_ORIGIN_OFFSET-shifted yet); `model` must be built from the
     ALREADY-height-normalized stamp list (see userLayers.py's
     normalize_stamp_heights) -- evaluating it, rather than reading any
     stamp's own .value, is what actually captures that normalization
     shift (see module docstring's "Water level" #1).
 
-    None if the footprint has no boundary length to sample at all
-    (degenerate geometry).
+    None if the way has no boundary length to sample at all (degenerate
+    geometry).
     """
-    boundary = footprint_polygon.boundary
+    boundary = way_polygon.boundary
     lines = list(boundary.geoms) if hasattr(boundary, "geoms") else [boundary]
     points: list[tuple[float, float]] = []
     for line in lines:
@@ -585,7 +630,7 @@ def _water_level_from_footprint(
         return None
 
     heights = model.evaluate_many(np.array(points))
-    return float(np.percentile(heights, percentile)) - safety_margin_m
+    return float(heights.mean()) - safety_margin_m
 
 
 def fit_water_rectangle(polygon) -> Optional[tuple[float, float, float, float, float]]:
@@ -1190,6 +1235,7 @@ def fit_water_stripes(
     min_edge_m: float = DEFAULT_WATER_TILE_MIN_EDGE_M,
     tolerance_m: float = DEFAULT_WATER_STRIPE_TOLERANCE_M,
     max_stripes_per_side: int = DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
+    buffer_m: float = DEFAULT_WATER_STRIPE_BUFFER_M,
 ) -> Optional[list[tuple[float, float, float, float, float]]]:
     """
     An alternative to fit_water_tiles' per-edge-plus-dedup fill --
@@ -1207,6 +1253,18 @@ def fit_water_stripes(
     by capping stripe count or aspect ratio -- by direct instruction,
     coverage is the only hard requirement; a very long, thin stripe (or
     many of them) is an accepted outcome, not a problem.
+
+    buffer_m (default DEFAULT_WATER_STRIPE_BUFFER_M, 0.0 -- byte-
+    identical output when left at default) grows `polygon` by this many
+    meters (shapely .buffer(), all directions) BEFORE anything else
+    happens -- the pond's own center/rotation (from fit_water_rectangle)
+    and every stripe's boundary probe all then run against the grown
+    shape, not the original. A per-course fudge factor for when the OSM
+    way and the real LIDAR-derived terrain don't quite agree on where
+    the pond edge actually is, leaving stripes ending visibly short of
+    where the ground really starts sloping into the water -- distinct
+    from overlap_m, which only bounds how far a stripe may extend past
+    whatever polygon it's given, not the polygon itself.
 
     Returns a list of (cx, cz, width, depth, rotation_deg) tuples, same
     convention as fit_water_rectangle/fit_water_tiles (rotation_deg a
@@ -1234,6 +1292,9 @@ def fit_water_stripes(
          needed; the first stripe from each walk IS the center stripe
          for that half.
     """
+    if buffer_m:
+        polygon = polygon.buffer(buffer_m)
+
     if polygon.geom_type != "Polygon" or polygon.is_empty:
         return None
 
@@ -1299,6 +1360,7 @@ def build_water_objects(
     water_stripe_min_edge_m: float = DEFAULT_WATER_TILE_MIN_EDGE_M,
     water_stripe_tolerance_m: float = DEFAULT_WATER_STRIPE_TOLERANCE_M,
     water_stripe_max_stripes_per_side: int = DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
+    water_stripe_buffer_m: float = DEFAULT_WATER_STRIPE_BUFFER_M,
 ) -> list[dict]:
     """
     One or more water entries per "water" Feature with Polygon geometry
@@ -1353,6 +1415,7 @@ def build_water_objects(
             fits = fit_water_stripes(
                 f.geometry, overlap_m=water_stripe_overlap_m, min_edge_m=water_stripe_min_edge_m,
                 tolerance_m=water_stripe_tolerance_m, max_stripes_per_side=water_stripe_max_stripes_per_side,
+                buffer_m=water_stripe_buffer_m,
             )
         elif multi_tile_water:
             fits = fit_water_tiles(
@@ -1370,11 +1433,10 @@ def build_water_objects(
             skipped += 1
             continue
 
-        footprint = unary_union([Polygon(_water_tile_corners(*t)) for t in fits])
-        level = _water_level_from_footprint(footprint, model)
+        level = _water_level_from_way_boundary(f.geometry, model)
         if level is None:
             cx0, cz0 = fits[0][0], fits[0][1]
-            printf(f"  Skipping a water feature near ({cx0:.0f}, {cz0:.0f}) -- its fitted footprint "
+            printf(f"  Skipping a water feature near ({cx0:.0f}, {cz0:.0f}) -- its way geometry "
                    "is too degenerate to render a water level from.")
             skipped += 1
             continue

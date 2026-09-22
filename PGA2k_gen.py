@@ -57,7 +57,7 @@ directory, running one pipeline step at a time:
                                  [--water-tile-redundancy-ratio R] [--water-tile-overlap-m M]
                                  [--water-fill-mode edge|stripe] [--water-stripe-overlap-m M]
                                  [--water-stripe-min-edge-m M] [--water-stripe-tolerance-m M]
-                                 [--water-stripe-max-stripes-per-side N]
+                                 [--water-stripe-max-stripes-per-side N] [--water-stripe-buffer-m M]
     PGA2k_gen.py <working_dir> --step generate-trees [--detect-lidar-trees] [--mark-cartpath-trees]
     PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023|2025>]
                                  [--theme <id-or-name>] [--tree-variety] [--stake-buildings]
@@ -293,7 +293,7 @@ from course_output.water import (
     DEFAULT_WATER_TILE_MAX_SEARCH_M, DEFAULT_WATER_TILE_WIDTH_SAMPLES,
     DEFAULT_WATER_TILE_REDUNDANCY_RATIO, DEFAULT_WATER_TILE_OVERLAP_M,
     DEFAULT_WATER_STRIPE_OVERLAP_M, DEFAULT_WATER_STRIPE_TOLERANCE_M,
-    DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
+    DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE, DEFAULT_WATER_STRIPE_BUFFER_M,
 )
 
 FEATURES_FILE = "features.geojson"
@@ -3293,8 +3293,14 @@ def step_generate_streams(
         "streams_bank_veg_width_m": bank_veg_width_m,
     })
 
-    print("Refreshing previews...")
-    step_visualize(working_dir)
+    # No full preview refresh: the streambed carve is a thin, low-stamp-
+    # count layer whose effect on hex/stamps/height/error is negligible
+    # next to the cost of re-rendering all of them (same reasoning as
+    # step_generate_parking/step_generate_range_nets). The stream-bank
+    # vegetation and waterfalls this step feeds are objects only -- the
+    # GUI's "Show objects" overlay reads streams.json/features.geojson
+    # live, so it doesn't need a fresh base PNG either. Run --step
+    # visualize explicitly once the carve needs a real look.
 
 
 def _clear_oob(working_dir: Path) -> None:
@@ -3533,15 +3539,13 @@ def step_generate_collections(working_dir: Path, library_dir: Path | None = None
 
     save_project(working_dir, {"collections_library_dir": str(library_dir)})
 
-    # Collections only need OSM, so this step can legitimately run before
-    # ingest-laz -- don't let a not-yet-possible preview refresh (or a
-    # crop whose relief exceeds the in-game ceiling, etc.) fail the step
-    # once collections.json is already written.
-    try:
-        print("Refreshing previews...")
-        step_visualize(working_dir)
-    except Exception as e:  # noqa: BLE001 -- cosmetic refresh, never fatal
-        print(f"  (skipping preview refresh: {type(e).__name__}: {e})")
+    # No full preview refresh: a placement's terrain stamps (if any) are
+    # a handful of small, template-defined bumps -- negligible next to
+    # the cost of re-rendering hex/stamps/height/error for all of them
+    # (same reasoning as step_generate_parking/step_generate_range_nets/
+    # step_generate_streams). The placed objects/splines are picked up
+    # live by the GUI's "Show objects" overlay from collections.json --
+    # run --step visualize explicitly if the terrain stamps need a look.
 
 
 def step_generate_parking(
@@ -4342,6 +4346,7 @@ def step_write_water(
     water_stripe_min_edge_m: float = DEFAULT_WATER_TILE_MIN_EDGE_M,
     water_stripe_tolerance_m: float = DEFAULT_WATER_STRIPE_TOLERANCE_M,
     water_stripe_max_stripes_per_side: int = DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
+    water_stripe_buffer_m: float = DEFAULT_WATER_STRIPE_BUFFER_M,
 ) -> None:
     """
     Writes only userLayers.json's "water" key, leaving "height" (and
@@ -4364,6 +4369,11 @@ def step_write_water(
     course_output/water.py's fit_water_tiles/fit_water_stripes) and is
     only consulted when multi_tile_water is set. The water_tile_*/
     water_stripe_* args tune their own respective fill mode only.
+    water_stripe_buffer_m (default 0.0) grows the pond's own polygon by
+    this many meters before stripe fitting runs, to cover cases where
+    the OSM way and the LIDAR-derived terrain don't quite agree on
+    where the pond edge is, leaving stripes ending short of the real
+    terrain intersection (see fit_water_stripes).
     """
     course_dir = working_dir / "course"
 
@@ -4393,6 +4403,7 @@ def step_write_water(
         water_stripe_overlap_m=water_stripe_overlap_m, water_stripe_min_edge_m=water_stripe_min_edge_m,
         water_stripe_tolerance_m=water_stripe_tolerance_m,
         water_stripe_max_stripes_per_side=water_stripe_max_stripes_per_side,
+        water_stripe_buffer_m=water_stripe_buffer_m,
     )
 
     streams_path = working_dir / STREAMS_FILE
@@ -6079,6 +6090,12 @@ def main(argv: list[str] | None = None) -> int:
                          help="write-water, --water-fill-mode stripe only: safety cap on stripes walked "
                               "outward in each of the +/- stacking directions. Default: "
                               f"{DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE}.")
+    parser.add_argument("--water-stripe-buffer-m", type=float, default=DEFAULT_WATER_STRIPE_BUFFER_M,
+                         help="write-water, --water-fill-mode stripe only: grow the pond's own polygon "
+                              "by this many meters (all directions) before stripe fitting -- a fudge "
+                              "factor for when the OSM way and the real LIDAR-derived terrain don't "
+                              "quite agree on where the pond edge is, leaving stripes ending short of "
+                              f"the real terrain intersection. Default: {DEFAULT_WATER_STRIPE_BUFFER_M}.")
     parser.add_argument("--height-mask-buffer-px", type=float, default=DEFAULT_HEIGHT_MASK_BUFFER_PX,
                          help="ingest-osm: buffer (grow) the merged fairway+green outline by this many "
                               "pixels before rasterizing -- 1 pixel = 1 m, since the course is exactly "
@@ -6433,7 +6450,8 @@ def main(argv: list[str] | None = None) -> int:
                               water_stripe_overlap_m=args.water_stripe_overlap_m,
                               water_stripe_min_edge_m=args.water_stripe_min_edge_m,
                               water_stripe_tolerance_m=args.water_stripe_tolerance_m,
-                              water_stripe_max_stripes_per_side=args.water_stripe_max_stripes_per_side)
+                              water_stripe_max_stripes_per_side=args.water_stripe_max_stripes_per_side,
+                              water_stripe_buffer_m=args.water_stripe_buffer_m)
         elif args.step == "write-splines":
             step_write_splines(working_dir, registration_marks=args.registration_marks)
         elif args.step == "write-holes":

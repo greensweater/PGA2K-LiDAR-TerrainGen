@@ -78,12 +78,15 @@ STREAM_WATER_WIDEN_PER_DESCENT = 0.2  # + this * (total bed descent from the str
 STREAM_WATER_OVERLAP_M = 6.0         # each tile's length = run length + this, so adjacent tiles overlap
 STREAM_WATER_FLOW_SPEED = 37.0       # options.flowSpeed (real stream tile ~37; 50 is the engine max)
 
-# Terrain-fit water level (mirrors course_output/water.py's pond
-# _water_level_from_footprint): a stream water tile is written at the
-# P-th percentile of the ACTUAL carved terrain height sampled along the
-# tile's centerline, minus a small margin, so the plane sits just inside
-# the channel and can't float. Only the fallback path uses
-# STREAM_WATER_FILL_DEPTH_M.
+# Terrain-fit water level (same sampling idea as course_output/water.py's
+# pond _water_level_from_way_boundary, but percentile-based rather than
+# mean-based -- a stream's centerline runs along the channel's deepest
+# line, not a real shoreline, so it has no reason to cluster around the
+# target level the way a pond's own tagged boundary does): a stream water
+# tile is written at the P-th percentile of the ACTUAL carved terrain
+# height sampled along the tile's centerline, minus a small margin, so
+# the plane sits just inside the channel and can't float. Only the
+# fallback path uses STREAM_WATER_FILL_DEPTH_M.
 STREAM_WATER_LEVEL_PERCENTILE = 15.0       # low percentile of centerline terrain samples (not strict min)
 STREAM_WATER_LEVEL_MARGIN_M = -0.2        # subtracted from that percentile -- negative lifts the surface
                                          # a visible film ABOVE the deepest carved bed (tuned in-game)
@@ -306,9 +309,12 @@ def _fitted_tile_level(
 ) -> Optional[float]:
     """Water level for a tile whose centerline runs (ax, az) -> (bx, bz):
     the `percentile`-th percentile of the actual terrain height sampled
-    every `spacing_m` along that chord, minus `margin_m` -- mirrors
-    course_output/water.py's _water_level_from_footprint for ponds. None
-    if the sampler returns nothing finite (caller falls back)."""
+    every `spacing_m` along that chord, minus `margin_m` -- same dense-
+    sampling approach as course_output/water.py's
+    _water_level_from_way_boundary for ponds, but percentile- rather
+    than mean-based (see STREAM_WATER_LEVEL_PERCENTILE's own comment for
+    why). None if the sampler returns nothing finite (caller falls
+    back)."""
     length = math.hypot(bx - ax, bz - az)
     n = max(2, int(math.ceil(length / spacing_m)) + 1)
     ts = np.linspace(0.0, 1.0, n)

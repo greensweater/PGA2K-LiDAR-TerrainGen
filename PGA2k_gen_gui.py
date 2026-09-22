@@ -135,7 +135,7 @@ from course_output.water import (  # noqa: E402
     DEFAULT_WATER_TILE_MAX_SEARCH_M, DEFAULT_WATER_TILE_WIDTH_SAMPLES,
     DEFAULT_WATER_TILE_REDUNDANCY_RATIO, DEFAULT_WATER_TILE_OVERLAP_M,
     DEFAULT_WATER_STRIPE_OVERLAP_M, DEFAULT_WATER_STRIPE_TOLERANCE_M,
-    DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
+    DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE, DEFAULT_WATER_STRIPE_BUFFER_M,
 )
 from shapely.geometry import Point, box as shapely_box  # noqa: E402
 from shapely.ops import linemerge, unary_union  # noqa: E402
@@ -200,10 +200,15 @@ def _spline_tag_detail(f: Feature) -> str:
         waterway = f.tags.get("waterway")
         if waterway:
             return waterway
+    if f.kind == "roadway":
+        railway = f.tags.get("railway")
+        if railway:
+            return railway
     return f.tags.get("natural", "")
 
 
-_ASSET_LABEL_BY_KEY = {(e.category, e.type): e.label for e in ASSET_ENTRIES}
+_ASSET_LABEL_BY_KEY = {(e.category, e.type): e.display for e in ASSET_ENTRIES}
+_ASSET_LABEL_BY_PATH = {e.path: e.display for e in ASSET_ENTRIES}
 
 # Category id -> (legend label, RGB) for the Objects tab's "Show objects"
 # preview overlay. Only the "nature"/scatterable categories (course_output.
@@ -275,6 +280,33 @@ def _spline_object_detail(f: Feature) -> str:
     return ", ".join(_ASSET_LABEL_BY_KEY.get((s.get("category"), s.get("type")), "?") for s in specs)
 
 
+def _hand_tuned_member_paths(template_path: Path) -> list[str]:
+    """Asset paths of every object member in `template_path` (a collection
+    library JSON file) that carries a hand-added variant field -- see
+    course_output/collections.py's PARAMETER section: "param_option",
+    "variants", or a "{param}" token in "path". [] if the file doesn't
+    exist, doesn't parse, or has no such members.
+
+    Re-capturing a collection (_capture_collection_dialog) always rebuilds
+    the template from scratch via capture_from_course, which has no notion
+    of these fields -- a fresh capture silently overwrites (and loses) any
+    hand-tuning a previous capture + hand-edit pass added. This is used to
+    warn before that overwrite happens, not to block or merge it."""
+    try:
+        data = json.loads(template_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    tuned = []
+    for member in data.get("objects", []):
+        if not isinstance(member, dict):
+            continue
+        path = member.get("path")
+        if (member.get("param_option") or member.get("variants")
+                or (isinstance(path, str) and "{param}" in path)):
+            tuned.append(path or "(no path)")
+    return tuned
+
+
 class _Tooltip:
     """Minimal hover tooltip: shows `text` near the widget on mouse-enter."""
 
@@ -319,6 +351,7 @@ class PGAGenGUI:
         self._current_proc = None  # see _stop_current_step
         self._stop_requested = False
         self._step_start_time = 0.0
+        self._step_name = ""
         self._step_on_done: Optional[Callable[[], None]] = None  # see _run_step's on_done param
         self._last_step_ok = False  # set in _poll_log_queue before on_done fires; on_done runs win/lose
         self._preview_imgtk = None  # keep a reference so tkinter doesn't GC it
@@ -338,6 +371,8 @@ class PGAGenGUI:
         self.objects_tree_asset_paths: list[str] = []  # v2021+ placed-tree asset pool; [] = use bundled rustic catalog default (see _open_tree_assets_dialog)
         self._cluster_fill_rows = []  # (spline_osm_ids_str, asset_label, ratio, density, source, category, type_) -- see _build_cluster_fill_rows
         self._ingame_object_groups = []  # (group_name, count) -- see summarize_ingame_object_groups
+        self._ingame_objects_records = []  # raw ingame_objects.json content, parallel to _ingame_object_groups below
+        self._ingame_object_group_record_indices = []  # per group in _ingame_object_groups: list of indices into _ingame_objects_records
         self._highlighted_feature_osm_ids = set()  # currently-selected spline(s), if any, to highlight on the preview
         self._highlighted_object_points = []  # (x, z) of currently-selected individual object/tree row(s), for a preview ring
         self._highlighted_object_group_spline_ids = set()  # currently-selected cluster-fill row(s)' source spline osm_ids, unioned into the spline highlight overlay
@@ -611,19 +646,6 @@ class PGAGenGUI:
         self._add_step_button(parent, "Ingest LAZ", self._run_ingest_laz)
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        self.preserve_synthetic_var = tk.BooleanVar(value=True)
-        preserve_cb = ttk.Checkbutton(
-            parent, text="Preserve edits",
-            variable=self.preserve_synthetic_var,
-        )
-        preserve_cb.pack(anchor="w")
-        _Tooltip(preserve_cb, "Keep GUI-authored cluster-fill border rings, 'Use mask' fills, "
-                 "per-feature mask overrides, cluster-fill specs, and generate-streams bank "
-                 "vegetation when re-running Ingest OSM. Uncheck to rebuild features.geojson "
-                 "purely from map.osm (old behavior).")
-        self._add_step_button(parent, "Ingest OSM", self._run_ingest_osm)
-
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         dig_row = ttk.Frame(parent)
         dig_row.pack(fill="x", pady=(0, 4))
         depth_col = ttk.Frame(dig_row)
@@ -656,7 +678,54 @@ class PGAGenGUI:
                  "terrain logic needed downstream.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self.preserve_synthetic_var = tk.BooleanVar(value=True)
+        preserve_cb = ttk.Checkbutton(
+            parent, text="Preserve edits",
+            variable=self.preserve_synthetic_var,
+        )
+        preserve_cb.pack(anchor="w")
+        _Tooltip(preserve_cb, "Keep GUI-authored cluster-fill border rings, 'Use mask' fills, "
+                 "per-feature mask overrides, cluster-fill specs, and generate-streams bank "
+                 "vegetation when re-running Ingest OSM. Uncheck to rebuild features.geojson "
+                 "purely from map.osm (old behavior).")
+        self._add_step_button(parent, "Ingest OSM", self._run_ingest_osm)
 
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Import in-game edits:").pack(anchor="w")
+        import_course_row = ttk.Frame(parent)
+        import_course_row.pack(fill="x", pady=(2, 0))
+        self.import_ingame_course_var = tk.StringVar()
+        import_course_entry = ttk.Entry(import_course_row, textvariable=self.import_ingame_course_var)
+        import_course_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            import_course_row, text="Browse...", command=self._browse_import_ingame_course,
+        ).pack(side="left", padx=(4, 0))
+        _Tooltip(import_course_entry, "A .course file exported by this tool, then hand-edited in "
+                 "PGA Tour 2K's own in-game object/terrain editor and saved -- reconciled against "
+                 "what this tool currently tracks (see course_output/ingame_objects.py). Never "
+                 "touches this project's own course/ folder.")
+        ttk.Label(parent, text="Group label:").pack(anchor="w", pady=(4, 0))
+        self.import_ingame_group_var = tk.StringVar()
+        ttk.Entry(parent, textvariable=self.import_ingame_group_var, width=24).pack(anchor="w")
+        import_buttons_row = ttk.Frame(parent)
+        import_buttons_row.pack(fill="x", pady=(4, 0))
+        preview_import_btn = ttk.Button(
+            import_buttons_row, text="Preview Import", command=self._run_import_ingame_preview,
+        )
+        preview_import_btn.pack(side="left")
+        _Tooltip(preview_import_btn, "Dry run -- prints a summary (new objects/stamps found, plus "
+                 "anything this tool tracks that's missing from the imported course, reported only, "
+                 "never removed) without changing anything on disk.")
+        commit_import_btn = ttk.Button(
+            import_buttons_row, text="Commit Import", command=self._run_import_ingame_commit,
+        )
+        commit_import_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(commit_import_btn, "Applies the same diff Preview Import shows: appends every new "
+                 "in-game object to ingame_objects.json (under the Group label above) and writes "
+                 "every new terrain stamp as the next stamps_N.json layer. Run Pack Objects / Write "
+                 "Objects / Write Terrain afterward to fold the result into placedObjects/userLayers.")
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self.repack_filename_var = tk.StringVar()
         self.repack_filename_var.trace_add("write", lambda *a: self._on_repack_filename_changed())
         ttk.Label(parent, text="Repack filename:").pack(anchor="w")
@@ -693,41 +762,6 @@ class PGAGenGUI:
                     "different-version-file case regardless of what these show).")
 
         self._add_step_button(parent, "Repack", self._run_repack)
-
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Label(parent, text="Import in-game edits:").pack(anchor="w")
-        import_course_row = ttk.Frame(parent)
-        import_course_row.pack(fill="x", pady=(2, 0))
-        self.import_ingame_course_var = tk.StringVar()
-        import_course_entry = ttk.Entry(import_course_row, textvariable=self.import_ingame_course_var)
-        import_course_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(
-            import_course_row, text="Browse...", command=self._browse_import_ingame_course,
-        ).pack(side="left", padx=(4, 0))
-        _Tooltip(import_course_entry, "A .course file exported by this tool, then hand-edited in "
-                 "PGA Tour 2K's own in-game object/terrain editor and saved -- reconciled against "
-                 "what this tool currently tracks (see course_output/ingame_objects.py). Never "
-                 "touches this project's own course/ folder.")
-        ttk.Label(parent, text="Group label:").pack(anchor="w", pady=(4, 0))
-        self.import_ingame_group_var = tk.StringVar()
-        ttk.Entry(parent, textvariable=self.import_ingame_group_var, width=24).pack(anchor="w")
-        import_buttons_row = ttk.Frame(parent)
-        import_buttons_row.pack(fill="x", pady=(4, 0))
-        preview_import_btn = ttk.Button(
-            import_buttons_row, text="Preview Import", command=self._run_import_ingame_preview,
-        )
-        preview_import_btn.pack(side="left")
-        _Tooltip(preview_import_btn, "Dry run -- prints a summary (new objects/stamps found, plus "
-                 "anything this tool tracks that's missing from the imported course, reported only, "
-                 "never removed) without changing anything on disk.")
-        commit_import_btn = ttk.Button(
-            import_buttons_row, text="Commit Import", command=self._run_import_ingame_commit,
-        )
-        commit_import_btn.pack(side="left", padx=(4, 0))
-        _Tooltip(commit_import_btn, "Applies the same diff Preview Import shows: appends every new "
-                 "in-game object to ingame_objects.json (under the Group label above) and writes "
-                 "every new terrain stamp as the next stamps_N.json layer. Run Pack Objects / Write "
-                 "Objects / Write Terrain afterward to fold the result into placedObjects/userLayers.")
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._add_step_button(parent, "Copy to Game Folder", self._run_copy_to_game)
@@ -1531,7 +1565,7 @@ class PGAGenGUI:
         water_mode_nb.bind("<<NotebookTabChanged>>", _on_water_mode_tab)
 
         # --- Stripe fill (first tab / default) ---
-        # Layout: row 1 = TOL, OVERLAP ; row 2 = MIN w, MAX L
+        # Layout: row 1 = TOL, OVERLAP, BUF ; row 2 = MIN w, MAX L
         water_stripe_grid = ttk.Frame(stripe_tab)
         water_stripe_grid.pack(anchor="w", fill="x")
         self.water_stripe_tolerance_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_TOLERANCE_M))
@@ -1544,6 +1578,12 @@ class PGAGenGUI:
                  "Stripe water fill only: the single knob controlling both how far a stripe may "
                  "overshoot the true polygon boundary and how much consecutive stripes overlap along "
                  "the stacking axis.")
+        self.water_stripe_buffer_var = tk.StringVar(value=str(DEFAULT_WATER_STRIPE_BUFFER_M))
+        self._add_grid_field(water_stripe_grid, 0, 2, self.water_stripe_buffer_var, "BUF m",
+                 "Stripe water fill only: grow the pond's own polygon by this many meters (all "
+                 "directions) BEFORE stripe fitting -- a fudge factor for when the OSM way and the "
+                 "real LIDAR-derived terrain don't quite line up, leaving stripes ending short of "
+                 "where the ground actually starts sloping into the water. Defaults off (0).")
         self.water_stripe_min_edge_var = tk.StringVar(value=str(DEFAULT_WATER_TILE_MIN_EDGE_M))
         self._add_grid_field(water_stripe_grid, 1, 0, self.water_stripe_min_edge_var, "MIN w",
                  "Stripe water fill only: floor (m) for a stripe's found width/depth.")
@@ -2267,6 +2307,7 @@ class PGAGenGUI:
         self.objects_tree.column("detail", width=110)
         self.objects_tree.pack(side="left", fill="both", expand=True)
         self.objects_tree.bind("<<TreeviewSelect>>", lambda e: self._on_object_selected())
+        self.objects_tree.bind("<Double-1>", self._on_object_row_double_click)
         obj_tree_scroll = ttk.Scrollbar(obj_tree_frame, orient="vertical", command=self.objects_tree.yview)
         obj_tree_scroll.pack(side="left", fill="y")
         self.objects_tree["yscrollcommand"] = obj_tree_scroll.set
@@ -2608,7 +2649,7 @@ class PGAGenGUI:
             return
         entries = sorted(
             (e for e in ASSET_ENTRIES if e.category == 0 and "/Trees/" in e.path),
-            key=lambda e: e.label,
+            key=lambda e: e.display,
         )
         dlg = tk.Toplevel(self.root)
         dlg.title("Tree assets")
@@ -2623,7 +2664,7 @@ class PGAGenGUI:
         tree.pack(fill="both", expand=True, padx=8)
         iid_to_path = {}
         for e in entries:
-            iid = tree.insert("", "end", text=e.label,
+            iid = tree.insert("", "end", text=e.display,
                               values=(f"{e.native_height_m:.1f}" if e.native_height_m else "-",))
             iid_to_path[iid] = e.path
             if e.path in self.objects_tree_asset_paths:
@@ -2701,6 +2742,26 @@ class PGAGenGUI:
             return
 
         libdir = self._collection_library_dir()
+        existing_path = Path(libdir) / f"{_collection_slug(name)}.json"
+        tuned_paths = _hand_tuned_member_paths(existing_path)
+        if tuned_paths:
+            listing = "\n".join(f"  - {p}" for p in tuned_paths)
+            proceed = messagebox.askyesno(
+                "Overwrite hand-tuned template?",
+                f"{existing_path.name} already has hand-added variant fields "
+                f"(param_option / variants / a \"{{param}}\" path token) on:\n\n{listing}\n\n"
+                "Re-capturing from a .course file always rebuilds the template from scratch "
+                "and does NOT carry these over -- they will be lost unless you re-add them "
+                "afterward. Continue anyway?",
+            )
+            self._append_log(
+                f"[NOTE: {existing_path.name} has hand-tuned variant field(s) on "
+                f"{len(tuned_paths)} member(s) -- {'overwriting anyway' if proceed else 'capture cancelled'}: "
+                + ", ".join(tuned_paths) + "]\n"
+            )
+            if not proceed:
+                return
+
         tmp_dir = Path(tempfile.mkdtemp(prefix="pga2k_collection_"))
         try:
             self._append_log(f"\n[capturing collection {name!r} from {course_file}]\n")
@@ -2990,6 +3051,24 @@ class PGAGenGUI:
         return " ".join(parts)
 
     @staticmethod
+    def _ingame_object_detail(record: dict) -> str:
+        """One-line asset label + rotation/scale for an ingame_objects.json
+        record's child row -- path (v2021+) resolves through
+        _ASSET_LABEL_BY_PATH, category/type (v2019) through
+        _ASSET_LABEL_BY_KEY, same fallback-to-raw-key style as
+        _build_cluster_fill_rows uses for cluster-fill asset labels."""
+        if record.get("path"):
+            label = _ASSET_LABEL_BY_PATH.get(record["path"], record["path"])
+        else:
+            label = _ASSET_LABEL_BY_KEY.get(
+                (record.get("category"), record.get("type")),
+                f"category={record.get('category')}/type={record.get('type')}",
+            )
+        rotation = float(record.get("rotation_deg") or 0.0)
+        scale = float(record.get("scale") or 1.0)
+        return f"{label} rot={rotation:.1f}° scale={scale:.2f}"
+
+    @staticmethod
     def _build_cluster_fill_rows(features: list) -> list[tuple[str, str, float, float, str, int, int, str]]:
         """
         (spline_osm_ids, asset_label, ratio, density, source, category,
@@ -3046,17 +3125,28 @@ class PGAGenGUI:
         "c"+index into self._cluster_fill_rows, source "manual" or
         "border"), and ingame_objects.json's `group` labels (objects
         imported from a hand-edited .course, see
-        step_import_ingame_edits -- iid is "g"+index into
-        self._ingame_object_groups, source "Imported"). Kept as three
-        disjoint iid namespaces so _delete_selected_objects/
+        step_import_ingame_edits -- the group itself is iid "g"+index
+        into self._ingame_object_groups, source "Imported"; each
+        individual object in that group is a CHILD row nested under
+        it, iid f"g{{j}}i{{idx}}" where idx indexes
+        self._ingame_objects_records, so it can be double-clicked to
+        edit that one object's position/rotation/scale -- see
+        _on_object_row_double_click). Kept as three disjoint top-level
+        iid namespaces so _delete_selected_objects/
         _delete_all_filtered_objects can always tell which kind of row
-        a given iid is.
+        a given iid is (the nested "g{j}i{idx}" child iids are never
+        returned by objects_tree.get_children() with no args, and fail
+        the int(iid[1:]) group-index parse those two use, so they're
+        harmlessly skipped there -- individual-object delete isn't
+        wired up yet, only edit).
         """
         wd = self.working_dir.get().strip()
         self.objects_tree.delete(*self.objects_tree.get_children())
         self._objects_tree_list = []
         self._cluster_fill_rows = []
         self._ingame_object_groups = []
+        self._ingame_objects_records = []
+        self._ingame_object_group_record_indices = []
         # Old iids/indices are gone along with the rows above -- drop any
         # stale preview highlight state rather than let it dangle.
         self._highlighted_object_points = []
@@ -3081,11 +3171,23 @@ class PGAGenGUI:
         ingame_objects_path = Path(wd) / INGAME_OBJECTS_FILE
         if ingame_objects_path.exists():
             try:
-                self._ingame_object_groups = summarize_ingame_object_groups(
-                    load_ingame_objects(ingame_objects_path)
-                )
+                self._ingame_objects_records = load_ingame_objects(ingame_objects_path)
             except (json.JSONDecodeError, OSError, KeyError):
-                self._ingame_object_groups = []
+                self._ingame_objects_records = []
+            # Group by `group` label, first-seen order, same grouping
+            # summarize_ingame_object_groups does -- but keeping each
+            # group's member record indices too (not just its count), so
+            # every individual object can get its own child row below.
+            group_indices: dict[str, list[int]] = {}
+            group_order: list[str] = []
+            for idx, record in enumerate(self._ingame_objects_records):
+                name = record.get("group", "")
+                if name not in group_indices:
+                    group_indices[name] = []
+                    group_order.append(name)
+                group_indices[name].append(idx)
+            self._ingame_object_groups = [(name, len(group_indices[name])) for name in group_order]
+            self._ingame_object_group_record_indices = [group_indices[name] for name in group_order]
 
         filter_val = self.objects_filter_var.get()
         for i, (x, z, tags) in enumerate(self._objects_tree_list):
@@ -3111,10 +3213,21 @@ class PGAGenGUI:
 
         if filter_val in ("All", "Imported"):
             for j, (group_name, count) in enumerate(self._ingame_object_groups):
+                # open=True: the tree is built with show="headings" (no
+                # tree/disclosure column, matching every other row in this
+                # list), so there's no expand triangle for the user to click
+                # -- children need to start open to be reachable at all.
                 self.objects_tree.insert(
-                    "", "end", iid=f"g{j}",
+                    "", "end", iid=f"g{j}", open=True,
                     values=("", "", "Imported", f"group={group_name!r} ({count} object(s))"),
                 )
+                for idx in self._ingame_object_group_record_indices[j]:
+                    record = self._ingame_objects_records[idx]
+                    x, z = float(record.get("x", 0.0)), float(record.get("z", 0.0))
+                    self.objects_tree.insert(
+                        f"g{j}", "end", iid=f"g{j}i{idx}",
+                        values=(f"{x:.1f}", f"{z:.1f}", "Imported", self._ingame_object_detail(record)),
+                    )
 
     def _remove_ingame_object_groups_by_name(self, working_dir: Path, group_names: set[str]) -> None:
         """
@@ -3412,6 +3525,11 @@ class PGAGenGUI:
                 if 0 <= idx < len(self._objects_tree_list):
                     x, z, _tags = self._objects_tree_list[idx]
                     points.append((x, z))
+            elif re.fullmatch(r"g\d+i\d+", iid):
+                idx = int(iid.split("i", 1)[1])
+                if 0 <= idx < len(self._ingame_objects_records):
+                    record = self._ingame_objects_records[idx]
+                    points.append((float(record.get("x", 0.0)), float(record.get("z", 0.0))))
             elif iid.startswith("c"):
                 try:
                     j = int(iid[1:])
@@ -3440,6 +3558,116 @@ class PGAGenGUI:
         if self._selection_preview_job is not None:
             self.root.after_cancel(self._selection_preview_job)
         self._selection_preview_job = self.root.after(150, self._show_preview_after_selection)
+
+    def _on_object_row_double_click(self, event) -> None:
+        """
+        Double-click an individual imported in-game object's child row
+        (iid f"g{{j}}i{{idx}}", see _refresh_objects_list) to open
+        _open_ingame_object_edit_dialog for it. Every other row kind in
+        this tree (a tree, a cluster-fill group, or an imported-group
+        parent row) has no single position/rotation/scale to edit, so
+        double-clicking one is a no-op here -- for the group parent row
+        that just leaves Tk's own default double-click (open/close
+        toggle) as the only effect, same as any other Treeview.
+        """
+        iid = self.objects_tree.identify_row(event.y)
+        if not iid:
+            return
+        m = re.fullmatch(r"g\d+i(\d+)", iid)
+        if not m:
+            return
+        idx = int(m.group(1))
+        if not 0 <= idx < len(self._ingame_objects_records):
+            return
+        wd = self.working_dir.get().strip()
+        if not wd:
+            return
+        self._open_ingame_object_edit_dialog(Path(wd), idx)
+
+    def _open_ingame_object_edit_dialog(self, working_dir: Path, record_index: int) -> None:
+        """
+        Edit one imported in-game object's position/rotation/scale in
+        place. `record_index` indexes self._ingame_objects_records
+        (the live in-memory copy of ingame_objects.json -- see
+        _refresh_objects_list); Save writes the whole list straight
+        back to disk, same "mutate in place, persist the whole file"
+        approach _open_spline_fill_pct_dialog uses for features.geojson.
+
+        `y` is edited as an optional field (blank = ground-snap, i.e.
+        the record's saved-verbatim `y` is None) rather than always a
+        number, since that's the actual tri-state the record supports
+        (see course_output/ingame_objects.py's module docstring) --
+        leaving it blank on an already-ground-snapped object keeps it
+        ground-snapped instead of accidentally pinning it at whatever
+        elevation the terrain happened to resolve to right now.
+        """
+        record = self._ingame_objects_records[record_index]
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit imported object")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(
+            dialog, text=self._ingame_object_detail(record), wraplength=320, justify="left",
+        ).pack(anchor="w", padx=8, pady=(8, 6))
+
+        form = ttk.Frame(dialog)
+        form.pack(fill="x", padx=8, pady=2)
+
+        x_var = tk.StringVar(value=f"{float(record.get('x', 0.0)):g}")
+        z_var = tk.StringVar(value=f"{float(record.get('z', 0.0)):g}")
+        y_raw = record.get("y")
+        y_var = tk.StringVar(value="" if y_raw is None else f"{float(y_raw):g}")
+        rotation_var = tk.StringVar(value=f"{float(record.get('rotation_deg', 0.0) or 0.0):g}")
+        scale_var = tk.StringVar(value=f"{float(record.get('scale', 1.0) or 1.0):g}")
+
+        for row, (label, var, hint) in enumerate([
+            ("X (m)", x_var, ""),
+            ("Z (m)", z_var, ""),
+            ("Y (m)", y_var, "blank = ground-snap"),
+            ("Rotation (deg)", rotation_var, ""),
+            ("Scale", scale_var, ""),
+        ]):
+            ttk.Label(form, text=label, width=16).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(form, textvariable=var, width=12).grid(row=row, column=1, sticky="w", pady=2)
+            if hint:
+                ttk.Label(form, text=hint, foreground="gray").grid(row=row, column=2, sticky="w", padx=(6, 0))
+
+        def do_save() -> None:
+            try:
+                x = float(x_var.get())
+                z = float(z_var.get())
+                rotation = float(rotation_var.get())
+                scale = float(scale_var.get())
+                y_text = y_var.get().strip()
+                y = None if not y_text else float(y_text)
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid value", "X, Z, Rotation, and Scale must be numbers "
+                    "(Y may be left blank for ground-snap).", parent=dialog,
+                )
+                return
+            record["x"] = x
+            record["z"] = z
+            record["y"] = y
+            record["rotation_deg"] = rotation
+            record["scale"] = scale
+            save_ingame_objects(self._ingame_objects_records, working_dir / INGAME_OBJECTS_FILE)
+            dialog.destroy()
+            self._regenerate_packed_objects(working_dir)
+            self._refresh_objects_list()
+            self._show_preview()
+            self._append_log(
+                f"\n[edited imported object {record.get('group')!r}: "
+                f"x={x:g} z={z:g} y={'ground-snap' if y is None else f'{y:g}'} "
+                f"rot={rotation:g} scale={scale:g}]\n"
+            )
+
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(fill="x", padx=8, pady=(8, 8))
+        ttk.Button(btn_row, text="Save", command=do_save).pack(side="right")
+        ttk.Button(btn_row, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 4))
 
     def _regenerate_height_mask(self, working_dir: Path) -> None:
         """
@@ -3616,6 +3844,26 @@ class PGAGenGUI:
 
     _SYNTHETIC_CLUSTER_KINDS = (SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND)
 
+    def _finalize_empty_fills(self, feature) -> set:
+        """
+        Called once `feature`'s PGA_CLUSTER_FILLS_TAG list has become
+        empty (its last asset was zeroed out). For a generated spline
+        (_SYNTHETIC_CLUSTER_KINDS), which exists only to carry fill specs,
+        returns {feature.osm_id, its centerline companion if any} for the
+        caller to drop from self._splines_features -- same rationale as
+        _clear_selected_cluster_fills. For a real OSM spline, just pops
+        the now-empty tag in place (the spline itself is real geometry
+        and must survive) and returns an empty set.
+        """
+        if feature.kind in self._SYNTHETIC_CLUSTER_KINDS:
+            remove_ids = {feature.osm_id}
+            centerline_id = feature.tags.get(PGA_CLUSTER_CENTERLINE_REF_TAG)
+            if centerline_id is not None:
+                remove_ids.add(centerline_id)
+            return remove_ids
+        feature.tags.pop(PGA_CLUSTER_FILLS_TAG, None)
+        return set()
+
     def _clear_selected_cluster_fills(self) -> None:
         """
         Remove PGA_CLUSTER_FILLS_TAG from every currently-selected row
@@ -3689,8 +3937,14 @@ class PGAGenGUI:
         spline fills (mode="spline" specs in PGA_CLUSTER_FILLS_TAG) to
         adjust each fill's "Fill % of max" in place -- the same knob the
         Fill dialog sets at creation time, without having to Clear and
-        re-Fill. One entry per spline-mode spec on that feature (an
-        asset can legitimately appear more than once).
+        re-Fill. One entry per spline-mode spec on that feature (an asset
+        shouldn't appear twice going forward -- re-Filling with an
+        already-present asset now overwrites its spec in place -- but
+        legacy data or specs from a separate border/masked Feature can
+        still show the same asset more than once). Setting an entry to 0
+        deletes that asset's fill; zeroing the last one deletes the whole
+        spline too, but only for a generated (pga_cluster_border/
+        pga_cluster_masked) spline -- an OSM spline just loses the tag.
 
         A row with nothing spline-mode to edit (untagged, stamps-mode
         fills only, or a pga_collection marker) is a no-op.
@@ -3732,9 +3986,11 @@ class PGAGenGUI:
 
         ttk.Label(
             dialog,
-            text=f"Spline {feature.osm_id} ({feature.kind}) -- percent (0 < % <= 100, linear) of "
+            text=f"Spline {feature.osm_id} ({feature.kind}) -- percent (0 <= % <= 100, linear) of "
                  "the asset category's max renderable fillPct. Trees & bushes cap at fillPct 0.03, "
-                 "grass / ground-cover are 1:1.",
+                 "grass / ground-cover are 1:1. Setting an entry to 0 deletes that asset's fill; if "
+                 "it's the last one left and this is a generated (pga_cluster_border/pga_cluster_"
+                 "masked) spline, the spline itself is deleted too -- an OSM spline just loses the tag.",
             wraplength=380, justify="left",
         ).pack(anchor="w", padx=8, pady=(8, 6))
 
@@ -3767,21 +4023,38 @@ class PGAGenGUI:
 
         def do_save() -> None:
             updated = []
+            zeroed = []
             for spec, var in rows:
                 try:
                     d = float(var.get())
-                    if not 0.0 < d <= 100.0:
+                    if not 0.0 <= d <= 100.0:
                         raise ValueError
                 except ValueError:
                     messagebox.showwarning(
                         "Invalid fill %",
-                        "Every Fill % must be a number greater than 0 and at most 100.",
+                        "Every Fill % must be a number from 0 to 100 (0 deletes that asset's fill).",
                         parent=dialog,
                     )
                     return
-                updated.append((spec, d))
+                if d == 0.0:
+                    zeroed.append(spec)
+                else:
+                    updated.append((spec, d))
             for spec, d in updated:
                 spec["density"] = d
+            spline_deleted = False
+            if zeroed:
+                fills = feature.tags.get(PGA_CLUSTER_FILLS_TAG) or []
+                remaining = [s for s in fills if not any(s is z for z in zeroed)]
+                if remaining:
+                    feature.tags[PGA_CLUSTER_FILLS_TAG] = remaining
+                else:
+                    remove_ids = self._finalize_empty_fills(feature)
+                    if remove_ids:
+                        spline_deleted = True
+                        self._splines_features = [
+                            f for f in self._splines_features if f.osm_id not in remove_ids
+                        ]
             save_features(self._splines_features, working_dir / FEATURES_FILE)
             dialog.destroy()
             self._regenerate_packed_objects(working_dir)
@@ -3790,13 +4063,18 @@ class PGAGenGUI:
             if self.splines_tree.exists(str(feature.osm_id)):
                 self.splines_tree.selection_set(str(feature.osm_id))
             self._show_preview()
+            log_parts = [
+                f"{_ASSET_LABEL_BY_KEY.get((s.get('category'), s.get('type')), '?')}={d:g}%"
+                for s, d in updated
+            ]
+            log_parts += [
+                f"{_ASSET_LABEL_BY_KEY.get((s.get('category'), s.get('type')), '?')}=deleted"
+                for s in zeroed
+            ]
+            suffix = " [spline deleted]" if spline_deleted else ""
             self._append_log(
                 f"\n[updated object-spline fill % on spline {feature.osm_id}: "
-                + ", ".join(
-                    f"{_ASSET_LABEL_BY_KEY.get((s.get('category'), s.get('type')), '?')}={d:g}%"
-                    for s, d in updated
-                )
-                + "]\n"
+                + ", ".join(log_parts) + suffix + "]\n"
             )
 
         btn_row = ttk.Frame(dialog)
@@ -3896,12 +4174,15 @@ class PGAGenGUI:
         tree_frame = ttk.Frame(dialog)
         tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
         asset_tree = ttk.Treeview(
-            tree_frame, columns=("category", "asset"), show="headings", height=14, selectmode="extended",
+            tree_frame, columns=("category", "asset", "description"), show="headings", height=14,
+            selectmode="extended",
         )
         asset_tree.heading("category", text="Category")
         asset_tree.heading("asset", text="Asset")
+        asset_tree.heading("description", text="Description")
         asset_tree.column("category", width=140)
-        asset_tree.column("asset", width=260)
+        asset_tree.column("asset", width=220)
+        asset_tree.column("description", width=220)
         asset_tree.pack(side="left", fill="both", expand=True)
         asset_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=asset_tree.yview)
         asset_scroll.pack(side="left", fill="y")
@@ -3911,10 +4192,10 @@ class PGAGenGUI:
             asset_tree.delete(*asset_tree.get_children())
             chosen = category_var.get()
             for i, entry in enumerate(CLUSTERABLE_ENTRIES):
-                description = ASSET_CATEGORIES[entry.category].description
-                if chosen != "All" and description != chosen:
+                cat_desc = ASSET_CATEGORIES[entry.category].description
+                if chosen != "All" and cat_desc != chosen:
                     continue
-                asset_tree.insert("", "end", iid=str(i), values=(description, entry.label))
+                asset_tree.insert("", "end", iid=str(i), values=(cat_desc, entry.label, entry.description or ""))
 
         category_box.bind("<<ComboboxSelected>>", lambda e: refresh_asset_tree())
         refresh_asset_tree()
@@ -4041,6 +4322,11 @@ class PGAGenGUI:
                         "Invalid ratio", "Raster ratio must be a positive number.", parent=dialog,
                     )
                     return
+            # 0 is only meaningful against an already-tagged, existing
+            # spline (it deletes that asset's fill there -- see below) --
+            # Border/"Use mask" always build a brand-new, empty-tagged
+            # synthetic Feature, so there's nothing existing to delete.
+            allow_zero = not border_mode and not use_mask_var.get()
             # Both modes store `density` as a percent. Spline (and Auto,
             # which becomes spline on v2021+) read it as "% of the asset
             # category's max fillPct" (0-100, see pack_spline_records);
@@ -4048,22 +4334,31 @@ class PGAGenGUI:
             if mode in (CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_AUTO):
                 try:
                     density = float(density_var.get())
-                    if not 0.0 < density <= 100.0:
+                    if density < 0.0 or density > 100.0 or (density == 0.0 and not allow_zero):
                         raise ValueError
                 except ValueError:
                     messagebox.showwarning(
-                        "Invalid fill %", "Fill % of max must be a number greater than 0 and at "
-                        "most 100.", parent=dialog,
+                        "Invalid fill %",
+                        "Fill % of max must be a number from 0 to 100."
+                        if allow_zero else
+                        "Fill % of max must be a number greater than 0 and at most 100 (0 isn't "
+                        "allowed here -- there's no existing fill on a new border/masked spline to "
+                        "delete).",
+                        parent=dialog,
                     )
                     return
             else:
                 try:
                     density = float(density_var.get())
-                    if density <= 0:
+                    if density < 0.0 or (density == 0.0 and not allow_zero):
                         raise ValueError
                 except ValueError:
                     messagebox.showwarning(
-                        "Invalid density", "Fill density (%) must be a positive number.", parent=dialog,
+                        "Invalid density",
+                        "Fill density (%) must be a positive number."
+                        if not allow_zero else
+                        "Fill density (%) must be a non-negative number (0 deletes that asset's fill).",
+                        parent=dialog,
                     )
                     return
 
@@ -4156,15 +4451,51 @@ class PGAGenGUI:
                         f"{len(chosen_entries)} asset(s) at ratio={ratio} density={density}%]\n"
                     )
                 else:
+                    # Re-Filling an asset already present on the spline
+                    # overwrites its spec in place rather than duplicating
+                    # it (identity is category+type only, mode-agnostic).
+                    # density==0 deletes that asset's spec instead; if
+                    # that empties the spline's fills entirely, a
+                    # generated (border/masked) spline is deleted outright
+                    # -- an OSM spline just loses the tag. See
+                    # _finalize_empty_fills.
+                    added = overwritten = removed = 0
+                    deleted_feature_ids: set = set()
                     for f in area_targets:
-                        fills = f.tags.setdefault(PGA_CLUSTER_FILLS_TAG, [])
-                        fills.extend(dict(s) for s in specs)
+                        existing = f.tags.get(PGA_CLUSTER_FILLS_TAG) or []
+                        had_tag = PGA_CLUSTER_FILLS_TAG in f.tags
+                        for spec in specs:
+                            match = next(
+                                (s for s in existing
+                                 if s.get("category") == spec["category"] and s.get("type") == spec["type"]),
+                                None,
+                            )
+                            if density == 0.0:
+                                if match is not None:
+                                    existing[:] = [s for s in existing if s is not match]
+                                    removed += 1
+                            elif match is not None:
+                                match.update(spec)
+                                overwritten += 1
+                            else:
+                                existing.append(dict(spec))
+                                added += 1
+                        if existing:
+                            f.tags[PGA_CLUSTER_FILLS_TAG] = existing
+                        elif had_tag:
+                            deleted_feature_ids |= self._finalize_empty_fills(f)
+                    if deleted_feature_ids:
+                        self._splines_features = [
+                            f for f in self._splines_features if f.osm_id not in deleted_feature_ids
+                        ]
                     save_features(self._splines_features, Path(wd) / FEATURES_FILE)
                     skipped = len(targets) - len(area_targets)
                     note = f" ({skipped} non-area spline(s) skipped)" if skipped else ""
                     self._append_log(
-                        f"\n[filled {len(area_targets)} spline(s) with {len(chosen_entries)} asset(s) "
-                        f"at ratio={ratio} density={density}%{note}]\n"
+                        f"\n[fill on {len(area_targets)} spline(s): {added} added, {overwritten} "
+                        f"overwritten, {removed} deleted (ratio={ratio} density={density}%)"
+                        f"{f', {len(deleted_feature_ids)} spline(s) deleted' if deleted_feature_ids else ''}"
+                        f"{note}]\n"
                     )
 
             self._regenerate_packed_objects(Path(wd))
@@ -4775,6 +5106,7 @@ class PGAGenGUI:
                 ("--water-stripe-min-edge-m", self.water_stripe_min_edge_var),
                 ("--water-stripe-tolerance-m", self.water_stripe_tolerance_var),
                 ("--water-stripe-max-stripes-per-side", self.water_stripe_max_stripes_var),
+                ("--water-stripe-buffer-m", self.water_stripe_buffer_var),
             ):
                 value = var.get().strip()
                 if value:  # blank field (mid-edit) -- let the CLI fall back to its own default
@@ -5103,6 +5435,7 @@ class PGAGenGUI:
         self._step_on_done = on_done
         self.stop_button.config(state="normal")
         step_name = extra_args[1]
+        self._step_name = step_name
         self.status_label.config(text=f"Running {step_name}...", foreground="orange")
         self._step_start_time = time.time()
 
@@ -5230,14 +5563,18 @@ class PGAGenGUI:
                     self.stop_button.config(state="disabled")
                     elapsed = time.time() - self._step_start_time
                     if self._stop_requested:
-                        self.status_label.config(text=f"Stopped ({elapsed:.1f}s)", foreground="gray")
+                        self.status_label.config(
+                            text=f"Stopped ({elapsed:.1f}s): {self._step_name}", foreground="gray"
+                        )
                         self._append_log(f"\n[stopped by user after {elapsed:.1f}s]\n")
                     elif payload == 0:
-                        self.status_label.config(text=f"Done ({elapsed:.1f}s)", foreground="green")
+                        self.status_label.config(
+                            text=f"Done ({elapsed:.1f}s): {self._step_name}", foreground="green"
+                        )
                         self._append_log(f"\n[finished in {elapsed:.1f}s]\n")
                     else:
                         self.status_label.config(
-                            text=f"Failed (exit {payload}, {elapsed:.1f}s)", foreground="red"
+                            text=f"Failed (exit {payload}, {elapsed:.1f}s): {self._step_name}", foreground="red"
                         )
                         self._append_log(f"\n[finished in {elapsed:.1f}s]\n")
                     self._last_step_ok = (not self._stop_requested) and payload == 0
@@ -5910,6 +6247,7 @@ class PGAGenGUI:
             multi_tile, fill_mode,
             self.water_stripe_overlap_var.get(), self.water_stripe_min_edge_var.get(),
             self.water_stripe_tolerance_var.get(), self.water_stripe_max_stripes_var.get(),
+            self.water_stripe_buffer_var.get(),
             self.water_tile_tolerance_var.get(), self.water_tile_min_edge_var.get(),
             self.water_tile_max_search_var.get(), self.water_tile_width_samples_var.get(),
             self.water_tile_redundancy_var.get(), self.water_tile_overlap_var.get(),
@@ -5931,6 +6269,7 @@ class PGAGenGUI:
                     max_stripes_per_side=int(self._float_field(
                         self.water_stripe_max_stripes_var, DEFAULT_WATER_STRIPE_MAX_STRIPES_PER_SIDE,
                     )),
+                    buffer_m=self._float_field(self.water_stripe_buffer_var, DEFAULT_WATER_STRIPE_BUFFER_M),
                 )
                 if fits:
                     rects.extend(fits)
@@ -5958,6 +6297,45 @@ class PGAGenGUI:
         self._cached_water_preview_rects = rects
         self._cached_water_preview_rects_key = cache_key
         return rects
+
+    def _object_overlay_fingerprint(self, working_dir: Path):
+        """
+        Everything _composite_objects_layer's three data sources
+        (_get_cached_object_preview_layer, _get_water_preview_rects,
+        _get_cached_object_spline_fill_layer) actually read, collapsed
+        into one tuple for _show_preview's outer per-zoom-level render
+        cache (see render_key there). Each of those three has its own
+        internal mtime-keyed cache already, but that only saves the
+        WORK of rebuilding their point/rect lists -- it does nothing
+        for the render cache sitting in front of them, which used to be
+        keyed only on show_objects_var.get() (on/off), not on whether
+        the underlying files actually changed. A step that rewrites
+        objects.json/object_list.json without touching the base preview
+        PNG (generate-parking, generate-range-nets, generate-streams,
+        generate-collections -- see PGA2k_gen.py) left geo_overlay_key
+        identical to the pre-run value, so the render cache kept
+        returning the stale pre-run composite forever, even though the
+        three inner caches above were already correctly holding the new
+        data. Cheap to compute every call: a handful of stat()s plus
+        already-materialized StringVar reads, no file parsing.
+        """
+        object_list_path = working_dir / OBJECT_LIST_FILE
+        objects_path = working_dir / OBJECTS_FILE
+        features_path = working_dir / FEATURES_FILE
+        project_path = working_dir / PROJECT_FILE
+        return (
+            object_list_path.stat().st_mtime if object_list_path.exists() else None,
+            objects_path.stat().st_mtime if objects_path.exists() else None,
+            features_path.stat().st_mtime if features_path.exists() else None,
+            project_path.stat().st_mtime if project_path.exists() else None,
+            self.multi_tile_water_var.get(), self.water_fill_mode_var.get(),
+            self.water_stripe_overlap_var.get(), self.water_stripe_min_edge_var.get(),
+            self.water_stripe_tolerance_var.get(), self.water_stripe_max_stripes_var.get(),
+            self.water_stripe_buffer_var.get(),
+            self.water_tile_tolerance_var.get(), self.water_tile_min_edge_var.get(),
+            self.water_tile_max_search_var.get(), self.water_tile_width_samples_var.get(),
+            self.water_tile_redundancy_var.get(), self.water_tile_overlap_var.get(),
+        )
 
     def _composite_objects_layer(self, img: "Image.Image", working_dir: Path) -> "Image.Image":
         """
@@ -7331,7 +7709,17 @@ class PGAGenGUI:
             # covers the base PNG mtime, OSM overlay, mask buffer and
             # spline highlight); the elevation-band and objects-toggle
             # inputs applied AFTER the cache check are added to the
-            # key explicitly.
+            # key explicitly. NOTE: show_objects_var.get() alone only
+            # says whether the overlay is ON, not whether the DATA it
+            # draws changed -- a step like generate-parking/generate-
+            # range-nets/generate-streams/generate-collections rewrites
+            # objects.json (or object_list.json) without touching the
+            # base preview PNG at all (see PGA2k_gen.py's steps that
+            # skip the full preview refresh), so without an explicit
+            # fingerprint here this cache kept serving the pre-run
+            # image forever -- confirmed as the cause of "Show objects"
+            # looking frozen after those steps. _object_overlay_fingerprint
+            # covers every input _composite_objects_layer actually reads.
             qz = max(0.25, round(zoom * 4) / 4)
             render_key = (
                 geo_overlay_key, qz,
@@ -7339,6 +7727,7 @@ class PGAGenGUI:
                 self.elevation_contour_var.get(), self.elevation_contour_width_var.get(),
                 self.show_stamp_coverage_var.get(),
                 self.show_objects_var.get(),
+                self._object_overlay_fingerprint(Path(wd)) if self.show_objects_var.get() else None,
                 tuple(self._highlighted_object_points),
             )
             render_cache = getattr(self, "_preview_render_cache", None)

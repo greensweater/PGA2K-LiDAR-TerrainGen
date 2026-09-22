@@ -182,8 +182,17 @@ from ingest.osm import Feature
 # tag convention as objects.py's TREE_TYPE_TAG. Value is a LIST of
 # {"category": int, "type": int, "ratio": float} dicts, not a single
 # scalar tag, specifically so multiple assets (e.g. grass understory +
-# scattered rocks) can be layered onto the same spline -- each Fill
-# action appends to it rather than overwriting it. Feature.tags is a
+# scattered rocks) can be layered onto the same spline. Re-Filling an
+# already-tagged spline with an asset it already carries overwrites that
+# asset's entry in place instead of duplicating it (match is by
+# category+type only, mode-agnostic); a density of 0 deletes that
+# asset's entry instead, and empties the spline's own entry as well --
+# for a generated (pga_cluster_border/pga_cluster_masked) spline, whose
+# Feature exists only to carry this tag, the Feature itself is then
+# deleted too (see PGA2k_gen_gui.py's _finalize_empty_fills). Only the
+# manual, no-mask Fill path re-tags an EXISTING Feature this way --
+# Border and "Use mask" always build a brand-new synthetic Feature from
+# an empty list, so they still require density > 0. Feature.tags is a
 # plain dict JSON-dumped as-is by ingest.osm.save_features, so a list
 # value round-trips fine (not restricted to OSM-style string tags).
 PGA_CLUSTER_FILLS_TAG = "pga_cluster_fills"

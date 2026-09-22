@@ -4,6 +4,7 @@
   "note": "category/type -> v2021+ asset path mapping, derived by matching item positions between a hand-placed v2019 placedObjects2.json and the same file re-saved from v2021 (placedObjects3.json). spacing (meters, center-to-center) is back-calculated per asset from a maxed-out cluster (spacing = radius / sqrt(count/pi)), taking the largest-radius sample seen across all maxed-cluster passes provided for that asset. Category 1 (rocks) types 1-6 borrow type 0's spacing and types 8-9 borrow type 7's spacing (not independently measured -- assigned per instruction). spacing is null where no maxed-cluster sample exists and no borrowed value was assigned. cluster_radius on each category is the largest cluster radius observed for any measured asset in that category (the apparent engine-side max radius cap); null for categories with no cluster samples at all.",
   "native_size_note": "native_height_m / native_canopy_radius_m (meters) are per-prefab in-game measurements, category-0 only, valid ONLY for source_theme_id (type ids are per-theme). Method: place the asset at scale 1, flatten the ground under it to a known datum (the capture used flatten-to-1.0), drop a type-73 hard-round sculpt stamp whose scale.x you match to the crown radius, and a water plane whose surface Y you set to the crown top; native_height_m = water_Y - datum, native_canopy_radius_m = stamp scale.x. null = not measured -> course_output/objects.py._tree_scale falls back to the course-relative height remap for that prefab. Re-capture another theme with util/extract_tree_dimensions.py.",
   "missing_spacing_data": [],
+  "description_note": "description is an optional, purely cosmetic blurb (course_output/asset_catalog.AssetEntry.description / .display) for entries whose prefab name alone doesn't say what they look like -- shown by the GUI wherever it lists assets, never read by the write-objects pipeline. Types 25-30 (NaturePackBushes/Elderberry, added for the 2k21 bush pack) were added by path only, without the v2019-diff capture this file's other entries went through -- their type ids are locally-assigned placeholders (not real v2019 type ids) and their theme=true is inherited from category 0's convention, not verified. native_height_m/native_canopy_radius_m and spacing for 25-30 were all captured in the same bushes.course: native size per native_size_note's method (one global type-72 datum flatten at value 3.23173046, matched to each asset's nearest type-73 stamp/water pair by position), spacing from a single maxed-radius (45.0) cluster stamp per asset (spacing = radius / sqrt(count/pi), per this file's own 'note'). NPBush03A/03B are the same prefab family at two sizes (30='large', 29='medium') -- the first cluster pass for the 5th bush landed on 03A instead of 03B by mistake, so both ended up captured and catalogued rather than just 03B.",
   "categories": [
     {
       "id": 0,
@@ -272,6 +273,66 @@
       "spacing": 8.8623,
       "native_height_m": 3.3,
       "native_canopy_radius_m": 2.3
+    },
+    {
+      "category": 0,
+      "type": 25,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/NaturePackBushes/Prefabs/NPBush08A",
+      "spacing": 15.9521,
+      "native_height_m": 9.9,
+      "native_canopy_radius_m": 6.1,
+      "description": "Large underbrush"
+    },
+    {
+      "category": 0,
+      "type": 26,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/NaturePackBushes/Prefabs/NPBush09A",
+      "spacing": 11.3943,
+      "native_height_m": 9.0,
+      "native_canopy_radius_m": 4.6,
+      "description": "Large underbrush (brown)"
+    },
+    {
+      "category": 0,
+      "type": 27,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/NaturePackBushes/Prefabs/NPBush01A",
+      "spacing": 7.2509,
+      "native_height_m": 3.6,
+      "native_canopy_radius_m": 2.4,
+      "description": "Small underbrush"
+    },
+    {
+      "category": 0,
+      "type": 28,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/Elderberry/Prefabs/Black_Elder_Desktop",
+      "spacing": 7.2509,
+      "native_height_m": 2.4,
+      "native_canopy_radius_m": 2.3,
+      "description": "Small underbrush (brown)"
+    },
+    {
+      "category": 0,
+      "type": 29,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/NaturePackBushes/Prefabs/NPBush03B",
+      "spacing": 11.3943,
+      "native_height_m": 1.9,
+      "native_canopy_radius_m": 2.3,
+      "description": "Medium water-fill bush"
+    },
+    {
+      "category": 0,
+      "type": 30,
+      "theme": true,
+      "path": "Assets/Foliage/SpeedTree/Bushes/NaturePackBushes/Prefabs/NPBush03A",
+      "spacing": 15.9521,
+      "native_height_m": 2.8,
+      "native_canopy_radius_m": 4.1,
+      "description": "Large water-fill bush"
     },
     {
       "category": 1,

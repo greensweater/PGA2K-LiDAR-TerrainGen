@@ -56,11 +56,22 @@ class AssetEntry:
     # "native_size_note" for how they're captured.
     native_height_m: Optional[float] = None
     native_canopy_radius_m: Optional[float] = None
+    # Free-text, human-written blurb for entries whose prefab name is
+    # useless at a glance (e.g. "NPBush08A") -- purely cosmetic, never
+    # read by the write-objects pipeline. None = no blurb written yet;
+    # display() then falls back to `label`.
+    description: Optional[str] = None
 
     @property
     def label(self) -> str:
         """Last path segment, e.g. 'Lombardy_Popular_Desktop01' -- what the GUI's asset picker shows."""
         return self.path.rsplit("/", 1)[-1]
+
+    @property
+    def display(self) -> str:
+        """`description` (with the raw prefab name parenthesized) when one's been
+        written, else just `label` -- what any GUI list of assets should show."""
+        return f"{self.description} ({self.label})" if self.description else self.label
 
 
 def _load() -> tuple[dict[int, AssetCategory], list[AssetEntry], Optional[int]]:
@@ -75,6 +86,7 @@ def _load() -> tuple[dict[int, AssetCategory], list[AssetEntry], Optional[int]]:
             spacing=e.get("spacing"),
             native_height_m=e.get("native_height_m"),
             native_canopy_radius_m=e.get("native_canopy_radius_m"),
+            description=e.get("description"),
         )
         for e in data["entries"]
     ]
