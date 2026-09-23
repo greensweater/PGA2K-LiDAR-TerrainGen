@@ -114,6 +114,7 @@ import argparse
 import copy
 import dataclasses
 import json
+import pickle
 import secrets
 import shutil
 import subprocess
@@ -300,6 +301,7 @@ FEATURES_FILE = "features.geojson"
 HEIGHT_MASK_FILE = "height_mask.geojson"
 HEIGHTMAP_FILE = "heightmap.npz"
 STAMPS_PATTERN = "stamps_{n}.json"
+TERRAIN_MODEL_CACHE_FILE = ".terrain_model_cache.pkl"
 OBJECT_LIST_FILE = "object_list.json"
 OBJECTS_FILE = "objects.json"
 STREAMS_FILE = "streams.json"
@@ -457,6 +459,56 @@ def _load_all_stamps_incl_collections(working_dir: Path, verbose: bool = True) -
         stamps = list(stamps) + coll_stamps
         return stamps, True
     return stamps, False
+
+
+def _terrain_model_source_fingerprint(working_dir: Path) -> list[tuple[str, int, int]]:
+    """(name, mtime_ns, size) for every file _load_all_stamps_incl_collections
+    reads -- every stamps_N.json layer plus collections.json, if present. Cheap
+    (stat only, no JSON parsing) -- used to tell whether a cached TerrainModel
+    (see _cached_terrain_model_for_objects) is still valid without re-reading
+    those files."""
+    paths = list(_stamps_files(working_dir))
+    collections_path = working_dir / COLLECTIONS_FILE
+    if collections_path.exists():
+        paths.append(collections_path)
+    fingerprint = []
+    for path in paths:
+        st = path.stat()
+        fingerprint.append((path.name, st.st_mtime_ns, st.st_size))
+    return fingerprint
+
+
+def _cached_terrain_model_for_objects(working_dir: Path, verbose: bool = True) -> TerrainModel:
+    """TerrainModel over load_all_stamps + collection terrain stamps, cached
+    on disk and reused across step_write_objects runs whenever no stamps_N.json
+    layer or collections.json has changed since the cache was written.
+
+    step_write_objects is a pure formatting step over objects.json (see
+    _build_placed_objects's docstring) -- most runs (a tree/ingame-object
+    tweak, a theme or asset-path change, ...) don't touch terrain/collections
+    at all, so reloading every stamp layer and rebuilding the KD-tree/kernels
+    from scratch every single run is wasted work. Fingerprint mismatch (or a
+    missing/corrupt cache -- never an error, just a cache miss) triggers a
+    full rebuild, so this can never serve stale terrain."""
+    cache_path = _stamps_dir(working_dir) / TERRAIN_MODEL_CACHE_FILE
+    fingerprint = _terrain_model_source_fingerprint(working_dir)
+    if cache_path.exists():
+        try:
+            with open(cache_path, "rb") as f:
+                cached_fingerprint, cached_model = pickle.load(f)
+            if cached_fingerprint == fingerprint:
+                return cached_model
+        except (pickle.UnpicklingError, EOFError, OSError, ValueError, AttributeError):
+            pass
+
+    stamps, _ = _load_all_stamps_incl_collections(working_dir, verbose=verbose)
+    model = TerrainModel(stamps)
+    try:
+        with open(cache_path, "wb") as f:
+            pickle.dump((fingerprint, model), f)
+    except OSError:
+        pass
+    return model
 
 
 def load_latest_stamp_metadata(working_dir: Path) -> dict | None:
@@ -2041,8 +2093,7 @@ def _build_placed_objects(
                 print("  NOTE: no output_height_shift_m in project.json yet -- run write-terrain so "
                       "elevated collection objects sit at the right height. Using 0 for now.")
                 shift_m = 0.0
-            stamps_for_height, _ = _load_all_stamps_incl_collections(working_dir)
-            model = TerrainModel(stamps_for_height)
+            model = _cached_terrain_model_for_objects(working_dir)
             apply_terrain_heights(collection_objects, model.evaluate, shift_m)
             print(f"  resolved terrain height for {len(elevated)} elevated collection object(s)")
         else:
@@ -2194,8 +2245,7 @@ def _build_placed_objects(
                       "so stream waterfalls sit at the right elevation. Using 0 for now.")
                 height_shift_m = 0.0
             if _stamps_files(working_dir):
-                raw_stamps, _ = _load_all_stamps_incl_collections(working_dir, verbose=False)
-                raw_model = TerrainModel(raw_stamps)
+                raw_model = _cached_terrain_model_for_objects(working_dir, verbose=False)
                 stream_records = rebuild_stream_drop_rows(
                     stream_records, raw_model.evaluate_many,
                     water_fill_depth_m=project.get(

@@ -365,6 +365,8 @@ class PGAGenGUI:
         self._cached_geo_overlay_key = None
         self._cached_water_preview_rects = None  # see _get_water_preview_rects
         self._cached_water_preview_rects_key = None
+        self._cluster_pack_cache = None  # see _regenerate_packed_objects
+        self._cluster_pack_cache_key = None
         self._splines_features = []  # loaded features.geojson content, for the Splines tab
         self._splines_features_mtime = None  # see _ensure_splines_features_fresh
         self._objects_tree_list = []  # loaded object_list.json content, for the Objects tab
@@ -3705,7 +3707,9 @@ class PGAGenGUI:
         packing self._splines_features, course-cropped, through
         object_clusters.pack_cluster_records -- the exact same packer
         PGA2k_gen.py's step_pack_objects uses, just invoked directly
-        here instead of as a subprocess step.
+        here instead of as a subprocess step (mtime-cached -- see below
+        -- so repeated calls that don't touch fill splines skip the
+        actual repacking).
         """
         trees = []
         object_list_path = working_dir / OBJECT_LIST_FILE
@@ -3716,13 +3720,37 @@ class PGAGenGUI:
                 trees = []
 
         self._ensure_splines_features_fresh(working_dir)
-        course_features = self._shift_and_crop_to_course(working_dir, self._splines_features)
         # "auto"/"spline" fill specs resolve against game_version at pack
         # time (object_clusters.resolve_fill_mode), so re-pack on a version
         # switch too (see _on_game_version_changed).
         gv = self.game_version.get()
-        cluster_records = pack_cluster_records(course_features, game_version=gv)
-        object_spline_fill_records = pack_spline_records(course_features, game_version=gv)
+
+        # pack_cluster_records/pack_spline_records are the RNG/shapely
+        # dart-throw circle-packing work -- not cheap on a course with many
+        # tagged fill splines, and this method is called unconditionally
+        # before every Write Objects run (see _run_write_objects) even when
+        # the edit that prompted it (a tree tweak, an ingame-object edit, a
+        # theme change, ...) never touched a cluster/spline fill at all.
+        # Both packers are pure functions of (course_features, game_version)
+        # -- same "compile once" reasoning as the pack-objects/write-objects
+        # CLI split itself (see step_pack_objects's docstring) -- so this
+        # skips the repack whenever nothing that could change their result
+        # has changed, same mtime-keyed cache idiom as
+        # _get_cached_water_preview_rects/_get_cached_object_preview_layer.
+        project_path = working_dir / PROJECT_FILE
+        pack_cache_key = (
+            str(working_dir), self._splines_features_mtime,
+            project_path.stat().st_mtime if project_path.exists() else None, gv,
+        )
+        cached = getattr(self, "_cluster_pack_cache", None)
+        if getattr(self, "_cluster_pack_cache_key", None) == pack_cache_key and cached is not None:
+            cluster_records, object_spline_fill_records = cached
+        else:
+            course_features = self._shift_and_crop_to_course(working_dir, self._splines_features)
+            cluster_records = pack_cluster_records(course_features, game_version=gv)
+            object_spline_fill_records = pack_spline_records(course_features, game_version=gv)
+            self._cluster_pack_cache_key = pack_cache_key
+            self._cluster_pack_cache = (cluster_records, object_spline_fill_records)
 
         # Preserve resolved collection placements -- they're owned by
         # collections.json (written by the generate-collections step),
