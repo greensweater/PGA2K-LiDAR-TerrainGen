@@ -61,7 +61,8 @@ Phase 2, Phase 2 gates Phase 3.
   full set). Must confirm which options are valid per asset (in-game).
 - v2023 confirms **tilted items are legal** (GolfCartPrefab rot.x/z=±10°) and
   lists the **5 hole-sign colors** (HoleSign01–05; north→south = green/red/blue/
-  white/black — the 0N↔color mapping needs an in-game check).
+  white/black; 01 black (the v2021 sign), 02 white, 03 blue, 04 red, 05 green
+  — see 0.3a.4).
 - New v2023 fence assets are under `Assets/CourseGen/Detail/Walls/**`
   (`*Post*Prefab`, `*SplinePostPrefab`), incl. Asia/Brick; carts + hole signs
   under `Assets/CourseProps/**`.
@@ -112,8 +113,9 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
         fl=0 only on straight brick rows; state=1 only on the retaining wall).
   - [ ] 0.3a.3 **`spacingRule` → cap-style ordering**: which of 0–3 is
         none / spaced / points / ends.
-  - [ ] 0.3a.4 **HoleSign0N ↔ color mapping** (author: N→S = green, red, blue,
-        white, black; need in-game check to bind 01–05 to colors).
+  - [x] 0.3a.4 **HoleSign0N ↔ color mapping** — 01 black (v2021 sign,
+        Andy), 02 white, 03 blue, 04 red, 05 green (derived from positions,
+        +z = north; see `V2023_SCHEMA.md` "Hole signs").
   - [ ] 0.3a.5 `holes2` / `surfaceSplines2` entry shapes (sample has both empty)
         — confirm vs `holes` / `surfaceSplines` once a populated course is
         available.
@@ -373,8 +375,9 @@ builder convention. This de-risks Phase 3 by isolating the new-feature work.
     (`V2023_SCHEMA.md` "Confirmed node set") with v2023 names, and a
     pre-existing 2021 node file in `course/` is either cleaned or not
     repacked.
-- [ ] **2.3 End-to-end verification (no fence feature yet)** — 2.3.1 + 2.3.3
-  DONE 2026-09-23; **2.3.2 ready for in-game verification**. Test course:
+- [x] **2.3 End-to-end verification (no fence feature yet)** — DONE
+  2026-09-23. **In-game VERIFIED (Andy):** the course opened and every
+  item on the checklist below rendered correctly. Test course:
   a copy of Andy's shawnee project (v2021 → 2023 via `ingest-course`), run
   through write-terrain/-water/-splines/-holes/-objects + repack →
   `LIDAR-2023-shawnee-phase2.course` (copied into the v2023 Courses folder).
@@ -397,7 +400,7 @@ builder convention. This de-risks Phase 3 by isolating the new-feature work.
   - **Steps**:
   - [x] 2.3.1 Run the full CLI pipeline targeting `--game-version 2023` on a
         test course; confirm each node file is produced.
-  - [ ] 2.3.2 Load the generated `.course` in the v2023 game and confirm trees,
+  - [x] 2.3.2 Load the generated `.course` in the v2023 game and confirm trees,
         water, holes, parking, range nets render correctly (spot-check a few).
   - [x] 2.3.3 Diff generated v2023 node files against the confirmed reference
         to catch structural drift.
@@ -407,6 +410,7 @@ builder convention. This de-risks Phase 3 by isolating the new-feature work.
     `V2023_SCHEMA.md`).
 
 **Exit:** a v2023 `.course` with all *pre-existing* features is playable in-game.
+**MET 2026-09-23** (`LIDAR-2023-shawnee-phase2`, Andy). Phase 3 is unblocked.
 
 ---
 

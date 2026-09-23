@@ -169,8 +169,12 @@ the course as **green, red, blue, white, black**. File positions
 (course-local, z ascending = south→north or vice versa — direction not
 known to us): `HoleSign01 z≈121.7`, `02 z≈123.8`, `03 z≈126.2`,
 `04 z≈128.8`, `05 z≈131.1` (all x≈-430, rot.y≈279.3°).
-→ **In-game subtask: confirm the HoleSign0N ↔ color mapping** (depends on
-which z direction is "north" in-game).
+**Resolved 2026-09-23 (Andy):** black is the v2021 sign (`HoleSign01Prefab`,
+already used in v2021 projects). Green/red/blue/white are the four v2023
+additions. 01 = black is the southernmost sign (lowest z), so **+z = north**,
+and the mapping follows from the author's N→S order: **01 black, 02 white,
+03 blue, 04 red, 05 green**. 02–05 are inferred from the sample's positions,
+not individually viewed; recorded in `asset_catalog.json` descriptions.
 
 ## Clear-generated-objects paint (CONFIRMED, second export 2026-09-23)
 
@@ -259,12 +263,18 @@ was empty, so whether v2021 also honors category 5 is unconfirmed (0.3b.3).
 - Collection `options.OffsetIndex` is written as an int (`0`); the game
   writes a float (`0.0`). JSON-number-equivalent, so it's left alone unless
   the in-game load says otherwise.
-- **Catalog correction pending:** `HoleSign01Prefab` was already used in
-  v2021 projects before the v2023 work began (`~/.pga2k/collections/hole_sign.json`,
-  2026-09-20; shawnee v2021 `placedObjects3.json`), so its
-  `min_game_version: "2023"` in `asset_catalog.json` is wrong. HoleSign02–05
-  and `GolfCartPrefab` are unverified for v2021. Nothing reads
-  `min_game_version` yet, so this has no effect on output.
+- **Catalog corrected:** `HoleSign01Prefab` (black) was already used in
+  v2021 (`~/.pga2k/collections/hole_sign.json`, 2026-09-20), so its
+  `min_game_version` is now `"2021"`. Andy confirmed the other four signs
+  are new in v2023. `GolfCartPrefab` is still unverified for v2021.
+- **In-game VERIFIED 2026-09-23 (Andy):** `LIDAR-2023-shawnee-phase2`
+  (shawnee re-targeted to 2023) opens in v2023 with every pre-existing
+  feature rendering correctly: trees, ponds + stream water, waterfalls,
+  holes/pins, splines, stakes, fills/clusters, parking, range nets, hole
+  signs, elevated collection props. So the v2021-shaped `water[]`,
+  `holes2` and `surfaceSplines2` entries and the int `OffsetIndex` are all
+  accepted by v2023. That's accepted, not confirmed to match what the game
+  writes: a game re-save could still trim fields.
 
 ## What this does NOT confirm (still open)
 

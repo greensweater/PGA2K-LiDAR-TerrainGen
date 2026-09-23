@@ -2186,8 +2186,8 @@
       "theme": false,
       "path": "Assets/CourseProps/Signs/HoleSign01Prefab",
       "spacing": null,
-      "description": "Hole sign 1 (one of green/red/blue/white/black -- which is unconfirmed)",
-      "min_game_version": "2023"
+      "description": "Hole sign, black",
+      "min_game_version": "2021"
     },
     {
       "category": 7,
@@ -2195,7 +2195,7 @@
       "theme": false,
       "path": "Assets/CourseProps/Signs/HoleSign02Prefab",
       "spacing": null,
-      "description": "Hole sign 2 (one of green/red/blue/white/black -- which is unconfirmed)",
+      "description": "Hole sign, white",
       "min_game_version": "2023"
     },
     {
@@ -2204,7 +2204,7 @@
       "theme": false,
       "path": "Assets/CourseProps/Signs/HoleSign03Prefab",
       "spacing": null,
-      "description": "Hole sign 3 (one of green/red/blue/white/black -- which is unconfirmed)",
+      "description": "Hole sign, blue",
       "min_game_version": "2023"
     },
     {
@@ -2213,7 +2213,7 @@
       "theme": false,
       "path": "Assets/CourseProps/Signs/HoleSign04Prefab",
       "spacing": null,
-      "description": "Hole sign 4 (one of green/red/blue/white/black -- which is unconfirmed)",
+      "description": "Hole sign, red",
       "min_game_version": "2023"
     },
     {
@@ -2222,10 +2222,10 @@
       "theme": false,
       "path": "Assets/CourseProps/Signs/HoleSign05Prefab",
       "spacing": null,
-      "description": "Hole sign 5 (one of green/red/blue/white/black -- which is unconfirmed)",
+      "description": "Hole sign, green",
       "min_game_version": "2023"
     }
   ],
-  "v2023_note": "Entries with \"min_game_version\" were first confirmed in that game version's .course output (templates/2023_fences.course, see V2023_SCHEMA.md) rather than the v2019->v2021 diff capture -- they have \"type\": null because no v2019 category/type id exists for them, so they can only be written by path (v2021+ schemas); whether each also exists in v2021 is unverified. Assets shared with v2021 keep the identical path in v2023 (StoneWall/WoodFences/UniFence/RetainWall post prefabs appear in the v2023 sample under exactly their v2021 catalog paths), so no v2021->v2023 path mapping is needed. The v2023 sample is fence-focused, not exhaustive: other v2023 fence/prop assets likely exist and need an in-game capture to add.",
+  "v2023_note": "Entries with \"min_game_version\" were first confirmed in that game version's .course output (templates/2023_fences.course, see V2023_SCHEMA.md) rather than the v2019->v2021 diff capture -- they have \"type\": null because no v2019 category/type id exists for them, so they can only be written by path (v2021+ schemas); whether each also exists in v2021 is unverified, except HoleSign01Prefab (black), which is in v2021 (min_game_version 2021; Andy confirmed 2026-09-23 that the green/red/blue/white signs are the four v2023 additions). Hole-sign colors: 01 black is confirmed; 02-05 are inferred from the sample's positions (V2023_SCHEMA.md, Hole signs section). Assets shared with v2021 keep the identical path in v2023 (StoneWall/WoodFences/UniFence/RetainWall post prefabs appear in the v2023 sample under exactly their v2021 catalog paths), so no v2021->v2023 path mapping is needed. The v2023 sample is fence-focused, not exhaustive: other v2023 fence/prop assets likely exist and need an in-game capture to add.",
   "fence_options_note": "fence_options (v2023 objectPaths fence/wall assets only -- the placedObjects3 group Key.path an objectPaths[] entry sits under): per objectPath rule field, the values known valid for this asset. \"complete\": true = the set is known exhaustive (author-confirmed or every value observed); false = only what the sample showed, other values untested (V2023_TASKS.md 0.3a.1). Fields: spacingRule 0-3 = end-cap style none/spaced/points/ends (0-3 order unverified, 0.3a.3); hasCurves true/false = curved/straight; heightRule 0 = contoured, 1 = stepped; flexibilityRule 0/1 meaning unconfirmed (0.3a.2)."
 }
