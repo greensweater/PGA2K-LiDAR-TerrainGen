@@ -255,9 +255,11 @@ def oob_records_to_entries(
     Same shape as course_output.userLayers.stamp_to_entry MINUS the
     "tool" field, with "value" pinned to 0.0. "_orientation" /
     "orientation" (both 0.0) are added only on schemas that carry them
-    (v2021+), exactly as stamp_to_entry does for "height".
+    (v2021), and "radius" only where has_radius_field (not v2023),
+    exactly as stamp_to_entry does for "height".
     """
-    has_orientation = schema_for(game_version).has_orientation_fields
+    schema = schema_for(game_version)
+    has_orientation = schema.has_orientation_fields
     entries: list[dict] = []
     for rec in records:
         r = rec if isinstance(rec, OOBRecord) else OOBRecord(**rec)
@@ -276,8 +278,9 @@ def oob_records_to_entries(
             "type": int(r.brush),
             "value": 0.0,
             "holeId": -1,
-            "radius": 0.0,
         })
+        if schema.has_radius_field:
+            entry["radius"] = 0.0
         if has_orientation:
             entry["orientation"] = 0.0
         entries.append(entry)

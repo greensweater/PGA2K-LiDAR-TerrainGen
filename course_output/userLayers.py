@@ -382,8 +382,11 @@ def stamp_to_entry(stamp: Stamp, game_version: str = DEFAULT_GAME_VERSION) -> di
     saved from each version (see course_output/game_versions.py);
     v2019 has neither. water[] entries already carry these in both
     versions (unlike height[]), so build_water_objects needs no
-    equivalent change.
+    equivalent change. v2023 drops "radius" too
+    (schema_for(...).has_radius_field), leaving tool/position/rotation/
+    scale/type/value/holeId.
     """
+    schema = schema_for(game_version)
     rotation_y = _round(stamp.rotation)
     entry = {
         "tool": stamp.tool,
@@ -394,7 +397,7 @@ def stamp_to_entry(stamp: Stamp, game_version: str = DEFAULT_GAME_VERSION) -> di
         },
         "rotation": {"x": 0.0, "y": rotation_y, "z": 0.0},
     }
-    if schema_for(game_version).has_orientation_fields:
+    if schema.has_orientation_fields:
         entry["_orientation"] = 0.0
     entry.update({
         "scale": {
@@ -405,9 +408,10 @@ def stamp_to_entry(stamp: Stamp, game_version: str = DEFAULT_GAME_VERSION) -> di
         "type": stamp.brush,
         "value": _round(stamp.value),
         "holeId": HOLE_ID_NONE,
-        "radius": UNUSED_RADIUS_FIELD,
     })
-    if schema_for(game_version).has_orientation_fields:
+    if schema.has_radius_field:
+        entry["radius"] = UNUSED_RADIUS_FIELD
+    if schema.has_orientation_fields:
         entry["orientation"] = 0.0
     return entry
 

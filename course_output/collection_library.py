@@ -199,10 +199,14 @@ def _num(value) -> Optional[float]:
 
 
 def _height_entries(course_nodes_dir: Path) -> list[dict]:
-    """The userLayers.json "height" array (Landscape-mode terrain stamps)
-    for an extracted course, or [] if the file/key is missing or unreadable."""
-    path = Path(course_nodes_dir) / "userLayers.json"
-    if not path.exists():
+    """The userLayers "height" array (Landscape-mode terrain stamps) for an
+    extracted course, or [] if the file/key is missing or unreadable.
+    userLayers.json is v2019/v2021, userLayers2.json is v2023."""
+    for fname in ("userLayers.json", "userLayers2.json"):
+        path = Path(course_nodes_dir) / fname
+        if path.exists():
+            break
+    else:
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))

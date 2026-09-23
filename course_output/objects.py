@@ -28,14 +28,13 @@ place that divergence is confirmed concretely:
     Value.splines), which v2019 has no equivalent for at all. See
     build_tree_objects_v2021.
 
-v2023 (spline fences) and v2025 (terrain painting, spline water) are
-NOT implemented here yet -- their placedObjects2 schema hasn't been
-confirmed against a real extracted .course file from those versions,
-so IMPLEMENTED_GAME_VERSIONS deliberately excludes them rather than
-guessing. GAME_VERSIONS lists all four for UI/CLI purposes (so a
-version can be selected and stored even before it's implemented);
-IMPLEMENTED_GAME_VERSIONS is the subset this module can actually
-build output for right now.
+v2023 keeps v2021's placedObjects3.json items/clusters/splines shape
+unchanged (confirmed from templates/2023_fences.course, see
+V2023_SCHEMA.md), so it goes through the _v2021 builders; its new
+Value.objectPaths[] (spline fences) has no builder here yet. v2025
+isn't confirmed against a real extracted .course file, so
+IMPLEMENTED_GAME_VERSIONS (game_versions.py) excludes it rather than
+guessing.
 
 The position/rotation/scale shape of one placed-object *item* --
 {"position": {x, y: "-Infinity", z}, "rotation": {x,y,z}, "scale":
@@ -119,7 +118,8 @@ from ingest.osm import Feature, latlon_to_local
 from terrain.bounding_box import BoundingBox
 from terrain.cart_paths import CART_PATH_WIDTH_M
 from course_output.asset_catalog import (
-    ASSET_ENTRIES, CATALOG_SOURCE_THEME_ID, NATIVE_TREE_HEIGHT_BY_PATH, native_tree_height_v2019,
+    ASSET_ENTRIES, CATALOG_SOURCE_THEME_ID, NATIVE_TREE_HEIGHT_BY_PATH, V2019_KEYED_ENTRIES,
+    native_tree_height_v2019,
 )
 from course_output.userLayers import GRID_ORIGIN_OFFSET
 # Re-exported for existing callers (PGA2k_gen.py, PGA2k_gen_gui.py) -- the
@@ -977,7 +977,7 @@ def _placed_object_group_v2021(asset_path: str) -> dict:
 # and object-spline-fill records (both still schema-neutral
 # {"category","type",...} dicts out of object_clusters.py) to a v2021+
 # asset path.
-_ENTRY_BY_KEY = {(e.category, e.type): e for e in ASSET_ENTRIES}
+_ENTRY_BY_KEY = {(e.category, e.type): e for e in V2019_KEYED_ENTRIES}
 
 
 def cluster_records_to_v2021_groups(records: list[dict]) -> list[dict]:

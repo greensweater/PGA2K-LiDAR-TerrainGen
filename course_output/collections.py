@@ -81,7 +81,7 @@ import math
 from pathlib import Path
 from typing import Optional
 
-from course_output.asset_catalog import ASSET_ENTRIES
+from course_output.asset_catalog import ASSET_ENTRIES, V2019_KEYED_ENTRIES
 from course_output.collection_library import Collection
 from course_output.objects import _placed_item, _placed_object_group_v2021
 from course_output.userLayers import GRID_ORIGIN_OFFSET
@@ -89,7 +89,7 @@ from terrain.stamp import TOOL_RAISE, Stamp
 
 _DECIMALS = 3
 
-_ENTRY_BY_KEY = {(e.category, e.type): e for e in ASSET_ENTRIES}
+_ENTRY_BY_KEY = {(e.category, e.type): e for e in V2019_KEYED_ENTRIES}
 _ENTRY_BY_PATH = {e.path: e for e in ASSET_ENTRIES}
 
 
@@ -306,7 +306,7 @@ def _resolve_v2019_key(obj: dict) -> Optional[tuple[int, int, bool]]:
     if obj.get("category") is not None and obj.get("type") is not None:
         return obj["category"], obj["type"], bool(obj.get("theme"))
     entry = _ENTRY_BY_PATH.get(obj.get("path"))
-    if entry is not None:
+    if entry is not None and entry.type is not None:  # type None = v2023-first, no v2019 id
         return entry.category, entry.type, entry.theme
     return None
 

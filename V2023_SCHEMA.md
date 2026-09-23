@@ -54,8 +54,15 @@ empty in v2023 (or relocated). The "clear generated objects" paint is
 **confirmed** to live in this same `surfaces` array with
 `surfaceCategory: 5` — see "Clear-generated-objects paint" below.
 
-The `height` layer entry shape is unchanged (tool/position/rotation/scale/
-type/value/holeId); `y: "-Infinity"` = terrain-grounded, same as v2021.
+The `height` layer entry is **trimmed vs v2021**: the game writes only
+`tool/position/rotation/scale/type/value/holeId` — v2021's `_orientation`,
+`radius` and `orientation` are gone (v2019 had `radius` only). The
+`surfaces` clear-objects stamps have the same trimmed shape. `y: "-Infinity"`
+= terrain-grounded, same as v2021. (Corrected 2026-09-23; this section
+earlier said "unchanged".) The writers follow this through
+`has_orientation_fields=False` / `has_radius_field=False` in the 2023
+`VersionSchema`. `water[]` entry shape is still unconfirmed: the sample's
+`water` is empty, so water entries are written in v2021 shape.
 
 ## placedObjects3.json entries (v2023)
 
@@ -191,6 +198,36 @@ had the key set `deletedHazards, newHazards, objects, clearTrees, addTrees,
 treeDensity, hazards, terrainHeight, height, trees, green, surfaces,
 outOfBounds, crowdLocations, water` and the v2021 sample's `surfaces` array
 was empty, so whether v2021 also honors category 5 is unconfirmed (0.3b.3).
+
+## Version registry (task 1.1 decisions, 2026-09-23)
+
+- **`placedObjects3` is a top-level CourseDescription key in v2023, same as
+  v2021.** It only *looked* absent from the v2023 base because
+  `util/course_extract.py` moves every non-empty list/dict value into a node
+  file (the v2021 template's `placedObjects3` was empty, so it stayed inline).
+  `course_repack.py` lets a node file override the base key, so no
+  `_ensure_course_baseline` / repack change was needed. Settled from the code,
+  no in-game check needed (task 1.1.2).
+- `holes2` / `surfaceSplines2` are the same kind of key (empty in the
+  sample). Writers now emit `holes2.json` / `surfaceSplines2.json` /
+  `userLayers2.json` via `schema_for(v).*_filename`, and repack puts them
+  under those keys.
+- `has_pins_field=True` for 2023 is **inherited from v2021, not confirmed**:
+  the sample's `holes2` is empty (0.3a.5).
+- `has_clear_objects=True` for 2023 only. v2019/v2021 stay False until 0.3b.3.
+- Theme: the v2023 sample carries `theme: 11` (= rustic), the same id as
+  the v2021 rustic template, so theme ids appear to carry over.
+  `templates/2023_rustic.course` is a blank built from `2023_fences.course`:
+  the placedObjects3 node is dropped and restored as an empty base key, the
+  userLayers2 `surfaces` stamps are cleared, `height` is cut down to the
+  single map-wide type-72 base stamp (the same one the v2021 template
+  carries), and it is renamed `rustic_2023` / `offlineSaverustic_2023`.
+  The thumbnail still shows the fence scene. Other themes need a blank saved
+  from the game.
+- **v2023 saves courses to `%USERPROFILE%\Documents\My Games\PGA TOUR
+  2K23\Courses`**, not `AppData\LocalLow\2K\...` like v2019/v2021 (its
+  LocalLow folder holds only logs). The GUI's `GAME_VERSION_FOLDERS` now maps
+  each version to a full home-relative path.
 
 ## What this does NOT confirm (still open)
 

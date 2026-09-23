@@ -93,7 +93,7 @@ from course_output.objects import (  # noqa: E402
     TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, load_objects, save_object_list, save_objects,
 )
 from course_output.asset_catalog import (  # noqa: E402
-    ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS,
+    ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS, V2019_KEYED_ENTRIES,
 )
 from course_output.object_clusters import (  # noqa: E402
     CLUSTER_FILL_MODE_AUTO, CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_STAMPS, CLUSTER_FILL_SOURCE_BORDER,
@@ -169,19 +169,22 @@ PREVIEW_FILES = [
     "preview_oob.png",
 ]
 
-# Game version -> Courses folder name under .../AppData/LocalLow/2K/.
-# Windows-specific path (AppData/LocalLow only exists on Windows, which is
-# also the only platform The Golf Club / PGA 2K actually runs on). Keyed
+# Game version -> the game's Courses folder, relative to the user's home.
+# v2019/v2021 save under AppData/LocalLow/2K/<title>/Courses; v2023 moved
+# to Documents/My Games/PGA TOUR 2K23/Courses (its LocalLow folder only
+# holds logs). Windows-specific paths (the only platform The Golf Club /
+# PGA 2K actually runs on). Keyed
 # by the SAME canonical version strings as objects.py's GAME_VERSIONS
 # ("2019", "2021", ...), not a display name -- this is looked up directly
 # from the single elevated Game version selector (self.game_version) at
 # the top of the window, same value write-objects targets, so "write" and
 # "move" (Copy to Game Folder) always agree on which version they mean.
-# 2023/2025 stay unmapped until those versions are actually implemented
-# (see objects.IMPLEMENTED_GAME_VERSIONS).
+# 2025 stays unmapped until it's actually implemented
+# (see game_versions.IMPLEMENTED_GAME_VERSIONS).
 GAME_VERSION_FOLDERS = {
-    "2019": "The Golf Club 2019",
-    "2021": "PGA TOUR 2K21",
+    "2019": Path("AppData/LocalLow/2K/The Golf Club 2019/Courses"),
+    "2021": Path("AppData/LocalLow/2K/PGA TOUR 2K21/Courses"),
+    "2023": Path("Documents/My Games/PGA TOUR 2K23/Courses"),
 }
 
 
@@ -207,7 +210,7 @@ def _spline_tag_detail(f: Feature) -> str:
     return f.tags.get("natural", "")
 
 
-_ASSET_LABEL_BY_KEY = {(e.category, e.type): e.display for e in ASSET_ENTRIES}
+_ASSET_LABEL_BY_KEY = {(e.category, e.type): e.display for e in V2019_KEYED_ENTRIES}
 _ASSET_LABEL_BY_PATH = {e.path: e.display for e in ASSET_ENTRIES}
 
 # Category id -> (legend label, RGB) for the Objects tab's "Show objects"
@@ -578,12 +581,12 @@ class PGAGenGUI:
             version_col, textvariable=self.game_version, state="readonly", width=8, values=list(GAME_VERSIONS),
         )
         game_version_box.pack(anchor="w", pady=(2, 0))
-        _Tooltip(game_version_box, "PGA 2K's .course schema diverges across versions -- currently "
-                 f"only {IMPLEMENTED_GAME_VERSIONS} are actually implemented (see objects.py's "
-                 "module docstring); the others can be selected and saved, but write/repack steps "
-                 "will raise a clear error until their schema is confirmed. Project-level, saved "
-                 "immediately, used by write-objects and (eventually) write-splines/write-terrain/"
-                 "repack.")
+        _Tooltip(game_version_box, "PGA 2K's .course schema diverges across versions (node filenames, "
+                 "object format -- see course_output/game_versions.py); implemented: "
+                 f"{IMPLEMENTED_GAME_VERSIONS}. Only the rustic theme has a bundled blank template "
+                 "(templates/{version}_rustic.course) for every version. Project-level, saved "
+                 "immediately, used by every write step and repack. After switching versions on an "
+                 "existing project, Reset Course Baseline so the old version's node files don't ship.")
         reset_baseline_btn = ttk.Button(
             version_row, text="Reset Course Baseline", command=self._run_ingest_course, width=22,
         )
@@ -5246,10 +5249,10 @@ class PGAGenGUI:
         mapping (see GAME_VERSION_FOLDERS). Doesn't check existence --
         callers that just want a dialog's starting point should.
         """
-        folder_name = GAME_VERSION_FOLDERS.get(version or self.game_version.get())
-        if folder_name is None:
+        rel_dir = GAME_VERSION_FOLDERS.get(version or self.game_version.get())
+        if rel_dir is None:
             return None
-        return Path.home() / "AppData" / "LocalLow" / "2K" / folder_name / "Courses"
+        return Path.home() / rel_dir
 
     def _courses_dir_dialog_kwarg(self) -> dict:
         """
@@ -5403,17 +5406,17 @@ class PGAGenGUI:
             return
 
         version = self.game_version.get()
-        folder_name = GAME_VERSION_FOLDERS.get(version)
-        if folder_name is None:
+        rel_dir = GAME_VERSION_FOLDERS.get(version)
+        if rel_dir is None:
             messagebox.showerror(
                 "Unknown game folder for this version",
                 f"No Courses-folder mapping is known yet for game_version={version!r} "
                 f"(only {list(GAME_VERSION_FOLDERS)} are wired up). Set Game version (top of "
-                "window) to one of those, or add this version's folder name to "
+                "window) to one of those, or add this version's Courses folder to "
                 "GAME_VERSION_FOLDERS once it's confirmed.",
             )
             return
-        dest_dir = Path.home() / "AppData" / "LocalLow" / "2K" / folder_name / "Courses"
+        dest_dir = Path.home() / rel_dir
         dest_path = dest_dir / source.name
 
         if dest_path.exists():

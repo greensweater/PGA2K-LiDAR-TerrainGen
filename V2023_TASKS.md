@@ -144,7 +144,16 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
 
 ## Phase 1 — Version registry + plumbing (low risk, unblocks everything)
 
-- [ ] **1.1 Add the `2023` `VersionSchema` entry** (`course_output/game_versions.py`)
+- [x] **1.1 Add the `2023` `VersionSchema` entry** (`course_output/game_versions.py`)
+  — DONE 2026-09-23. `schema_for("2023")` is fully populated. Hardcoded
+  node names were replaced by `schema_for(v).*_filename` in
+  `step_write_splines`, `step_write_holes`, `step_write_terrain`,
+  `step_write_water`, `_inject_collection_into_course` and
+  `step_import_ingame_edits`. `collection_library._height_entries` reads
+  either userLayers name. New flag `has_radius_field` (v2023 height/OOB stamps
+  drop `radius` as well as `_orientation`/`orientation`; see
+  `V2023_SCHEMA.md` userLayers2 section). 1.1.2 was resolved from code, not
+  in-game (see `V2023_SCHEMA.md` "Version registry").
   - **Context**: Phase 0 is done (schema in `V2023_SCHEMA.md`). This task
     registers v2023 in the version table so every downstream `schema_for(v)`
     call has something to return.
@@ -153,7 +162,7 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
     dict (look at the `2021` entry as the template), `IMPLEMENTED_GAME_VERSIONS`,
     and the module docstring.
   - **Steps**:
-  - [ ] 1.1.1 Set confirmed fields: `objects_filename="placedObjects3.json"`,
+  - [x] 1.1.1 Set confirmed fields: `objects_filename="placedObjects3.json"`,
         `theme_scheme="path"`, **`holes_filename="holes2"`**,
         **`splines_filename="surfaceSplines2"`**,
         **`userlayers_filename="userLayers2"`** (v2023 renames the v2021
@@ -163,20 +172,22 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
         nodes are produced, consumed, and stale-file-checked under the new
         names. Grep: `grep -rn 'holes\|surfaceSplines\|userLayers' --include='*.py' course_output/ util/ PGA2k_gen.py`
         (filter comments).
-  - [ ] 1.1.2 **Verify `placedObjects3` placement in v2023**: the v2021
+  - [x] 1.1.2 **Verify `placedObjects3` placement in v2023** (resolved: the
+        "absent from base" was an extractor artifact, see `V2023_SCHEMA.md`
+        "Version registry"): the v2021
         template carries `placedObjects3` as a *base* key (empty, inlined in
         CourseDescription), while v2023's base does NOT list it — the sample
         has it only as a node file. Confirm in-game that a repacked course
         with `CourseDescription_nodes/placedObjects3.json` (and the key absent
         from base) is loaded, and adjust `_ensure_course_baseline` /
         `course_repack.py` accordingly if the game wants it in the base.
-  - [ ] 1.1.3 Set capability flags: `has_fences=True` (objectPaths),
+  - [x] 1.1.3 Set capability flags: `has_fences=True` (objectPaths),
         `has_texture_paint` (deferred, Phase 4), and a clear-objects flag
         (e.g. `has_clear_objects=True` — the schema is confirmed; add the field
         to `VersionSchema` now, set it per version once 0.3b.3 resolves
         v2019/v2021 support).
-  - [ ] 1.1.4 Add `"2023"` to `IMPLEMENTED_GAME_VERSIONS`.
-  - [ ] 1.1.5 Update the module docstring to drop the "unconfirmed" note for
+  - [x] 1.1.4 Add `"2023"` to `IMPLEMENTED_GAME_VERSIONS`.
+  - [x] 1.1.5 Update the module docstring to drop the "unconfirmed" note for
         2023.
   - **Done when**: `schema_for("2023")` returns a fully-populated entry
     (no placeholder/None fields); `python3 -c "from course_output.game_versions import schema_for; print(schema_for('2023'))"`
@@ -184,7 +195,26 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
   - **Decisions to record**: any field whose meaning required a guess (e.g.
     whether `placedObjects3` belongs in base) → append to `V2023_SCHEMA.md`
     under "Version registry" with the decision + evidence.
-- [ ] **1.2 Thread v2023 through version-gated code**
+- [x] **1.2 Thread v2023 through version-gated code** — DONE 2026-09-23.
+  Branch audit (location → v2023 behavior); Phase 2/3 don't need to redo it:
+
+  | location | v2023 behavior |
+  |---|---|
+  | `_resolve_write_objects_params` / `step_import_ingame_edits` "isn't implemented" guards | pass (2023 is in `IMPLEMENTED_GAME_VERSIONS`) |
+  | `_build_placed_objects` `game_version == "2019"` (trees/stakes/clusters/spline fills) | v2021 path-keyed builders (same placedObjects3 items/clusters/splines shape) |
+  | same fn, waterfalls/splashes `== "2019"` | `build_*_v2021` |
+  | `_apply_course_theme` `!= "2019"` → return | no-op (template encodes the look) |
+  | `_inject_collection_into_course` `== "2019"` | `build_collection_objects_v2021`; splines/stamps go to the schema filenames |
+  | `object_clusters._NO_SPLINE_FILL_VERSIONS = {"2019"}` | spline fills enabled |
+  | `stamp_to_entry` / `oob_records_to_entries` | trimmed stamp shape via `has_orientation_fields` / `has_radius_field` |
+  | `_stale_version_node_files` | v2021 `holes.json`/`surfaceSplines.json`/`userLayers.json` leftovers flagged stale in a 2023 project |
+  | GUI `_sync_tree_assets_enabled` `!= "2019"` | tree-asset picker enabled |
+  | GUI `GAME_VERSION_FOLDERS` | `Documents/My Games/PGA TOUR 2K23/Courses` (not LocalLow) |
+  | `step_refine_terrain` | no version branch at all, nothing to do |
+
+  Not yet version-aware (Phase 2 scope): `write_user_layers`' blank fallback
+  schema is the v2021 key set (only used if the node file is missing);
+  `water[]` entries keep the v2021 shape (unconfirmed for v2023).
   - **Context**: after 1.1, `schema_for("2023")` works; now make sure no code
     path hard-rejects or mis-handles v2023.
   - **Where**: `PGA2k_gen.py` (the `"isn't implemented yet"` guard at
@@ -193,13 +223,13 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
     `PGA2k_gen_gui.py`. Start with:
     `grep -n 'game_version\|is_v2021\|is_v2019' PGA2k_gen.py PGA2k_gen_gui.py`.
   - **Steps**:
-  - [ ] 1.2.1 Audit every `game_version == "2019"` / `!= "2019"` / `is_v2021`
+  - [x] 1.2.1 Audit every `game_version == "2019"` / `!= "2019"` / `is_v2021`
         branch (notably `PGA2k_gen_gui.py:2639` — the v2021+ picker gating
         uses `!= "2019"` so v2023 falls into the v2021 side automatically;
         `step_write_objects`; `step_refine_terrain` at `PGA2k_gen.py:3816`)
         and decide v2023's behavior in each. Prefer `schema_for(v).has_*`
         flags over string comparisons where a capability drives the branch.
-  - [ ] 1.2.2 Add a v2023 branch to the `game_version` resolution/error path
+  - [x] 1.2.2 Add a v2023 branch to the `game_version` resolution/error path
         (`PGA2k_gen.py:2009` and the second guard at :5370 — "isn't implemented
         yet") so v2023 is no longer rejected.
   - **Done when**: `python PGA2k_gen.py --game-version 2023 ...` passes version
@@ -208,7 +238,14 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
   - **Decisions to record**: a one-line table (branch location → v2023
     behavior) appended to `V2023_TASKS.md` under this task, so Phase 2/3
     sessions don't re-audit.
-- [ ] **1.3 Add a v2023 theme/template baseline**
+- [ ] **1.3 Add a v2023 theme/template baseline** — code DONE 2026-09-23
+  (`templates/2023_rustic.course`; CLI `--game-version` choices come from
+  `GAME_VERSIONS`, and the GUI selector/tooltip read the registry). Checked
+  with `ingest-course` → `push-blank-template` → `repack` on a
+  `game_version=2023` project. **Ready for in-game verification:** load
+  `templates/2023_rustic.course` (or a `push-blank-template` output) in
+  v2023 and confirm it opens as an empty rustic course (no fences, carts,
+  signs or clear-object stamps; flat base).
   - **Context**: version resolution needs a resolvable template file to go
     end-to-end.
   - **Where**: `templates/` (existing `2019_*.course`, `2021_*.course`, and the
@@ -218,15 +255,26 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
     `--game-version` argparse choices.
   - **Steps**:
   - [ ] 1.3.1 Confirm which themes exist in v2023 (do v2019/v2021 theme IDs
-        carry over? new set?).
-  - [ ] 1.3.2 Add `templates/2023_{theme}.course` (from the confirmed v2023
+        carry over? new set?). *Partial:* the sample's `theme: 11` = rustic,
+        same id as v2021. The full v2023 theme list needs Andy (in-game).
+  - [x] 1.3.2 Add `templates/2023_{theme}.course` (from the confirmed v2023
         template file) so `resolve_course_template` can resolve v2023.
-  - [ ] 1.3.3 Expose v2023 + its theme list in the GUI version selector and
+        *Rustic only*, same as 2019/2021. More themes = save a blank per
+        theme from the game.
+  - [x] 1.3.3 Expose v2023 + its theme list in the GUI version selector and
         tooltip (currently reads `IMPLEMENTED_GAME_VERSIONS`/`THEMES_V2019`).
-  - [ ] 1.3.4 Expose v2023 in the CLI `--game-version` choices/help.
+  - [x] 1.3.4 Expose v2023 in the CLI `--game-version` choices/help.
   - **Done when**: `resolve_course_template("2023", theme)` returns a real file
     for every advertised theme; GUI + CLI both list v2023.
-- [ ] **1.4 Extend the asset catalog for new v2023 assets**
+- [x] **1.4 Extend the asset catalog for new v2023 assets** — DONE
+  2026-09-23 for everything in the sample. 10 new entries (4 fences, the
+  cart, 5 hole signs) with `type: null` + `min_game_version: "2023"`: they
+  have no v2019 id, so `(category, type)` lookups now build from
+  `V2019_KEYED_ENTRIES` and `_resolve_v2019_key` skips type-null entries.
+  `fence_options` sits on all 8 fence posts (`FENCE_ENTRIES`). Stone wall:
+  spacingRule complete (author); its other rules only have the sample's
+  values (`complete: false`) — they need the in-game trial (0.3a.1). Assets
+  outside the sample still need an in-game capture.
   - **Context**: v2023 adds fence/wall + prop assets (full list in
     `V2023_SCHEMA.md` "Fence/wall assets" + "Props seen in the sample"); the
     builder needs them in the catalog before Phase 2/3 can select them.
@@ -234,17 +282,20 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
     both first — learn the existing entry shape and the v2019/v2021→v2023
     mapping pattern).
   - **Steps**:
-  - [ ] 1.4.1 Add the new v2023 assets (from `V2023_SCHEMA.md`) to
+  - [x] 1.4.1 Add the new v2023 assets (from `V2023_SCHEMA.md`) to
         `course_output/asset_catalog.json` / `asset_catalog.py` — fence/wall
         materials (the 8 in the sample — see `V2023_SCHEMA.md` "Fence/wall
         assets": StoneWall, WoodFences, CanvasFence Red/Black, Hedge,
         Asia_BrickWalls, UniFence, RetainWall; the sample is fence-focused,
         check the game for the full set), plus carts/hole-signs from
         `Assets/CourseProps/**` if the catalog covers props.
-  - [ ] 1.4.2 Record v2019/v2021→v2023 asset-path mappings for shared props
+  - [x] 1.4.2 Record v2019/v2021→v2023 asset-path mappings for shared props
         (the existing catalog pattern, e.g. the fence-post stake mapping) so
         a prop re-written across versions stays the identical asset.
-  - [ ] 1.4.3 **Fence option matrix** (data): add a per-fence-asset field for
+        *Identity mapping:* all 4 shared wall posts appear in the v2023 sample
+        under exactly their v2021 catalog paths (recorded in the catalog's
+        `v2023_note`).
+  - [x] 1.4.3 **Fence option matrix** (data): add a per-fence-asset field for
         the allowed `spacingRule`/`hasCurves`/`heightRule` set — seed from the
         author's statement (stone wall = all 4 caps) and the sample rows, mark
         unknown cells explicitly; this feeds 3.2.3 validation and 0.3a.1.

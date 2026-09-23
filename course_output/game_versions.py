@@ -27,12 +27,10 @@ This registry only centralizes the mechanical bits: which node file a
 version writes to, and which capabilities (has_object_splines, etc.)
 gate which branch a writer takes.
 
-"2023"/"2025" entries are UNCONFIRMED placeholders -- their real
-schemas haven't been diffed against an extracted .course file the way
-2019 vs 2021 was (see hhills3_2019/hhills3_2021). They exist here so
-GAME_VERSIONS can list them for UI/CLI purposes, but
-IMPLEMENTED_GAME_VERSIONS keeps them out of anything that would
-actually try to build output for them.
+"2023" is confirmed: templates/2023_fences.course was diffed against
+2021_rustic.course the same way hhills3_2019/hhills3_2021 were (findings
+in V2023_SCHEMA.md). "2025" is still unconfirmed and gets no entry here
+until its schema is diffed the same way.
 """
 from __future__ import annotations
 
@@ -51,9 +49,15 @@ class VersionSchema:
     theme_scheme: str = "numeric"
     has_object_splines: bool = False  # v2021+ Value.splines[] fill regions
     has_pins_field: bool = False  # v2021+ holes.json "pins"
-    has_orientation_fields: bool = False  # v2021+ userLayers height-entry _orientation/orientation
-    has_fences: bool = False  # v2023+ -- UNCONFIRMED placeholder, not implemented
-    has_texture_paint: bool = False  # v2023+ -- UNCONFIRMED placeholder, not implemented
+    has_orientation_fields: bool = False  # v2021 only: userLayers height/OOB-entry _orientation/orientation
+    has_radius_field: bool = True  # v2019/v2021 height/OOB entries carry "radius": 0.0; v2023 dropped it
+    has_fences: bool = False  # v2023+ placedObjects3 Value.objectPaths[] (schema confirmed, writer not built yet)
+    has_texture_paint: bool = False  # v2023+ -- deferred (V2023_TASKS.md Phase 4), not implemented
+    # userLayers "surfaces" entries with surfaceCategory 5 (brush-stamp
+    # exclusion zone for generated objects). Confirmed written by v2023;
+    # whether v2019/v2021 honor it is still open (V2023_TASKS.md 0.3b.3),
+    # so they stay False until checked.
+    has_clear_objects: bool = False
     has_spline_water: bool = False  # v2025+ -- UNCONFIRMED placeholder, not implemented
 
 
@@ -63,15 +67,28 @@ VERSION_SCHEMAS: dict[str, VersionSchema] = {
         version="2021", objects_filename="placedObjects3.json", theme_scheme="path",
         has_object_splines=True, has_pins_field=True, has_orientation_fields=True,
     ),
-    # "2023"/"2025" entries added once their real schemas are confirmed the
-    # same way hhills3_2019/hhills3_2021 were diffed -- not populated
-    # speculatively.
+    # v2023 renames three v2021 nodes (holes -> holes2, surfaceSplines ->
+    # surfaceSplines2, userLayers -> userLayers2); placedObjects3 keeps its
+    # name. All four are top-level CourseDescription keys, same as v2021
+    # (see V2023_SCHEMA.md "Version registry"). Its brush-stamp entries
+    # (height/surfaces) are trimmed to tool/position/rotation/scale/type/
+    # value/holeId -- no _orientation/radius/orientation. has_pins_field
+    # is inherited from v2021 unconfirmed (the sample's holes2 is empty).
+    "2023": VersionSchema(
+        version="2023", objects_filename="placedObjects3.json",
+        holes_filename="holes2.json", splines_filename="surfaceSplines2.json",
+        userlayers_filename="userLayers2.json", theme_scheme="path",
+        has_object_splines=True, has_pins_field=True, has_orientation_fields=False,
+        has_radius_field=False, has_fences=True, has_clear_objects=True,
+    ),
+    # "2025" added once its real schema is confirmed the same way -- not
+    # populated speculatively.
 }
 
 # Kept as strings (not ints) since "2019" etc. are display/config labels,
 # not quantities -- nothing here does arithmetic on a version.
 GAME_VERSIONS = tuple(VERSION_SCHEMAS)
-IMPLEMENTED_GAME_VERSIONS = ("2019", "2021")
+IMPLEMENTED_GAME_VERSIONS = ("2019", "2021", "2023")
 DEFAULT_GAME_VERSION = "2019"
 
 

@@ -21,6 +21,13 @@ by per-theme numeric type id for v2019 (native_tree_height_v2019, gated
 on CATALOG_SOURCE_THEME_ID since those ids are theme-specific).
 native_canopy_radius_m is captured but not yet consumed (scale is
 uniform x=y=z).
+
+v2023-first assets (min_game_version="2023", see the JSON's
+"v2023_note") have type=None -- no v2019 id exists, so every
+(category, type) lookup must skip them (V2019_KEYED_ENTRIES) and they
+can only be written by path. Fence/wall post prefabs carry
+fence_options, the per-asset objectPaths option matrix (see the JSON's
+"fence_options_note"; FENCE_ENTRIES).
 """
 
 from __future__ import annotations
@@ -44,7 +51,7 @@ class AssetCategory:
 @dataclass(frozen=True, slots=True)
 class AssetEntry:
     category: int
-    type: int
+    type: Optional[int]  # None = no v2019 id (v2023-first asset) -- path-only, see V2019_KEYED_ENTRIES
     theme: bool
     path: str
     spacing: Optional[float]  # None = no measured planting density -- can't be cluster-filled, see CLUSTERABLE_ENTRIES
@@ -61,6 +68,12 @@ class AssetEntry:
     # read by the write-objects pipeline. None = no blurb written yet;
     # display() then falls back to `label`.
     description: Optional[str] = None
+    # Earliest game version this asset is confirmed in; None = in the
+    # original v2019->v2021 capture (available everywhere).
+    min_game_version: Optional[str] = None
+    # v2023 objectPaths option matrix: {rule field: {"values": [...],
+    # "complete": bool}} -- None = not a fence/wall objectPath asset.
+    fence_options: Optional[dict] = None
 
     @property
     def label(self) -> str:
@@ -87,6 +100,8 @@ def _load() -> tuple[dict[int, AssetCategory], list[AssetEntry], Optional[int]]:
             native_height_m=e.get("native_height_m"),
             native_canopy_radius_m=e.get("native_canopy_radius_m"),
             description=e.get("description"),
+            min_game_version=e.get("min_game_version"),
+            fence_options=e.get("fence_options"),
         )
         for e in data["entries"]
     ]
@@ -94,6 +109,15 @@ def _load() -> tuple[dict[int, AssetCategory], list[AssetEntry], Optional[int]]:
 
 
 ASSET_CATEGORIES, ASSET_ENTRIES, CATALOG_SOURCE_THEME_ID = _load()
+
+# Entries with a real v2019 (category, type) id -- what every
+# (category, type)-keyed lookup must be built from, so a v2023-first
+# type=None entry never resolves into v2019 output.
+V2019_KEYED_ENTRIES = [e for e in ASSET_ENTRIES if e.type is not None]
+
+# v2023 objectPaths fence/wall materials (the group Key.path an
+# objectPaths[] entry sits under), with their option matrix.
+FENCE_ENTRIES = [e for e in ASSET_ENTRIES if e.fence_options is not None]
 
 # Native tree heights (m) for calibrated placed-tree scale in
 # course_output/objects.py. v2021+ keys placed objects by global asset

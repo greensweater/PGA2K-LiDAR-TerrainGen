@@ -59,7 +59,7 @@ directory, running one pipeline step at a time:
                                  [--water-stripe-min-edge-m M] [--water-stripe-tolerance-m M]
                                  [--water-stripe-max-stripes-per-side N] [--water-stripe-buffer-m M]
     PGA2k_gen.py <working_dir> --step generate-trees [--detect-lidar-trees] [--mark-cartpath-trees]
-    PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023|2025>]
+    PGA2k_gen.py <working_dir> --step write-objects [--game-version <2019|2021|2023>]
                                  [--theme <id-or-name>] [--tree-variety] [--stake-buildings]
                                  [--tree-asset-path <path>]...
                                  [--tree-type-asset-path <TAG=path>]... [--stake-asset-path <path>]  (2021+)
@@ -1471,7 +1471,8 @@ def step_write_splines(working_dir: Path, registration_marks: bool = False) -> N
     _ensure_course_baseline(working_dir)
     nodes_dir = working_dir / "course" / "CourseDescription_nodes"
 
-    out_path = nodes_dir / "surfaceSplines.json"
+    game_version = load_project(working_dir).get("game_version", DEFAULT_GAME_VERSION)
+    out_path = nodes_dir / schema_for(game_version).splines_filename
     save_surface_splines(splines, out_path)
     print(f"Wrote {out_path}")
 
@@ -1516,7 +1517,7 @@ def step_write_holes(working_dir: Path) -> None:
     _ensure_course_baseline(working_dir)
     nodes_dir = working_dir / "course" / "CourseDescription_nodes"
 
-    out_path = nodes_dir / "holes.json"
+    out_path = nodes_dir / schema_for(game_version).holes_filename
     save_holes(holes, out_path)
     print(f"Wrote {out_path}")
 
@@ -2165,7 +2166,7 @@ def _build_placed_objects(
                   "v2019 has no object-spline schema, and objects.json was packed for a different "
                   "version. Re-run pack-objects: mode=auto / mode=spline fills fall back to "
                   "circle-scatter for a v2019 target.")
-    else:  # 2021+ (only "2021" itself is in IMPLEMENTED_GAME_VERSIONS right now)
+    else:  # 2021+ (v2023 shares v2021's placedObjects3 items/clusters/splines schema)
         if trees:
             pool, type_map = tree_asset_paths, tree_type_asset_paths
             if not pool and not type_map:
@@ -4357,7 +4358,7 @@ def step_write_terrain(
     elif "oob_enabled" in project:
         oob_entries = []
 
-    out_path = nodes_dir / "userLayers.json"
+    out_path = nodes_dir / schema_for(game_version).userlayers_filename
     write_user_layers(out_path, stamps=stamps, oob=oob_entries, game_version=game_version)
     print(f"Wrote {out_path}")
     if oob_entries:
@@ -4480,7 +4481,8 @@ def step_write_water(
                 "streams_water_widen_per_descent", STREAM_WATER_WIDEN_PER_DESCENT),
         )
 
-    out_path = nodes_dir / "userLayers.json"
+    game_version = load_project(working_dir).get("game_version", DEFAULT_GAME_VERSION)
+    out_path = nodes_dir / schema_for(game_version).userlayers_filename
     write_user_layers(out_path, water=water_entries)
     print(f"Wrote {out_path} ({len(water_entries)} water object(s))")
 
@@ -4752,7 +4754,7 @@ def _inject_collection_into_course(nodes_dir: Path, record: dict, game_version: 
     # --- splines ---
     new_splines = build_collection_splines([record])
     if new_splines:
-        spl_path = nodes_dir / "surfaceSplines.json"
+        spl_path = nodes_dir / schema_for(game_version).splines_filename
         if spl_path.exists():
             with spl_path.open(encoding="utf-8") as fh:
                 existing_splines = json.load(fh)
@@ -4765,7 +4767,7 @@ def _inject_collection_into_course(nodes_dir: Path, record: dict, game_version: 
     stamps = build_collection_stamps([record])
     n_stamps = 0
     if stamps:
-        ul_path = nodes_dir / "userLayers.json"
+        ul_path = nodes_dir / schema_for(game_version).userlayers_filename
         if ul_path.exists():
             with ul_path.open(encoding="utf-8") as fh:
                 ul = json.load(fh)
@@ -5402,7 +5404,7 @@ def step_import_ingame_edits(
             )
         actual_groups = load_placed_objects(objects_node_path)
 
-        userlayers_path = nodes_dir / "userLayers.json"
+        userlayers_path = nodes_dir / schema.userlayers_filename
         actual_stamp_entries: list[dict] = []
         if userlayers_path.exists():
             with userlayers_path.open(encoding="utf-8") as f:
@@ -6233,11 +6235,10 @@ def main(argv: list[str] | None = None) -> int:
                               "course). Optional -- defaults to a generated serial "
                               "('LIDAR-<version>-<timestamp>' / 'COLL-<name>-<timestamp>').")
     parser.add_argument("--game-version", type=str, default=None, choices=GAME_VERSIONS,
-                         help="Project-level target game version -- selects which of objects.py's "
-                              f"placedObjects2 schemas write-objects writes (implemented: "
-                              f"{IMPLEMENTED_GAME_VERSIONS}; the rest are accepted here but will "
-                              "raise a clear error until their schema is confirmed -- see "
-                              "objects.py's module docstring). Persists to project.json when given, "
+                         help="Project-level target game version -- selects the .course schema "
+                              "(node filenames + object format, see course_output/game_versions.py) "
+                              f"every write step targets (implemented: {IMPLEMENTED_GAME_VERSIONS}). "
+                              "Persists to project.json when given, "
                               "same as the GUI's top-level Game version selector. Default: use "
                               f"whatever's saved in project.json, or {DEFAULT_GAME_VERSION} if never set.")
     parser.add_argument("--theme", type=str, default=None,

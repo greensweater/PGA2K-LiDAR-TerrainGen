@@ -172,7 +172,9 @@ from typing import Optional
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 from shapely.ops import unary_union
 
-from course_output.asset_catalog import ASSET_CATEGORIES, ASSET_ENTRIES, AssetCategory, AssetEntry, cluster_count
+from course_output.asset_catalog import (
+    ASSET_CATEGORIES, ASSET_ENTRIES, V2019_KEYED_ENTRIES, AssetCategory, AssetEntry, cluster_count,
+)
 from course_output.game_versions import DEFAULT_GAME_VERSION
 from course_output.userLayers import GRID_ORIGIN_OFFSET
 from ingest.osm import Feature
@@ -342,7 +344,7 @@ _DECIMALS = 3
 def _round(value: float) -> float:
     return round(float(value), _DECIMALS)
 
-_ENTRIES_BY_KEY = {(e.category, e.type): e for e in ASSET_ENTRIES}
+_ENTRIES_BY_KEY = {(e.category, e.type): e for e in V2019_KEYED_ENTRIES}
 
 
 def _resolve_spec(spec: dict) -> Optional[tuple[AssetCategory, AssetEntry]]:
