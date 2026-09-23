@@ -13,6 +13,27 @@ Context is limited in this setup: keep reads targeted (offset/limit windows,
 `grep`/`awk` for scanning, not whole-file reads), and append findings to
 `OPTIMIZATION_AUDIT.md` incrementally so progress survives a context reset.
 
+## `.course` file format + extraction
+
+`.course` files are **gzip-compressed UTF-16LE JSON** (NOT zip — `unzip`
+fails). Outer JSON = meta, whose `binaryData` holds base64(gzip(UTF-16LE
+JSON)) blobs for `CourseDescription`, `CourseMetadata`, `Thumbnail`.
+Extract/repack with the repo tools (no third-party deps; system python3
+works):
+
+- `python3 util/course_extract.py <file.course> <out_dir>` →
+  `out_dir/CourseDescription.json` (base fields),
+  `CourseDescription_nodes/<key>.json` (one file per top-level list/dict
+  value — **node files are the schema surface to diff**), `CourseMetadata.json`,
+  `meta.json`, `Thumbnail.jpg` + `Thumbnail_meta.json`.
+- `python3 util/course_repack.py <course_dir> <out.course>` (inverts the
+  above; `step_repack` calls it as a subprocess).
+
+Schema discovery workflow (used for v2019/v2021/v2023): extract two
+versions' `.course` files and diff the `CourseDescription_nodes/` sets and
+entry shapes. v2023 findings live in `V2023_SCHEMA.md`; the v2023 work plan
+in `V2023_TASKS.md`.
+
 ## Repo layout (what actually matters)
 
 Python golf-course terrain generator: ingests LAZ LiDAR + OpenStreetMap, emits

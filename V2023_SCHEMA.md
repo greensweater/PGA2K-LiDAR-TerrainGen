@@ -20,21 +20,39 @@ work unchanged for v2023.
 - Node files renamed: `userLayers` → **`userLayers2.json`**,
   `weather2` → **`weather3.json`**.
 - Base keys renamed: `holes` → **`holes2`**, `surfaceSplines` →
-  **`surfaceSplines2`**.
+  **`surfaceSplines2`** (base keys, not node files — the sample has both
+  empty, so no node file was emitted).
 - New base keys: `blurHeight`, `useV28FairwaySeed`, `useV30Rough`.
-- `placedObjects3` is the SAME key name in both (confirmed: v2023 writes
-  `placedObjects3.json`, matching the user-confirmed fact).
+- **`placedObjects3`: base key present in v2021 (empty, inlined), ABSENT from
+  the v2023 base** — in v2023 it appears only as a node file. Whether the
+  game wants it in the v2023 base too is unverified (task 1.1.2).
 - `CourseMetadata.json`, `meta.json`, `Thumbnail` — structurally unchanged.
 
 ## userLayers2.json (v2023)
+
+### Node renames (v2021 → v2023)
+
+| v2021 | v2023 |
+|---|---|
+| `userLayers.json` | `userLayers2.json` |
+| `holes.json` | `holes2.json` (base key `holes` → `holes2`) |
+| `surfaceSplines.json` | `surfaceSplines2.json` (base key renamed too) |
+| `weather2.json` | `weather3.json` |
+
+Confirmed node set (v2023, from the sample): `fairwayEdge, fairwayEdge2,
+fairwayNoise, grassNoise, greenEdge, greenNoise, hazardEdge, hazardVariance,
+perturbationNoise, placedObjects3, roughEdge, roughNoise, surfaces,
+teeColours, terrainNoise, treeOptions, unplayableNoise, userLayers2,
+weather3`. (`holes2`/`surfaceSplines2` exist as base keys but were empty in
+the sample, so no node file was emitted for them.)
 
 Sample keys (blank-ish course): `treeDensity`, `terrainHeight`, `height`,
 `surfaces`, `outOfBounds`, `crowdLocations`, `water`. The v2021
 `userLayers.json` additionally had `deletedHazards`, `newHazards`, `objects`,
 `clearTrees`, `addTrees`, `hazards`, `trees`, `green` — likely omitted when
-empty in v2023 (or relocated). **UNCONFIRMED**: whether a "clear generated
-objects" layer exists in v2023 and its key name — the sample course has no
-clear-objects paint. Need a course with that feature painted (see task 0.3b).
+empty in v2023 (or relocated). The "clear generated objects" paint is
+**confirmed** to live in this same `surfaces` array with
+`surfaceCategory: 5` — see "Clear-generated-objects paint" below.
 
 The `height` layer entry shape is unchanged (tool/position/rotation/scale/
 type/value/holeId); `y: "-Infinity"` = terrain-grounded, same as v2021.
@@ -79,6 +97,20 @@ objectPaths, IsEmpty}}]`.
     (`*Post*Prefab` / `*SplinePostPrefab`); carts/signs under
     `Assets/CourseProps/**`.
 
+### Fence/wall assets (v2023, from the sample)
+
+`Assets/CourseGen/Detail/Walls/` (8 in the sample): `StoneWallAPostAPrefab`,
+`WoodFencesAPostAPrefab`, `CanvasFence01AARedPostAPrefab`,
+`CanvasFence01AABlackPostAPrefab`, `HedgeSplinePostPrefab`,
+`Asia_Walls/Asia_BrickWalls_PostPrefab`, `UniFencePostAPrefab`,
+`RetainWallAPostAPrefab`. (The sample is fence-focused, not exhaustive —
+other fence assets may exist in the game; 1.4.1 should check.)
+
+### Props seen in the sample (v2023)
+
+`Assets/CourseProps/Equipment/GolfCartPrefab` (one tilted entry — tilt legal
+in v2023) and `Assets/CourseProps/Signs/HoleSign0[1-5]Prefab` (5 hole signs).
+
 ## objectPaths rule fields → observed options
 
 Confirmed from the 12 fence objectPaths in the sample (all `spacing` 4.0
@@ -109,10 +141,10 @@ options are available per asset"):**
 | `Asia_BrickWalls_PostPrefab` | 0, 1, 2, 3 | false, true | 0, 1 | 0, 1 |
 | `RetainWallAPostAPrefab` | 0 | true (4 wp, state=1) | 0 | 1 |
 
-The brick wall sample exercises all four spacingRule values → the author
-described the **stone fence** as having the full option set (caps ×4,
-stepped/contoured, curved/straight); canvas/hedge rows in the sample do not
-exercise every value. Per-asset option matrix must be confirmed in-game.
+Per-asset option matrix must still be confirmed in-game (0.3a.1) — the
+author confirmed only that the **stone wall** has the full 4-cap option set
+(omitted from the course for brevity); canvas/hedge rows in the sample don't
+cover every value either.
 
 ## "Tricks" from the sample course (reproducible recipes)
 
@@ -133,14 +165,42 @@ known to us): `HoleSign01 z≈121.7`, `02 z≈123.8`, `03 z≈126.2`,
 → **In-game subtask: confirm the HoleSign0N ↔ color mapping** (depends on
 which z direction is "north" in-game).
 
-## What this does NOT confirm (still open for Phase 0)
+## Clear-generated-objects paint (CONFIRMED, second export 2026-09-23)
 
-1. The **clear-generated-objects** layer: name, entry shape, and which
-   generated object types it suppresses (2021's userLayers has `clearTrees`;
-   v2023 sample has no painted example).
-2. Per-asset fence option matrix (which spacingRule/hasCurves/heightRule are
-   valid per fence type) — needs in-game trial per asset.
-3. `flexibilityRule` and `state` semantics.
+The re-exported `2023_fences.course` (commit `8376f0e`) added
+**clear_generated_objects stamps** — they live in the **existing
+`userLayers2.json` `surfaces` layer** as `surfaceCategory: 5` entries (NOT a
+new key). Two stamps were provided:
+
+- square: `type: 15` at `(-575.4, z 165.1)`, scale 58.8456268, value 1.0
+- round:  `type: 8`  at `(-751.7, z 176.5)`, scale 58.8456268, value 1.0
+
+`type` 8 (round) / 15 (smooth square) are the SAME brush ids the OOB feature
+uses (`OOB_ROUND_BRUSH=8`, `OOB_SQUARE_BRUSH=15` in
+`course_output/out_of_bounds.py`) — the course author's expectation that they
+correspond to known stamp shapes is borne out by the data; the in-game visual
+match still needs a quick check (0.3b.2). Entry shape is identical to a
+height-layer stamp (tool 0, y "-Infinity" = terrain-grounded, value 1.0) but
+with `surfaceCategory` instead of the height layer's `value` semantics.
+
+Known `surfaceCategory` values so far: **5 = clear generated objects** (this
+sample), **9 = water** (`course_output/water.py`
+`WATER_SURFACE_CATEGORY=9`, written with `type: 15` stamps). Category 5 was
+unused by this repo's writers in both v2019/v2021 — v2021's userLayers.json
+had the key set `deletedHazards, newHazards, objects, clearTrees, addTrees,
+treeDensity, hazards, terrainHeight, height, trees, green, surfaces,
+outOfBounds, crowdLocations, water` and the v2021 sample's `surfaces` array
+was empty, so whether v2021 also honors category 5 is unconfirmed (0.3b.3).
+
+## What this does NOT confirm (still open)
+
+1. **Per-asset fence option matrix** (which spacingRule/hasCurves/heightRule
+   are valid per fence asset; stone wall confirmed full 4 caps by the author)
+   — needs in-game trial per asset.
+2. `flexibilityRule` and `state` semantics.
+3. `spacingRule` → cap-style ordering (which of 0–3 is none/spaced/points/ends).
 4. Whether `holes2`/`surfaceSplines2` entry shapes differ from
    `holes`/`surfaceSplines` (sample has both empty).
-5. `spacingRule` → cap-style ordering (which of 0–3 is none/spaced/points/ends).
+5. Clear-objects details: in-game confirmation that category 5 actually
+   suppresses generated objects (and which kinds), whether v2021 honors it too,
+   and the exact `value` semantics of the surface stamp.
