@@ -120,6 +120,19 @@ _BLANK_USER_LAYERS_SCHEMA = {
     "water": [],
 }
 
+# v2023's userLayers2.json key set, in the game's own order
+# (templates/2023_fences.course). The v2021-only keys (deletedHazards,
+# trees, green, ...) aren't written by v2023 -- see V2023_SCHEMA.md.
+_BLANK_USER_LAYERS_SCHEMA_V2023 = {
+    "treeDensity": [],
+    "terrainHeight": [],
+    "height": [],
+    "surfaces": [],
+    "outOfBounds": [],
+    "crowdLocations": [],
+    "water": [],
+}
+
 _DECIMALS = 3
 
 
@@ -435,7 +448,8 @@ def write_user_layers(
     throughout.
 
     If `path` doesn't exist yet, falls back to an all-empty schema
-    (_BLANK_USER_LAYERS_SCHEMA) rather than writing a bare array --
+    (_BLANK_USER_LAYERS_SCHEMA, or _BLANK_USER_LAYERS_SCHEMA_V2023 for
+    game_version 2023) rather than writing a bare array --
     userLayers.json is always the full object, never just our stamps.
     """
     path = Path(path)
@@ -443,6 +457,8 @@ def write_user_layers(
     if path.exists():
         with path.open(encoding="utf-8") as f:
             data = json.load(f)
+    elif game_version == "2023":
+        data = dict(_BLANK_USER_LAYERS_SCHEMA_V2023)
     else:
         data = dict(_BLANK_USER_LAYERS_SCHEMA)
 

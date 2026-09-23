@@ -28,10 +28,14 @@ place that divergence is confirmed concretely:
     Value.splines), which v2019 has no equivalent for at all. See
     build_tree_objects_v2021.
 
-v2023 keeps v2021's placedObjects3.json items/clusters/splines shape
-unchanged (confirmed from templates/2023_fences.course, see
-V2023_SCHEMA.md), so it goes through the _v2021 builders; its new
-Value.objectPaths[] (spline fences) has no builder here yet. v2025
+v2023 keeps v2021's placedObjects3.json item/cluster/spline entry
+shapes unchanged (confirmed from templates/2023_fences.course, see
+V2023_SCHEMA.md), so it goes through the _v2021 builders -- there is no
+per-version asset resolution to differ, so no build_X_v2023 copies.
+What does differ is the group envelope: v2023 adds Value.objectPaths[]
+and a derived Value.IsEmpty to every group, which
+placed_object_groups_to_v2023 applies once over the merged group list.
+objectPaths[] (spline fences) has no builder here yet. v2025
 isn't confirmed against a real extracted .course file, so
 IMPLEMENTED_GAME_VERSIONS (game_versions.py) excludes it rather than
 guessing.
@@ -1371,6 +1375,11 @@ def merge_object_groups(groups: list[dict]) -> list[dict]:
     one asset, instead of one node with everything merged in. This is
     the single place that's fixed up, applied once after every
     builder's contribution has been concatenated together.
+
+    Only list fields are merged. A scalar Value field -- v2023's derived
+    IsEmpty flag, present on groups loaded back from a game-saved v2023
+    course -- is dropped here; placed_object_groups_to_v2023 recomputes
+    it from the merged lists.
     """
     merged: dict[tuple, dict] = {}
     order: list[tuple] = []
@@ -1381,9 +1390,38 @@ def merge_object_groups(groups: list[dict]) -> list[dict]:
             order.append(key)
         dest_value = merged[key]["Value"]
         for field, seq in g.get("Value", {}).items():
+            if not isinstance(seq, list):
+                continue
             dest_value.setdefault(field, [])
             dest_value[field].extend(seq)
     return [merged[k] for k in order]
+
+
+# v2023's group Value field order, exactly as the game writes it
+# (templates/2023_fences.course -- every group carries all five).
+_V2023_GROUP_LIST_FIELDS = ("items", "clusters", "splines", "objectPaths")
+
+
+def placed_object_groups_to_v2023(groups: list[dict]) -> list[dict]:
+    """
+    v2023 placedObjects3 groups from v2021-shaped ones. The item/cluster/
+    spline entries themselves are unchanged in v2023 (see V2023_SCHEMA.md),
+    so every _v2021 builder's output is reused as-is; only the group
+    envelope differs: v2021 writes Value {items, clusters, splines}, v2023
+    writes {items, clusters, splines, objectPaths, IsEmpty} on EVERY group
+    (objectPaths [] when the group has no fence). IsEmpty is derived --
+    True only when all four lists are empty (the sample only shows False,
+    on non-empty groups). Applied once, after merge_object_groups, by
+    every v2023 placedObjects3 writer (step_write_objects,
+    _inject_collection_into_course).
+    """
+    out = []
+    for g in groups:
+        value = g.get("Value", {})
+        new_value = {field: list(value.get(field, [])) for field in _V2023_GROUP_LIST_FIELDS}
+        new_value["IsEmpty"] = not any(new_value[field] for field in _V2023_GROUP_LIST_FIELDS)
+        out.append({"Key": g["Key"], "Value": new_value})
+    return out
 
 
 def object_counts(objects: list[dict]) -> list[tuple[str, int, int, int]]:

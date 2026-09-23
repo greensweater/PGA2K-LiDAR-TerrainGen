@@ -229,6 +229,43 @@ was empty, so whether v2021 also honors category 5 is unconfirmed (0.3b.3).
   LocalLow folder holds only logs). The GUI's `GAME_VERSION_FOLDERS` now maps
   each version to a full home-relative path.
 
+## Phase 2 re-target decisions (2026-09-23)
+
+- **placedObjects3 group envelope differs; entries don't.** The game writes
+  every v2023 group as `Value: {items, clusters, splines, objectPaths,
+  IsEmpty}` (all 14 sample groups, `objectPaths: []` when the group has no
+  fence, `IsEmpty: false`). v2021 game saves (`templates/rangenets.course`,
+  v25) write `{items, clusters, splines}` only. Item/cluster/spline entry
+  shapes are identical. So there are **no `build_X_v2023` copies** of the
+  tree/stake/cluster/spline-fill/waterfall builders (no per-version
+  resolution logic differs). Instead `objects.placed_object_groups_to_v2023`
+  applies the envelope once, after `merge_object_groups`, gated on
+  `schema_for(v).has_fences`. `IsEmpty` is derived as "all four lists empty";
+  the sample only shows `false` on non-empty groups, so the `true` case is
+  inferred.
+- `merge_object_groups` now merges list fields only. Before this, merging a
+  game-saved v2023 group (scalar `IsEmpty`) crashed with `extend(False)`,
+  for example `_inject_collection_into_course` into a v2023 course that
+  already has objects.
+- `userLayers2.json` blank fallback (`_BLANK_USER_LAYERS_SCHEMA_V2023`) = the
+  sample's 7 keys. Only used when the node file is missing.
+- **`water[]` entries still use the v2021 shape** (`_orientation`/`radius`/
+  `orientation` included). No v2023 water sample exists, and a field the
+  game ignores is safer than dropping one it needs. The in-game load (2.3.2)
+  decides. If the game re-saves water trimmed like `height`, gate
+  `water._water_entry` on `has_orientation_fields`/`has_radius_field`.
+- `holes2`/`surfaceSplines2` are written in the v2021 entry shape
+  (unconfirmed, sample empty — same as open item 4 below).
+- Collection `options.OffsetIndex` is written as an int (`0`); the game
+  writes a float (`0.0`). JSON-number-equivalent, so it's left alone unless
+  the in-game load says otherwise.
+- **Catalog correction pending:** `HoleSign01Prefab` was already used in
+  v2021 projects before the v2023 work began (`~/.pga2k/collections/hole_sign.json`,
+  2026-09-20; shawnee v2021 `placedObjects3.json`), so its
+  `min_game_version: "2023"` in `asset_catalog.json` is wrong. HoleSign02–05
+  and `GolfCartPrefab` are unverified for v2021. Nothing reads
+  `min_game_version` yet, so this has no effect on output.
+
 ## What this does NOT confirm (still open)
 
 1. **Per-asset fence option matrix** (which spacingRule/hasCurves/heightRule

@@ -51,7 +51,10 @@ class VersionSchema:
     has_pins_field: bool = False  # v2021+ holes.json "pins"
     has_orientation_fields: bool = False  # v2021 only: userLayers height/OOB-entry _orientation/orientation
     has_radius_field: bool = True  # v2019/v2021 height/OOB entries carry "radius": 0.0; v2023 dropped it
-    has_fences: bool = False  # v2023+ placedObjects3 Value.objectPaths[] (schema confirmed, writer not built yet)
+    # v2023+ placedObjects3 Value.objectPaths[] (schema confirmed, fence
+    # writer not built yet). Also gates the v2023 group envelope
+    # (objectPaths + IsEmpty on every group, objects.placed_object_groups_to_v2023).
+    has_fences: bool = False
     has_texture_paint: bool = False  # v2023+ -- deferred (V2023_TASKS.md Phase 4), not implemented
     # userLayers "surfaces" entries with surfaceCategory 5 (brush-stamp
     # exclusion zone for generated objects). Confirmed written by v2023;

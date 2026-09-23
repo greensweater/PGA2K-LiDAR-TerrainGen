@@ -315,7 +315,16 @@ Goal: prove the whole *existing* pipeline (trees, clusters, splines, holes,
 water, parking, range nets) emits correct v2023 output, using the per-version
 builder convention. This de-risks Phase 3 by isolating the new-feature work.
 
-- [ ] **2.1 Per-version builders for placed objects** (`course_output/objects.py`)
+- [x] **2.1 Per-version builders for placed objects** (`course_output/objects.py`)
+  — DONE 2026-09-23. The only v2023 difference is the group envelope
+  (`objectPaths` + `IsEmpty` on every group). Entry shapes are unchanged, so
+  **no `build_X_v2023` copies**: `placed_object_groups_to_v2023` runs once
+  after `merge_object_groups` in `_build_placed_objects` and
+  `_inject_collection_into_course` (gated on `has_fences`).
+  `merge_object_groups` skips scalar fields (it used to crash on `IsEmpty`).
+  v2023-first assets are usable by path through collections/in-game
+  imports (shawnee run: 16 GolfCart items, hole signs with `OffsetIndex`).
+  Details and evidence are in `V2023_SCHEMA.md` "Phase 2 re-target decisions".
   - **Context**: Phase 1 done — v2023 resolves end-to-end. Now make the
     existing object-emitting builders produce v2023 records.
   - **Where**: `course_output/objects.py` — read the `build_tree_objects_v2019`
@@ -323,50 +332,74 @@ builder convention. This de-risks Phase 3 by isolating the new-feature work.
     plus the dispatch in `step_pack_objects`/`step_write_objects` in
     `PGA2k_gen.py`.
   - **Steps**:
-  - [ ] 2.1.1 Follow the `build_tree_objects_v2019` / `_v2021` pattern: add
+  - [x] 2.1.1 Follow the `build_tree_objects_v2019` / `_v2021` pattern: add
         `build_tree_objects_v2023` (and any `_v2023` counterpart for stakes,
         clusters, spline-fill records, stream drops).
-  - [ ] 2.1.2 v2023 uses the same asset-path scheme as v2021
+  - [x] 2.1.2 v2023 uses the same asset-path scheme as v2021
         (`theme_scheme="path"`) — reuse/extend the v2021 asset-path resolution
         rather than guessing a numeric triple; confirm no new required fields
         in the diff (Phase 0.2.2).
-  - [ ] 2.1.3 Wire the v2023 builders into `step_pack_objects` /
+  - [x] 2.1.3 Wire the v2023 builders into `step_pack_objects` /
         `step_write_objects` dispatch.
-  - [ ] 2.1.4 Make sure v2023-only assets (from 1.4) are selectable/usable in
+  - [x] 2.1.4 Make sure v2023-only assets (from 1.4) are selectable/usable in
         the builders' asset pools.
   - **Done when**: running the pipeline for v2023 emits
     `CourseDescription_nodes/placedObjects3.json` with valid tree/stake/cluster
     records (spot-check 2–3 entries against the v2023 sample's entry shapes —
     same keys, same path-scheme).
-- [ ] **2.2 Re-target the other node writers**
+- [x] **2.2 Re-target the other node writers** — DONE 2026-09-23.
+  holes/userLayers/OOB were already version-aware from Phase 1. Added the
+  v2023 blank-userLayers fallback. Water entries keep the v2021 shape
+  (unconfirmed, pending the 2.3.2 load). splines/parking/range_nets have no
+  version-specific shape (parking and range nets reach placedObjects3 as
+  collection objects). 2.2.2 verified: a 2021 `course/` baseline with
+  `game_version=2023` makes `repack` refuse (`holes.json,
+  surfaceSplines.json, userLayers.json` flagged stale). Every template
+  carries `userLayers(2).json`, so a 2021↔2023 switch is always caught.
   - **Context**: everything that writes a node file must honor the v2023
     renames + shapes from `V2023_SCHEMA.md` "Node renames".
   - **Where**: `course_output/` — `holes.py`, `userLayers.py`, `splines.py`,
     `water.py`, `parking.py`, `range_nets.py`, `out_of_bounds.py`; grep each
     for `2021`/`2019` branches and hardcoded filenames.
   - **Steps**:
-  - [ ] 2.2.1 `holes.py`, `userLayers.py`, `splines.py`, `water.py`,
+  - [x] 2.2.1 `holes.py`, `userLayers.py`, `splines.py`, `water.py`,
         `parking.py`, `range_nets.py`, `out_of_bounds.py` — add/verify v2023
         branches per the confirmed schema (`holes2`, `surfaceSplines2`,
         `userLayers2`; water keeps `surfaceCategory: 9`).
-  - [ ] 2.2.2 Confirm the v2023 `objects_filename` is what gets written and
+  - [x] 2.2.2 Confirm the v2023 `objects_filename` is what gets written and
         that a stale v2019/v2021 node file in `course/` doesn't leak into the
         repack (see the existing "leftover different-game_version file" note).
   - **Done when**: a v2023 run produces every node file the v2023 sample has
     (`V2023_SCHEMA.md` "Confirmed node set") with v2023 names, and a
     pre-existing 2021 node file in `course/` is either cleaned or not
     repacked.
-- [ ] **2.3 End-to-end verification (no fence feature yet)**
+- [ ] **2.3 End-to-end verification (no fence feature yet)** — 2.3.1 + 2.3.3
+  DONE 2026-09-23; **2.3.2 ready for in-game verification**. Test course:
+  a copy of Andy's shawnee project (v2021 → 2023 via `ingest-course`), run
+  through write-terrain/-water/-splines/-holes/-objects + repack →
+  `LIDAR-2023-shawnee-phase2.course` (copied into the v2023 Courses folder).
+  Node set = the sample's set plus `holes2`/`surfaceSplines2`; base keys and
+  `version: 31` match. Shape diff vs `2023_fences` shows only expected gaps:
+  `objectPaths`/`surfaces` cat-5 (Phase 3), real `position.y` on
+  waterfalls/elevated collection members, int `OffsetIndex`.
+  `import-ingame-edits` of the output against the project reports "No
+  differences".
+  **In-game check (Andy):** load `LIDAR-2023-shawnee-phase2` in v2023 and
+  confirm: trees (1563), 4 ponds + 179 stream water tiles, 129
+  waterfalls/splashes, 18 holes with pins, surface splines, building stakes,
+  object-spline fills (1227) + 12 cluster stamps, parking cars/golf carts,
+  range nets, hole signs showing the right numbers, and collection props at
+  their designed elevation.
   - **Context**: gate for Phase 3 — proves the whole pre-existing pipeline
     emits correct v2023 output.
   - **Where**: full CLI pipeline (`PGA2k_gen.py`) on a test course with trees,
     water, holes, parking, range nets; the v2023 game for the load check.
   - **Steps**:
-  - [ ] 2.3.1 Run the full CLI pipeline targeting `--game-version 2023` on a
+  - [x] 2.3.1 Run the full CLI pipeline targeting `--game-version 2023` on a
         test course; confirm each node file is produced.
   - [ ] 2.3.2 Load the generated `.course` in the v2023 game and confirm trees,
         water, holes, parking, range nets render correctly (spot-check a few).
-  - [ ] 2.3.3 Diff generated v2023 node files against the confirmed reference
+  - [x] 2.3.3 Diff generated v2023 node files against the confirmed reference
         to catch structural drift.
   - **Done when**: in-game load succeeds with all pre-existing features
     rendering; structural diff vs `2023_fences.course` node files shows no

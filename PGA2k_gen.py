@@ -175,8 +175,8 @@ from course_output.objects import (
     default_tree_asset_paths_v2021,
     lidar_trees_to_tagged, load_object_list,
     load_objects, load_placed_objects, load_tree_theme_species, merge_object_groups, move_trees_off_cartpaths,
-    object_counts, object_spline_fill_records_to_v2021_groups, parse_osm_trees, schema_for,
-    save_object_list, save_objects, save_placed_objects,
+    object_counts, object_spline_fill_records_to_v2021_groups, parse_osm_trees,
+    placed_object_groups_to_v2023, schema_for, save_object_list, save_objects, save_placed_objects,
 )
 from course_output.course_templates import resolve_course_template
 from course_output.game_versions import VERSION_SCHEMAS
@@ -2166,7 +2166,7 @@ def _build_placed_objects(
                   "v2019 has no object-spline schema, and objects.json was packed for a different "
                   "version. Re-run pack-objects: mode=auto / mode=spline fills fall back to "
                   "circle-scatter for a v2019 target.")
-    else:  # 2021+ (v2023 shares v2021's placedObjects3 items/clusters/splines schema)
+    else:  # 2021+ (v2023 shares v2021's item/cluster/spline entries; envelope applied after the merge)
         if trees:
             pool, type_map = tree_asset_paths, tree_type_asset_paths
             if not pool and not type_map:
@@ -2273,6 +2273,9 @@ def _build_placed_objects(
             placed_objects += splashes
 
     placed_objects = merge_object_groups(placed_objects)
+    if schema_for(game_version).has_fences:
+        # v2023+ group envelope: objectPaths[] + IsEmpty on every group.
+        placed_objects = placed_object_groups_to_v2023(placed_objects)
 
     for label, item_count, cluster_count, spline_count in object_counts(placed_objects):
         print(f"    {label}: {item_count} item(s), {cluster_count} cluster(s), {spline_count} spline(s)")
@@ -4749,7 +4752,10 @@ def _inject_collection_into_course(nodes_dir: Path, record: dict, game_version: 
     n_objects = sum(len(g.get("Value", {}).get("items", [])) for g in new_groups)
     if new_groups:
         existing_groups = load_placed_objects(obj_path) if obj_path.exists() else []
-        save_placed_objects(merge_object_groups(existing_groups + new_groups), obj_path)
+        merged = merge_object_groups(existing_groups + new_groups)
+        if schema_for(game_version).has_fences:
+            merged = placed_object_groups_to_v2023(merged)
+        save_placed_objects(merged, obj_path)
 
     # --- splines ---
     new_splines = build_collection_splines([record])
