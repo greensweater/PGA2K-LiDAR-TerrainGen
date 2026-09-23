@@ -238,14 +238,12 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
   - **Decisions to record**: a one-line table (branch location → v2023
     behavior) appended to `V2023_TASKS.md` under this task, so Phase 2/3
     sessions don't re-audit.
-- [ ] **1.3 Add a v2023 theme/template baseline** — code DONE 2026-09-23
+- [x] **1.3 Add a v2023 theme/template baseline** — DONE 2026-09-23
   (`templates/2023_rustic.course`; CLI `--game-version` choices come from
   `GAME_VERSIONS`, and the GUI selector/tooltip read the registry). Checked
   with `ingest-course` → `push-blank-template` → `repack` on a
-  `game_version=2023` project. **Ready for in-game verification:** load
-  `templates/2023_rustic.course` (or a `push-blank-template` output) in
-  v2023 and confirm it opens as an empty rustic course (no fences, carts,
-  signs or clear-object stamps; flat base).
+  `game_version=2023` project. **In-game VERIFIED 2026-09-23 (Andy):** a
+  `push-blank-template` output (`LIDAR-2023-20260923183452`) opens in v2023.
   - **Context**: version resolution needs a resolvable template file to go
     end-to-end.
   - **Where**: `templates/` (existing `2019_*.course`, `2021_*.course`, and the
@@ -305,6 +303,9 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
 
 **Exit:** `--game-version 2023` is accepted end-to-end and resolves a template,
 even if fence generation is not yet wired (existing features re-target to v2023).
+**MET 2026-09-23**: the v2023 blank round-trips into the game. Still open
+from Phase 1, none of it blocking Phase 2: the full v2023 theme list (1.3.1)
+and per-fence option confirmation (0.3a.1).
 
 ---
 
