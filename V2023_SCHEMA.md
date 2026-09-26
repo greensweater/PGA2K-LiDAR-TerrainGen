@@ -125,8 +125,8 @@ except one 1.3; `width` 4.0 except retaining wall 2.5):
 
 | field | observed values | mapped meaning (per course author's description) |
 |---|---|---|
-| `spacingRule` | 0, 1, 2, 3 | **end caps, 4 options: none / spaced / points / ends** (order unverified — needs in-game check) |
-| `heightRule` | 0, 1 | **0 = contoured** (follows heightmap), **1 = stepped** (fixed raised height; all ht=1 rows carry `height ≈ 3.23`) |
+| `spacingRule` | 0, 1, 2, 3 | **end caps: 0 none / 1 ends only / 2 spaced / 3 spline points** (JSON values, in-game verified 2026-09-26; the game menu lists them in a different order) |
+| `heightRule` | 0, 1 | **0 = contoured** (follows the stamped terrain; `height` = offset), **1 = stepped** (level top; `height` = ABSOLUTE elevation, verified; sample rows use 3.23 = the blank's datum) |
 | `hasCurves` | true, false | **curved vs straight** segments |
 | `flexibilityRule` | 0, 1 | unconfirmed — candidate: rigid panels vs flexible/flexing along path (fl=0 seen on the straight brick rows) |
 | `state` | 0 (11 rows), 1 (retaining wall, 4 waypoints) | unconfirmed |
@@ -152,6 +152,54 @@ Per-asset option matrix must still be confirmed in-game (0.3a.1) — the
 author confirmed only that the **stone wall** has the full 4-cap option set
 (omitted from the course for brevity); canvas/hedge rows in the sample don't
 cover every value either.
+
+### In-game fence test results (FENCETEST at (-900, 900), Andy, 2026-09-26)
+
+Built with `--step push-fence-test`; the row ids are from its legend.
+
+- **Every asset renders from our records** (B1–B8), as do the sample's own
+  13 rows (A).
+- **Orientation is correct** (C): waypoint `x` is +x and `y` is course +z,
+  with no mirroring.
+- **objectPaths follow the userLayers height stamps** (D1 sits exactly on
+  the +15 m flatten pad). D3 contours across the pad's edges; D2's
+  `height=+15` floats about 15 m above. So `height` is an offset from the
+  *stamped* terrain when `heightRule=0`.
+- **`spacingRule`**, the JSON value (verified in-game on the 4-point zigzags
+  E3/E4):
+  - 0 = none
+  - 1 = ends only
+  - 2 = spaced (by `spacing`)
+  - 3 = spline points (a cap at every waypoint)
+
+  The game's menu lists them as none / spline points / spaced / ends only
+  (Andy). That's the UI order, *not* the stored values; E3 (value 1) showed
+  ends only and E4 (value 3) showed spline points. 1 and 3 look identical on
+  2-point runs (B10/B12, B16/B17).
+- **`heightRule=1` (stepped): `height` is an ABSOLUTE elevation**, not an
+  offset. E1 at height = datum 3.23 sat on the surface; E2 at datum+3
+  floated; B13 at 0 was underground. `heightRule=0`: `height` is an offset
+  from the stamped terrain.
+- **`hasCurves`**: true draws a smooth curve through the waypoints (E5);
+  false draws straight segments, so a 3-point bend is a V (E6).
+- **The fences in the full course render** (BX3/BX4, near hole 18). My
+  earlier "not visible" came from pointing at the wrong spot (the hole 18
+  tee from CourseMetadata `teePositions`); the fences are near the 18th hole. WoodFences accepts
+  all four, so the catalog set is now complete.
+- **`heightRule=1` with `height` 0 doesn't render** (B13). Every sample
+  stepped row carries `height ≈ 3.23`, the blank's datum. Hypothesis: when
+  stepped, `height` is an **absolute elevation**, so 0 is about 3 m
+  underground. E1 (height = datum) and E2 (datum+3) test this.
+- `hasCurves=false` looks identical to curved on a straight 2-point run
+  (B14), as expected. E5 vs E6 show it on a bend.
+- **Retaining wall** renders 0.3 m high at the sample's `-0.715`, so
+  `RETAINING_WALL_HEIGHT_M` is now **-1.015**. Verified flush in-game. The asset is special: it
+  draws a tile that "refracts" the ground texture at the level of the wall's
+  cap, set about 1.9 m back from the spline (an upside-down L / Γ profile).
+  Use for pond edges: place the spline about 2 m inside the contour line,
+  then set `height` by trig from the bank slope over a ~1.5 m run, so the
+  tile overlaps and clips into the terrain. That's a future builder feature,
+  not implemented.
 
 ## "Tricks" from the sample course (reproducible recipes)
 
@@ -276,13 +324,177 @@ was empty, so whether v2021 also honors category 5 is unconfirmed (0.3b.3).
   accepted by v2023. That's accepted, not confirmed to match what the game
   writes: a game re-save could still trim fields.
 
+## OSM fence/wall ingest + asset routing (task 3.1, 2026-09-23)
+
+**Kinds** (`ingest/osm.py` `classify_way`, checked *last* so a way that
+already classifies as something else keeps its kind, e.g. `building=yes +
+barrier=wall` stays `building`):
+
+| OSM tag | kind |
+|---|---|
+| `barrier=fence`, `barrier=chain` | `fence` |
+| `barrier=wall`, `barrier=retaining_wall`, `barrier=city_wall` | `wall` |
+| `barrier=hedge`, `natural=hedge` | `hedge` |
+
+**Always lines, never areas**, even for a closed ring or `hedge area=yes`.
+OSM draws a perimeter fence as a closed way, and the objectPath runs along
+it. A closed way stays a closed `LineString` (`coords[0] == coords[-1]`), so
+3.2 can still tell it's a closed run. No spline/hole/mask/water consumer
+matches these kinds: `feature_to_spline` returns None, and `mask` defaults
+True.
+
+**Tag → asset** (`course_output/fences.py` `fence_asset_for_tags`, first
+match wins; only the 8 `fence_options` post prefabs are valid targets):
+
+1. `wall=retaining_wall` / `barrier=retaining_wall` → `RetainWallAPostAPrefab`
+2. kind `hedge` → `HedgeSplinePostPrefab`
+3. `material=*`, then `wall=*`, then `fence_type=*`:
+   - stone / dry_stone / flint → `StoneWallAPostAPrefab`
+   - brick → `Asia_BrickWalls_PostPrefab`
+   - wood / split_rail / palisade / pole / rail → `WoodFencesAPostAPrefab`
+   - chain_link / metal / steel / wire / barbed_wire / electric / mesh /
+     metal_bars / railing → `UniFencePostAPrefab`
+4. `barrier=chain` → `UniFencePostAPrefab`
+5. kind default: fence → `WoodFencesAPostAPrefab`, wall → `StoneWallAPostAPrefab`
+
+No OSM tag reaches the canvas fences (red/black). They're for the trick
+presets (3.2.4) and per-way GUI overrides (3.3.3). That UniFence reads as
+chain-link/metal is an assumption from its name; confirm in-game (3.5.3).
+Probe: `python util/probe_fence_tags.py [extract.osm]`. With no argument it
+checks a synthetic extract (20 cases incl. regressions); with an extract it
+reports. `~/Downloads/map(1).osm` has 4 closed `barrier=fence` runs (2
+chain_link → UniFence, 2 untyped → WoodFences).
+
+## objectPath handle rule + builder decisions (task 3.2, 2026-09-23)
+
+**Handle rule (resolves 0.3a.6), derived from the sample rows.**
+`pointOne`/`pointTwo` are real bezier handles, populated the same way
+whether `hasCurves` is true or false:
+
+- **Open run, end waypoints:** the outer handle sits on the waypoint (the
+  first waypoint's `pointOne` and the last one's `pointTwo`). The inner
+  handle is **0.25 ×** the segment, pointing toward the neighbour.
+- **Interior / closed-run waypoints (smooth):** both handles lie along the
+  tangent `normalize(next − prev)`. Each is **0.375 ×** its own adjacent
+  segment length, so they're asymmetric when the segments differ.
+- `course_output/fences.py` rebuilds 12 of the 13 sample rows from their
+  waypoints alone to within 0.1 mm (`tests/test_fences.py`). The exception
+  is the `WoodFences` row: its handles are 1.03 m, which is 0.25 × 4.1 m
+  on a 15.2 m segment. Its end was evidently dragged after drawing without
+  the handles being re-derived, so the game tolerates stale/arbitrary
+  handles.
+
+**`state` = 1 → closed loop (inferred).** The sample's only `state=1` row is
+its only closed run: the retaining wall, 4 waypoints, first not repeated,
+and the last waypoint's `pointTwo` points back at the first. The builder
+writes `state` 1 for closed runs and 0 for open ones. Confirm in-game
+(3.5.3).
+
+**Builder choices (ours, not the game's):**
+- **Corners.** An OSM way is a polyline with real corners, but the game
+  editor smooths every interior waypoint (the sample's 4-point diamond
+  renders as a circle). For an interior waypoint that turns more than
+  `CORNER_ANGLE_DEG` (45°), or any waypoint when `hasCurves=false`, the
+  builder writes *corner handles*: each handle sits on its own segment
+  (0.25 ×), so the bezier stays straight through a sharp corner. Gentle
+  bends keep smooth handles.
+- **Joining ways.** Ways with the same resolved style (asset + every rule
+  field) are joined end-to-end where exactly two ends meet (0.5 m
+  tolerance), giving one post per shared node and no gap. At a 3-way
+  junction the runs stay separate. A joined run whose ends meet becomes
+  closed. Where different styles meet, each keeps its own end posts;
+  that can't be avoided.
+- **Simplify.** Douglas-Peucker at 0.25 m, applied as a ring for closed
+  runs so the seam isn't pinned.
+- **Per-asset defaults** are that asset's plain (contoured, unburied)
+  sample row. Brick defaults to `flexibilityRule` 0 and `hasCurves` false,
+  as in its sample row. The retaining wall defaults to its only sample
+  row: width 2.5, height −0.715.
+- **Presets** (`pga_fence_preset`): `curb` (stone, h −1.498), `railroad`
+  (black canvas, h −2.688), `retaining_wall` (w 2.5, h −0.715).
+- **Per-way overrides** use this project's own tags `pga_fence_asset`
+  (label or path) and `pga_fence_<field>` (e.g. `pga_fence_spacingRule=3`).
+  Precedence: asset default < preset < field tag. The GUI (3.3.3) will
+  write these.
+- **Option-matrix check:** a value outside a `complete` option set warns
+  and reverts to the asset default. A value outside an incomplete set
+  warns "unverified" and is kept, so in-game trials can extend
+  `asset_catalog.json`.
+- **Stepped (`heightRule=1`)** doesn't auto-set a height. Every sample
+  stepped row uses `height ≈ 3.23`; set `pga_fence_height` alongside it.
+- **Output:** `fences.json` stores the frozen `FenceRecord`s in the local
+  frame. `fence_records_to_groups_v2023` emits `{Key:{path}, Value:
+  {objectPaths}}` groups for `merge_object_groups` +
+  `placed_object_groups_to_v2023`.
+
+## Fence pipeline wiring (task 3.3, 2026-09-24)
+
+- **`--step generate-fences`** (`step_generate_fences`): crops
+  `features.geojson` to the course, builds from the fence/wall/hedge
+  kinds, and writes **`fences.json`**. It prints per-way style warnings.
+  Flags: `--fence-simplify-tol`, `--fence-endpoint-tol`,
+  `--fence-corner-angle` (negative = smooth everywhere, like the game
+  editor) and `--clear-fences`.
+- **Not routed through `objects.json` / pack-objects.** Fences are paths,
+  not placed objects, and there's nothing to pack. `_build_placed_objects`
+  reads `fences.json` directly (the same way it reads `streams.json`) and
+  adds `fence_records_to_groups_v2023` groups before `merge_object_groups`
+  + `placed_object_groups_to_v2023`. Only v2023+ (`has_fences`) gets them;
+  v2019/v2021 print a NOTE and drop them. `step_repack` needed no change,
+  since it packs `course/` as-is. `step_import_ingame_edits` only diffs
+  `items`, so fences never show up as user edits. The flip side: fences
+  drawn by hand in the game aren't imported.
+- **`project.json` keys:** `fence_simplify_tol_m`, `fence_endpoint_tol_m`
+  and `fence_corner_angle_deg` (settings, CLI → persisted), plus
+  `fence_count` and `fence_assets` (what the last run produced). The
+  corner angle is also frozen into each `fences.json` record, so
+  write-objects stays a pure formatter.
+- **Per-way style** lives in `pga_fence_*` tags on `features.geojson`. The
+  GUI's Objects → "Fences & Walls (v2023)" panel writes them with Apply to
+  Selected / Reset Selected, acting on the Splines-tab selection.
+  `ingest-osm` carries them over a re-ingest, per tag, and a value coming
+  from OSM itself wins, the same rule as `pga_cluster_fills`. The Splines
+  tab detail column shows each fence row's resolved asset.
+- **End-to-end (code-level) check:** a copy of `bouldercreek2` (v2023) with
+  6 injected fence ways runs `generate-fences` → `write-objects` →
+  `repack`. The result is a version-31 `.course` whose `placedObjects3`
+  has 5 objectPaths (1 closed wood square; 2 brick ways joined into 1 run;
+  a curved hedge; chain-link with `spacingRule=3`, warned as unverified; a
+  curb preset) alongside 3150 items, and every group carries the v2023
+  envelope. **Not yet loaded in-game** (that's 3.5).
+- Note: the real `bouldercreek2/course/` still holds v2021 node files
+  (`holes.json`/`surfaceSplines.json`/`userLayers.json`), and repack
+  refuses to run until **Reset Course Baseline** is done. This predates the
+  fence work; do the reset before the next real repack of that project.
+
+## Course filename rule (CONFIRMED in-game, 2026-09-26)
+
+The game can't load, or delete, a `.course` whose **filename** has a hyphen
+followed by an all-letter last segment (`FT2-1-S-compact`,
+`BZ1-shawnee-good`, `LIDAR-2023-bouldercreek-fences`). Byte-identical files
+renamed `BZ2-shawnee-good2` / `BZ5-FT2-1-copy5` load, and so do
+`hinckleyhills`, `hhills3` and `2023_fences`. The stored name (CD `name`,
+CM `name`) and the `_id` don't matter: the game rewrites `_id` to
+`offlineSave<filename>` (and the Thumbnail `_id` to `…-Thumb`) the first time
+it opens a course, and it re-saves every course it opens. Likely cause: the
+game names a course's parts `<id>-Meta` / `<id>-Thumb`, so it strips a
+`-<Letters>` tail as a part suffix. The pipeline writes game filenames
+through `PGA2k_gen.game_safe_course_stem` (hyphens → underscores).
+
+Also found in the 3.3a bisection: the game writes gzip at **zlib level 1**
+(header flg=0, xfl=0, os=255, mtime = local wall-clock seconds), but it
+reads our level 9 fine. Encoding level, BOMs, JSON whitespace and key order
+all load.
+
 ## What this does NOT confirm (still open)
 
-1. **Per-asset fence option matrix** (which spacingRule/hasCurves/heightRule
-   are valid per fence asset; stone wall confirmed full 4 caps by the author)
-   — needs in-game trial per asset.
-2. `flexibilityRule` and `state` semantics.
-3. `spacingRule` → cap-style ordering (which of 0–3 is none/spaced/points/ends).
+1. **Per-asset fence option matrix**: partly answered by the in-game fence
+   test above (WoodFences: all 4 spacingRules). The rest still needs
+   per-asset trials.
+2. `flexibilityRule` semantics; `state` = closed loop is inferred, not
+   confirmed (see "objectPath handle rule" above).
+3. ~~`spacingRule` ordering~~ and ~~stepped height~~: both resolved (see "In-game fence
+   test results").
 4. Whether `holes2`/`surfaceSplines2` entry shapes differ from
    `holes`/`surfaceSplines` (sample has both empty).
 5. Clear-objects details: in-game confirmation that category 5 actually

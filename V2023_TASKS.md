@@ -50,7 +50,7 @@ Phase 2, Phase 2 gates Phase 3.
   spacingRule, flexibilityRule, heightRule, spacing}`. Waypoints are 2D
   `{x, y}` (y = course Z) with `pointOne`/`pointTwo` bezier handles.
 - Rule fields map to the described options: **`spacingRule` 0–3 = end-cap style
-  (none/spaced/points/ends)**, **`heightRule` 0=contoured / 1=stepped**,
+  (JSON: 0 none / 1 ends only / 2 spaced / 3 spline points — in-game verified 2026-09-26)**, **`heightRule` 0=contoured / 1=stepped**,
   **`hasCurves` true/false = curved/straight**, `height` = vertical offset
   (negative = buried), `spacing` = post spacing (m), `width` = fence width (m).
   `flexibilityRule`/`state` semantics still unconfirmed.
@@ -78,7 +78,7 @@ Phase 2, Phase 2 gates Phase 3.
   (`water.py`).
 
 **STILL UNCONFIRMED:** per-asset option matrix; `flexibilityRule`/`state`
-meaning; `spacingRule`→cap-style ordering; in-game confirmation that category 5
+meaning; in-game confirmation that category 5
 suppresses generated objects (and which kinds); whether v2019/v2021 honor
 category 5; `holes2`/`surfaceSplines2` entry shapes (sample empty).
 
@@ -111,16 +111,17 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
         asset, or a richer sample course.
   - [ ] 0.3a.2 **`flexibilityRule` / `state` semantics** (values seen: 0/1;
         fl=0 only on straight brick rows; state=1 only on the retaining wall).
-  - [ ] 0.3a.3 **`spacingRule` → cap-style ordering**: which of 0–3 is
-        none / spaced / points / ends.
+  - [x] 0.3a.3 **`spacingRule` → cap-style ordering** — JSON 0 none, 1 ends only,
+        2 spaced, 3 spline points (E3/E4 zigzags, 2026-09-26; the game menu lists them in a different order).
   - [x] 0.3a.4 **HoleSign0N ↔ color mapping** — 01 black (v2021 sign,
         Andy), 02 white, 03 blue, 04 red, 05 green (derived from positions,
         +z = north; see `V2023_SCHEMA.md` "Hole signs").
   - [ ] 0.3a.5 `holes2` / `surfaceSplines2` entry shapes (sample has both empty)
         — confirm vs `holes` / `surfaceSplines` once a populated course is
         available.
-  - [ ] 0.3a.6 Confirm `pointOne`/`pointTwo` are bezier handles (vs endpoint
-        duplicates) when `hasCurves=false`.
+  - [x] 0.3a.6 Confirm `pointOne`/`pointTwo` are bezier handles (vs endpoint
+        duplicates) when `hasCurves=false` — yes, same 0.25/0.375 rule either
+        way (3.2; `V2023_SCHEMA.md` "objectPath handle rule").
 - [ ] **0.3b "Clear generated objects" paint — schema CONFIRMED (2026-09-23, second
       export, commit `8376f0e`)** — see `V2023_SCHEMA.md` "Clear-generated-objects
       paint" section. It reuses the `userLayers2.json` `surfaces` layer with
@@ -431,7 +432,7 @@ objectPath = {
   path: { waypoints: [{pointOne:{x,y}, pointTwo:{x,y}, waypoint:{x,y}}...],
           width: float, hasCurves: bool, state: int },
   height: float,          # vertical offset (negative = buried)
-  spacingRule: int,       # 0-3 = end-cap style (none/spaced/points/ends, order TBD)
+  spacingRule: int,       # 0 none / 1 ends only / 2 spaced / 3 spline points (JSON values)
   flexibilityRule: int,   # TBD (0/1 observed)
   heightRule: int,        # 0 = contoured (follow terrain), 1 = stepped
   spacing: float          # post/panel spacing (m)
@@ -443,7 +444,10 @@ parking-style object tiling (placed `items[]`) remains a valid *alternative*
 per the course author, but objectPaths is the native game-written mechanism —
 prioritize it; treat the object-tile version as a later optional variant.
 
-- [ ] **3.1 OSM input path (currently all `None`)**
+- [x] **3.1 OSM input path** — DONE 2026-09-23: kinds `fence`/`wall`/`hedge`
+      (all lines), routing in `course_output/fences.py`, probe
+      `util/probe_fence_tags.py` passes 20/20; decisions + mapping table in
+      `V2023_SCHEMA.md` "OSM fence/wall ingest + asset routing".
   - **Context**: Phase 2 done. OSM fence/wall ways must become features the
     fence builder can consume. Today `classify_way` returns `None` for every
     fence/wall/hedge tag (verified this session by probing
@@ -452,16 +456,16 @@ prioritize it; treat the object-tile version as a later optional variant.
     assignments (water/hazard etc.) to copy the pattern; grep every `kind`
     consumer before adding a new one.
   - **Steps**:
-  - [ ] 3.1.1 Add `classify_way` branches for fence/wall tags
+  - [x] 3.1.1 Add `classify_way` branches for fence/wall tags
         (`barrier=fence`, `barrier=wall`, `barrier=hedge`, `barrier=chain`,
         `natural=hedge` — probe first; today they all return `None`).
-  - [ ] 3.1.2 Assign a `kind` string to each (e.g. `fence`, `wall`, `hedge`)
+  - [x] 3.1.2 Assign a `kind` string to each (e.g. `fence`, `wall`, `hedge`)
         and confirm it routes to exactly the v2023 fence consumer and no
         unintended existing consumer (grep every kind consumer before adding).
-  - [ ] 3.1.3 Decide area vs line semantics per tag (fence/wall are lines; a
+  - [x] 3.1.3 Decide area vs line semantics per tag (fence/wall are lines; a
         hedge could be a closed area — confirm against OSM conventions and the
         target rendering).
-  - [ ] 3.1.4 Tag→asset routing: map OSM tags to a v2023 fence asset
+  - [x] 3.1.4 Tag→asset routing: map OSM tags to a v2023 fence asset
         (using the asset catalog from 1.4) — e.g. `material=stone` →
         `StoneWall*`, `material=wood` → `WoodFences*`, `material=chain_link` →
         `UniFence*`, `natural=hedge` → `HedgeSpline*`, `wall=brick` →
@@ -470,7 +474,13 @@ prioritize it; treat the object-tile version as a later optional variant.
     `util/probe_fence_tags.py` — none exists yet) on an OSM extract containing
     fence/wall ways shows the ways classified to the new kinds and routed to
     the expected asset paths.
-- [ ] **3.2 Feature → objectPath record builder**
+- [x] **3.2 Feature → objectPath record builder** — DONE 2026-09-23:
+      `course_output/fences.py` (`build_fence_records`,
+      `fence_records_to_groups_v2023`, presets, `pga_fence_*` overrides,
+      matrix validation, same-style way joining); `python -m unittest
+      tests.test_fences` 15/15. Decisions in `V2023_SCHEMA.md` "objectPath
+      handle rule + builder decisions". `state`=closed is inferred — check
+      in 3.5.3.
   - **Context**: 3.1 done — fence ways are classified features. Now convert a
     feature line into the exact `objectPath` record shape (in
     `V2023_SCHEMA.md` "objectPaths rule fields").
@@ -479,48 +489,166 @@ prioritize it; treat the object-tile version as a later optional variant.
     fence output belongs with it); the resample/simplify helpers already used
     for OOB (`course_output/out_of_bounds.py`) and water.
   - **Steps**:
-  - [ ] 3.2.1 Feature line → objectPath record. Waypoints: resample/simplify
+  - [x] 3.2.1 Feature line → objectPath record. Waypoints: resample/simplify
         the OSM way (Douglas-Peucker, as elsewhere) into 2D `{x, y}`
         waypoints in the course frame; set `pointOne`/`pointTwo` handles per
         the curve style (0.3a.6 — confirm handle semantics before emitting
         curves).
-  - [ ] 3.2.2 Map fence style → rule fields: `spacingRule` (cap style),
+  - [x] 3.2.2 Map fence style → rule fields: `spacingRule` (cap style),
         `heightRule` (contoured vs stepped), `hasCurves`, `spacing`, `width`,
         `height` offset. Defaults per asset from the sample rows
         (`V2023_SCHEMA.md` matrix).
-  - [ ] 3.2.3 **Per-asset option validation**: enforce the option matrix
+  - [x] 3.2.3 **Per-asset option validation**: enforce the option matrix
         (1.4.3) — warn/skip when an OSM-tag-requested option isn't valid for
         the chosen asset. Keep the matrix data-driven (asset_catalog.json) so
         it grows as 0.3a completes.
-  - [ ] 3.2.4 Support the "trick" recipes as named presets (sample-proven,
+  - [x] 3.2.4 Support the "trick" recipes as named presets (sample-proven,
         `V2023_SCHEMA.md` "Tricks"): curb (buried stone, h≈-1.5), railroad
         (buried black canvas, h≈-2.69), retaining wall (`RetainWall*`,
         w=2.5, h≈-0.7, contoured, 4 wp, state=1).
-  - [ ] 3.2.5 Handle closed vs open fence runs and shared corners between
+  - [x] 3.2.5 Handle closed vs open fence runs and shared corners between
         adjacent ways (no double posts / no gaps).
   - **Done when**: unit test feeds a synthetic way (straight + curved, open +
         closed) and produces objectPath records byte-comparable in structure
         to the sample rows (same keys, 2D waypoints, handles populated).
-- [ ] **3.3 Pipeline wiring**
+- [x] **3.3 Pipeline wiring** — DONE 2026-09-24 (code-level): `--step
+      generate-fences` → `fences.json` → write-objects (v2023 only) → repack;
+      GUI Objects → "Fences & Walls (v2023)" panel. Done-when met on a
+      `bouldercreek2` copy with injected fence ways (5 objectPaths + 3150
+      items in the repacked v31 course). In-game check is 3.5. Decisions in
+      `V2023_SCHEMA.md` "Fence pipeline wiring".
   - **Context**: 3.2 done — records build in isolation; now wire them into
     the pipeline like range nets.
   - **Where**: `PGA2k_gen.py` — read `step_generate_range_nets` +
     `step_write_objects`/`step_pack_objects` + `step_repack` as the pattern;
     `PGA2k_gen_gui.py` for the step UI.
   - **Steps**:
-  - [ ] 3.3.1 `step_generate_fences` in `PGA2k_gen.py` following the
+  - [x] 3.3.1 `step_generate_fences` in `PGA2k_gen.py` following the
         `step_generate_range_nets` pattern (kind → features.geojson → tiler).
-  - [ ] 3.3.2 Emit objectPath entries into `placedObjects3.json` — merge with
+  - [x] 3.3.2 Emit objectPath entries into `placedObjects3.json` — merge with
         the existing `step_write_objects`/`step_pack_objects` output for the
         same Key.path (fence assets get their own Key entries alongside
         items/clusters/splines) and include in `step_repack`.
-  - [ ] 3.3.3 GUI button/menu entry + CLI step, with per-way style options
+  - [x] 3.3.3 GUI button/menu entry + CLI step, with per-way style options
         (cap style, contoured/stepped, curved/straight, spacing, burial depth).
-  - [ ] 3.3.4 Persist derived state (origins, frame, chosen assets) in
+  - [x] 3.3.4 Persist derived state (origins, frame, chosen assets) in
         `project.json` per the state-bus convention.
   - **Done when**: a v2023 run with fence ways in the OSM extract produces a
     repacked `.course` whose `placedObjects3.json` contains the fence
     objectPaths alongside normal items.
+- [ ] **3.3a (RESOLVED in code 2026-09-26: filename rule) generated courses fail to load in v2023** —
+      fixed by `game_safe_course_stem`. The only thing left is loading a real
+      Repack under a formerly failing name (folded into 3.5.2/3.5.3).
+      Investigation history:
+  - Symptom: every course built this session shows in the v2023 course list but
+    "Failed to load"; in-game **Delete also fails** on them. A blank pushed via the
+    GUI's "Push Blank to Game" loads fine. `LIDAR-2023-shawnee-phase2` still loads.
+  - **Not the fences**: `FT2-1-S-compact` (shawnee, repacked with no content change,
+    no fences) fails too; so do all no-fence variants.
+  - **Ruled out**: file ACLs / Mark-of-the-Web (identical to working files);
+    container format (FT3-1/2 match the game's gzip headers, BOMs, compact JSON,
+    Thumbnail `_id`, exactly); id convention (`offlineSave<filename>` tried, FT3-1);
+    JSON spacing/size (FT2-1 compact, 19.9M chars like shawnee). Unity
+    `Player.log` has no course-load error at all (game gives up before reading?);
+    the profile `.data` holds no course list.
+  - Every file that loads was last written by the game itself (compact JSON, gzip
+    flg=0, id `offlineSave<filename>`); shawnee-phase2 and the 9/23 blank were
+    our pipeline output when first loaded, then re-saved by the game.
+  - Not yet tested: whether a *full* course (not a blank) freshly built by the
+    normal GUI flow (Repack → Copy to Game Folder) loads today; whether size
+    matters (all failures ~1.4–1.6 MB, working blank ~40 KB); diff the
+    shipped `blank_template.course` against its game-rewritten copy to see what
+    the game changes.
+  - Test files to delete when done (game UI can't): `LIDAR-2023-bouldercreek-fences`,
+    `FenceTest-*`, `FT2-*`, `FT3-*`, `BX*`, `BY*`, `BZ*`, `FENCETEST_*` in `Documents/My Games/PGA TOUR 2K23/Courses`.
+    Build scripts: session scratchpad (`make_variants*.py`) — not in repo.
+  - **2026-09-25 session 2 findings (offline, no game run):**
+    - **Lead: compression level.** The v2023 writer uses **zlib level 1** for
+      every gzip layer (header flg=0 xfl=0 os=255, mtime = local wall-clock s).
+      Level 1 reproduces shawnee-phase2, the rewritten pushed blank and
+      `2023_fences` **byte for byte** (scratch `gamefmt.py`). `course_repack.py`
+      uses `gzip.compress` (level 9), and the FT3-1/2 "gamefmt" variants used
+      level 6, so **no large test file matched the game's bytes**. CD
+      decompression ratio: game ≈26×, all failures 32–39×; blanks ≈5× (so the
+      level wouldn't matter for them if the game caps the ratio or pre-sizes
+      its buffer).
+    - Caveat: the 9/23 shawnee-phase2 first load was reportedly level-9
+      pipeline output, which contradicts this. No pre-game copy survives to
+      check it.
+    - Ruled out: content — FT2-1 nodes == shawnee-phase2 nodes after JSON
+      normalization; only `_id`/name/timestamps differ. Also ruled out: a
+      game-side course registry or cache (profile `.data` blobs have no
+      `offlineSave` ids; nothing else under AppData/Steam userdata/Documents
+      was written 16:10–16:45); a game update (Steam `LastUpdated` = May 2026);
+      and file attributes and ADS streams.
+    - Loaded blank: push wrote a random `offlineSave<hex>` id, and the game
+      rewrote it to `offlineSave<filename>` (+ Thumbnail `_id`) on load. So
+      random ids are fine.
+    - IL2CPP metadata shows a course budget (`IsCourseTooLarge`,
+      `FileSizeCostLimit`, `ObjectCostLimit`, `MemoryCostLimit`). It's content-
+      based, so it can't explain FT2-1 vs shawnee (identical content), but
+      remember it if a big course fails after the encoding fix.
+  - **Bisection set built (in game folder); in-game check needed.** Restart
+    the game first so every file is picked up in a fresh scan:
+    - `BX1-shawnee-level1`: shawnee-phase2 re-encoded game-exact; only the
+      id/name are new.
+    - `BX2-shawnee-level9`: byte-for-byte same text as BX1, but the
+      CourseDescription blob uses level 9.
+    - `BX3-ourfences-level1`: FT2-4 content (our 5 fence objectPaths),
+      game-exact encoding.
+    - `BX4-bcfences-level1`: `LIDAR-2023-bouldercreek-fences` content (full
+      pipeline output + fences), game-exact encoding.
+    - Read: BX1 loads + BX2 fails ⇒ compression level confirmed → fix
+      `course_repack.py` (level 1 + game header, compact JSON). BX1 fails ⇒
+      "new file/id" is the problem, not encoding. BX1+BX2 both load ⇒ the
+      encoding doesn't matter; look at what BX3/4 do.
+  - **BX result (Andy, 2026-09-26): BX1–BX4 all load; all FT2-* still fail;
+    restarting the game makes no difference.** BX2 was still level 9 when it
+    loaded, so **the level is ruled out**. (The game re-saves a course on
+    load, and BX1–4 are level 1 now.) BX3/BX4 prove that fence objectPaths
+    load in v2023, and they're ready for the 3.5.3 in-game check. The 5 test
+    runs are synthetic lines near the hole 18 tee (shawnee) / hole 2 tee
+    (bouldercreek).
+  - **Round 2, BY1–BY4:** each starts from game-exact BX1 and switches ONE
+    factor to FT2-1's form. BY1 = CourseMetadata written with spaces
+    (`": "`). BY2 = `course_repack.py` outer layer (`gzip.open`, level 9,
+    FNAME header). BY3 = FT2-1 thumbnail (no BOM, timeStamp-first key
+    order). BY4 = FT2-1 CourseDescription text (repack moves nodes last).
+    The one that fails is the cause. The loading blank also has
+    BY1–BY3's traits, but its metadata has no tee/pin objects; best guess is
+    BY1.
+  - **BY result: all four fail.** Each differed from loading BX1 by a single
+    factor, so none of those factors is the cause. **New hypothesis: the
+    name.** Across all 26 files tested, every loader's filename ends in a
+    digit (`2023_fences` is the exception, but its stored CD name ends in a
+    digit), and every failure's filename and CD name both end in a letter.
+  - **Round 3, BZ1–BZ5** (game-exact BX1 content; only filename/`_id`/name
+    change): BZ1 = letter/letter (predict fail). BZ2 = digit/digit (load).
+    BZ3 = filename digit, name letter (load). BZ4 = filename letter, name
+    digit (load). **BZ5 = byte-for-byte copy of failing FT2-1, renamed to end
+    in a digit (load)** — the decisive one.
+  - **BZ result (Andy, 2026-09-26): ROOT CAUSE = FILENAME.** BZ1 fails, BZ2
+    loads, BZ3 loads, BZ4 fails. BZ5 (the renamed FT2-1 bytes) loads, and it
+    lists as "FT2-1-S-compact". Andy's renamed `hinckleyhills` / `hhills3`
+    load too. Rule that fits all ~30 files: **a filename with a hyphen whose
+    last `-` segment is all letters fails, for both load and delete.** The
+    stored name (CD + CM) doesn't matter. Nor does the encoding (every BY file
+    failed only because of its `-spaced` / `-ours` style name). Likely cause:
+    the game names parts `<id>-Meta` / `<id>-Thumb` and strips a `-<Letters>`
+    tail as a part suffix.
+  - **Fix (code, 2026-09-26):** `game_safe_course_stem` (hyphens →
+    underscores) is applied in `step_repack` (the saved `repack_filename` is
+    the safe one, so Copy to Game Folder follows) and in the GUI's push-*
+    copies. `course_repack.py` is unchanged. **Remaining check:** load a
+    normal pipeline build repacked under a formerly failing name (e.g.
+    `LIDAR-2023-bouldercreek-fences` → `LIDAR_2023_bouldercreek_fences`).
+  - **Fences in BX3/BX4 load but aren't visible.** Frames are consistent
+    and the JSON matches the sample key for key. Offline evidence for
+    burial: the terrain under BX3's fences is ~287 m of flatten stamps,
+    while the blank's datum is 3.23 m and every sample fence sits near it.
+    If objectPaths are grounded on base terrain, ours are ~284 m
+    underground. Tested by the 3.5 harness below (`push-fence-test`, burial
+    rows D1–D3).
 - [ ] **3.3b Optional variant: object-tile fences** (deferred; only if wanted)
   - **Where**: `course_output/parking.py` / `range_nets.py` — the
     object-tile-along-line pattern (tiler places post/panel `items[]`).
@@ -589,6 +717,42 @@ prioritize it; treat the object-tile version as a later optional variant.
 - [ ] **3.5 Fence + clear-objects verification**
   - **Context**: everything in Phase 3 built; this is the gate before
     declaring v2023 done.
+  - **Harness (2026-09-26):** `--step push-fence-test` / GUI Objects →
+    Fences → "Push Fence Test to Game". It builds a blank v2023 course with
+    labelled rows from game-frame (-900, 900) (`--fence-test-origin`; the
+    grid is ±1000 — a first build at (-1900, 1900) was off-map and showed
+    nothing, and the step now refuses off-map origins), and
+    `fence_test_legend.txt` in the working dir maps each row to its
+    position:
+    - A: the sample's own 13 objectPaths as a control.
+    - B1–B20: every asset at its defaults, then BrickWall spacingRule 0–3 /
+      stepped / straight, WoodFences spacingRule 0/1/3 (unverified), and the
+      3 presets.
+    - C: an orientation L.
+    - D: a +15 m flatten pad with runs on it (D1), lifted +15 (D2), and
+      across its edges (D3).
+
+    Build 1 at (-900, 900): `FENCETEST_2023_20260926173345`. **Andy's
+    result: all of A, B, C, D render correctly.** Details are in
+    `V2023_SCHEMA.md` "In-game fence test results". Summary:
+    - Fences follow height stamps, so burial is ruled out.
+    - spacingRule (JSON): 0 none, 1 ends only, 2 spaced, 3 spline points (E3/E4). WoodFences takes
+      all 4.
+    - Stepped at height 0 is invisible (B13).
+    - The retaining wall was 0.3 m high; it's now -1.015.
+
+    Build 2: `FENCETEST_2023_20260926180724`, which adds the E block. **Andy's
+    results, all as expected:**
+    - E1 (stepped at datum) sits on the surface; E2 (datum+3) floats. So
+      stepped `height` is absolute.
+    - E3 (spacingRule 1) shows ends only; E4 (3) shows spline points.
+    - E5 (curved) is curved; E6 (straight) is a V.
+    - The retaining wall (B8/B20 at -1.015) is flush.
+    - **The fences in the BX3/BX4 full courses render too**, near the 18th
+      hole. They'd only been looked for at the wrong spot.
+
+    That settles 3.5.4 (presets) and the harness side of 3.5.3. What's left
+    is a real-OSM pipeline build (3.5.2/3.5.3).
   - **Where**: the tag probe script from 3.1 (e.g. `util/probe_fence_tags.py`),
     a real OSM extract with fence/wall ways, the v2023 game.
   - **Steps**:
@@ -596,12 +760,37 @@ prioritize it; treat the object-tile version as a later optional variant.
         fence/wall/hedge tags end-to-end (tag → kind → objectPath record).
   - [ ] 3.5.2 Generate a course with real OSM fence/wall ways; diff emitted
         objectPaths against `2023_fences.course`'s rows (same rule-field
-        shapes, sane waypoints).
+        shapes, sane waypoints). **Next up.** Use `bouldercreek2`, which
+        needs GUI "Reset Course Baseline" first because its `course/` still
+        holds v2021 node files. Then run the normal pipeline → Repack as
+        `LIDAR-2023-bouldercreek-fences`. It should come out as
+        `LIDAR_2023_bouldercreek_fences`, which also closes 3.3a. Then Copy
+        to Game Folder → 3.5.3. Use the repo `.venv`.
   - [ ] 3.5.3 Load in the v2023 game: fences/walls render on their spline,
         grounded/contoured correctly, cap styles match `spacingRule`, stepped
         rows sit at the offset height; no collision with surface splines.
-  - [ ] 3.5.4 Verify the trick presets (curb / railroad / retaining wall)
-        in-game.
+  - [x] 3.5.4 Verify the trick presets (curb / railroad / retaining wall)
+        in-game. Done via the fence test (B18–B20), 2026-09-26; the retaining
+        wall height was corrected to -1.015.
+  - [ ] 3.5.6 **Stepped fences need an absolute height** (found by the fence
+        test). With `heightRule=1`, `height` is an absolute elevation, but
+        today the builder passes the rule/tag value through as-is, so a
+        stepped OSM fence at the default 0 is underground.
+    - Where: `course_output/fences.py` `resolve_fence_style` /
+      `build_fence_records`, and the terrain model used by
+      `step_generate_fences` (`PGA2k_gen.py`).
+    - Steps: for stepped runs, set `height` = terrain elevation along the run
+      (e.g. the max over its waypoints) + the user's offset. Treat
+      `pga_fence_height` as an *offset* in both modes and convert at build
+      time. Record the rule in `V2023_SCHEMA.md`.
+    - Done when: a stepped OSM fence renders with its top level and resting
+      on the ground in-game.
+  - [ ] 3.5.7 (future, from Andy) **Retaining wall along pond edges.** The
+        retaining wall draws a ground-textured cap tile about 1.9 m back
+        from the spline, at cap height (Γ profile). Place the spline about
+        2 m inside the water contour, and set `height` by trig from the bank
+        slope over a ~1.5 m run so the tile clips into the terrain. See
+        `V2023_SCHEMA.md` "In-game fence test results".
   - [ ] 3.5.5 Regression: confirm untouched features (trees, water, splines)
         are unchanged when fences/clear-objects are present vs absent.
 

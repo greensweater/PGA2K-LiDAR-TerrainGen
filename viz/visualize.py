@@ -273,6 +273,9 @@ _OSM_FEATURE_STYLES: dict[str, tuple[Optional[str], str]] = {
     "mulch": ("#C8A165", "#C8A165"),         # light brown, solid fill (like cartpath's old style)
     "hole": ("#FFD700", "#FFD700"),
     "range_net": ("#FF8C00", "#FF8C00"),     # bright orange -- the barrier=range_nets fence lines
+    "fence": ("#D2B48C", "#D2B48C"),         # tan -- barrier=fence/chain lines (v2023 objectPaths)
+    "wall": ("#A0A0A0", "#A0A0A0"),          # light gray -- barrier=wall/retaining_wall lines
+    "hedge": ("#228B22", "#228B22"),         # forest green -- barrier=hedge / natural=hedge lines
 }
 _OSM_DEFAULT_COLOR = "#FF00FF"  # unclassified kind -- deliberately jarring so it's obvious
 

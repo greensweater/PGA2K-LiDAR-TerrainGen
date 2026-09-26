@@ -59,7 +59,7 @@ from constants import (  # noqa: E402
     PREVIEW_STAMPS, PROJECT_FILE, STAMPS_DIR,
 )
 from PGA2k_gen import (  # noqa: E402
-    BLANK_TEMPLATE_COURSE_FILE, PUSH_COLLECTION_COURSE_FILE,
+    BLANK_TEMPLATE_COURSE_FILE, FENCE_TEST_COURSE_FILE, PUSH_COLLECTION_COURSE_FILE, game_safe_course_stem,
     COLLECTIONS_FILE, DEFAULT_DIG_WATER_BUFFER_M, DEFAULT_DIG_WATER_DEPTH_M,
     DEFAULT_REMOVE_COVERED_MARGIN_M, EXPORT_STATUS_FRESH, EXPORT_STATUS_MISSING, EXPORT_STATUS_STALE,
     FEATURES_FILE, HEIGHT_MASK_FILE, HEIGHTMAP_FILE, INGAME_OBJECTS_FILE, OBJECT_LIST_FILE, OBJECTS_FILE,
@@ -93,7 +93,12 @@ from course_output.objects import (  # noqa: E402
     TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, load_objects, save_object_list, save_objects,
 )
 from course_output.asset_catalog import (  # noqa: E402
-    ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS, V2019_KEYED_ENTRIES,
+    ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, FENCE_ENTRIES, NATURE_CATEGORY_IDS,
+    V2019_KEYED_ENTRIES,
+)
+from course_output.fences import (  # noqa: E402
+    ASSET_TAG as FENCE_ASSET_TAG, FENCE_KINDS, FENCE_PRESETS, FENCE_STYLE_TAGS,
+    PRESET_TAG as FENCE_PRESET_TAG, RULE_TAG_PREFIX as FENCE_RULE_TAG_PREFIX, resolve_fence_style,
 )
 from course_output.object_clusters import (  # noqa: E402
     CLUSTER_FILL_MODE_AUTO, CLUSTER_FILL_MODE_SPLINE, CLUSTER_FILL_MODE_STAMPS, CLUSTER_FILL_SOURCE_BORDER,
@@ -207,6 +212,8 @@ def _spline_tag_detail(f: Feature) -> str:
         railway = f.tags.get("railway")
         if railway:
             return railway
+    if f.kind in FENCE_KINDS:
+        return resolve_fence_style(f.kind, f.tags)[0].rsplit("/", 1)[-1]
     return f.tags.get("natural", "")
 
 
@@ -2553,6 +2560,8 @@ class PGAGenGUI:
                   "Ingest OSM. v2021+ only. Re-run after any fresh Ingest OSM; re-pack objects "
                   "afterwards (this does it).")
 
+        self._build_fences_section(parent)
+
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         ttk.Label(parent, text="Collections", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 2))
 
@@ -3009,6 +3018,181 @@ class PGAGenGUI:
             args, wd,
             on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=True),
         )
+
+    # Fences panel choice labels -> pga_fence_* tag values ("" = leave unset,
+    # i.e. OSM tag routing / asset default decides). Cap-style order 0-3 is
+    # unverified in-game, so the raw spacingRule number is shown too.
+    _FENCE_CAP_CHOICES = {"": None, "0 (none)": "0", "1 (ends only)": "1", "2 (spaced)": "2",
+                          "3 (spline points)": "3"}
+    _FENCE_HEIGHT_RULE_CHOICES = {"": None, "contoured": "0", "stepped": "1"}
+    _FENCE_CURVE_CHOICES = {"": None, "curved": "true", "straight": "false"}
+
+    def _build_fences_section(self, parent) -> None:
+        """Objects / Fences -- v2023 spline fences/walls (course_output/
+        fences.py). Generate/Clear run the generate-fences step; the style
+        rows write per-way pga_fence_* tags onto the rows selected in the
+        Splines tab (blank = don't set)."""
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(parent, text="Fences & Walls (v2023)", font=("TkDefaultFont", 10, "bold")).pack(
+            anchor="w", pady=(0, 2))
+
+        self.fence_preset_var = tk.StringVar(value="")
+        self.fence_asset_var = tk.StringVar(value="")
+        self.fence_caps_var = tk.StringVar(value="")
+        self.fence_height_rule_var = tk.StringVar(value="")
+        self.fence_curves_var = tk.StringVar(value="")
+        self.fence_spacing_var = tk.StringVar(value="")
+        self.fence_width_var = tk.StringVar(value="")
+        self.fence_height_var = tk.StringVar(value="")
+        self._fence_asset_by_display = {e.display: e.label for e in FENCE_ENTRIES}
+
+        def _row(label, widget_factory, tip):
+            row = ttk.Frame(parent)
+            row.pack(anchor="w", fill="x", pady=1)
+            lbl = ttk.Label(row, text=label, width=12)
+            lbl.pack(side="left")
+            w = widget_factory(row)
+            w.pack(side="left", fill="x", expand=True, padx=4)
+            _Tooltip(lbl, tip)
+            _Tooltip(w, tip)
+
+        def _combo(var, values):
+            return lambda row: ttk.Combobox(row, textvariable=var, values=values, state="readonly", width=18)
+
+        def _entry(var):
+            return lambda row: ttk.Entry(row, textvariable=var, width=8)
+
+        _row("PRESET", _combo(self.fence_preset_var, [""] + list(FENCE_PRESETS)),
+             "Sample-proven trick recipes: curb (buried stone wall), railroad (buried black "
+             "canvas fence), retaining_wall. Sets the asset + rule fields; any field below "
+             "still overrides it.")
+        _row("ASSET", _combo(self.fence_asset_var, [""] + list(self._fence_asset_by_display)),
+             "Force the fence material. Blank = routed from the OSM tags (barrier/material/"
+             "wall/fence_type -- see V2023_SCHEMA.md).")
+        _row("END CAPS", _combo(self.fence_caps_var, list(self._FENCE_CAP_CHOICES)),
+             "spacingRule (JSON value, in-game verified): 0 none, 1 ends only, 2 spaced, 3 spline "
+             "points (a cap at every waypoint). The game's menu lists them in a different order. "
+             "1 and 3 look the same on a 2-point run. A value "
+             "the asset doesn't support is warned about at Generate.")
+        _row("HEIGHT", _combo(self.fence_height_rule_var, list(self._FENCE_HEIGHT_RULE_CHOICES)),
+             "heightRule: contoured follows the terrain (OFFSET is relative to it); stepped holds "
+             "a level top and OFFSET becomes an ABSOLUTE elevation (in-game verified -- 0 is "
+             "underground; the blank template's ground is ~3.23).")
+        _row("SEGMENTS", _combo(self.fence_curves_var, list(self._FENCE_CURVE_CHOICES)),
+             "hasCurves: curved smooths gentle bends (sharp corners stay sharp); straight = "
+             "straight segments everywhere.")
+        _row("SPACING m", _entry(self.fence_spacing_var), "Post/panel spacing along the path (m).")
+        _row("WIDTH m", _entry(self.fence_width_var), "Fence width (m). Sample: 4.0, retaining wall 2.5.")
+        _row("OFFSET m", _entry(self.fence_height_var),
+             "Vertical offset from the terrain (m); negative = buried (curb -1.5, railroad -2.69).")
+
+        btns = ttk.Frame(parent)
+        btns.pack(anchor="w", pady=2)
+        apply_btn = ttk.Button(btns, text="Apply to Selected", command=self._apply_fence_style_to_selected)
+        apply_btn.pack(side="left")
+        _Tooltip(apply_btn, "Write the non-blank style fields above as pga_fence_* tags onto the "
+                 "fence/wall/hedge rows selected in the Splines tab (features.geojson; survives "
+                 "a re-ingest). Blank fields are left as they are. Then Generate.")
+        reset_btn = ttk.Button(btns, text="Reset Selected", command=self._reset_fence_style_on_selected)
+        reset_btn.pack(side="left", padx=4)
+        _Tooltip(reset_btn, "Remove every pga_fence_* tag from the selected rows (back to OSM "
+                 "tag routing + asset defaults).")
+
+        gen_row = ttk.Frame(parent)
+        gen_row.pack(anchor="w", pady=2)
+        gen_btn = ttk.Button(gen_row, text="Generate", command=lambda: self._run_generate_fences(False))
+        gen_btn.pack(side="left")
+        _Tooltip(gen_btn, "Builds fences.json from every OSM barrier=fence/chain/wall/"
+                 "retaining_wall/city_wall and barrier/natural=hedge way: one objectPath per "
+                 "continuous fence (same-style ways sharing a node are joined; a loop is closed). "
+                 "Needs Ingest OSM. v2023 only -- Write Objects + Repack to reach the game.")
+        clear_btn = ttk.Button(gen_row, text="Clear", command=lambda: self._run_generate_fences(True))
+        clear_btn.pack(side="left", padx=4)
+        _Tooltip(clear_btn, "Empties fences.json (per-way style tags stay on the splines).")
+        test_btn = ttk.Button(gen_row, text="Push Fence Test to Game", command=self._run_push_fence_test_to_game)
+        test_btn.pack(side="left", padx=4)
+        _Tooltip(test_btn, "Builds a blank v2023 course with every fence asset, rule variant and preset "
+                 "in labelled rows from (-900, 900) (NW area), the sample course's own fences as a "
+                 "control, an orientation L and a raised pad (burial check), then copies it to the "
+                 "game. Row positions: fence_test_legend.txt in the working folder. Doesn't touch "
+                 "course/.")
+
+    def _run_generate_fences(self, clear: bool) -> None:
+        """Objects / Fences / Generate or Clear -- runs the generate-fences
+        CLI step. No re-pack needed (fences skip objects.json); still needs
+        a Write Objects + Repack to reach the game."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = ["--step", "generate-fences"] + (["--clear-fences"] if clear else [])
+        self._run_step(args, wd, on_done=lambda: self._on_objects_step_done(wd, regenerate_packed=False))
+
+    def _selected_fence_features(self) -> list:
+        selected_ids = {int(s) for s in self.splines_tree.selection()}
+        targets = [f for f in self._splines_features if f.osm_id in selected_ids and f.kind in FENCE_KINDS]
+        if not targets:
+            messagebox.showinfo("No fences selected",
+                                "Select one or more fence / wall / hedge rows in the Splines tab first.")
+        return targets
+
+    def _save_fence_tag_edit(self, targets: list) -> None:
+        wd = self.working_dir.get().strip()
+        save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+        restorable = [str(f.osm_id) for f in targets if self.splines_tree.exists(str(f.osm_id))]
+        self._refresh_splines_list()
+        restorable = [i for i in restorable if self.splines_tree.exists(i)]
+        if restorable:
+            self.splines_tree.selection_set(restorable)
+
+    def _apply_fence_style_to_selected(self) -> None:
+        if not self.working_dir.get().strip():
+            return
+        targets = self._selected_fence_features()
+        if not targets:
+            return
+        tags: dict[str, str] = {}
+        if self.fence_preset_var.get():
+            tags[FENCE_PRESET_TAG] = self.fence_preset_var.get()
+        if self.fence_asset_var.get():
+            tags[FENCE_ASSET_TAG] = self._fence_asset_by_display[self.fence_asset_var.get()]
+        for field, var, choices in (
+            ("spacingRule", self.fence_caps_var, self._FENCE_CAP_CHOICES),
+            ("heightRule", self.fence_height_rule_var, self._FENCE_HEIGHT_RULE_CHOICES),
+            ("hasCurves", self.fence_curves_var, self._FENCE_CURVE_CHOICES),
+        ):
+            value = choices.get(var.get())
+            if value is not None:
+                tags[FENCE_RULE_TAG_PREFIX + field] = value
+        for field, var in (("spacing", self.fence_spacing_var), ("width", self.fence_width_var),
+                           ("height", self.fence_height_var)):
+            raw = var.get().strip()
+            if not raw:
+                continue
+            try:
+                float(raw)
+            except ValueError:
+                messagebox.showwarning("Bad value", f"{field} must be a number (got {raw!r}).")
+                return
+            tags[FENCE_RULE_TAG_PREFIX + field] = raw
+        if not tags:
+            messagebox.showinfo("Nothing to apply", "Every fence style field is blank.")
+            return
+        for f in targets:
+            f.tags.update(tags)
+        self._save_fence_tag_edit(targets)
+        self._append_log(f"Fence style {tags} applied to {len(targets)} spline(s) -- run Fences / Generate.\n")
+
+    def _reset_fence_style_on_selected(self) -> None:
+        if not self.working_dir.get().strip():
+            return
+        targets = self._selected_fence_features()
+        if not targets:
+            return
+        for f in targets:
+            for t in FENCE_STYLE_TAGS:
+                f.tags.pop(t, None)
+        self._save_fence_tag_edit(targets)
+        self._append_log(f"Fence style reset on {len(targets)} spline(s) -- run Fences / Generate.\n")
 
     def _run_write_objects_with_stakes(self, stake_buildings: bool) -> None:
         """Shared by the Stake Buildings / Clear Building Stakes buttons --
@@ -5297,23 +5481,28 @@ class PGAGenGUI:
         )
 
     def _copy_blank_to_game(self, wd: Path, version: str, serial: str) -> None:
+        self._copy_built_course_to_game(wd / BLANK_TEMPLATE_COURSE_FILE, version, serial, "Blank")
+
+    def _copy_built_course_to_game(self, source: Path, version: str, serial: str, what: str) -> None:
+        """on_done for the push-* steps: copy the course the step just built
+        into the game's Courses folder as <serial>.course, game-safe (see
+        game_safe_course_stem -- a '-letters' filename tail won't load)."""
         if not self._last_step_ok:
             return  # the build step failed/was stopped -- nothing to push
-        source = wd / BLANK_TEMPLATE_COURSE_FILE
         if not source.exists():
-            self._append_log(f"Push Blank: expected {source}, but it doesn't exist.\n")
+            self._append_log(f"Push {what}: expected {source}, but it doesn't exist.\n")
             return
 
         dest_dir = self._game_courses_dir(version)
-        dest_path = dest_dir / f"{serial}.course"
+        dest_path = dest_dir / f"{game_safe_course_stem(serial)}.course"
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, dest_path)
-            self._append_log(f"Pushed blank template -> {dest_path}\n")
-            self.status_label.config(text=f"Blank '{serial}' pushed to game", foreground="green")
+            self._append_log(f"Pushed {what.lower()} -> {dest_path}\n")
+            self.status_label.config(text=f"{what} '{serial}' pushed to game", foreground="green")
         except OSError as e:
             messagebox.showerror("Copy failed", str(e))
-            self.status_label.config(text="Push blank failed", foreground="red")
+            self.status_label.config(text=f"Push {what.lower()} failed", foreground="red")
 
     # ------------------------------------------------------------------
     # Push to Game for Editing -- the inverse of "Capture from .course..."
@@ -5362,23 +5551,30 @@ class PGAGenGUI:
         )
 
     def _copy_pushed_collection_to_game(self, wd: Path, version: str, serial: str) -> None:
-        if not self._last_step_ok:
-            return  # the build step failed/was stopped -- nothing to push
-        source = wd / PUSH_COLLECTION_COURSE_FILE
-        if not source.exists():
-            self._append_log(f"Push Collection: expected {source}, but it doesn't exist.\n")
-            return
+        self._copy_built_course_to_game(wd / PUSH_COLLECTION_COURSE_FILE, version, serial, "Collection")
 
-        dest_dir = self._game_courses_dir(version)
-        dest_path = dest_dir / f"{serial}.course"
-        try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, dest_path)
-            self._append_log(f"Pushed collection -> {dest_path}\n")
-            self.status_label.config(text=f"Collection '{serial}' pushed to game", foreground="green")
-        except OSError as e:
-            messagebox.showerror("Copy failed", str(e))
-            self.status_label.config(text="Push collection failed", foreground="red")
+    def _run_push_fence_test_to_game(self) -> None:
+        """Objects / Fences / Push Fence Test to Game -- push-fence-test
+        builds a blank v2023 course with every fence option in labelled rows
+        (legend: fence_test_legend.txt), then this copies it to the game."""
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        version = self.game_version.get()
+        if version != "2023":
+            messagebox.showerror("v2023 only", "Fences are objectPaths, which only exist in v2023. "
+                                 "Set Game version to 2023 first.")
+            return
+        if self.objects_theme_var.get() == "(not set)":
+            messagebox.showwarning("No theme selected",
+                                   "Pick a Theme first -- it selects which bundled blank template is used.")
+            return
+        serial = f"FENCETEST_{version}_{time.strftime('%Y%m%d%H%M%S')}"
+        self._run_step(
+            ["--step", "push-fence-test", "--blank-course-name", serial], wd,
+            on_done=lambda: self._copy_built_course_to_game(wd / FENCE_TEST_COURSE_FILE, version, serial,
+                                                            "Fence test"),
+        )
 
     # ------------------------------------------------------------------
     # Copy to Game Folder -- a plain file copy, not a pipeline step, so

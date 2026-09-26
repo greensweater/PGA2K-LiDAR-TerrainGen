@@ -297,6 +297,25 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     if amenity_type == "parking":
         return ("pavement", True)
 
+    # Fences, walls and hedges -- v2023 objectPaths material (see
+    # course_output/fences.py for the tag -> fence-asset routing; v2019/
+    # v2021 have no consumer). Checked LAST so a way that already
+    # classifies as something else (a building or parking lot that also
+    # carries a barrier=* tag) keeps its existing kind -- these only pick
+    # up ways that would otherwise be dropped. Always a line, never an
+    # area, even for a closed ring or hedge area=yes: OSM draws a
+    # perimeter fence as a closed way, and the objectPath runs along it
+    # (a closed LineString keeps coords[0] == coords[-1], so the builder
+    # can still tell it's a closed run). No surface spline / hole / mask
+    # consumer matches these kinds.
+    barrier_type = tags.get("barrier")
+    if barrier_type in ("fence", "chain"):
+        return ("fence", False)
+    if barrier_type in ("wall", "retaining_wall", "city_wall"):
+        return ("wall", False)
+    if barrier_type == "hedge" or natural_type == "hedge":
+        return ("hedge", False)
+
     return None
 
 

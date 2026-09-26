@@ -41,12 +41,24 @@ directory, running one pipeline step at a time:
                                  per 8 m node (shared at corners, never doubled) and one
                                  4-high span of panels per 8 m interval -> range_nets.json;
                                  folded into objects.json by pack-objects)
+    PGA2k_gen.py <working_dir> --step generate-fences [--fence-simplify-tol M]
+                                 [--fence-endpoint-tol M] [--fence-corner-angle DEG]
+                                 [--clear-fences]
+                                 (v2023 spline fences/walls from OSM barrier=fence/wall/hedge
+                                 ways + per-way pga_fence_* tags -> fences.json; formatted
+                                 into placedObjects3.json objectPaths by write-objects)
     PGA2k_gen.py <working_dir> --step push-collection --collection-name <name>
                                  [--collection-library <dir>] [--blank-course-name <name>]
                                  (builds a fresh .course holding one collection template's
                                  objects/splines/stamps at the course centre for in-game
                                  editing -> working_dir/pushed_collection.course; does not
                                  touch course/)
+    PGA2k_gen.py <working_dir> --step push-fence-test [--fence-test-origin X Z]
+                                 [--blank-course-name <name>]
+                                 (v2023: blank template + every fence asset / rule variant /
+                                 preset in labelled rows at a corner, sample control rows, and
+                                 a raised pad for the burial check -> working_dir/fence_test.course
+                                 + fence_test_legend.txt; does not touch course/)
     PGA2k_gen.py <working_dir> --step refine-terrain [--error-tolerance M] [--resolution N]
                                  [--method adaptive|scatter] [--rad-m M]
     PGA2k_gen.py <working_dir> --step write-terrain [--registration-marks] [--direct-height-shift]
@@ -122,6 +134,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -196,6 +209,12 @@ from course_output.parking import (
     PARKING_ORIENTATION, PARKING_SIDES, PARKING_SKIP_PROB, PARKING_SPACING_M,
     ParkingAisle, build_parking_records, iter_parking_cars, load_parking_records,
     parse_color_weights, resolve_pool, save_parking_records,
+)
+from course_output.fences import (
+    CORNER_ANGLE_DEG as FENCE_CORNER_ANGLE_DEG, FENCE_ENDPOINT_TOL_M, FENCE_KINDS,
+    FENCE_SIMPLIFY_TOL_M, FENCE_STYLE_TAGS, FENCE_TEST_ORIGIN, FENCE_TEST_PAD_BRUSH, FENCE_TEST_ROW_PITCH_M,
+    build_fence_records, build_fence_test_layout, fence_records_to_groups_v2023,
+    load_fence_records, save_fence_records,
 )
 from course_output.range_nets import (
     RANGE_NET_ENDPOINT_TOL_M, RANGE_NET_MIN_LENGTH_M, RANGE_NET_SNAP,
@@ -341,6 +360,10 @@ PGA_PARKING_REF_TAG = "ref"
 RANGE_NET_TAG = "barrier"
 RANGE_NET_TAG_VALUE = "range_nets"
 RANGE_NETS_FILE = "range_nets.json"
+# v2023 spline fences/walls (course_output/fences.py): frozen objectPath
+# runs from OSM fence/wall/hedge ways, written by step_generate_fences and
+# formatted into placedObjects3.json by write-objects (v2023 only).
+FENCES_FILE = "fences.json"
 
 # OSM waterway tag values treated as linear streams (carved bed + flowing
 # water + bank vegetation), as opposed to filled water bodies.
@@ -1222,7 +1245,8 @@ def step_ingest_osm(
         if any(preserved.values()):
             print(f"  preserved {preserved['synthetic']} synthetic feature(s), re-applied "
                   f"{preserved['mask_reapplied']} mask override(s) and "
-                  f"{preserved['fills_reapplied']} cluster-fill edit(s) from the existing "
+                  f"{preserved['fills_reapplied']} cluster-fill edit(s) and "
+                  f"{preserved['fence_styles_reapplied']} fence style(s) from the existing "
                   f"{FEATURES_FILE} (--no-preserve-synthetic rebuilds purely from map.osm)")
 
     counts: dict[str, int] = {}
@@ -1364,9 +1388,11 @@ def _preserved_synthetic_features(parsed: list, previous: list) -> tuple[list, d
     transplants -- re-toggle in the GUI). pga_cluster_fills is only
     copied when the fresh Feature has none, so a spec coming straight
     from OSM tags wins and GUI-only spec lists (always written whole)
-    never get duplicated.
+    never get duplicated. Per-way fence style tags (fences.FENCE_STYLE_TAGS,
+    set from the GUI's Fences panel) follow the same rule, per tag.
 
-    Returns (synthetic_features, {"synthetic", "mask_reapplied", "fills_reapplied"}).
+    Returns (synthetic_features, {"synthetic", "mask_reapplied", "fills_reapplied",
+    "fence_styles_reapplied"}).
     """
     synthetic = [f for f in previous if _is_synthetic_feature(f)]
 
@@ -1374,7 +1400,7 @@ def _preserved_synthetic_features(parsed: list, previous: list) -> tuple[list, d
         f.osm_id: f for f in previous
         if f.osm_id is not None and not _is_synthetic_feature(f)
     }
-    mask_reapplied = fills_reapplied = 0
+    mask_reapplied = fills_reapplied = fence_styles_reapplied = 0
     for f in parsed:
         old = prev_by_id.get(f.osm_id)
         if old is None:
@@ -1386,11 +1412,16 @@ def _preserved_synthetic_features(parsed: list, previous: list) -> tuple[list, d
         if old_fills and not f.tags.get(PGA_CLUSTER_FILLS_TAG):
             f.tags[PGA_CLUSTER_FILLS_TAG] = old_fills
             fills_reapplied += 1
+        carried = [t for t in FENCE_STYLE_TAGS if t in old.tags and t not in f.tags]
+        for t in carried:
+            f.tags[t] = old.tags[t]
+        fence_styles_reapplied += bool(carried)
 
     return synthetic, {
         "synthetic": len(synthetic),
         "mask_reapplied": mask_reapplied,
         "fills_reapplied": fills_reapplied,
+        "fence_styles_reapplied": fence_styles_reapplied,
     }
 
 
@@ -2272,13 +2303,30 @@ def _build_placed_objects(
             placed_objects += falls
             placed_objects += splashes
 
+    # Spline fences/walls from fences.json (see step_generate_fences) --
+    # objectPaths[] groups keyed by fence asset, v2023+ only. Read straight
+    # from fences.json (like streams.json above), not routed through
+    # objects.json: they're paths, not placed objects, and need no packing.
+    fences_path = working_dir / FENCES_FILE
+    if fences_path.exists():
+        fence_records = load_fence_records(fences_path)
+        if fence_records and schema_for(game_version).has_fences:
+            fence_groups = fence_records_to_groups_v2023(fence_records)
+            print(f"  {len(fence_records)} fence/wall objectPath(s) across {len(fence_groups)} asset(s)")
+            placed_objects += fence_groups
+        elif fence_records:
+            print(f"  NOTE: dropped {len(fence_records)} fence/wall run(s) from {FENCES_FILE} -- "
+                  f"objectPaths are v2023+ only (game_version={game_version}).")
+
     placed_objects = merge_object_groups(placed_objects)
     if schema_for(game_version).has_fences:
         # v2023+ group envelope: objectPaths[] + IsEmpty on every group.
         placed_objects = placed_object_groups_to_v2023(placed_objects)
 
-    for label, item_count, cluster_count, spline_count in object_counts(placed_objects):
-        print(f"    {label}: {item_count} item(s), {cluster_count} cluster(s), {spline_count} spline(s)")
+    for g, (label, item_count, cluster_count, spline_count) in zip(placed_objects, object_counts(placed_objects)):
+        path_count = len(g.get("Value", {}).get("objectPaths", []))
+        print(f"    {label}: {item_count} item(s), {cluster_count} cluster(s), {spline_count} spline(s)"
+              + (f", {path_count} objectPath(s)" if path_count else ""))
 
     return placed_objects
 
@@ -3817,6 +3865,88 @@ def step_generate_range_nets(
     })
 
 
+def step_generate_fences(
+    working_dir: Path, *,
+    simplify_tol_m: float | None = None,
+    endpoint_tol_m: float | None = None,
+    corner_angle_deg: float | None = None,
+    clear: bool = False,
+) -> None:
+    """
+    Build v2023 spline fences/walls (course_output/fences.py) from every
+    OSM fence/wall/hedge way (features.geojson kinds "fence"/"wall"/
+    "hedge" -- see ingest/osm.py) into fences.json, the frozen
+    version-agnostic per-project record: one objectPath run per
+    continuous fence (same-style ways sharing an end node are joined; a
+    run whose ends meet is closed), with its asset + rule fields
+    resolved from the OSM tags and any per-way pga_fence_* override
+    tags (GUI Fences panel).
+
+    write-objects formats fences.json into placedObjects3.json
+    objectPaths[] groups for v2023; for v2019/v2021 it's skipped with a
+    note (no objectPaths node). No pack-objects needed -- run
+    write-objects (+ repack) afterwards. Re-runnable; overwrites
+    fences.json wholesale. clear=True writes an empty fences.json (the
+    GUI's Clear button). Re-run after any fresh ingest-osm.
+
+    simplify_tol_m / endpoint_tol_m / corner_angle_deg: None = project.json
+    value, else the fences.py default; explicit values persist.
+    corner_angle_deg < 0 means "never a corner" (every interior waypoint
+    smooth, as the game's own editor writes them).
+    """
+    out_path = working_dir / FENCES_FILE
+    if clear:
+        save_fence_records([], out_path)
+        save_project(working_dir, {"fence_count": 0, "fence_assets": []})
+        print(f"Cleared {out_path}")
+        return
+
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
+
+    project = load_project(working_dir)
+
+    def _setting(arg, key, const):
+        return arg if arg is not None else project.get(key, const)
+
+    simplify_tol = _setting(simplify_tol_m, "fence_simplify_tol_m", FENCE_SIMPLIFY_TOL_M)
+    endpoint_tol = _setting(endpoint_tol_m, "fence_endpoint_tol_m", FENCE_ENDPOINT_TOL_M)
+    corner_angle = _setting(corner_angle_deg, "fence_corner_angle_deg", FENCE_CORNER_ANGLE_DEG)
+
+    game_version = project.get("game_version", DEFAULT_GAME_VERSION)
+    if not schema_for(game_version).has_fences:
+        print(f"  NOTE: game_version={game_version} has no objectPaths -- fences.json is still "
+              "built, but write-objects only emits it for v2023+.")
+
+    features = _crop_features_to_course(working_dir, load_features(features_path))
+    fence_features = [f for f in features if f.kind in FENCE_KINDS]
+    records, warnings = build_fence_records(
+        fence_features, simplify_tol_m=simplify_tol, endpoint_tol_m=endpoint_tol,
+        corner_angle_deg=None if corner_angle is not None and corner_angle < 0 else corner_angle,
+    )
+    for w in warnings:
+        print(f"  WARNING: {w}")
+    save_fence_records(records, out_path)
+
+    by_asset: dict[str, int] = {}
+    for r in records:
+        by_asset[r.asset] = by_asset.get(r.asset, 0) + 1
+    print(f"  {len(fence_features)} fence/wall/hedge way(s) -> {len(records)} run(s) "
+          f"({sum(r.closed for r in records)} closed)")
+    for asset, n in sorted(by_asset.items()):
+        print(f"    {asset.rsplit('/', 1)[-1]}: {n}")
+    print(f"  wrote {out_path}")
+
+    save_project(working_dir, {
+        "fence_simplify_tol_m": simplify_tol,
+        "fence_endpoint_tol_m": endpoint_tol,
+        "fence_corner_angle_deg": corner_angle,
+        "fence_count": len(records),
+        "fence_assets": sorted(by_asset),
+    })
+
+
 def step_refine_terrain(
     working_dir: Path,
     tolerance: float,
@@ -4596,6 +4726,23 @@ def step_ingest_course(working_dir: Path, theme: str | None = None) -> None:
 
 BLANK_TEMPLATE_COURSE_FILE = "blank_template.course"
 PUSH_COLLECTION_COURSE_FILE = "pushed_collection.course"
+FENCE_TEST_COURSE_FILE = "fence_test.course"
+FENCE_TEST_LEGEND_FILE = "fence_test_legend.txt"
+
+
+def game_safe_course_stem(stem: str) -> str:
+    """
+    A .course filename stem the game can load. PGA 2K23 fails to load (and
+    to delete) any course whose filename has a hyphen followed by an
+    all-letter last segment -- "FT2-1-S-compact", "BZ1-shawnee-good",
+    "LIDAR-2023-bouldercreek-fences" -- while byte-identical copies named
+    "BZ2-shawnee-good2" / "BZ5-FT2-1-copy5" load, as do "hinckleyhills" and
+    "2023_fences" (V2023_TASKS.md 3.3a, 2026-09-26 bisection). The game
+    names a course's parts "<id>-Meta" / "<id>-Thumb", so it likely strips
+    a "-<Letters>" tail as a part suffix. Hyphens -> underscores sidesteps
+    it; the in-game display name (CD/CM "name") is unaffected.
+    """
+    return stem.replace("-", "_")
 
 
 def _new_offline_course_id() -> str:
@@ -4671,50 +4818,49 @@ def step_push_blank_template(working_dir: Path, course_name: str | None = None) 
         raise StepError(str(e)) from e
 
     serial = (course_name or "").strip() or f"LIDAR-{game_version}-{time.strftime('%Y%m%d%H%M%S')}"
-    course_id = _new_offline_course_id()
-    now_ms = int(time.time() * 1000)
-
-    extract_script = SCRIPT_DIR / "util" / "course_extract.py"
-    repack_script = SCRIPT_DIR / "util" / "course_repack.py"
-    for script in (extract_script, repack_script):
-        if not script.exists():
-            raise StepError(f"{script.name} not found at {script}")
-
-    stage_dir = Path(tempfile.mkdtemp(prefix="pga2k_blank_"))
     out_path = working_dir / BLANK_TEMPLATE_COURSE_FILE
-    try:
-        print(f"Staging template {template_file} (game_version={game_version}, theme={theme}) ...")
-        result = subprocess.run(
-            [sys.executable, str(extract_script), str(template_file), str(stage_dir)],
-            capture_output=True, text=True,
-        )
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.returncode != 0:
-            if result.stderr:
-                print(result.stderr, end="", file=sys.stderr)
-            raise StepError(f"course_extract.py failed (exit {result.returncode})")
-
-        _patch_blank_identity(stage_dir, serial, course_id, now_ms)
-        # v2019 numeric theme id patch (no-op for v2021+, whose template
-        # already encodes its look) -- same call write-terrain/repack use.
-        _apply_course_theme(stage_dir, project)
-
-        result = subprocess.run(
-            [sys.executable, str(repack_script), str(stage_dir), str(out_path)],
-            capture_output=True, text=True,
-        )
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.returncode != 0:
-            if result.stderr:
-                print(result.stderr, end="", file=sys.stderr)
-            raise StepError(f"course_repack.py failed (exit {result.returncode})")
-    finally:
-        shutil.rmtree(stage_dir, ignore_errors=True)
-
+    _build_course_from_template(project, template_file, serial, out_path, prefix="pga2k_blank_")
     print(f"Wrote blank course {out_path} (name={serial!r})")
     save_project(working_dir, {"blank_template_serial": serial})
+
+
+def _run_course_script(script: Path, *args: Path) -> None:
+    """Run util/course_extract.py or course_repack.py as a subprocess,
+    echoing its output; StepError on failure."""
+    if not script.exists():
+        raise StepError(f"{script.name} not found at {script}")
+    result = subprocess.run([sys.executable, str(script), *map(str, args)], capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0:
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        raise StepError(f"{script.name} failed (exit {result.returncode})")
+
+
+def _build_course_from_template(
+    project: dict, template_file: Path, serial: str, out_path: Path,
+    inject: Callable[[Path], None] | None = None, prefix: str = "pga2k_stage_",
+) -> None:
+    """
+    Shared body of the push-* steps: extract the bundled template into a
+    throwaway temp dir (working_dir/course/ is never touched), let
+    `inject` edit the staged dir, stamp a unique name + course id so the
+    game sees a new course, apply the v2019 theme patch (no-op for v2021+),
+    and repack to out_path.
+    """
+    stage_dir = Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        print(f"Staging template {template_file} (game_version="
+              f"{project.get('game_version', DEFAULT_GAME_VERSION)}) ...")
+        _run_course_script(SCRIPT_DIR / "util" / "course_extract.py", template_file, stage_dir)
+        if inject is not None:
+            inject(stage_dir)
+        _patch_blank_identity(stage_dir, serial, _new_offline_course_id(), int(time.time() * 1000))
+        _apply_course_theme(stage_dir, project)
+        _run_course_script(SCRIPT_DIR / "util" / "course_repack.py", stage_dir, out_path)
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 def _inject_collection_into_course(nodes_dir: Path, record: dict, game_version: str) -> tuple[int, int, int]:
@@ -4843,30 +4989,9 @@ def step_push_collection(
     serial = (course_name or "").strip() or (
         f"COLL-{_collection_slug(collection_name)}-{time.strftime('%Y%m%d%H%M%S')}"
     )
-    course_id = _new_offline_course_id()
-    now_ms = int(time.time() * 1000)
-
-    extract_script = SCRIPT_DIR / "util" / "course_extract.py"
-    repack_script = SCRIPT_DIR / "util" / "course_repack.py"
-    for script in (extract_script, repack_script):
-        if not script.exists():
-            raise StepError(f"{script.name} not found at {script}")
-
-    stage_dir = Path(tempfile.mkdtemp(prefix="pga2k_collection_push_"))
     out_path = working_dir / PUSH_COLLECTION_COURSE_FILE
-    try:
-        print(f"Staging template {template_file} (game_version={game_version}, theme={theme}) ...")
-        result = subprocess.run(
-            [sys.executable, str(extract_script), str(template_file), str(stage_dir)],
-            capture_output=True, text=True,
-        )
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.returncode != 0:
-            if result.stderr:
-                print(result.stderr, end="", file=sys.stderr)
-            raise StepError(f"course_extract.py failed (exit {result.returncode})")
 
+    def inject(stage_dir: Path) -> None:
         record = resolve_collection(template, COURSE_SIZE_M / 2, COURSE_SIZE_M / 2, 0.0)
         n_obj, n_spl, n_stamp = _inject_collection_into_course(
             stage_dir / "CourseDescription_nodes", record, game_version,
@@ -4874,29 +4999,96 @@ def step_push_collection(
         print(f"  injected {n_obj} object(s), {n_spl} spline(s), {n_stamp} terrain stamp(s) "
               f"from collection {collection_name!r}")
 
-        _patch_blank_identity(stage_dir, serial, course_id, now_ms)
-        # v2019 numeric theme id patch (no-op for v2021+) -- same call
-        # write-terrain / repack / push-blank-template use.
-        _apply_course_theme(stage_dir, project)
-
-        result = subprocess.run(
-            [sys.executable, str(repack_script), str(stage_dir), str(out_path)],
-            capture_output=True, text=True,
-        )
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.returncode != 0:
-            if result.stderr:
-                print(result.stderr, end="", file=sys.stderr)
-            raise StepError(f"course_repack.py failed (exit {result.returncode})")
-    finally:
-        shutil.rmtree(stage_dir, ignore_errors=True)
-
+    _build_course_from_template(project, template_file, serial, out_path, inject,
+                                prefix="pga2k_collection_push_")
     print(f"Wrote collection course {out_path} (name={serial!r})")
     save_project(working_dir, {
         "pushed_collection_serial": serial,
         "collections_library_dir": str(library_dir),
     })
+
+
+def step_push_fence_test(
+    working_dir: Path, origin: tuple[float, float] = FENCE_TEST_ORIGIN, course_name: str | None = None,
+) -> None:
+    """
+    Build working_dir/fence_test.course: the project's blank template
+    (game_version + theme) with course_output/fences.py's
+    build_fence_test_layout at `origin` (game frame) -- the sample course's
+    own objectPaths as a control, one row per asset / rule variant /
+    preset, an orientation L, and a raised flatten pad for the burial
+    check -- plus fence_test_legend.txt mapping rows to positions. The
+    GUI's "Push Fence Test to Game" copies it into the Courses folder.
+    One in-game load checks every fence option without hunting through a
+    full course (V2023_TASKS.md 3.5). v2023 only.
+    """
+    project = load_project(working_dir)
+    game_version = project.get("game_version", DEFAULT_GAME_VERSION)
+    schema = schema_for(game_version)
+    if not schema.has_fences:
+        raise StepError(f"push-fence-test needs a game version with objectPaths fences (v2023); "
+                        f"this project is game_version={game_version!r}.")
+    theme = _resolve_project_theme(project)
+    if not theme:
+        raise StepError("No theme set for this project -- pick one on the File tab (GUI) or run "
+                        "--step ingest-course --course-theme <name> (CLI) before pushing a fence test.")
+    try:
+        template_file = resolve_course_template(SCRIPT_DIR, game_version, theme)
+    except FileNotFoundError as e:
+        raise StepError(str(e)) from e
+
+    sample_file = SCRIPT_DIR / "templates" / "2023_fences.course"
+    sample_dir = Path(tempfile.mkdtemp(prefix="pga2k_fence_sample_"))
+    try:
+        _run_course_script(SCRIPT_DIR / "util" / "course_extract.py", sample_file, sample_dir)
+        sample_groups = load_placed_objects(sample_dir / "CourseDescription_nodes" / schema.objects_filename)
+    finally:
+        shutil.rmtree(sample_dir, ignore_errors=True)
+
+    try:
+        build_fence_test_layout(sample_groups, origin)  # off-map check before staging anything
+    except ValueError as e:
+        raise StepError(str(e)) from e
+    serial = (course_name or "").strip() or f"FENCETEST_{game_version}_{time.strftime('%Y%m%d%H%M%S')}"
+    out_path = working_dir / FENCE_TEST_COURSE_FILE
+    layout = None
+
+    def inject(stage_dir: Path) -> None:
+        nonlocal layout
+        nodes_dir = stage_dir / "CourseDescription_nodes"
+        # The stepped rows (heightRule=1) test height-as-absolute against the
+        # template's datum, so the layout is built once the datum is known.
+        datum, found = _collection_flatten_datum(nodes_dir)
+        if not found:
+            print("  WARNING: template has no map-wide flatten datum; pad/stepped rows use 0")
+        layout = build_fence_test_layout(sample_groups, origin, datum)
+        obj_path = nodes_dir / schema.objects_filename
+        existing = load_placed_objects(obj_path) if obj_path.exists() else []
+        new_groups = fence_records_to_groups_v2023(layout.records) + layout.control_groups
+        save_placed_objects(placed_object_groups_to_v2023(merge_object_groups(existing + new_groups)), obj_path)
+
+        # Raised pad: one square flatten stamp on top of the template's
+        # map-wide datum (same append-not-replace as collection stamps).
+        px, py = layout.pad_center
+        pad = Stamp(x=px + GRID_ORIGIN_OFFSET, z=py + GRID_ORIGIN_OFFSET, scale_x=layout.pad_half,
+                    scale_z=layout.pad_half, value=datum + layout.pad_lift, brush=FENCE_TEST_PAD_BRUSH,
+                    tool=TOOL_FLATTEN)
+        ul_path = nodes_dir / schema.userlayers_filename
+        ul = json.loads(ul_path.read_text(encoding="utf-8")) if ul_path.exists() else {}
+        ul.setdefault("height", []).append(stamp_to_entry(pad, game_version))
+        ul_path.write_text(json.dumps(ul, indent=2), encoding="utf-8")
+        n_paths = sum(len(g["Value"]["objectPaths"]) for g in new_groups)
+        print(f"  injected {n_paths} objectPath(s) and a pad at datum {datum:g} + {layout.pad_lift:g} m")
+
+    _build_course_from_template(project, template_file, serial, out_path, inject, prefix="pga2k_fence_test_")
+
+    legend_path = working_dir / FENCE_TEST_LEGEND_FILE
+    header = [f"{serial} -- fence test at game-frame origin ({origin[0]:g}, {origin[1]:g}); "
+              f"rows run +x from the corner, {FENCE_TEST_ROW_PITCH_M:g} m apart toward -y."]
+    legend_path.write_text("\n".join(header + layout.legend) + "\n", encoding="utf-8")
+    print("\n".join(header + layout.legend))
+    print(f"Wrote fence test course {out_path} and legend {legend_path}")
+    save_project(working_dir, {"fence_test_serial": serial})
 
 
 def _stale_version_node_files(course_dir: Path, game_version: str) -> list[str]:
@@ -5069,6 +5261,11 @@ def step_repack(working_dir: Path, filename: str) -> None:
         raise StepError("Repack filename can't be empty.")
     if filename.lower().endswith(".course"):
         filename = filename[: -len(".course")]
+    safe = game_safe_course_stem(filename)
+    if safe != filename:
+        print(f"Repack filename {filename!r} -> {safe!r} (the game can't load a filename whose "
+              f"last '-' segment is all letters; see game_safe_course_stem)")
+        filename = safe
 
     out_path = working_dir / f"{filename}.course"
 
@@ -5542,7 +5739,9 @@ STEPS = {
     "generate-collections": step_generate_collections,
     "generate-parking": step_generate_parking,
     "generate-range-nets": step_generate_range_nets,
+    "generate-fences": step_generate_fences,
     "push-collection": step_push_collection,
+    "push-fence-test": step_push_fence_test,
     "refine-terrain": step_refine_terrain,
     "write-terrain": step_write_terrain,
     "write-water": step_write_water,
@@ -5984,6 +6183,21 @@ def main(argv: list[str] | None = None) -> int:
                          help="generate-range-nets: do NOT reposition inner corners to the 8 m "
                               "grid (keep corners exactly where drawn; segment lengths stay "
                               "non-multiple-of-8 and no post falls on a corner). Off by default.")
+    parser.add_argument("--fence-simplify-tol", type=float, default=None,
+                         help="generate-fences: Douglas-Peucker tolerance (m) for fence runs. "
+                              f"Default: project.json, or {FENCE_SIMPLIFY_TOL_M}.")
+    parser.add_argument("--fence-endpoint-tol", type=float, default=None,
+                         help="generate-fences: way ends within this distance (m) are the same "
+                              "node -- same-style ways meeting there are joined into one run. "
+                              f"Default: project.json, or {FENCE_ENDPOINT_TOL_M}.")
+    parser.add_argument("--fence-corner-angle", type=float, default=None,
+                         help="generate-fences: an interior waypoint turning more than this "
+                              "(degrees) keeps a sharp corner; gentler bends are smoothed. "
+                              "Negative = smooth everywhere (the game editor's behaviour). "
+                              f"Default: project.json, or {FENCE_CORNER_ANGLE_DEG}.")
+    parser.add_argument("--clear-fences", action="store_true",
+                         help="generate-fences: write an empty fences.json instead (removes every "
+                              "fence at the next write-objects).")
     parser.add_argument("--error-resolution", type=int, default=None,
                          help="visualize: grid resolution for preview_error.png, overriding the "
                               "default of inheriting whatever --resolution refine-terrain last used "
@@ -6236,10 +6450,14 @@ def main(argv: list[str] | None = None) -> int:
                               "saved to project.json's \"theme\" field. Optional: only needed on the "
                               "first --step ingest-course for a project, or to change theme afterward.")
     parser.add_argument("--blank-course-name", type=str, default=None,
-                         help="push-blank-template / push-collection: in-game name to stamp into the "
+                         help="push-blank-template / push-collection / push-fence-test: in-game name to stamp into the "
                               "built .course (its course id is also regenerated so the game sees a new "
                               "course). Optional -- defaults to a generated serial "
                               "('LIDAR-<version>-<timestamp>' / 'COLL-<name>-<timestamp>').")
+    parser.add_argument("--fence-test-origin", type=float, nargs=2, metavar=("X", "Z"),
+                         default=list(FENCE_TEST_ORIGIN),
+                         help="push-fence-test: game-frame corner the test layout grows from "
+                              f"(+x / -z). Default {FENCE_TEST_ORIGIN[0]:g} {FENCE_TEST_ORIGIN[1]:g} (NW).")
     parser.add_argument("--game-version", type=str, default=None, choices=GAME_VERSIONS,
                          help="Project-level target game version -- selects the .course schema "
                               "(node filenames + object format, see course_output/game_versions.py) "
@@ -6468,6 +6686,14 @@ def main(argv: list[str] | None = None) -> int:
                 snap=(False if args.range_net_no_snap else None),
                 min_length_m=args.range_net_min_length,
             )
+        elif args.step == "generate-fences":
+            step_generate_fences(
+                working_dir,
+                simplify_tol_m=args.fence_simplify_tol,
+                endpoint_tol_m=args.fence_endpoint_tol,
+                corner_angle_deg=args.fence_corner_angle,
+                clear=args.clear_fences,
+            )
         elif args.step == "push-collection":
             if not args.collection_name:
                 print("error: --step push-collection requires --collection-name", file=sys.stderr)
@@ -6475,6 +6701,8 @@ def main(argv: list[str] | None = None) -> int:
             step_push_collection(
                 working_dir, args.collection_name, args.collection_library, args.blank_course_name,
             )
+        elif args.step == "push-fence-test":
+            step_push_fence_test(working_dir, tuple(args.fence_test_origin), args.blank_course_name)
         elif args.step == "refine-terrain":
             parsed_candidate_brushes = (
                 tuple(int(b.strip()) for b in args.candidate_brushes.split(","))

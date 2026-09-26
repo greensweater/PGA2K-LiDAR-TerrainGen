@@ -70,6 +70,28 @@ Pipeline hot path = the `step_*` functions in `PGA2k_gen.py` plus the
 - **Stamps are layered, not snapshot.** Each pass writes only the stamps *it*
   added (`stamps/stamps_N.json`); `load_all_stamps` reconstructs the effective
   list. Deleting the highest-numbered file is the natural "undo".
+- **Game `.course` filenames: no `-<letters>` tail.** PGA 2K23 can't load or
+  delete `foo-bar.course` (last `-` segment all letters); `foo_bar` and
+  `foo-bar2` are fine. Route every filename written into the game's Courses
+  folder through `game_safe_course_stem` (`V2023_SCHEMA.md` "Course filename
+  rule"). When hand-building test courses, use `_` or end names in a digit.
+- **Python: use the repo `.venv`** (`.venv/Scripts/python.exe`). The system
+  3.9 / 3.13 interpreters lack shapely / pyproj.
+- **In-game verification checkpoints are not something a session can close
+  itself.** Some `Done when` criteria require loading a generated `.course` in
+  the actual game (PGA2K) — only Andy can do that. When a task's acceptance
+  criterion depends on an in-game check:
+  - Build and wire the code up to that checkpoint, then stop — report the
+    subtask as "ready for in-game verification," not "done."
+  - State plainly what to load and what to look for (e.g. "load `X.course`
+    in v2023, confirm fences render on their spline with the right cap
+    style").
+  - Don't mark the parent task/phase complete until that confirmation comes
+    back.
+
+  This avoids two failure modes: a session stalling on work it can't
+  perform, and a session prematurely claiming a feature works when only the
+  code path exists.
 
 ## Already-verified performance state (do not re-audit)
 

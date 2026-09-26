@@ -1433,9 +1433,12 @@
       "fence_options": {
         "spacingRule": {
           "values": [
-            2
+            0,
+            1,
+            2,
+            3
           ],
-          "complete": false
+          "complete": true
         },
         "hasCurves": {
           "values": [
