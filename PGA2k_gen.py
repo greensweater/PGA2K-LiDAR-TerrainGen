@@ -213,7 +213,7 @@ from course_output.parking import (
 from course_output.fences import (
     CORNER_ANGLE_DEG as FENCE_CORNER_ANGLE_DEG, FENCE_ENDPOINT_TOL_M, FENCE_KINDS,
     FENCE_SIMPLIFY_TOL_M, FENCE_STYLE_TAGS, FENCE_TEST_ORIGIN, FENCE_TEST_PAD_BRUSH, FENCE_TEST_ROW_PITCH_M,
-    build_fence_records, build_fence_test_layout, fence_records_to_groups_v2023,
+    apply_leveled_heights, build_fence_records, build_fence_test_layout, fence_records_to_groups_v2023,
     load_fence_records, save_fence_records,
 )
 from course_output.range_nets import (
@@ -2311,6 +2311,24 @@ def _build_placed_objects(
     if fences_path.exists():
         fence_records = load_fence_records(fences_path)
         if fence_records and schema_for(game_version).has_fences:
+            # Leveled runs (heightRule=1) take ONE absolute height -- the
+            # run's lowest ground, as the game's editor sets it -- so their
+            # stored offset resolves against the terrain as it stands now,
+            # same approach as elevated collection objects above.
+            n_leveled = sum(int(r.rules["heightRule"]) == 1 for r in fence_records)
+            if n_leveled:
+                if _stamps_files(working_dir):
+                    shift_m = project.get("output_height_shift_m")
+                    if shift_m is None:
+                        print("  NOTE: no output_height_shift_m in project.json yet -- run write-terrain so "
+                              "leveled fences sit at the right height. Using 0 for now.")
+                        shift_m = 0.0
+                    model = _cached_terrain_model_for_objects(working_dir)
+                    fence_records = apply_leveled_heights(fence_records, model.evaluate, shift_m)
+                    print(f"  resolved height for {n_leveled} leveled fence run(s) (lowest ground + offset)")
+                else:
+                    print(f"  NOTE: {n_leveled} leveled fence run(s) but no terrain stamps exist yet -- "
+                          "their height stays the raw offset (likely underground).")
             fence_groups = fence_records_to_groups_v2023(fence_records)
             print(f"  {len(fence_records)} fence/wall objectPath(s) across {len(fence_groups)} asset(s)")
             placed_objects += fence_groups

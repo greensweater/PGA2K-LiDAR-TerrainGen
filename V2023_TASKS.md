@@ -813,19 +813,21 @@ prioritize it; treat the object-tile version as a later optional variant.
   - [x] 3.5.4 Verify the trick presets (curb / railroad / retaining wall)
         in-game. Done via the fence test (B18–B20), 2026-09-26; the retaining
         wall height was corrected to -1.015.
-  - [ ] 3.5.6 **Stepped fences need an absolute height** (found by the fence
-        test). With `heightRule=1`, `height` is an absolute elevation, but
-        today the builder passes the rule/tag value through as-is, so a
-        stepped OSM fence at the default 0 is underground.
-    - Where: `course_output/fences.py` `resolve_fence_style` /
-      `build_fence_records`, and the terrain model used by
-      `step_generate_fences` (`PGA2k_gen.py`).
-    - Steps: for stepped runs, set `height` = terrain elevation along the run
-      (e.g. the max over its waypoints) + the user's offset. Treat
-      `pga_fence_height` as an *offset* in both modes and convert at build
-      time. Record the rule in `V2023_SCHEMA.md`.
-    - Done when: a stepped OSM fence renders with its top level and resting
-      on the ground in-game.
+  - [ ] 3.5.6 **Leveled (stepped) fences need an absolute height** (found by the fence
+        test). **Code DONE 2026-09-27; ready for in-game verification.**
+    - Semantics (Andy, in-game): `heightRule=1` = ONE height for the whole
+      run, which the editor sets to the run's minimum ground.
+    - Implemented as `fences.apply_leveled_heights`, called from
+      `_build_placed_objects` at write-objects: min terrain along the run
+      (1 m sampling) + `output_height_shift_m` + the offset tag. See
+      `V2023_SCHEMA.md` "Leveled fence height". The GUI's HEIGHT choice
+      now reads "leveled".
+    - Tests: `LeveledHeightTest` (5 cases). Checked on a bouldercreek2
+      scratch copy: heights match an independent terrain sweep within 6 mm.
+    - Done when: a leveled OSM fence in-game sits level at its run's low
+      point, like one placed in the editor. Test it on a way over a slope
+      (`pga_fence_heightRule=1`); the picket and railing parts should line
+      up in the same load.
   - [ ] 3.5.7 (future, from Andy) **Retaining wall along pond edges.** The
         retaining wall draws a ground-textured cap tile about 1.9 m back
         from the spline, at cap height (Γ profile). Place the spline about

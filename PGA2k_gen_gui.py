@@ -3024,7 +3024,7 @@ class PGAGenGUI:
     # unverified in-game, so the raw spacingRule number is shown too.
     _FENCE_CAP_CHOICES = {"": None, "0 (none)": "0", "1 (ends only)": "1", "2 (spaced)": "2",
                           "3 (spline points)": "3"}
-    _FENCE_HEIGHT_RULE_CHOICES = {"": None, "contoured": "0", "stepped": "1"}
+    _FENCE_HEIGHT_RULE_CHOICES = {"": None, "contoured": "0", "leveled": "1"}
     _FENCE_CURVE_CHOICES = {"": None, "curved": "true", "straight": "false"}
 
     def _build_fences_section(self, parent) -> None:
@@ -3075,16 +3075,17 @@ class PGAGenGUI:
              "1 and 3 look the same on a 2-point run. A value "
              "the asset doesn't support is warned about at Generate.")
         _row("HEIGHT", _combo(self.fence_height_rule_var, list(self._FENCE_HEIGHT_RULE_CHOICES)),
-             "heightRule: contoured follows the terrain (OFFSET is relative to it); stepped holds "
-             "a level top and OFFSET becomes an ABSOLUTE elevation (in-game verified -- 0 is "
-             "underground; the blank template's ground is ~3.23).")
+             "heightRule: contoured skews each panel along the ground; leveled holds the whole run "
+             "at ONE height -- the run's lowest ground, as the game's editor sets it (resolved at "
+             "Write Objects from the terrain). OFFSET is relative in both modes.")
         _row("SEGMENTS", _combo(self.fence_curves_var, list(self._FENCE_CURVE_CHOICES)),
              "hasCurves: curved smooths gentle bends (sharp corners stay sharp); straight = "
              "straight segments everywhere.")
         _row("SPACING m", _entry(self.fence_spacing_var), "Post/panel spacing along the path (m).")
         _row("WIDTH m", _entry(self.fence_width_var), "Fence width (m). Sample: 4.0, retaining wall 2.5.")
         _row("OFFSET m", _entry(self.fence_height_var),
-             "Vertical offset from the terrain (m); negative = buried (curb -1.5, railroad -2.69).")
+             "Vertical offset (m): from the ground when contoured, from the run's lowest ground "
+             "when leveled; negative = buried (curb -1.5, railroad -2.69).")
 
         btns = ttk.Frame(parent)
         btns.pack(anchor="w", pady=2)

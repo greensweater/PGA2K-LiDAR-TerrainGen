@@ -126,7 +126,7 @@ except one 1.3; `width` 4.0 except retaining wall 2.5):
 | field | observed values | mapped meaning (per course author's description) |
 |---|---|---|
 | `spacingRule` | 0, 1, 2, 3 | **end caps: 0 none / 1 ends only / 2 spaced / 3 spline points** (JSON values, in-game verified 2026-09-26; the game menu lists them in a different order) |
-| `heightRule` | 0, 1 | **0 = contoured** (follows the stamped terrain; `height` = offset), **1 = stepped** (level top; `height` = ABSOLUTE elevation, verified; sample rows use 3.23 = the blank's datum) |
+| `heightRule` | 0, 1 | **0 = contoured** (follows the stamped terrain; `height` = offset), **1 = leveled** (the editor's name; "stepped" in older notes): ONE absolute `height` for the whole run, which the editor sets to the run's **minimum ground** (Andy, 2026-09-27); sample rows use 3.23 = the blank's flat datum. See "Leveled fence height" |
 | `hasCurves` | true, false | **curved vs straight** segments |
 | `flexibilityRule` | 0, 1 | unconfirmed — candidate: rigid panels vs flexible/flexing along path (fl=0 seen on the straight brick rows) |
 | `state` | 0 (11 rows), 1 (retaining wall, 4 waypoints) | unconfirmed |
@@ -179,7 +179,8 @@ Built with `--step push-fence-test`; the row ids are from its legend.
 - **`heightRule=1` (stepped): `height` is an ABSOLUTE elevation**, not an
   offset. E1 at height = datum 3.23 sat on the surface; E2 at datum+3
   floated; B13 at 0 was underground. `heightRule=0`: `height` is an offset
-  from the stamped terrain.
+  from the stamped terrain. (Refined 2026-09-27: see "Leveled fence
+  height" below — one height per run, the run's lowest ground.)
 - **`hasCurves`**: true draws a smooth curve through the waypoints (E5);
   false draws straight segments, so a 3-point bend is a V (E6).
 - **The fences in the full course render** (BX3/BX4, near hole 18). My
@@ -482,8 +483,9 @@ writes `state` 1 for closed runs and 0 for open ones. Confirm in-game
   and reverts to the asset default. A value outside an incomplete set
   warns "unverified" and is kept, so in-game trials can extend
   `asset_catalog.json`.
-- **Stepped (`heightRule=1`)** doesn't auto-set a height. Every sample
-  stepped row uses `height ≈ 3.23`; set `pga_fence_height` alongside it.
+- **Leveled (`heightRule=1`)** height is resolved at write time. See
+  "Leveled fence height" (superseded the original "doesn't auto-set a
+  height" note, 3.5.6).
 - **Output:** `fences.json` stores the frozen `FenceRecord`s in the local
   frame. `fence_records_to_groups_v2023` emits `{Key:{path}, Value:
   {objectPaths}}` groups for `merge_object_groups` +
@@ -526,6 +528,34 @@ writes `state` 1 for closed runs and 0 for open ones. Confirm in-game
   envelope. **Not yet loaded in-game** (that's 3.5).
 - `bouldercreek2/course/` was reset to the v2023 baseline
   (`--step ingest-course`) on 2026-09-27 for 3.5.2.
+
+## Leveled fence height (task 3.5.6, 2026-09-27)
+
+**Game semantics (Andy, in-game):**
+- `heightRule=0` (contoured): each panel skews along the ground, so the
+  top follows the terrain; `height` is an offset from the ground.
+- `heightRule=1` (the editor calls it **leveled**): the whole run sits at
+  **one absolute `height`**, and the editor sets it to the run's
+  **minimum** ground height. Andy first thought each panel anchored at
+  its own start height (true steps), but an in-game test showed it
+  doesn't.
+
+**Pipeline rule:** in `fences.json`, `height` stays an **offset in both
+modes** (`pga_fence_height`; default 0 = what the editor does). At
+write-objects, `_build_placed_objects` resolves leveled runs with
+`fences.apply_leveled_heights`: absolute `height` = min over the run of
+`TerrainModel.evaluate` + `output_height_shift_m` + offset. Details:
+- Sampling: every 1 m along every segment, including a closed run's wrap
+  segment, so a dip between waypoints counts. The terrain model is the
+  one `_cached_terrain_model_for_objects` builds for elevated collection
+  objects.
+- Multi-part types share points and offset, so both parts get the same
+  height.
+- `push-fence-test` rows keep explicit absolute heights and bypass this.
+
+Checked on a bouldercreek2 scratch copy: the emitted heights match an
+independent 0.25 m terrain sweep to within 6 mm, and sit at each run's
+low point.
 
 ## Course filename rule (CONFIRMED in-game, 2026-09-26)
 

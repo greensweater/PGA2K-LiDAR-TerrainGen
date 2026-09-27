@@ -653,6 +653,41 @@ def fence_records_to_groups_v2023(records: Sequence[FenceRecord | dict]) -> list
     return [{"Key": {"path": asset}, "Value": {"objectPaths": paths}} for asset, paths in groups.items()]
 
 
+LEVELED_SAMPLE_STEP_M = 1.0   # ground sampling pitch along a leveled run
+
+
+def apply_leveled_heights(
+    records: Sequence[FenceRecord | dict], height_at, height_shift_m: float = 0.0,
+) -> list[FenceRecord]:
+    """
+    Resolve leveled (heightRule=1) runs to the game's absolute height. A
+    leveled objectPath has ONE height for the whole run, and the game's
+    editor sets it to the run's MINIMUM ground height (Andy, in-game,
+    2026-09-27). fences.json keeps `height` as an offset in both modes, so
+    a leveled record gets min(height_at along the run) + height_shift_m +
+    its offset. Ground is sampled every LEVELED_SAMPLE_STEP_M along each
+    segment (plus the wrap segment of a closed run), so a dip between
+    waypoints still counts. `height_at(x, z)` is the terrain height in the
+    pre-shift course-local frame (TerrainModel.evaluate); height_shift_m
+    is project.json's output_height_shift_m. Contoured records pass
+    through; returns copies, never mutates the input.
+    """
+    out: list[FenceRecord] = []
+    for rec in records:
+        r = rec if isinstance(rec, FenceRecord) else load_fence_record(rec)
+        r = load_fence_record(asdict(r))
+        if int(r.rules["heightRule"]) == 1 and r.points:
+            pts = r.points + ([r.points[0]] if r.closed else [])
+            ground = [height_at(*pts[0])]
+            for a, b in zip(pts, pts[1:]):
+                n = max(1, math.ceil(_dist(a, b) / LEVELED_SAMPLE_STEP_M))
+                ground += [height_at(a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n)
+                           for i in range(1, n + 1)]
+            r.rules["height"] = _round(min(ground) + height_shift_m + float(r.rules["height"]))
+        out.append(r)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # In-game test harness (push-fence-test): a blank course with every fence
 # asset / rule variant / preset laid out in labelled rows at one corner, so

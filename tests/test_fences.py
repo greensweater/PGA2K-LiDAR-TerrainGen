@@ -28,7 +28,8 @@ from course_extract import extract_course_file  # noqa: E402
 from course_output.fences import (  # noqa: E402
     BRICK_LOW_RAILS_ASSET, BRICK_WALL_ASSET, CANVAS_BLACK_ASSET, FENCE_TYPES, FenceRecord,
     LOW_METAL_RAILING_ASSET, PICKET_PICKETS_ASSET, PICKET_POSTS_ASSET, RETAINING_WALL_ASSET,
-    STONE_WALL_ASSET, UNI_FENCE_ASSET, WIRE_FENCE_ASSET, WOOD_FENCE_ASSET, build_fence_records,
+    STONE_WALL_ASSET, UNI_FENCE_ASSET, WIRE_FENCE_ASSET, WOOD_FENCE_ASSET, apply_leveled_heights,
+    build_fence_records,
     fence_record_to_object_path_v2023, fence_records_to_groups_v2023, load_fence_records,
     resolve_fence_style, save_fence_records,
 )
@@ -215,6 +216,48 @@ class BuilderTest(unittest.TestCase):
             save_fence_records(recs, Path(tmp) / "fences.json")
             again = load_fence_records(Path(tmp) / "fences.json")
         self.assertEqual(fence_records_to_groups_v2023(again), groups)
+
+
+class LeveledHeightTest(unittest.TestCase):
+    """heightRule=1: one height per run = lowest ground + shift + offset."""
+
+    @staticmethod
+    def _rec(points, heightRule=1, height=0.0, closed=False):
+        rules = {"width": 4.0, "height": height, "spacing": 4.0, "spacingRule": 2,
+                 "flexibilityRule": 1, "heightRule": heightRule, "hasCurves": True}
+        return FenceRecord(asset=WOOD_FENCE_ASSET, points=list(points), closed=closed, rules=rules)
+
+    def test_slope_takes_minimum_plus_shift_and_offset(self):
+        slope = lambda x, z: 10.0 + 0.5 * x  # noqa: E731
+        (r,) = apply_leveled_heights([self._rec([(0, 0), (20, 0)], height=0.25)], slope, 3.0)
+        self.assertAlmostEqual(r.rules["height"], 10.0 + 3.0 + 0.25)
+
+    def test_dip_between_waypoints_counts(self):
+        dip = lambda x, z: 5.0 - (2.0 if 9.5 <= x <= 10.5 else 0.0)  # noqa: E731
+        (r,) = apply_leveled_heights([self._rec([(0, 0), (20, 0)])], dip)
+        self.assertAlmostEqual(r.rules["height"], 3.0)
+
+    def test_closed_run_includes_wrap_segment(self):
+        # Low ground only on the closing edge (0,10)->(0,0), x == 0, 0 < z < 10.
+        ground = lambda x, z: 1.0 if (x == 0 and 0 < z < 10) else 8.0  # noqa: E731
+        square = [(0, 0), (10, 0), (10, 10), (0, 10)]
+        (closed,) = apply_leveled_heights([self._rec(square, closed=True)], ground)
+        (opened,) = apply_leveled_heights([self._rec(square)], ground)
+        self.assertEqual((closed.rules["height"], opened.rules["height"]), (1.0, 8.0))
+
+    def test_contoured_untouched_and_input_not_mutated(self):
+        rec = self._rec([(0, 0), (5, 0)], heightRule=0, height=-1.5)
+        leveled = self._rec([(0, 0), (5, 0)], height=0.5)
+        out = apply_leveled_heights([rec, leveled], lambda x, z: 7.0, 1.0)
+        self.assertEqual(out[0].rules["height"], -1.5)
+        self.assertEqual(leveled.rules["height"], 0.5)
+
+    def test_multi_part_parts_share_height(self):
+        recs, _ = build_fence_records([_way([(0, 0), (10, 5)], {
+            "fence_type": "picket", "pga_fence_heightRule": "1"})])
+        out = apply_leveled_heights(recs, lambda x, z: 2.0 + x)
+        self.assertEqual(len({r.rules["height"] for r in out}), 1)
+        self.assertEqual(out[0].rules["height"], 2.0)
 
 
 class StyleTest(unittest.TestCase):
