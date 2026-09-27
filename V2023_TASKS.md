@@ -122,7 +122,7 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
   - [x] 0.3a.6 Confirm `pointOne`/`pointTwo` are bezier handles (vs endpoint
         duplicates) when `hasCurves=false` — yes, same 0.25/0.375 rule either
         way (3.2; `V2023_SCHEMA.md` "objectPath handle rule").
-- [ ] **0.3b "Clear generated objects" paint — schema CONFIRMED (2026-09-23, second
+- [x] **0.3b "Clear generated objects" paint — schema CONFIRMED, all of 0.3b closed 2026-09-27 (2026-09-23, second
       export, commit `8376f0e`)** — see `V2023_SCHEMA.md` "Clear-generated-objects
       paint" section. It reuses the `userLayers2.json` `surfaces` layer with
       `surfaceCategory: 5`; entries are OOB-shaped brush stamps (`type` 8 round /
@@ -142,16 +142,17 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
         edges. The earlier "29 m ≈ scale/2" eyeball read was wrong. Still
         unknown and not blocking: what `value` means (1.0, or 2.0 for heavy
         rough); copy the game's values as they are.
-  - [ ] 0.3b.3 v2019/v2021 support. **Tools confirmed (Andy, 2026-09-27)**:
-        the earlier editors have "clear trees" and "clear objects", but **no
-        "clear heavy rough"** (category 11 is v2023-only). **Still open: how they
-        are stored.** v2021 userLayers has both `surfaces` (empty in our sample)
-        and a separate `clearTrees` key, so clear-trees may live in
-        `clearTrees` rather than as a `surfaceCategory: 6` entry. To settle it:
-        get a v2021 (and v2019) course with one clear-trees and one
-        clear-objects stamp placed in the editor, then extract it and read the
-        `userLayers` entries.
-  - [ ] 0.3b.4 Record answers in `V2023_SCHEMA.md` and lift the 3.4 gate.
+  - [x] 0.3b.3 v2019/v2021 support (Andy's editor exports, 2026-09-27:
+        `LIDAR-2019-20260927194006` / `LIDAR-2021-20260927194159`). Both
+        editors have "clear trees" and "clear objects" but **no "clear heavy
+        rough"** (category 11 is v2023-only). Both store them **exactly like
+        v2023**: `userLayers.json` → `surfaces[]`, category **6** = trees and
+        **5** = objects, `type` 15, `value` 1.0, in that version's own entry
+        shape (with `_orientation`/`radius`/`orientation`). The `clearTrees` key
+        stays empty, so it isn't what the clear-trees tool writes.
+  - [x] 0.3b.4 Recorded in `V2023_SCHEMA.md`. The 3.4 gate is lifted.
+        `has_clear_objects` (categories 5/6) is now True for every version, and
+        the new `has_clear_heavy_rough` (category 11) is True for 2023 only.
 - [x] **0.4 Document findings** — `V2023_SCHEMA.md` written; `VERSION_SCHEMAS`
       `2023` entry still to be populated (that is task 1.1, gated only on
       0.3b for the clear-objects capability flag).
@@ -201,7 +202,8 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
         `has_texture_paint` (deferred, Phase 4), and a clear-objects flag
         (e.g. `has_clear_objects=True` — the schema is confirmed; add the field
         to `VersionSchema` now, set it per version once 0.3b.3 resolves
-        v2019/v2021 support).
+        v2019/v2021 support). Done 2026-09-27: `has_clear_objects` is True for
+        every version, `has_clear_heavy_rough` for 2023 only.
   - [x] 1.1.4 Add `"2023"` to `IMPLEMENTED_GAME_VERSIONS`.
   - [x] 1.1.5 Update the module docstring to drop the "unconfirmed" note for
         2023.
@@ -679,7 +681,8 @@ prioritize it; treat the object-tile version as a later optional variant.
       `value` 1.0, `tool` 0, y "-Infinity"). 0.3b.1/0.3b.2 are closed
       in-game (2026-09-27): the paint clears only the game's procedural
       scatter; categories are 5 objects / 6 trees / 11 heavy rough (type 72,
-      value 2.0). Only 0.3b.3 (v2019/v2021 support) is still open.
+      value 2.0). 0.3b.3 is closed too: v2019/v2021 store 5/6 the same way,
+      and have no category 11. **3.4 is ungated.**
   - **Context**: Phase 2 done; schema confirmed from the second sample export
     (commit `8376f0e`, see `V2023_SCHEMA.md` "Clear-generated-objects paint").
   - **Where**: `course_output/out_of_bounds.py` is the blueprint (brush-stamp
@@ -715,10 +718,9 @@ prioritize it; treat the object-tile version as a later optional variant.
         *own* procedural scatter; our placedObjects3 trees are unaffected
         (0.3b.1). So the generator-side suppression (3.4.4) is a choice we
         make, not something the game does for us. Also decide which categories
-        to emit: 5 objects, 6 trees, 11 heavy rough. Also decide whether it
-        applies in v2023 only or also v2019/v2021 (pending 0.3b.3 —
-        does it apply in v2023 only or also v2019/v2021 (pending 0.3b.3 —
-        gate the v2019/v2021 wiring on that answer).
+        to emit: 5 objects, 6 trees, 11 heavy rough. Categories 5/6 work in
+        every version (`has_clear_objects`); 11 is v2023 only
+        (`has_clear_heavy_rough`) (0.3b.3).
   - [ ] 3.4.6 **Wiring**: `step_generate_clear_objects` (+ clear flag,
         mirroring `step_generate_oob`/`_clear_oob`), fold into
         `step_write_terrain` like OOB is (`oob_entries` pattern), `project.json`

@@ -315,9 +315,30 @@ treeDensity, hazards, terrainHeight, height, trees, green, surfaces,
 outOfBounds, crowdLocations, water` and the v2021 sample's `surfaces` array
 was empty. Andy confirms (2026-09-27) that the v2019/v2021 editors have
 "clear trees" and "clear objects" tools but **no "clear heavy rough"**
-(category 11 is v2023-only). How the earlier versions store the two tools
-is still unconfirmed (0.3b.3): as `surfaces` categories 5/6 like v2023, or
-(for trees) in v2021's separate `clearTrees` key.
+(category 11 is v2023-only).
+
+**v2019/v2021 storage — CONFIRMED (0.3b.3, Andy's editor exports
+2026-09-27: `LIDAR-2019-20260927194006`, `LIDAR-2021-20260927194159`).**
+Each has one clear-trees and one clear-objects stamp, and both versions
+store them exactly like v2023. They go in `userLayers.json` → `surfaces[]`:
+**category 6 = trees**, **category 5 = objects**, `type` 15, `value` 1.0.
+The `clearTrees` key stays empty, so it is not what the clear-trees tool
+writes. Entries use that version's full stamp shape, the same key set as
+its `height` entries:
+
+```json
+{"surfaceCategory": 6, "position": {"x": -688.9412, "y": "-Infinity", "z": 607.689453},
+ "rotation": {"x": 0.0, "y": 0.0, "z": 0.0}, "_orientation": 0.0,
+ "scale": {"x": 229.833572, "y": 1.0, "z": 229.833572}, "type": 15, "value": 1.0,
+ "holeId": -1, "radius": 0.0, "orientation": 0.0}
+```
+
+Side finding: the game-saved **v2019** course carries `_orientation` /
+`orientation` on its `height` entries too, although
+`VERSION_SCHEMAS["2019"]` has `has_orientation_fields=False`. Our v2019 writes
+without them have always loaded, so the game accepts both; no writer change
+needed. A v2019 clear-stamp formatter can go either way, but copying the
+game's shape (with the fields) is the safer default.
 
 ## Version registry (task 1.1 decisions, 2026-09-23)
 
@@ -334,7 +355,9 @@ is still unconfirmed (0.3b.3): as `surfaces` categories 5/6 like v2023, or
   under those keys.
 - `has_pins_field=True` for 2023 is **inherited from v2021, not confirmed**:
   the sample's `holes2` is empty (0.3a.5).
-- `has_clear_objects=True` for 2023 only. v2019/v2021 stay False until 0.3b.3.
+- `has_clear_objects` (categories 5/6) is True for every version since
+  0.3b.3 (2026-09-27). `has_clear_heavy_rough` (category 11) is True for
+  2023 only.
 - Theme: the v2023 sample carries `theme: 11` (= rustic), the same id as
   the v2021 rustic template, so theme ids appear to carry over.
   `templates/2023_rustic.course` is a blank built from `2023_fences.course`:

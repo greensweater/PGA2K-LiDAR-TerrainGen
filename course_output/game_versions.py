@@ -56,11 +56,14 @@ class VersionSchema:
     # (objectPaths + IsEmpty on every group, objects.placed_object_groups_to_v2023).
     has_fences: bool = False
     has_texture_paint: bool = False  # v2023+ -- deferred (V2023_TASKS.md Phase 4), not implemented
-    # userLayers "surfaces" entries with surfaceCategory 5 (brush-stamp
-    # exclusion zone for generated objects). Confirmed written by v2023;
-    # whether v2019/v2021 honor it is still open (V2023_TASKS.md 0.3b.3),
-    # so they stay False until checked.
-    has_clear_objects: bool = False
+    # userLayers "surfaces" clear stamps for the game's procedural scatter:
+    # surfaceCategory 5 = clear generated objects (trees/plants/grass/rocks),
+    # 6 = clear generated trees. Confirmed from editor exports in all three
+    # versions (V2023_SCHEMA.md "Clear-generated-objects paint").
+    has_clear_objects: bool = True
+    # surfaceCategory 11 = clear generated heavy rough (type 72, value 2.0).
+    # v2023 only -- the v2019/v2021 editors have no such tool.
+    has_clear_heavy_rough: bool = False
     has_spline_water: bool = False  # v2025+ -- UNCONFIRMED placeholder, not implemented
 
 
@@ -82,7 +85,7 @@ VERSION_SCHEMAS: dict[str, VersionSchema] = {
         holes_filename="holes2.json", splines_filename="surfaceSplines2.json",
         userlayers_filename="userLayers2.json", theme_scheme="path",
         has_object_splines=True, has_pins_field=True, has_orientation_fields=False,
-        has_radius_field=False, has_fences=True, has_clear_objects=True,
+        has_radius_field=False, has_fences=True, has_clear_heavy_rough=True,
     ),
     # "2025" added once its real schema is confirmed the same way -- not
     # populated speculatively.
