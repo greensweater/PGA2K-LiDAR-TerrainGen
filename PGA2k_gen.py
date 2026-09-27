@@ -3930,12 +3930,15 @@ def step_generate_fences(
     save_fence_records(records, out_path)
 
     by_asset: dict[str, int] = {}
+    by_type: dict[str, int] = {}
     for r in records:
         by_asset[r.asset] = by_asset.get(r.asset, 0) + 1
-    print(f"  {len(fence_features)} fence/wall/hedge way(s) -> {len(records)} run(s) "
-          f"({sum(r.closed for r in records)} closed)")
-    for asset, n in sorted(by_asset.items()):
-        print(f"    {asset.rsplit('/', 1)[-1]}: {n}")
+        by_type[r.fence_type] = by_type.get(r.fence_type, 0) + 1
+    print(f"  {len(fence_features)} fence/wall/hedge way(s) -> {len(records)} objectPath(s) "
+          f"({sum(r.closed for r in records)} closed; multi-part types write one per part)")
+    for type_name, n in sorted(by_type.items()):
+        parts = sorted({r.asset.rsplit('/', 1)[-1] for r in records if r.fence_type == type_name})
+        print(f"    {type_name}: {n}  [{', '.join(parts)}]")
     print(f"  wrote {out_path}")
 
     save_project(working_dir, {

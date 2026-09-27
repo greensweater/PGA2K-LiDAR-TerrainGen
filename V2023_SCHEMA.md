@@ -332,9 +332,14 @@ barrier=wall` stays `building`):
 
 | OSM tag | kind |
 |---|---|
-| `barrier=fence`, `barrier=chain` | `fence` |
 | `barrier=wall`, `barrier=retaining_wall`, `barrier=city_wall` | `wall` |
 | `barrier=hedge`, `natural=hedge` | `hedge` |
+| **any other `barrier=*`** (2026-09-27, Andy: "anything with a barrier tag is a fence of some kind") | `fence` |
+
+Exceptions: `barrier=range_nets` / `range_net` (singular accepted) stay
+`range_net`. Passage barriers (`gate`, `lift_gate`, `stile`, `bollard`,
+`cattle_grid`, ... — `_NON_FENCE_BARRIERS`) are dropped. Drawn as a way, a
+gate spans the gap in a fence, so a fence there would close the opening.
 
 **Always lines, never areas**, even for a closed ring or `hedge area=yes`.
 OSM draws a perimeter fence as a closed way, and the objectPath runs along
@@ -343,27 +348,84 @@ it. A closed way stays a closed `LineString` (`coords[0] == coords[-1]`), so
 matches these kinds: `feature_to_spline` returns None, and `mask` defaults
 True.
 
-**Tag → asset** (`course_output/fences.py` `fence_asset_for_tags`, first
-match wins; only the 8 `fence_options` post prefabs are valid targets):
+**Tag → fence type** (`course_output/fences.py` `fence_type_for_tags`,
+first match wins; superseded 2026-09-27 by the fence-types table below —
+the original 3.1 table routed to 8 assets, and wrongly sent chain_link to
+UniFence, which is "Fence - metal"):
 
-1. `wall=retaining_wall` / `barrier=retaining_wall` → `RetainWallAPostAPrefab`
-2. kind `hedge` → `HedgeSplinePostPrefab`
-3. `material=*`, then `wall=*`, then `fence_type=*`:
-   - stone / dry_stone / flint → `StoneWallAPostAPrefab`
-   - brick → `Asia_BrickWalls_PostPrefab`
-   - wood / split_rail / palisade / pole / rail → `WoodFencesAPostAPrefab`
-   - chain_link / metal / steel / wire / barbed_wire / electric / mesh /
-     metal_bars / railing → `UniFencePostAPrefab`
-4. `barrier=chain` → `UniFencePostAPrefab`
-5. kind default: fence → `WoodFencesAPostAPrefab`, wall → `StoneWallAPostAPrefab`
+1. `wall=retaining_wall` / `barrier=retaining_wall` → `retaining_wall`
+2. kind `hedge` → `hedge`
+3. `material=*`, then `wall=*`, then `fence_type=*`, then `barrier=*`,
+   through `_MATERIAL_TYPES`:
+   - stone / dry_stone / flint / city_wall → `stone_wall`; cobblestone → `stone_chunky`
+   - brick → `brick_low`; concrete / concrete_block / cinder_block → `brick_cinder`
+   - wood / pole / rail → `wood_rustic`; split_rail → `three_rail_natural`
+   - palisade / wood_panel / wooden_panels / panel / board / privacy → `wood_panels`
+   - chain_link / wire / mesh / barbed_wire / electric → `chain_link`
+   - metal / steel / metal_bars / bars / railing / guard_rail / handrail / chain → `metal`
+   - hedge → `hedge` (Andy tags hedges `barrier=fence material=hedge`)
+   - canvas → `canvas_green`; white_canvas / red_canvas / black_canvas /
+     blue_canvas / green_canvas → that colour
+   - **any fence-type name verbatim** (`material=picket`, `material=high_metal_fence`, ...)
+4. kind default: fence → `wood_rustic`, wall → `stone_wall`
 
-No OSM tag reaches the canvas fences (red/black). They're for the trick
-presets (3.2.4) and per-way GUI overrides (3.3.3). That UniFence reads as
-chain-link/metal is an assumption from its name; confirm in-game (3.5.3).
 Probe: `python util/probe_fence_tags.py [extract.osm]`. With no argument it
-checks a synthetic extract (20 cases incl. regressions); with an extract it
-reports. `~/Downloads/map(1).osm` has 4 closed `barrier=fence` runs (2
-chain_link → UniFence, 2 untyped → WoodFences).
+checks a synthetic extract (31 cases incl. regressions); with an extract it
+reports.
+
+## Fence types (the game's fence menu, 2026-09-27)
+
+Captured from Andy's fence sampler `LIDAR-2023-20260927105132` (one run of
+each menu entry, placed with the editor's defaults). The menu is
+**alphabetical by asset name**: sorted by position, the sampler's runs are
+Andy's list 1–28 in reverse, and every name-identifiable entry lines up.
+`FENCE_TYPES` in `course_output/fences.py` holds this table; `pga_fence_asset`
+takes the type name, the menu label, or a part asset.
+
+**Multi-part types:** three entries write two objectPaths over the same
+waypoints, one per part asset. `build_fence_records` emits one record per
+part. On these types `width`/`height`/`heightRule` overrides apply to both
+parts (`SHARED_RULE_FIELDS`), and the other overrides apply to the first part only.
+
+| # | menu name | type name | part asset(s) (`Walls/…`) | sampler rules (sR/flex/curves/spacing) |
+|---|---|---|---|---|
+| 1 | Brick wall - Asian green cap | `asian_green_cap` | `Asia_Walls/Asia_BrickWalls_PostPrefab` | 1/1/T/4 |
+| 2 | Brick wall - Asian black cap | `asian_black_cap` | `Asia_Walls/Asia_Walls_PostPrefab` | 1/1/T/4 |
+| 3 | Black canvas wall | `canvas_black` | `CanvasFence01AABlackPostAPrefab` | 2/1/T/4 |
+| 4 | Blue canvas wall | `canvas_blue` | `CanvasFence01AABluePostAPrefab` | 2/1/T/4 |
+| 5 | Brick with railings | `brick_with_railings` | `BrickWallsLowRailsAPostAPrefab` + `LowMetalFenceInnerPost01Prefab` | 0/1/T/4 + 2/1/T/0.1, both h=-0.594 (lowered to railing height) |
+| 6 | Stone wall - chunky rounded | `stone_chunky` | `Brit_Walls/Brit_CobbleWalls_GeneratePostPrefab` | 3/1/T/4 |
+| 7 | Brick wall - pavers | `brick_pavers` | `Brit_Walls/Brit_LowWalls_GeneratePostPrefab` | 2/1/T/4 |
+| 8 | Brick wall - red brick | `brick_red` | `Brit_Walls/Brit_BrickWalls_01_GeneratePostPrefab` | 2/1/T/4 |
+| 9 | Brick wall - big stone | `brick_big_stone` | `Brit_Walls/Brit_BrickWalls_02_GeneratePostPrefab` | 2/1/T/4 |
+| 10 | Brick wall - cinder | `brick_cinder` | `Brit_Walls/Brit_BrickWalls_03_GeneratePostPrefab` | 2/1/T/4 |
+| 11 | Brick wall - quarried | `brick_quarried` | `Brit_Walls/Brit_Walls_01_GeneratePostPrefab` | 2/1/T/4 |
+| 12 | Green canvas wall | `canvas_green` | `CanvasFence01AAPostAPrefab` | 2/1/T/4 |
+| 13 | Hedge | `hedge` | `HedgeSplinePostPrefab` | 1/1/T/4 |
+| 14 | High brick wall - classic brick | `brick_high` | `BrickWallsHighAPostAPrefab` | 2/1/T/4 |
+| 15 | High metal fence | `high_metal_fence` | `BrickWallsHighRailsAPostAPrefab` + `HighMetalFenceInnerPost01Prefab` | 0/1/T/4 + 2/1/T/0.1, both h=-0.104 (lowered to railing height) |
+| 16 | Brick wall - Asian panels | `asian_panels` | `Asia_Walls/Asia_KoreanWalls_PostPrefab` | 1/1/T/4 |
+| 17 | Low brick wall - classic brick | `brick_low` | `BrickWallsLowAPostAPrefab` | 2/1/T/4 |
+| 18 | Picket fence | `picket` | `PicketFencePicket01Prefab` + `PicketFencePost01APrefab` | 2/0/F/0.1 + 2/0/F/4 |
+| 19 | Red canvas wall | `canvas_red` | `CanvasFence01AARedPostAPrefab` | 2/1/T/4 |
+| 20 | Retaining wall | `retaining_wall` | `RetainWallAPostAPrefab` | 0/0/F/4 |
+| 21 | Stone wall | `stone_wall` | `StoneWallAPostAPrefab` | 2/1/T/4 |
+| 22 | Fence - 3-rail white | `three_rail_white` | `TriFence01Post01APrefab` | 2/1/T/4 |
+| 23 | Fence - 3-rail natural | `three_rail_natural` | `TriFence02Post01APrefab` | 2/1/T/4 |
+| 24 | Fence - metal | `metal` | `UniFencePostAPrefab` | 2/1/T/4 |
+| 25 | White canvas wall | `canvas_white` | `CanvasFence01AAWhitePostAPrefab` | 2/1/T/4 |
+| 26 | Wire fence - chain-link | `chain_link` | `WireFenceAPostAPrefab` | 2/1/T/4 |
+| 27 | Wooden fence - 2-rail rustic | `wood_rustic` | `WoodFencesAPostAPrefab` | 2/1/T/4 |
+| 28 | Wooden panels | `wood_panels` | `WoodFencesBPostCPrefab` | 2/1/T/4 |
+
+All rows are width 4, heightRule 0, and height 0 unless noted. **Part
+defaults** (`ASSET_DEFAULT_RULES`) are these sampler values, except for the 8
+assets the 9/26 fence test already verified, which keep their
+`2023_fences.course` defaults: stone wall sR 0 (menu 2); Asian green cap
+0/0/F (menu 1/1/T); retaining wall w 2.5, h -1.015, curves T, flex 1 (menu
+w 4, h 0, curves F, flex 0). The sampler's values are merged into each
+asset's `fence_options` in `asset_catalog.json` (every new set is
+`complete: false`).
 
 ## objectPath handle rule + builder decisions (task 3.2, 2026-09-23)
 
@@ -462,12 +524,13 @@ writes `state` 1 for closed runs and 0 for open ones. Confirm in-game
   a curved hedge; chain-link with `spacingRule=3`, warned as unverified; a
   curb preset) alongside 3150 items, and every group carries the v2023
   envelope. **Not yet loaded in-game** (that's 3.5).
-- Note: the real `bouldercreek2/course/` still holds v2021 node files
-  (`holes.json`/`surfaceSplines.json`/`userLayers.json`), and repack
-  refuses to run until **Reset Course Baseline** is done. This predates the
-  fence work; do the reset before the next real repack of that project.
+- `bouldercreek2/course/` was reset to the v2023 baseline
+  (`--step ingest-course`) on 2026-09-27 for 3.5.2.
 
 ## Course filename rule (CONFIRMED in-game, 2026-09-26)
+
+A full pipeline build repacked through `game_safe_course_stem`
+(`LIDAR_2023_bouldercreek_fences`) loads too (2026-09-27).
 
 The game can't load, or delete, a `.course` whose **filename** has a hyphen
 followed by an all-letter last segment (`FT2-1-S-compact`,

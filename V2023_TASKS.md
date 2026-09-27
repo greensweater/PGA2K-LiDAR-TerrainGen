@@ -536,9 +536,11 @@ prioritize it; treat the object-tile version as a later optional variant.
   - **Done when**: a v2023 run with fence ways in the OSM extract produces a
     repacked `.course` whose `placedObjects3.json` contains the fence
     objectPaths alongside normal items.
-- [ ] **3.3a (RESOLVED in code 2026-09-26: filename rule) generated courses fail to load in v2023** —
-      fixed by `game_safe_course_stem`. The only thing left is loading a real
-      Repack under a formerly failing name (folded into 3.5.2/3.5.3).
+- [x] **3.3a (DONE 2026-09-27: filename rule) generated courses fail to load in v2023** —
+      fixed by `game_safe_course_stem`. Closed by a full pipeline build
+      repacked under a formerly failing name
+      (`LIDAR-2023-bouldercreek-fences` → `LIDAR_2023_bouldercreek_fences`,
+      3.5.2), which loads in-game (Andy, 2026-09-27).
       Investigation history:
   - Symptom: every course built this session shows in the v2023 course list but
     "Failed to load"; in-game **Delete also fails** on them. A blank pushed via the
@@ -756,19 +758,58 @@ prioritize it; treat the object-tile version as a later optional variant.
   - **Where**: the tag probe script from 3.1 (e.g. `util/probe_fence_tags.py`),
     a real OSM extract with fence/wall ways, the v2023 game.
   - **Steps**:
-  - [ ] 3.5.1 Extend the 3.1 probe to cover a representative set of
+  - [x] 3.5.1 Extend the 3.1 probe to cover a representative set of
         fence/wall/hedge tags end-to-end (tag → kind → objectPath record).
-  - [ ] 3.5.2 Generate a course with real OSM fence/wall ways; diff emitted
+        DONE 2026-09-27: 31 synthetic cases, routing to fence types.
+  - [x] 3.5.2 Generate a course with real OSM fence/wall ways; diff emitted
         objectPaths against `2023_fences.course`'s rows (same rule-field
-        shapes, sane waypoints). **Next up.** Use `bouldercreek2`, which
-        needs GUI "Reset Course Baseline" first because its `course/` still
-        holds v2021 node files. Then run the normal pipeline → Repack as
-        `LIDAR-2023-bouldercreek-fences`. It should come out as
-        `LIDAR_2023_bouldercreek_fences`, which also closes 3.3a. Then Copy
-        to Game Folder → 3.5.3. Use the repo `.venv`.
-  - [ ] 3.5.3 Load in the v2023 game: fences/walls render on their spline,
+        shapes, sane waypoints). DONE 2026-09-27 (code-level):
+    - Andy hand-drew 70 barrier ways into `bouldercreek2/map.osm` (the
+      real OSM had none).
+    - Andy's fence sampler (`LIDAR-2023-20260927105132`) gave all 28 menu
+      types. They're now `FENCE_TYPES`; see `V2023_SCHEMA.md` "Fence
+      types". Picket and the two railing walls are 2-part.
+    - Any `barrier=*` way is now a fence (gates excepted), and
+      `barrier=range_net` is accepted as a range-net alias.
+    - `chain_link` routing fixed: it went to UniFence ("Fence - metal") and
+      now goes to WireFence.
+    - Pipeline: `ingest-course` (the reset) → `ingest-osm` → write-terrain/
+      water/splines/holes → generate-range-nets → generate-fences →
+      pack-objects → write-objects → repack as
+      `LIDAR-2023-bouldercreek-fences`, which came out as
+      `LIDAR_2023_bouldercreek_fences.course`.
+    - Diff (scratch `diff_fences.py`): 69 objectPaths. All have the same
+      value types and key order as all 44 game-written rows (2023_fences +
+      sampler). The group envelope matches and the file is v31. No
+      off-grid, zero-length or bad-handle waypoints; 3 closed runs.
+      Alongside: 3150 trees + 178 range-net items.
+    - Rule fields equal the sampler's menu row for every asset except stone
+      wall and retaining wall. Those keep the defaults the 9/26 fence test
+      verified.
+    - The file has been copied to the game's Courses folder.
+  - [x] 3.5.3 Load in the v2023 game: fences/walls render on their spline,
         grounded/contoured correctly, cap styles match `spacingRule`, stepped
         rows sit at the offset height; no collision with surface splines.
+        **DONE 2026-09-27 (Andy: "course looks good").** Not covered by this
+        course: leveled/stepped rows (3.5.6) and the multi-part types
+        (picket, railings), which get checked in the 3.5.6 in-game pass.
+        What was loaded:
+        `LIDAR_2023_bouldercreek_fences` (Boulder Creek). This also closes
+        3.3a, since it's a full pipeline build under a formerly failing name.
+        Look for:
+        - 57 hedge runs
+        - 3 chain-link (WireFence) runs, 1 of them a closed loop
+        - 3 wood 2-rail runs
+        - 1 white canvas run
+        - 1 wooden-panels run
+        - 2 low classic brick runs
+        - 1 stone wall
+        - 1 closed retaining wall (33 nodes)
+        - 2 range-net chains
+        None are stepped (3.5.6 is still open). Also confirm that
+        chain_link → WireFence reads as chain-link. The multi-part types
+        (picket, railings) aren't in this course; test them by setting
+        `pga_fence_asset` on a way.
   - [x] 3.5.4 Verify the trick presets (curb / railroad / retaining wall)
         in-game. Done via the fence test (B18–B20), 2026-09-26; the retaining
         wall height was corrected to -1.015.

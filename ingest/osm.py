@@ -86,6 +86,13 @@ class Feature:
                         # Defaults set per-kind at parse time -- see parse_osm_features/GOLF_OBJECT_KINDS.
 
 
+_NON_FENCE_BARRIERS = frozenset((
+    "gate", "lift_gate", "swing_gate", "sliding_gate", "hampshire_gate", "kissing_gate",
+    "entrance", "stile", "turnstile", "full-height_turnstile", "cattle_grid", "toll_booth",
+    "border_control", "bollard", "block", "bump_gate", "no",
+))
+
+
 def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     """
     Return (kind, is_area) for a way's OSM tags, or None if this way
@@ -144,7 +151,10 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     # chains (a box of nets with a side missing is one chain). No
     # surface spline / hole / mask consumer matches "range_net" -- the
     # kind rides features.geojson for step_generate_range_nets to tile.
-    if tags.get("barrier") == "range_nets":
+    # The singular "range_net" is accepted too -- it's an easy slip when
+    # hand-tagging, and without it the way would fall through to the
+    # any-barrier=*-is-a-fence rule at the bottom.
+    if tags.get("barrier") in ("range_nets", "range_net"):
         return ("range_net", False)
 
     # area:highway=footway -- the OSM convention for a closed way meant
@@ -307,14 +317,18 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
     # perimeter fence as a closed way, and the objectPath runs along it
     # (a closed LineString keeps coords[0] == coords[-1], so the builder
     # can still tell it's a closed run). No surface spline / hole / mask
-    # consumer matches these kinds.
+    # consumer matches these kinds. Any other barrier=* way is a fence of
+    # some kind (guard_rail, handrail, kerb, ...; fences.py routes it by
+    # material / barrier value) -- except the passage barriers in
+    # _NON_FENCE_BARRIERS: drawn as a way, a gate spans the GAP in a
+    # fence, so rendering it as fence would close the opening.
     barrier_type = tags.get("barrier")
-    if barrier_type in ("fence", "chain"):
-        return ("fence", False)
     if barrier_type in ("wall", "retaining_wall", "city_wall"):
         return ("wall", False)
     if barrier_type == "hedge" or natural_type == "hedge":
         return ("hedge", False)
+    if barrier_type and barrier_type not in _NON_FENCE_BARRIERS:
+        return ("fence", False)
 
     return None
 

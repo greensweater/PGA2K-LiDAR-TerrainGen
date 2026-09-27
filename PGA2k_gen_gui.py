@@ -93,11 +93,11 @@ from course_output.objects import (  # noqa: E402
     TREE_RADIUS_TAG, TREE_TYPE_TAG, load_object_list, load_objects, save_object_list, save_objects,
 )
 from course_output.asset_catalog import (  # noqa: E402
-    ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, FENCE_ENTRIES, NATURE_CATEGORY_IDS,
+    ASSET_CATEGORIES, ASSET_ENTRIES, CLUSTERABLE_ENTRIES, NATURE_CATEGORY_IDS,
     V2019_KEYED_ENTRIES,
 )
 from course_output.fences import (  # noqa: E402
-    ASSET_TAG as FENCE_ASSET_TAG, FENCE_KINDS, FENCE_PRESETS, FENCE_STYLE_TAGS,
+    ASSET_TAG as FENCE_ASSET_TAG, FENCE_KINDS, FENCE_PRESETS, FENCE_STYLE_TAGS, FENCE_TYPES,
     PRESET_TAG as FENCE_PRESET_TAG, RULE_TAG_PREFIX as FENCE_RULE_TAG_PREFIX, resolve_fence_style,
 )
 from course_output.object_clusters import (  # noqa: E402
@@ -213,7 +213,7 @@ def _spline_tag_detail(f: Feature) -> str:
         if railway:
             return railway
     if f.kind in FENCE_KINDS:
-        return resolve_fence_style(f.kind, f.tags)[0].rsplit("/", 1)[-1]
+        return resolve_fence_style(f.kind, f.tags)[0].type_name
     return f.tags.get("natural", "")
 
 
@@ -3044,7 +3044,7 @@ class PGAGenGUI:
         self.fence_spacing_var = tk.StringVar(value="")
         self.fence_width_var = tk.StringVar(value="")
         self.fence_height_var = tk.StringVar(value="")
-        self._fence_asset_by_display = {e.display: e.label for e in FENCE_ENTRIES}
+        self._fence_asset_by_display = {f"{t.label} ({t.name})": t.name for t in FENCE_TYPES.values()}
 
         def _row(label, widget_factory, tip):
             row = ttk.Frame(parent)
@@ -3067,8 +3067,8 @@ class PGAGenGUI:
              "canvas fence), retaining_wall. Sets the asset + rule fields; any field below "
              "still overrides it.")
         _row("ASSET", _combo(self.fence_asset_var, [""] + list(self._fence_asset_by_display)),
-             "Force the fence material. Blank = routed from the OSM tags (barrier/material/"
-             "wall/fence_type -- see V2023_SCHEMA.md).")
+             "Force the fence type (the game's fence menu, in its order). Blank = routed from "
+             "the OSM tags (barrier/material/wall/fence_type -- see V2023_SCHEMA.md).")
         _row("END CAPS", _combo(self.fence_caps_var, list(self._FENCE_CAP_CHOICES)),
              "spacingRule (JSON value, in-game verified): 0 none, 1 ends only, 2 spaced, 3 spline "
              "points (a cap at every waypoint). The game's menu lists them in a different order. "

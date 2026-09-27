@@ -13,29 +13,33 @@ groups ({Key: {path: <fence asset>}, Value: {objectPaths: [...]}}), which
 objects.merge_object_groups + placed_object_groups_to_v2023 fold in
 alongside items/clusters/splines.
 
-ROUTING: only the post prefabs the sample course proved as objectPath
-materials (asset_catalog.FENCE_ENTRIES -- the entries carrying
-fence_options) are valid targets. The rest of the Walls/** catalog
-(panel / post B-D variants, TriFence, PicketFence, ...) are placed-item
-pieces, not objectPath materials, and are never routed to here.
+FENCE TYPES (FENCE_TYPES): the 28 entries of the v2023 editor's fence
+menu, in menu order (V2023_SCHEMA.md "Fence types"; captured from the
+2026-09-27 fence sampler). A type is one or more objectPath PARTS over
+the same waypoints -- the game writes picket fence as pickets + posts,
+and the two railing walls as a brick wall + an inner metal railing, one
+objectPath per part under each part's own asset Key. Every part asset
+carries fence_options in asset_catalog.json (FENCE_ENTRIES).
 
-Precedence, first match wins:
-  1. wall=retaining_wall / barrier=retaining_wall -> retaining wall
+ROUTING (tags -> type), first match wins:
+  1. wall=retaining_wall / barrier=retaining_wall -> retaining_wall
   2. hedge kind (barrier=hedge / natural=hedge)   -> hedge
-  3. material=* (then wall=*, then fence_type=*) through _MATERIAL_ASSETS
-  4. barrier=chain                                 -> UniFence
-  5. the kind's default (_KIND_DEFAULT_ASSETS)
-The canvas fences have no OSM tag that reaches them -- they're for the
-trick presets (FENCE_PRESETS) and per-way overrides.
+  3. material=* (then wall=*, then fence_type=*, then barrier=*) through
+     _MATERIAL_TYPES -- which also takes any FENCE_TYPES name verbatim
+     (material=canvas_white, material=picket, ...)
+  4. the kind's default (_KIND_DEFAULT_TYPES)
 
 PER-WAY OVERRIDES are this project's own tags on the Feature (what the
 GUI's Objects / Fences panel writes; ingest-osm carries them over a
 re-ingest -- FENCE_STYLE_TAGS): pga_fence_preset=<FENCE_PRESETS name>,
-pga_fence_asset=<asset label or path>, and pga_fence_<rule field> for
-each field in RULE_FIELDS (e.g. pga_fence_spacingRule=3,
-pga_fence_height=-1.5). Precedence: asset defaults < preset < explicit
-field tags. Rule values are then checked against the asset's option
-matrix (validate_fence_rules).
+pga_fence_asset=<FENCE_TYPES name, or a part asset's label or path>, and
+pga_fence_<rule field> for each field in RULE_FIELDS (e.g.
+pga_fence_spacingRule=3, pga_fence_height=-1.5). Precedence: part
+defaults < preset < explicit field tags. On a multi-part type the
+SHARED_RULE_FIELDS (width / height / heightRule -- what keeps the parts
+lined up) apply to every part, the rest to the first part only. Rule
+values are then checked against each part asset's option matrix
+(validate_fence_rules).
 
 HANDLES (derived from templates/2023_fences.course, V2023_SCHEMA.md
 "objectPath handle rule"): an open run's end waypoints have their outer
@@ -65,44 +69,37 @@ _DECIMALS = 4
 _WALLS = "Assets/CourseGen/Detail/Walls/"
 STONE_WALL_ASSET = _WALLS + "StoneWallAPostAPrefab"
 WOOD_FENCE_ASSET = _WALLS + "WoodFencesAPostAPrefab"
+WOOD_PANELS_ASSET = _WALLS + "WoodFencesBPostCPrefab"
 UNI_FENCE_ASSET = _WALLS + "UniFencePostAPrefab"
+WIRE_FENCE_ASSET = _WALLS + "WireFenceAPostAPrefab"
+TRI_FENCE_WHITE_ASSET = _WALLS + "TriFence01Post01APrefab"
+TRI_FENCE_NATURAL_ASSET = _WALLS + "TriFence02Post01APrefab"
+PICKET_PICKETS_ASSET = _WALLS + "PicketFencePicket01Prefab"
+PICKET_POSTS_ASSET = _WALLS + "PicketFencePost01APrefab"
 HEDGE_ASSET = _WALLS + "HedgeSplinePostPrefab"
 BRICK_WALL_ASSET = _WALLS + "Asia_Walls/Asia_BrickWalls_PostPrefab"
+ASIA_BLACK_CAP_ASSET = _WALLS + "Asia_Walls/Asia_Walls_PostPrefab"
+ASIA_PANELS_ASSET = _WALLS + "Asia_Walls/Asia_KoreanWalls_PostPrefab"
+BRIT_COBBLE_ASSET = _WALLS + "Brit_Walls/Brit_CobbleWalls_GeneratePostPrefab"
+BRIT_PAVERS_ASSET = _WALLS + "Brit_Walls/Brit_LowWalls_GeneratePostPrefab"
+BRIT_RED_BRICK_ASSET = _WALLS + "Brit_Walls/Brit_BrickWalls_01_GeneratePostPrefab"
+BRIT_BIG_STONE_ASSET = _WALLS + "Brit_Walls/Brit_BrickWalls_02_GeneratePostPrefab"
+BRIT_CINDER_ASSET = _WALLS + "Brit_Walls/Brit_BrickWalls_03_GeneratePostPrefab"
+BRIT_QUARRIED_ASSET = _WALLS + "Brit_Walls/Brit_Walls_01_GeneratePostPrefab"
+BRICK_HIGH_ASSET = _WALLS + "BrickWallsHighAPostAPrefab"
+BRICK_LOW_ASSET = _WALLS + "BrickWallsLowAPostAPrefab"
+BRICK_HIGH_RAILS_ASSET = _WALLS + "BrickWallsHighRailsAPostAPrefab"
+HIGH_METAL_RAILING_ASSET = _WALLS + "HighMetalFenceInnerPost01Prefab"
+BRICK_LOW_RAILS_ASSET = _WALLS + "BrickWallsLowRailsAPostAPrefab"
+LOW_METAL_RAILING_ASSET = _WALLS + "LowMetalFenceInnerPost01Prefab"
 RETAINING_WALL_ASSET = _WALLS + "RetainWallAPostAPrefab"
 CANVAS_RED_ASSET = _WALLS + "CanvasFence01AARedPostAPrefab"
 CANVAS_BLACK_ASSET = _WALLS + "CanvasFence01AABlackPostAPrefab"
+CANVAS_BLUE_ASSET = _WALLS + "CanvasFence01AABluePostAPrefab"
+CANVAS_GREEN_ASSET = _WALLS + "CanvasFence01AAPostAPrefab"
+CANVAS_WHITE_ASSET = _WALLS + "CanvasFence01AAWhitePostAPrefab"
 
 FENCE_KINDS = ("fence", "wall", "hedge")
-
-_KIND_DEFAULT_ASSETS = {
-    "fence": WOOD_FENCE_ASSET,
-    "wall": STONE_WALL_ASSET,
-    "hedge": HEDGE_ASSET,
-}
-
-# OSM material / wall / fence_type values -> asset. One table for all
-# three keys: the vocabularies overlap (wall=brick, material=brick) and
-# don't collide.
-_MATERIAL_ASSETS = {
-    "stone": STONE_WALL_ASSET,
-    "dry_stone": STONE_WALL_ASSET,
-    "flint": STONE_WALL_ASSET,
-    "brick": BRICK_WALL_ASSET,
-    "wood": WOOD_FENCE_ASSET,
-    "split_rail": WOOD_FENCE_ASSET,
-    "palisade": WOOD_FENCE_ASSET,
-    "pole": WOOD_FENCE_ASSET,
-    "rail": WOOD_FENCE_ASSET,
-    "chain_link": UNI_FENCE_ASSET,
-    "metal": UNI_FENCE_ASSET,
-    "steel": UNI_FENCE_ASSET,
-    "wire": UNI_FENCE_ASSET,
-    "barbed_wire": UNI_FENCE_ASSET,
-    "electric": UNI_FENCE_ASSET,
-    "mesh": UNI_FENCE_ASSET,
-    "metal_bars": UNI_FENCE_ASSET,
-    "railing": UNI_FENCE_ASSET,
-}
 
 # objectPath rule fields (game key names) and their types. width/hasCurves
 # live under objectPath.path in the game's JSON; the rest at the top level.
@@ -120,7 +117,10 @@ def _rules(spacingRule: int, *, width: float = 4.0, height: float = 0.0, spacing
             "flexibilityRule": flexibilityRule, "heightRule": heightRule, "hasCurves": hasCurves}
 
 
-# Per-asset defaults = that asset's plain (contoured, unburied) sample row.
+# Per-part-asset defaults. The first 8 are that asset's plain (contoured,
+# unburied) row in templates/2023_fences.course, in-game verified by the
+# 2026-09-26 fence test; the rest are what the game's editor writes when
+# the type is placed from its menu (the 2026-09-27 fence sampler).
 # Retaining wall has only one sample row -- the heightmap-hugging one; its
 # -0.715 renders 0.3 m high in-game (fence test, 2026-09-26), so -1.015.
 RETAINING_WALL_HEIGHT_M = -1.015
@@ -133,14 +133,147 @@ ASSET_DEFAULT_RULES: dict[str, dict] = {
     HEDGE_ASSET: _rules(1),
     BRICK_WALL_ASSET: _rules(0, flexibilityRule=0, hasCurves=False),
     RETAINING_WALL_ASSET: _rules(0, width=2.5, height=RETAINING_WALL_HEIGHT_M),
+    ASIA_BLACK_CAP_ASSET: _rules(1),
+    ASIA_PANELS_ASSET: _rules(1),
+    CANVAS_BLUE_ASSET: _rules(2),
+    CANVAS_GREEN_ASSET: _rules(2),
+    CANVAS_WHITE_ASSET: _rules(2),
+    BRIT_COBBLE_ASSET: _rules(3),
+    BRIT_PAVERS_ASSET: _rules(2),
+    BRIT_RED_BRICK_ASSET: _rules(2),
+    BRIT_BIG_STONE_ASSET: _rules(2),
+    BRIT_CINDER_ASSET: _rules(2),
+    BRIT_QUARRIED_ASSET: _rules(2),
+    BRICK_HIGH_ASSET: _rules(2),
+    BRICK_LOW_ASSET: _rules(2),
+    BRICK_HIGH_RAILS_ASSET: _rules(0),
+    HIGH_METAL_RAILING_ASSET: _rules(2, spacing=0.1),
+    BRICK_LOW_RAILS_ASSET: _rules(0),
+    LOW_METAL_RAILING_ASSET: _rules(2, spacing=0.1),
+    PICKET_PICKETS_ASSET: _rules(2, spacing=0.1, flexibilityRule=0, hasCurves=False),
+    PICKET_POSTS_ASSET: _rules(2, flexibilityRule=0, hasCurves=False),
+    TRI_FENCE_WHITE_ASSET: _rules(2),
+    TRI_FENCE_NATURAL_ASSET: _rules(2),
+    WIRE_FENCE_ASSET: _rules(2),
+    WOOD_PANELS_ASSET: _rules(2),
 }
 
-# Sample-proven "trick" recipes (V2023_SCHEMA.md "Tricks"): an asset plus
-# rule overrides on top of that asset's defaults.
+
+@dataclass(frozen=True, slots=True)
+class FenceType:
+    """One entry of the game's fence menu: `label` is the menu name,
+    `parts` the objectPaths it writes -- (part asset, rule overrides on
+    top of that asset's ASSET_DEFAULT_RULES) -- all over the same
+    waypoints."""
+    name: str
+    label: str
+    parts: tuple[tuple[str, dict], ...]
+
+
+def _type(name: str, label: str, *parts) -> FenceType:
+    return FenceType(name, label, tuple(p if isinstance(p, tuple) else (p, {}) for p in parts))
+
+
+# The railing walls sit lowered to railing height in the sampler (Andy's
+# placement, 2026-09-27) -- both parts at the same height.
+_HIGH_RAILS_HEIGHT_M = -0.104
+_LOW_RAILS_HEIGHT_M = -0.594
+
+# Menu order (alphabetical by asset name in the game's list).
+FENCE_TYPES: dict[str, FenceType] = {t.name: t for t in (
+    _type("asian_green_cap", "Brick wall - Asian green cap", BRICK_WALL_ASSET),
+    _type("asian_black_cap", "Brick wall - Asian black cap", ASIA_BLACK_CAP_ASSET),
+    _type("canvas_black", "Black canvas wall", CANVAS_BLACK_ASSET),
+    _type("canvas_blue", "Blue canvas wall", CANVAS_BLUE_ASSET),
+    _type("brick_with_railings", "Brick with railings",
+          (BRICK_LOW_RAILS_ASSET, {"height": _LOW_RAILS_HEIGHT_M}),
+          (LOW_METAL_RAILING_ASSET, {"height": _LOW_RAILS_HEIGHT_M})),
+    _type("stone_chunky", "Stone wall - chunky rounded", BRIT_COBBLE_ASSET),
+    _type("brick_pavers", "Brick wall - pavers", BRIT_PAVERS_ASSET),
+    _type("brick_red", "Brick wall - red brick", BRIT_RED_BRICK_ASSET),
+    _type("brick_big_stone", "Brick wall - big stone", BRIT_BIG_STONE_ASSET),
+    _type("brick_cinder", "Brick wall - cinder", BRIT_CINDER_ASSET),
+    _type("brick_quarried", "Brick wall - quarried", BRIT_QUARRIED_ASSET),
+    _type("canvas_green", "Green canvas wall", CANVAS_GREEN_ASSET),
+    _type("hedge", "Hedge", HEDGE_ASSET),
+    _type("brick_high", "High brick wall - classic brick", BRICK_HIGH_ASSET),
+    _type("high_metal_fence", "High metal fence",
+          (BRICK_HIGH_RAILS_ASSET, {"height": _HIGH_RAILS_HEIGHT_M}),
+          (HIGH_METAL_RAILING_ASSET, {"height": _HIGH_RAILS_HEIGHT_M})),
+    _type("asian_panels", "Brick wall - Asian panels", ASIA_PANELS_ASSET),
+    _type("brick_low", "Low brick wall - classic brick", BRICK_LOW_ASSET),
+    _type("picket", "Picket fence", PICKET_PICKETS_ASSET, PICKET_POSTS_ASSET),
+    _type("canvas_red", "Red canvas wall", CANVAS_RED_ASSET),
+    _type("retaining_wall", "Retaining wall", RETAINING_WALL_ASSET),
+    _type("stone_wall", "Stone wall", STONE_WALL_ASSET),
+    _type("three_rail_white", "Fence - 3-rail white", TRI_FENCE_WHITE_ASSET),
+    _type("three_rail_natural", "Fence - 3-rail natural", TRI_FENCE_NATURAL_ASSET),
+    _type("metal", "Fence - metal", UNI_FENCE_ASSET),
+    _type("canvas_white", "White canvas wall", CANVAS_WHITE_ASSET),
+    _type("chain_link", "Wire fence - chain-link", WIRE_FENCE_ASSET),
+    _type("wood_rustic", "Wooden fence - 2-rail rustic", WOOD_FENCE_ASSET),
+    _type("wood_panels", "Wooden panels", WOOD_PANELS_ASSET),
+)}
+
+_KIND_DEFAULT_TYPES = {
+    "fence": "wood_rustic",
+    "wall": "stone_wall",
+    "hedge": "hedge",
+}
+
+# OSM material / wall / fence_type / barrier values -> FENCE_TYPES name.
+# One table for all four keys: the vocabularies overlap (wall=brick,
+# material=brick) and don't collide. Every FENCE_TYPES name also matches
+# itself (added below), so material=canvas_white etc. work as-is.
+_MATERIAL_TYPES = {
+    "stone": "stone_wall",
+    "dry_stone": "stone_wall",
+    "flint": "stone_wall",
+    "city_wall": "stone_wall",
+    "cobblestone": "stone_chunky",
+    "brick": "brick_low",
+    "concrete": "brick_cinder",
+    "concrete_block": "brick_cinder",
+    "cinder_block": "brick_cinder",
+    "wood": "wood_rustic",
+    "pole": "wood_rustic",
+    "rail": "wood_rustic",
+    "split_rail": "three_rail_natural",
+    "palisade": "wood_panels",
+    "wood_panel": "wood_panels",
+    "wooden_panels": "wood_panels",
+    "panel": "wood_panels",
+    "board": "wood_panels",
+    "privacy": "wood_panels",
+    "chain_link": "chain_link",
+    "wire": "chain_link",
+    "mesh": "chain_link",
+    "barbed_wire": "chain_link",
+    "electric": "chain_link",
+    "metal": "metal",
+    "steel": "metal",
+    "metal_bars": "metal",
+    "bars": "metal",
+    "railing": "metal",
+    "guard_rail": "metal",
+    "handrail": "metal",
+    "chain": "metal",
+    "hedge": "hedge",
+    "canvas": "canvas_green",
+    "white_canvas": "canvas_white",
+    "red_canvas": "canvas_red",
+    "black_canvas": "canvas_black",
+    "blue_canvas": "canvas_blue",
+    "green_canvas": "canvas_green",
+    **{name: name for name in FENCE_TYPES},
+}
+
+# Sample-proven "trick" recipes (V2023_SCHEMA.md "Tricks"): a fence type
+# plus rule overrides on top of its part defaults.
 FENCE_PRESETS: dict[str, tuple[str, dict]] = {
-    "curb": (STONE_WALL_ASSET, {"height": -1.498, "spacingRule": 0}),
-    "railroad": (CANVAS_BLACK_ASSET, {"height": -2.688, "spacingRule": 2}),
-    "retaining_wall": (RETAINING_WALL_ASSET, {"width": 2.5, "height": RETAINING_WALL_HEIGHT_M, "heightRule": 0}),
+    "curb": ("stone_wall", {"height": -1.498, "spacingRule": 0}),
+    "railroad": ("canvas_black", {"height": -2.688, "spacingRule": 2}),
+    "retaining_wall": ("retaining_wall", {"width": 2.5, "height": RETAINING_WALL_HEIGHT_M, "heightRule": 0}),
 }
 
 PRESET_TAG = "pga_fence_preset"
@@ -160,32 +293,48 @@ FENCE_MIN_SEGMENT_M = 0.05     # consecutive points closer than this are duplica
 _VALID_ASSETS = {e.path for e in FENCE_ENTRIES}
 _FENCE_OPTIONS = {e.path: e.fence_options for e in FENCE_ENTRIES}
 _ASSET_BY_LABEL = {e.label: e.path for e in FENCE_ENTRIES}
-_unknown = ({RETAINING_WALL_ASSET, CANVAS_RED_ASSET, CANVAS_BLACK_ASSET}
-            | set(_KIND_DEFAULT_ASSETS.values()) | set(_MATERIAL_ASSETS.values())
-            | set(ASSET_DEFAULT_RULES)) - _VALID_ASSETS
-assert not _unknown, f"fence routing targets missing from asset_catalog fence_options: {_unknown}"
+_TYPE_BY_LABEL = {t.label: t.name for t in FENCE_TYPES.values()}
+_unknown = {a for t in FENCE_TYPES.values() for a, _ in t.parts} ^ _VALID_ASSETS
+assert not _unknown, f"fence part assets vs asset_catalog fence_options mismatch: {_unknown}"
 assert set(ASSET_DEFAULT_RULES) == _VALID_ASSETS, "every fence asset needs ASSET_DEFAULT_RULES"
+assert set(_KIND_DEFAULT_TYPES.values()) | set(_MATERIAL_TYPES.values()) \
+    | {name for name, _ in FENCE_PRESETS.values()} <= set(FENCE_TYPES)
+
+# Rule fields every part of a multi-part type shares (keeps the railing on
+# its wall / the pickets on their posts); the rest override the first part.
+SHARED_RULE_FIELDS = ("width", "height", "heightRule")
 
 
 def _round(value: float) -> float:
     return round(float(value), _DECIMALS)
 
 
-def fence_asset_for_tags(kind: str, tags: dict) -> str:
-    """The v2023 objectPath material (asset path) for a fence/wall/hedge
-    Feature from its OSM tags alone -- see the module docstring for the
-    precedence. Per-way overrides are resolve_fence_style's job."""
+def fence_type_for_tags(kind: str, tags: dict) -> str:
+    """The FENCE_TYPES name for a fence/wall/hedge Feature from its OSM
+    tags alone -- see the module docstring for the precedence. Per-way
+    overrides are resolve_fence_style's job."""
     if tags.get("wall") == "retaining_wall" or tags.get("barrier") == "retaining_wall":
-        return RETAINING_WALL_ASSET
+        return "retaining_wall"
     if kind == "hedge":
-        return HEDGE_ASSET
-    for key in ("material", "wall", "fence_type"):
-        asset = _MATERIAL_ASSETS.get(tags.get(key, ""))
-        if asset is not None:
-            return asset
-    if tags.get("barrier") == "chain":
-        return UNI_FENCE_ASSET
-    return _KIND_DEFAULT_ASSETS[kind]
+        return "hedge"
+    for key in ("material", "wall", "fence_type", "barrier"):
+        name = _MATERIAL_TYPES.get(tags.get(key, ""))
+        if name is not None:
+            return name
+    return _KIND_DEFAULT_TYPES[kind]
+
+
+def _requested_type(requested: str) -> Optional[FenceType]:
+    """pga_fence_asset value -> a FenceType: a FENCE_TYPES name or menu
+    label, or a single part asset (label or path) as a one-part type."""
+    if requested in FENCE_TYPES:
+        return FENCE_TYPES[requested]
+    if requested in _TYPE_BY_LABEL:
+        return FENCE_TYPES[_TYPE_BY_LABEL[requested]]
+    path = requested if requested in _VALID_ASSETS else _ASSET_BY_LABEL.get(requested)
+    if path is None:
+        return None
+    return FenceType(path.rsplit("/", 1)[-1], path.rsplit("/", 1)[-1], ((path, {}),))
 
 
 def _parse_rule(name: str, raw) -> object:
@@ -229,30 +378,44 @@ def validate_fence_rules(asset: str, rules: dict) -> tuple[dict, list[str]]:
     return out, warnings
 
 
-def resolve_fence_style(kind: str, tags: dict) -> tuple[str, dict, list[str]]:
-    """(asset path, validated rule dict, warnings) for one fence Feature:
-    tag routing, then preset, then pga_fence_<field> overrides, then the
-    option-matrix check."""
+@dataclass(frozen=True, slots=True)
+class FenceStyle:
+    """A resolved fence style: the type name and, per part, (asset,
+    validated rule dict) -- one objectPath each over the same waypoints."""
+    type_name: str
+    parts: tuple[tuple[str, dict], ...]
+
+    @property
+    def key(self) -> tuple:
+        """Hashable identity -- ways join into one run only when this matches."""
+        return (self.type_name, tuple((a, tuple(sorted(r.items()))) for a, r in self.parts))
+
+
+def resolve_fence_style(kind: str, tags: dict) -> tuple[FenceStyle, list[str]]:
+    """(FenceStyle, warnings) for one fence Feature: tag routing, then
+    preset, then pga_fence_asset, then pga_fence_<field> overrides, then
+    each part's option-matrix check."""
     warnings: list[str] = []
-    asset = fence_asset_for_tags(kind, tags)
+    ftype = FENCE_TYPES[fence_type_for_tags(kind, tags)]
     overrides: dict = {}
 
     preset = tags.get(PRESET_TAG)
     if preset:
         if preset in FENCE_PRESETS:
-            asset, preset_rules = FENCE_PRESETS[preset]
+            type_name, preset_rules = FENCE_PRESETS[preset]
+            ftype = FENCE_TYPES[type_name]
             overrides.update(preset_rules)
         else:
             warnings.append(f"unknown {PRESET_TAG}={preset!r} (known: {', '.join(FENCE_PRESETS)})")
 
     requested = tags.get(ASSET_TAG)
     if requested:
-        path = requested if requested in _VALID_ASSETS else _ASSET_BY_LABEL.get(requested)
-        if path is None:
-            warnings.append(f"{ASSET_TAG}={requested!r} is not an objectPath fence asset; keeping "
-                            f"{asset.rsplit('/', 1)[-1]}")
+        got = _requested_type(requested)
+        if got is None:
+            warnings.append(f"{ASSET_TAG}={requested!r} is not a fence type or objectPath fence asset; "
+                            f"keeping {ftype.name}")
         else:
-            asset = path
+            ftype = got
 
     for name in RULE_FIELDS:
         raw = tags.get(RULE_TAG_PREFIX + name)
@@ -263,8 +426,13 @@ def resolve_fence_style(kind: str, tags: dict) -> tuple[str, dict, list[str]]:
         except ValueError:
             warnings.append(f"{RULE_TAG_PREFIX}{name}={raw!r} is not a valid {RULE_FIELDS[name].__name__}; ignored")
 
-    rules, matrix_warnings = validate_fence_rules(asset, {**ASSET_DEFAULT_RULES[asset], **overrides})
-    return asset, rules, warnings + matrix_warnings
+    parts = []
+    for i, (asset, part_rules) in enumerate(ftype.parts):
+        mine = overrides if i == 0 else {k: v for k, v in overrides.items() if k in SHARED_RULE_FIELDS}
+        rules, matrix_warnings = validate_fence_rules(asset, {**ASSET_DEFAULT_RULES[asset], **part_rules, **mine})
+        parts.append((asset, rules))
+        warnings.extend(matrix_warnings)
+    return FenceStyle(ftype.name, tuple(parts)), warnings
 
 
 @dataclass(slots=True)
@@ -275,13 +443,16 @@ class FenceRecord:
     the OSM way ids merged into this run, in path order.
     `corner_angle_deg` is frozen here (not read at write time) so
     write-objects stays a pure formatter; None = every interior waypoint
-    smooth (see object_path_handles)."""
+    smooth (see object_path_handles). `fence_type` is the FENCE_TYPES
+    name the record is a part of (a multi-part type gives one record per
+    part, same points)."""
     asset: str
     points: list[tuple[float, float]]
     closed: bool
     rules: dict
     source_ids: list[Optional[int]] = field(default_factory=list)
     corner_angle_deg: Optional[float] = CORNER_ANGLE_DEG
+    fence_type: Optional[str] = None
 
 
 def _dist(a, b) -> float:
@@ -368,29 +539,31 @@ def build_fence_records(
     crop to the course first, see ingest.osm.crop_features). Ways with
     the same resolved style that share an end node are joined into one
     run (_merge_runs); a run whose ends meet becomes a closed objectPath.
-    Returns (records, warnings) -- warnings are per-way style problems
-    (unknown preset, option outside the asset's matrix, ...).
+    A multi-part type (picket, railing walls) gives one record per part
+    over the same points. Returns (records, warnings) -- warnings are
+    per-way style problems (unknown preset, option outside the asset's
+    matrix, ...).
     """
-    by_style: dict[tuple, tuple[str, dict, list]] = {}
+    by_style: dict[tuple, tuple[FenceStyle, list]] = {}
     warnings: list[str] = []
     for f in features:
         if f.kind not in FENCE_KINDS or f.geometry.geom_type != "LineString":
             continue
-        asset, rules, way_warnings = resolve_fence_style(f.kind, f.tags)
+        style, way_warnings = resolve_fence_style(f.kind, f.tags)
         warnings.extend(f"way {f.osm_id}: {w}" for w in way_warnings)
-        key = (asset, tuple(sorted(rules.items())))
-        by_style.setdefault(key, (asset, rules, []))[2].append(
+        by_style.setdefault(style.key, (style, []))[1].append(
             ([(float(x), float(z)) for x, z in f.geometry.coords], [f.osm_id]))
 
     records: list[FenceRecord] = []
-    for asset, rules, runs in by_style.values():
+    for style, runs in by_style.values():
         for coords, source_ids in _merge_runs(runs, endpoint_tol_m):
             points, closed = _clean_points(coords, simplify_tol_m)
             if len(points) < 2 or (closed and len(points) < 3):
                 continue
-            records.append(FenceRecord(asset=asset, points=points, closed=closed,
-                                       rules=dict(rules), source_ids=source_ids,
-                                       corner_angle_deg=corner_angle_deg))
+            for asset, rules in style.parts:
+                records.append(FenceRecord(asset=asset, points=list(points), closed=closed,
+                                           rules=dict(rules), source_ids=list(source_ids),
+                                           corner_angle_deg=corner_angle_deg, fence_type=style.type_name))
     return records, warnings
 
 
@@ -577,8 +750,8 @@ def build_fence_test_layout(
     rows.append(("BrickWall hasCurves=false", BRICK_WALL_ASSET, {"hasCurves": False}))
     for sr in (0, 1, 3):
         rows.append((f"WoodFences spacingRule={sr} (unverified)", WOOD_FENCE_ASSET, {"spacingRule": sr}))
-    for name, (asset, overrides) in FENCE_PRESETS.items():
-        rows.append((f"preset {name}", asset, dict(overrides)))
+    for name, (type_name, overrides) in FENCE_PRESETS.items():
+        rows.append((f"preset {name}", FENCE_TYPES[type_name].parts[0][0], dict(overrides)))
 
     records: list[FenceRecord] = []
     labels: list[str] = []
@@ -645,7 +818,8 @@ def build_fence_test_layout(
 def load_fence_record(d: dict) -> FenceRecord:
     return FenceRecord(asset=d["asset"], points=[tuple(p) for p in d["points"]], closed=d["closed"],
                        rules=dict(d["rules"]), source_ids=list(d.get("source_ids", [])),
-                       corner_angle_deg=d.get("corner_angle_deg", CORNER_ANGLE_DEG))
+                       corner_angle_deg=d.get("corner_angle_deg", CORNER_ANGLE_DEG),
+                       fence_type=d.get("fence_type"))
 
 
 def save_fence_records(records: Sequence[FenceRecord], path: Path) -> None:

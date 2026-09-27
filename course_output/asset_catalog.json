@@ -1231,6 +1231,7 @@
         },
         "hasCurves": {
           "values": [
+            false,
             true
           ],
           "complete": false
@@ -1243,11 +1244,13 @@
         },
         "flexibilityRule": {
           "values": [
+            0,
             1
           ],
           "complete": false
         }
-      }
+      },
+      "description": "Retaining wall"
     },
     {
       "category": 13,
@@ -1282,7 +1285,34 @@
       "type": 5,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighAPostAPrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "High brick wall - classic brick",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1324,7 +1354,34 @@
       "type": 11,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/BrickWallsHighRailsAPostAPrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "High metal fence (wall part)",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1366,7 +1423,34 @@
       "type": 17,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowAPostAPrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "Low brick wall - classic brick",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1458,7 +1542,8 @@
           ],
           "complete": false
         }
-      }
+      },
+      "description": "Wooden fence - 2-rail rustic"
     },
     {
       "category": 13,
@@ -1514,7 +1599,34 @@
       "type": 34,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/WoodFencesBPostCPrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "Wooden panels",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1556,7 +1668,34 @@
       "type": 40,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/WireFenceAPostAPrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "Wire fence - chain-link",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1703,7 +1842,34 @@
       "type": 61,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/BrickWallsLowRailsAPostAPrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "Brick with railings (wall part)",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1815,7 +1981,34 @@
       "type": 77,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/PicketFencePost01APrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "Picket fence (posts part)",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            false
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1850,7 +2043,34 @@
       "type": 82,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/TriFence01Post01APrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "Fence - 3-rail white",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1885,7 +2105,34 @@
       "type": 87,
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/TriFence02Post01APrefab",
-      "spacing": null
+      "spacing": null,
+      "description": "Fence - 3-rail natural",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
     },
     {
       "category": 13,
@@ -1946,7 +2193,8 @@
           ],
           "complete": false
         }
-      }
+      },
+      "description": "Fence - metal"
     },
     {
       "category": 13,
@@ -2010,7 +2258,8 @@
           ],
           "complete": false
         }
-      }
+      },
+      "description": "Stone wall"
     },
     {
       "category": 13,
@@ -2032,7 +2281,7 @@
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/CanvasFence01AARedPostAPrefab",
       "spacing": null,
-      "description": "Red canvas fence",
+      "description": "Red canvas wall",
       "min_game_version": "2023",
       "fence_options": {
         "spacingRule": {
@@ -2068,7 +2317,7 @@
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/CanvasFence01AABlackPostAPrefab",
       "spacing": null,
-      "description": "Black canvas fence",
+      "description": "Black canvas wall",
       "min_game_version": "2023",
       "fence_options": {
         "spacingRule": {
@@ -2103,7 +2352,7 @@
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/HedgeSplinePostPrefab",
       "spacing": null,
-      "description": "Hedge (spline)",
+      "description": "Hedge",
       "min_game_version": "2023",
       "fence_options": {
         "spacingRule": {
@@ -2139,7 +2388,7 @@
       "theme": false,
       "path": "Assets/CourseGen/Detail/Walls/Asia_Walls/Asia_BrickWalls_PostPrefab",
       "spacing": null,
-      "description": "Asian brick wall",
+      "description": "Brick wall - Asian green cap",
       "min_game_version": "2023",
       "fence_options": {
         "spacingRule": {
@@ -2171,6 +2420,496 @@
             1
           ],
           "complete": true
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/Asia_Walls/Asia_Walls_PostPrefab",
+      "spacing": null,
+      "description": "Brick wall - Asian black cap",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/CanvasFence01AABluePostAPrefab",
+      "spacing": null,
+      "description": "Blue canvas wall",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/LowMetalFenceInnerPost01Prefab",
+      "spacing": null,
+      "description": "Brick with railings (railing part)",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/Brit_Walls/Brit_CobbleWalls_GeneratePostPrefab",
+      "spacing": null,
+      "description": "Stone wall - chunky rounded",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            3
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/Brit_Walls/Brit_LowWalls_GeneratePostPrefab",
+      "spacing": null,
+      "description": "Brick wall - pavers",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/Brit_Walls/Brit_BrickWalls_01_GeneratePostPrefab",
+      "spacing": null,
+      "description": "Brick wall - red brick",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/Brit_Walls/Brit_BrickWalls_02_GeneratePostPrefab",
+      "spacing": null,
+      "description": "Brick wall - big stone",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/Brit_Walls/Brit_BrickWalls_03_GeneratePostPrefab",
+      "spacing": null,
+      "description": "Brick wall - cinder",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/Brit_Walls/Brit_Walls_01_GeneratePostPrefab",
+      "spacing": null,
+      "description": "Brick wall - quarried",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/CanvasFence01AAPostAPrefab",
+      "spacing": null,
+      "description": "Green canvas wall",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/HighMetalFenceInnerPost01Prefab",
+      "spacing": null,
+      "description": "High metal fence (railing part)",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/Asia_Walls/Asia_KoreanWalls_PostPrefab",
+      "spacing": null,
+      "description": "Brick wall - Asian panels",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/PicketFencePicket01Prefab",
+      "spacing": null,
+      "description": "Picket fence (pickets part)",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            false
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        }
+      }
+    },
+    {
+      "category": 13,
+      "type": null,
+      "theme": false,
+      "path": "Assets/CourseGen/Detail/Walls/CanvasFence01AAWhitePostAPrefab",
+      "spacing": null,
+      "description": "White canvas wall",
+      "min_game_version": "2023",
+      "fence_options": {
+        "spacingRule": {
+          "values": [
+            2
+          ],
+          "complete": false
+        },
+        "hasCurves": {
+          "values": [
+            true
+          ],
+          "complete": false
+        },
+        "heightRule": {
+          "values": [
+            0
+          ],
+          "complete": false
+        },
+        "flexibilityRule": {
+          "values": [
+            1
+          ],
+          "complete": false
         }
       }
     },

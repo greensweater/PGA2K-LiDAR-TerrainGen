@@ -26,9 +26,11 @@ sys.path.insert(0, str(REPO / "util"))
 
 from course_extract import extract_course_file  # noqa: E402
 from course_output.fences import (  # noqa: E402
-    BRICK_WALL_ASSET, CANVAS_BLACK_ASSET, FenceRecord, RETAINING_WALL_ASSET, STONE_WALL_ASSET,
-    UNI_FENCE_ASSET, WOOD_FENCE_ASSET, build_fence_records, fence_record_to_object_path_v2023,
-    fence_records_to_groups_v2023, load_fence_records, resolve_fence_style, save_fence_records,
+    BRICK_LOW_RAILS_ASSET, BRICK_WALL_ASSET, CANVAS_BLACK_ASSET, FENCE_TYPES, FenceRecord,
+    LOW_METAL_RAILING_ASSET, PICKET_PICKETS_ASSET, PICKET_POSTS_ASSET, RETAINING_WALL_ASSET,
+    STONE_WALL_ASSET, UNI_FENCE_ASSET, WIRE_FENCE_ASSET, WOOD_FENCE_ASSET, build_fence_records,
+    fence_record_to_object_path_v2023, fence_records_to_groups_v2023, load_fence_records,
+    resolve_fence_style, save_fence_records,
 )
 from course_output.userLayers import GRID_ORIGIN_OFFSET  # noqa: E402
 from ingest.osm import Feature  # noqa: E402
@@ -182,7 +184,23 @@ class BuilderTest(unittest.TestCase):
             _way([(0, 0), (10, 0)], {"barrier": "fence"}, 1),
             _way([(10, 0), (20, 0)], {"barrier": "fence", "fence_type": "chain_link"}, 2),
         ])
-        self.assertEqual(sorted(r.asset for r in recs), sorted([WOOD_FENCE_ASSET, UNI_FENCE_ASSET]))
+        self.assertEqual(sorted(r.asset for r in recs), sorted([WOOD_FENCE_ASSET, WIRE_FENCE_ASSET]))
+
+    def test_multi_part_type_one_record_per_part(self):
+        # Picket = pickets + posts over the same run; a 2-way L still joins first.
+        recs, w, paths = self._build([
+            _way([(0, 0), (10, 0)], {"barrier": "fence", "fence_type": "picket"}, 1),
+            _way([(10, 0), (10, 10)], {"barrier": "fence", "fence_type": "picket"}, 2),
+        ])
+        self.assertEqual(w, [])
+        self.assertEqual({r.asset for r in recs}, {PICKET_PICKETS_ASSET, PICKET_POSTS_ASSET})
+        self.assertEqual(len(recs), 2)
+        self.assertEqual(recs[0].points, recs[1].points)
+        self.assertEqual({r.fence_type for r in recs}, {"picket"})
+        self.assertEqual(paths[0]["path"]["waypoints"], paths[1]["path"]["waypoints"])
+        self.assertEqual(sorted(p["spacing"] for p in paths), [0.1, 4.0])
+        groups = fence_records_to_groups_v2023(recs)
+        self.assertEqual(len(groups), 2)
 
     def test_groups_and_roundtrip(self):
         recs, _, _ = self._build([
@@ -200,8 +218,15 @@ class BuilderTest(unittest.TestCase):
 
 
 class StyleTest(unittest.TestCase):
+    @staticmethod
+    def _one(kind, tags):
+        """(asset, rules, warnings) for a single-part style."""
+        style, w = resolve_fence_style(kind, tags)
+        (asset, rules), = style.parts
+        return asset, rules, w
+
     def test_asset_defaults_match_sample(self):
-        _, rules, w = resolve_fence_style("wall", {"barrier": "wall", "wall": "brick"})
+        _, rules, w = self._one("wall", {"barrier": "wall", "pga_fence_asset": "asian_green_cap"})
         self.assertEqual((rules["spacingRule"], rules["flexibilityRule"], rules["hasCurves"]), (0, 0, False))
         self.assertEqual(w, [])
 
@@ -209,34 +234,56 @@ class StyleTest(unittest.TestCase):
         for preset, asset, height in (("curb", STONE_WALL_ASSET, -1.498),
                                       ("railroad", CANVAS_BLACK_ASSET, -2.688),
                                       ("retaining_wall", RETAINING_WALL_ASSET, -1.015)):
-            got_asset, rules, w = resolve_fence_style("fence", {"barrier": "fence", "pga_fence_preset": preset})
+            got_asset, rules, w = self._one("fence", {"barrier": "fence", "pga_fence_preset": preset})
             self.assertEqual((got_asset, rules["height"]), (asset, height))
             self.assertEqual(w, [])
-        self.assertEqual(resolve_fence_style("wall", {"pga_fence_preset": "retaining_wall"})[1]["width"], 2.5)
+        self.assertEqual(self._one("wall", {"pga_fence_preset": "retaining_wall"})[1]["width"], 2.5)
 
     def test_field_overrides_and_asset_override(self):
-        asset, rules, w = resolve_fence_style("fence", {
-            "pga_fence_asset": "Asia_BrickWalls_PostPrefab", "pga_fence_spacingRule": "3",
-            "pga_fence_hasCurves": "yes", "pga_fence_height": "3.23", "pga_fence_heightRule": "1"})
-        self.assertEqual(asset, BRICK_WALL_ASSET)
-        self.assertEqual((rules["spacingRule"], rules["hasCurves"], rules["height"], rules["heightRule"]),
-                         (3, True, 3.23, 1))
+        # pga_fence_asset takes a type name, a menu label, or a part asset label.
+        for requested in ("asian_green_cap", "Brick wall - Asian green cap", "Asia_BrickWalls_PostPrefab"):
+            asset, rules, w = self._one("fence", {
+                "pga_fence_asset": requested, "pga_fence_spacingRule": "3",
+                "pga_fence_hasCurves": "yes", "pga_fence_height": "3.23", "pga_fence_heightRule": "1"})
+            self.assertEqual(asset, BRICK_WALL_ASSET)
+            self.assertEqual((rules["spacingRule"], rules["hasCurves"], rules["height"], rules["heightRule"]),
+                             (3, True, 3.23, 1))
+            self.assertEqual(w, [])
+
+    def test_multi_part_overrides(self):
+        # Shared fields (height) hit every part; the rest only the first.
+        style, w = resolve_fence_style("fence", {"pga_fence_asset": "brick_with_railings",
+                                                 "pga_fence_height": "-0.3", "pga_fence_spacing": "6"})
         self.assertEqual(w, [])
+        (a1, r1), (a2, r2) = style.parts
+        self.assertEqual((a1, a2), (BRICK_LOW_RAILS_ASSET, LOW_METAL_RAILING_ASSET))
+        self.assertEqual((r1["height"], r2["height"]), (-0.3, -0.3))
+        self.assertEqual((r1["spacing"], r2["spacing"]), (6.0, 0.1))
+        # Defaults: both parts at the sampler's lowered railing height.
+        style, _ = resolve_fence_style("fence", {"material": "brick_with_railings"})
+        self.assertEqual({r["height"] for _, r in style.parts}, {-0.594})
+
+    def test_every_menu_type_resolves_clean(self):
+        self.assertEqual(len(FENCE_TYPES), 28)
+        for name in FENCE_TYPES:
+            style, w = resolve_fence_style("fence", {"pga_fence_asset": name})
+            self.assertEqual((style.type_name, w), (name, []))
 
     def test_matrix_validation(self):
         # Complete set -> invalid value reverts to the default.
-        _, rules, w = resolve_fence_style("fence", {"pga_fence_asset": "Asia_BrickWalls_PostPrefab",
-                                                    "pga_fence_spacingRule": "7"})
+        _, rules, w = self._one("fence", {"pga_fence_asset": "Asia_BrickWalls_PostPrefab",
+                                          "pga_fence_spacingRule": "7"})
         self.assertEqual(rules["spacingRule"], 0)
         self.assertIn("not a valid option", w[0])
         # Incomplete set -> unseen value kept, flagged unverified (UniFence;
         # WoodFences' spacingRule set is complete since the 2026-09-26 test).
-        _, rules, w = resolve_fence_style("fence", {"barrier": "chain", "pga_fence_spacingRule": "3"})
+        asset, rules, w = self._one("fence", {"barrier": "chain", "pga_fence_spacingRule": "3"})
+        self.assertEqual(asset, UNI_FENCE_ASSET)
         self.assertEqual(rules["spacingRule"], 3)
         self.assertIn("unverified", w[0])
         # Bad input -> warned and ignored.
-        _, rules, w = resolve_fence_style("fence", {"pga_fence_preset": "moat", "pga_fence_spacing": "wide",
-                                                    "pga_fence_asset": "Nope"})
+        _, rules, w = self._one("fence", {"pga_fence_preset": "moat", "pga_fence_spacing": "wide",
+                                          "pga_fence_asset": "Nope"})
         self.assertEqual(len(w), 3)
         self.assertEqual(rules["spacing"], 4.0)
 
