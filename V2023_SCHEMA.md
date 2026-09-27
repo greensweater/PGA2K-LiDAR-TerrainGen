@@ -293,9 +293,11 @@ The game re-saved `clearobj_test1.course` with three new `surfaces` entries
 | clear generated objects    | **5**             | 15 (soft square)   | 1.0     | (-586.1, 835.9)        | 185.9  |
 | clear generated heavy rough| **11**            | **72** (hard square) | **2.0** | (-261.5, 829.7)      | 127.1  |
 
-Category 5 is the one already confirmed above. Mapping 6 → trees and 11 →
-heavy rough is inferred: 11 is the only hard-brush entry, and 6 is the
-remaining soft square, furthest west, so likely placed first. Heavy rough is
+Mapping confirmed (Andy, 2026-09-27): 5 = objects (0.3b.1), 11 = heavy
+rough (its type-72 stamp cleared the grass in `scale_test1.course`), and
+6 = trees **by elimination**. Andy placed exactly one of each tool, and 6
+is the only category left. What category 6 clears hasn't been tested
+directly (e.g. that it leaves grass and rocks in place). Heavy rough is
 the default grass that covers basically the whole map; clearing it removes
 that grass. Its `value` of 2.0 (vs 1.0 for the other two) is unexplained.
 Brush ids agree with the rest of the repo: **72 = hard square, 73 = hard

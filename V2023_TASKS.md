@@ -131,7 +131,8 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
         category 5 clears every kind of generated scatter (trees, plants, grass,
         rocks) inside the stamp and nothing outside it. Manually placed objects
         (our LIDAR trees) are untouched. The editor also has categories **6**
-        (clear trees) and **11** (clear heavy rough: type 72, value 2.0); see
+        (clear trees, confirmed by elimination) and **11** (clear heavy rough:
+        type 72, value 2.0, confirmed in-game); see
         `V2023_SCHEMA.md` "Three clear-stamp categories".
   - [x] 0.3b.2 Shapes confirmed (8 → circle, 15 → square). **`scale` uses the
         same convention as height stamps** (centre-to-edge of the full texture),
