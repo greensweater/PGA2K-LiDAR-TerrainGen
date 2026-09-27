@@ -813,8 +813,10 @@ prioritize it; treat the object-tile version as a later optional variant.
   - [x] 3.5.4 Verify the trick presets (curb / railroad / retaining wall)
         in-game. Done via the fence test (B18–B20), 2026-09-26; the retaining
         wall height was corrected to -1.015.
-  - [ ] 3.5.6 **Leveled (stepped) fences need an absolute height** (found by the fence
-        test). **Code DONE 2026-09-27; ready for in-game verification.**
+  - [x] 3.5.6 **Leveled (stepped) fences need an absolute height** (found by the fence
+        test). **DONE 2026-09-27:** Andy loaded `LIDAR_2023_bouldercreek_leveled`.
+        The leveled picket (over a 1.5 m slope), leveled stone wall, and
+        brick with railings all look correct.
     - Semantics (Andy, in-game): `heightRule=1` = ONE height for the whole
       run, which the editor sets to the run's minimum ground.
     - Implemented as `fences.apply_leveled_heights`, called from

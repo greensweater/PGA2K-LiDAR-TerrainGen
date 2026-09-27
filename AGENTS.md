@@ -81,10 +81,9 @@ Pipeline hot path = the `step_*` functions in `PGA2k_gen.py` plus the
   otherwise both show as e.g. "Boulder Creek". Repack test builds with
   `--repack-course-name <same as filename>` (the flag isn't persisted; a
   plain repack goes back to the project's `course_name`).
-- **Don't overwrite a course in the game folder without checking it.** The
-  game re-saves every course it opens (size/mtime change), so a changed
-  file means Andy has loaded it and may have edited it. Use a new filename
-  instead.
+- **Game-folder `.course` files are scratch during development.** The game
+  re-saves every course it opens (size/mtime change on every load). It's
+  fine to overwrite test courses there (Andy, 2026-09-27).
 - **Python: use the repo `.venv`** (`.venv/Scripts/python.exe`). The system
   3.9 / 3.13 interpreters lack shapely / pyproj.
 - **In-game verification checkpoints are not something a session can close
