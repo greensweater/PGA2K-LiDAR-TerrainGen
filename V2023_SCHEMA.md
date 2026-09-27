@@ -313,7 +313,11 @@ unused by this repo's writers in both v2019/v2021 — v2021's userLayers.json
 had the key set `deletedHazards, newHazards, objects, clearTrees, addTrees,
 treeDensity, hazards, terrainHeight, height, trees, green, surfaces,
 outOfBounds, crowdLocations, water` and the v2021 sample's `surfaces` array
-was empty, so whether v2021 also honors category 5 is unconfirmed (0.3b.3).
+was empty. Andy confirms (2026-09-27) that the v2019/v2021 editors have
+"clear trees" and "clear objects" tools but **no "clear heavy rough"**
+(category 11 is v2023-only). How the earlier versions store the two tools
+is still unconfirmed (0.3b.3): as `surfaces` categories 5/6 like v2023, or
+(for trees) in v2021's separate `clearTrees` key.
 
 ## Version registry (task 1.1 decisions, 2026-09-23)
 

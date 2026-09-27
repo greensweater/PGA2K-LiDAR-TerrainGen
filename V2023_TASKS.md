@@ -142,10 +142,15 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
         edges. The earlier "29 m ≈ scale/2" eyeball read was wrong. Still
         unknown and not blocking: what `value` means (1.0, or 2.0 for heavy
         rough); copy the game's values as they are.
-  - [ ] 0.3b.3 Check whether v2019/v2021 honor `surfaceCategory: 5` (v2021
-        userLayers has the `surfaces` key, empty in the sample; v2021 also has a
-        `clearTrees` key — determine if that is the same or a different
-        mechanism).
+  - [ ] 0.3b.3 v2019/v2021 support. **Tools confirmed (Andy, 2026-09-27)**:
+        the earlier editors have "clear trees" and "clear objects", but **no
+        "clear heavy rough"** (category 11 is v2023-only). **Still open: how they
+        are stored.** v2021 userLayers has both `surfaces` (empty in our sample)
+        and a separate `clearTrees` key, so clear-trees may live in
+        `clearTrees` rather than as a `surfaceCategory: 6` entry. To settle it:
+        get a v2021 (and v2019) course with one clear-trees and one
+        clear-objects stamp placed in the editor, then extract it and read the
+        `userLayers` entries.
   - [ ] 0.3b.4 Record answers in `V2023_SCHEMA.md` and lift the 3.4 gate.
 - [x] **0.4 Document findings** — `V2023_SCHEMA.md` written; `VERSION_SCHEMAS`
       `2023` entry still to be populated (that is task 1.1, gated only on
