@@ -295,9 +295,10 @@ The game re-saved `clearobj_test1.course` with three new `surfaces` entries
 
 Mapping confirmed (Andy, 2026-09-27): 5 = objects (0.3b.1), 11 = heavy
 rough (its type-72 stamp cleared the grass in `scale_test1.course`), and
-6 = trees **by elimination**. Andy placed exactly one of each tool, and 6
-is the only category left. What category 6 clears hasn't been tested
-directly (e.g. that it leaves grass and rocks in place). Heavy rough is
+6 = trees (by elimination: Andy placed exactly one of each tool, and 6 is
+the only category left). Andy also watched it in-game while placing it:
+category 6 clears **only generated trees**, and leaves plants, grass and
+rocks in place. Heavy rough is
 the default grass that covers basically the whole map; clearing it removes
 that grass. Its `value` of 2.0 (vs 1.0 for the other two) is unexplained.
 Brush ids agree with the rest of the repo: **72 = hard square, 73 = hard
