@@ -238,13 +238,73 @@ new key). Two stamps were provided:
 `type` 8 (round) / 15 (smooth square) are the SAME brush ids the OOB feature
 uses (`OOB_ROUND_BRUSH=8`, `OOB_SQUARE_BRUSH=15` in
 `course_output/out_of_bounds.py`) — the course author's expectation that they
-correspond to known stamp shapes is borne out by the data; the in-game visual
-match still needs a quick check (0.3b.2). Entry shape is identical to a
+correspond to known stamp shapes is borne out by the data, and the shapes were
+confirmed in-game (0.3b.2, see below). Entry shape is identical to a
 height-layer stamp (tool 0, y "-Infinity" = terrain-grounded, value 1.0) but
 with `surfaceCategory` instead of the height layer's `value` semantics.
 
-Known `surfaceCategory` values so far: **5 = clear generated objects** (this
-sample), **9 = water** (`course_output/water.py`
+### In-game results (0.3b.1/0.3b.2, Andy, 2026-09-27)
+
+Loaded `clearobj_test1.course` (the repo template renamed; identical
+stamps) in v2023:
+
+- The editor lists these stamps as **"clear terrain"** objects. Both shapes
+  render where expected: type 15 is a square, type 8 is a circle.
+- **"Generated objects"** means the game's own random, procedurally-generated
+  scatter of trees, plants, grass and rocks across the whole playfield.
+  Category 5 clears all of it (trees, plants, grass, rocks) inside the stamp
+  and leaves everything outside alone.
+- **Manually placed objects are untouched.** That includes our
+  LIDAR-generated trees (`placedObjects3`). The sample's stamps don't overlap
+  its fences, so fences weren't tested.
+- **Size — SETTLED (`scale_test1.course`, Andy, 2026-09-27)**: clear stamps
+  use the **same `scale` convention as height stamps**: `scale` is the
+  centre-to-edge distance of the full brush texture, not the width. An eyeball
+  read of the first sample suggested about 29 m (scale/2) for scale 58.85; the
+  ruler test below showed that read was wrong.
+
+  Test: stamps at scale 80 with marker posts 100 m north of each centre, at
+  ±40 (scale/2), +45.6 (type-15 plateau), +64.4 (type-15 active edge), ±80
+  (scale):
+  - clear heavy rough (cat 11, **type 72** hard square) → edge **exactly at
+    ±80**;
+  - height flatten, type 72 → **exactly at ±80**, identical to the clear
+    stamp;
+  - clear objects (cat 5, **type 15** soft square) → falloff ends **between
+    45.6 and 64.4**, i.e. inside the plateau-to-active band that
+    `terrain/cart_paths.py`'s `TYPE15_*` profile predicts;
+  - height flatten, type 15 → looks exactly like the clear type-15 falloff.
+
+  So size clear stamps with the existing helpers: type 72 hard edge at
+  `scale`; type 15 full effect out to `scale * 292/512`, fading to zero by
+  `scale * 412/512` (`_TYPE15_SCALE_PER_HALF_WIDTH` in `out_of_bounds.py`).
+  The round clear stamp (type 8, row B) wasn't read separately; it's
+  assumed to follow its height-brush profile too. This also agrees with the
+  blank template's map-wide datum stamp (type 72, scale 1000 on a ±1000 m map).
+
+### Three clear-stamp categories (Andy placed one of each, NW of the test map)
+
+The game re-saved `clearobj_test1.course` with three new `surfaces` entries
+(read back 2026-09-27). The editor has three clear tools:
+
+| Tool (editor)              | `surfaceCategory` | `type`             | `value` | sample position (x, z) | scale  |
+|----------------------------|-------------------|--------------------|---------|------------------------|--------|
+| clear generated trees      | **6**             | 15 (soft square)   | 1.0     | (-861.7, 852.6)        | 149.2  |
+| clear generated objects    | **5**             | 15 (soft square)   | 1.0     | (-586.1, 835.9)        | 185.9  |
+| clear generated heavy rough| **11**            | **72** (hard square) | **2.0** | (-261.5, 829.7)      | 127.1  |
+
+Category 5 is the one already confirmed above. Mapping 6 → trees and 11 →
+heavy rough is inferred: 11 is the only hard-brush entry, and 6 is the
+remaining soft square, furthest west, so likely placed first. Heavy rough is
+the default grass that covers basically the whole map; clearing it removes
+that grass. Its `value` of 2.0 (vs 1.0 for the other two) is unexplained.
+Brush ids agree with the rest of the repo: **72 = hard square, 73 = hard
+circle** (`FENCE_TEST_PAD_BRUSH = 72`, the GUI's "type-73 (circle)"
+registration marks).
+
+Known `surfaceCategory` values so far: **5 = clear generated objects**,
+**6 = clear generated trees**, **11 = clear generated heavy rough**,
+**9 = water** (`course_output/water.py`
 `WATER_SURFACE_CATEGORY=9`, written with `type: 15` stamps). Category 5 was
 unused by this repo's writers in both v2019/v2021 — v2021's userLayers.json
 had the key set `deletedHazards, newHazards, objects, clearTrees, addTrees,

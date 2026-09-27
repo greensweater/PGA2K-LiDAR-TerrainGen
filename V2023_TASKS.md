@@ -127,13 +127,20 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
       paint" section. It reuses the `userLayers2.json` `surfaces` layer with
       `surfaceCategory: 5`; entries are OOB-shaped brush stamps (`type` 8 round /
       15 smooth square, scale = radius in m, value 1.0). Remaining verification:
-  - [ ] 0.3b.1 **In-game check**: load `2023_fences.course` in v2023 — confirm
-        the two stamps visibly suppress generated objects inside their area and
-        do nothing outside it; note which object kinds are suppressed (trees?
-        auto-placed props? all generated?).
-  - [ ] 0.3b.2 Confirm the two stamp shapes render as expected (round stamp →
-        circular exclusion; square stamp → square) and record the in-game
-        semantics of `scale` (radius vs diameter) and `value`.
+  - [x] 0.3b.1 **In-game check** (Andy, 2026-09-27, `clearobj_test1.course`):
+        category 5 clears every kind of generated scatter (trees, plants, grass,
+        rocks) inside the stamp and nothing outside it. Manually placed objects
+        (our LIDAR trees) are untouched. The editor also has categories **6**
+        (clear trees) and **11** (clear heavy rough: type 72, value 2.0); see
+        `V2023_SCHEMA.md` "Three clear-stamp categories".
+  - [x] 0.3b.2 Shapes confirmed (8 → circle, 15 → square). **`scale` uses the
+        same convention as height stamps** (centre-to-edge of the full texture),
+        settled with the `scale_test1.course` ruler test (2026-09-27): type 72
+        clear and height stamps both end exactly at ±scale, and type 15 clear
+        and height stamps show the same falloff between the plateau and active
+        edges. The earlier "29 m ≈ scale/2" eyeball read was wrong. Still
+        unknown and not blocking: what `value` means (1.0, or 2.0 for heavy
+        rough); copy the game's values as they are.
   - [ ] 0.3b.3 Check whether v2019/v2021 honor `surfaceCategory: 5` (v2021
         userLayers has the `surfaces` key, empty in the sample; v2021 also has a
         `clearTrees` key — determine if that is the same or a different
@@ -662,10 +669,11 @@ prioritize it; treat the object-tile version as a later optional variant.
 - [ ] **3.4 Fill splines with "clear generated objects" stamps (new feature)**
       — **schema confirmed** (0.3b): `userLayers2.json` → `surfaces[]` entries
       with `surfaceCategory: 5`, OOB-shaped stamps (`type` 8 round / 15 smooth
-      square, `scale` = radius m, `value` 1.0, `tool` 0, y "-Infinity"). The
-      only remaining gate is 0.3b.1 (in-game suppression semantics), which
-      does not block writing the formatter — build against the confirmed
-      shape, verify semantics in 3.4.8.
+      square, `scale` = centre-to-edge in m, the same convention as height stamps,
+      `value` 1.0, `tool` 0, y "-Infinity"). 0.3b.1/0.3b.2 are closed
+      in-game (2026-09-27): the paint clears only the game's procedural
+      scatter; categories are 5 objects / 6 trees / 11 heavy rough (type 72,
+      value 2.0). Only 0.3b.3 (v2019/v2021 support) is still open.
   - **Context**: Phase 2 done; schema confirmed from the second sample export
     (commit `8376f0e`, see `V2023_SCHEMA.md` "Clear-generated-objects paint").
   - **Where**: `course_output/out_of_bounds.py` is the blueprint (brush-stamp
@@ -697,8 +705,12 @@ prioritize it; treat the object-tile version as a later optional variant.
         containment test so every generator uses the same rule. (This is
         independent of the paint: it keeps our generator consistent with areas
         painted in-game, and gives us a containment primitive to reuse.)
-  - [ ] 3.4.5 **Scope decision**: which generated objects are suppressed where
-        the fill is painted (trees only? all auto-generated placements?) and
+  - [ ] 3.4.5 **Scope decision**: in-game, the paint only clears the game's
+        *own* procedural scatter; our placedObjects3 trees are unaffected
+        (0.3b.1). So the generator-side suppression (3.4.4) is a choice we
+        make, not something the game does for us. Also decide which categories
+        to emit: 5 objects, 6 trees, 11 heavy rough. Also decide whether it
+        applies in v2023 only or also v2019/v2021 (pending 0.3b.3 —
         does it apply in v2023 only or also v2019/v2021 (pending 0.3b.3 —
         gate the v2019/v2021 wiring on that answer).
   - [ ] 3.4.6 **Wiring**: `step_generate_clear_objects` (+ clear flag,
