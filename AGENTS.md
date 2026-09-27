@@ -75,6 +75,16 @@ Pipeline hot path = the `step_*` functions in `PGA2k_gen.py` plus the
   `foo-bar2` are fine. Route every filename written into the game's Courses
   folder through `game_safe_course_stem` (`V2023_SCHEMA.md` "Course filename
   rule"). When hand-building test courses, use `_` or end names in a digit.
+- **Test courses: set the stored name to match the filename.** The in-game
+  course list/editor shows only the stored name (CourseDescription +
+  CourseMetadata `name`), not the filename, so two builds of one project
+  otherwise both show as e.g. "Boulder Creek". Repack test builds with
+  `--repack-course-name <same as filename>` (the flag isn't persisted; a
+  plain repack goes back to the project's `course_name`).
+- **Don't overwrite a course in the game folder without checking it.** The
+  game re-saves every course it opens (size/mtime change), so a changed
+  file means Andy has loaded it and may have edited it. Use a new filename
+  instead.
 - **Python: use the repo `.venv`** (`.venv/Scripts/python.exe`). The system
   3.9 / 3.13 interpreters lack shapely / pyproj.
 - **In-game verification checkpoints are not something a session can close

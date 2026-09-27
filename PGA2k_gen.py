@@ -5247,10 +5247,17 @@ def export_status(working_dir: Path) -> dict[str, str]:
     }
 
 
-def step_repack(working_dir: Path, filename: str) -> None:
+def step_repack(working_dir: Path, filename: str, course_name: str | None = None) -> None:
     """
     Repack working_dir/course into a .course file via util/course_repack.py,
     invoked as a subprocess (see step_ingest_course).
+
+    course_name, if given, is the name stored in the packed file
+    (CourseDescription + CourseMetadata "name") instead of project.json's
+    course_name -- the in-game course list shows only that stored name, so
+    test builds of one project repacked under different filenames need
+    distinct names to be told apart. Not persisted: the next plain repack
+    goes back to the project's own name.
     """
     _ensure_course_baseline(working_dir)
     course_dir = working_dir / "course"
@@ -5297,7 +5304,10 @@ def step_repack(working_dir: Path, filename: str) -> None:
     # (forced when switching game_version, e.g. to 2021) reverts the name
     # to the template's own.
     _apply_course_theme(course_dir, project)
-    _apply_course_name(course_dir, project)
+    if course_name and course_name.strip():
+        _apply_course_name(course_dir, {**project, "course_name": course_name.strip()})
+    else:
+        _apply_course_name(course_dir, project)
 
     print(f"Repacking {course_dir} -> {out_path} ...")
     result = subprocess.run(
@@ -6570,6 +6580,10 @@ def main(argv: list[str] | None = None) -> int:
                               f"GUI's slider, or {DEFAULT_LIDAR_TREE_MIN_HEIGHT_M:.0f} m if never set.")
     parser.add_argument("--repack-filename", type=str, default=None,
                          help="repack: output filename (without .course extension)")
+    parser.add_argument("--repack-course-name", type=str, default=None,
+                         help="repack: course name stored in the packed file (what the in-game course "
+                              "list shows) instead of project.json's course_name -- e.g. the filename, "
+                              "so test builds of one project are told apart. Not persisted.")
     parser.add_argument("--edited-course", type=Path, default=None,
                          help="import-ingame-edits: path to a saved .course file (exported by this "
                               "tool, then hand-edited in PGA Tour 2K's own in-game editor and saved) "
@@ -6786,7 +6800,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.repack_filename:
                 print("error: --step repack requires --repack-filename <name>", file=sys.stderr)
                 return 1
-            step_repack(working_dir, args.repack_filename)
+            step_repack(working_dir, args.repack_filename, args.repack_course_name)
         elif args.step == "import-ingame-edits":
             if not args.edited_course:
                 print("error: --step import-ingame-edits requires --edited-course <path>", file=sys.stderr)
