@@ -435,6 +435,40 @@ def _dedup_same_node_posts(objects: list[dict]) -> list[dict]:
     return out
 
 
+def _snap_chain_length(nodes: list[tuple[float, float]],
+                       module_len: float = MODULE_LENGTH_M,
+                       ) -> tuple[list[tuple[float, float]], float]:
+    """Move the chain's LAST node along the polyline so the total length
+    is exactly the nearest multiple of `module_len` (at least one).
+
+    The corner solver only moves inner corners, so a chain with none (a
+    single straight way) keeps its drawn, arbitrary length. Tiling that
+    with round(total / L) spans leaves the final post clamped to the
+    drawn end while the last span's panels still run a full L -- they
+    dangle past the post. Snapping the end instead keeps every post on a
+    panel end: shortening truncates the polyline at n*L, lengthening
+    extends the last segment in its own direction.
+
+    Returns (nodes, signed end movement in metres; + = extended)."""
+    cum = _cumulative_lengths(nodes)
+    total = cum[-1]
+    target = max(1, int(round(total / module_len))) * module_len
+    delta = target - total
+    if abs(delta) < 1e-6:
+        return list(nodes), 0.0
+    if delta > 0:
+        ax, az = nodes[-2]
+        bx, bz = nodes[-1]
+        seg = math.hypot(bx - ax, bz - az)
+        if seg < 1e-9:
+            return list(nodes), 0.0
+        ux, uz = (bx - ax) / seg, (bz - az) / seg
+        return list(nodes[:-1]) + [(bx + ux * delta, bz + uz * delta)], delta
+    x, z, _ = _point_and_heading_at(nodes, cum, target)
+    kept = [p for p, c in zip(nodes, cum) if c < target - 1e-9]
+    return kept + [(x, z)], delta
+
+
 def tile_range_net_chain(chain: RangeNetChain,
                          module_len: float = MODULE_LENGTH_M,
                          snap: bool = RANGE_NET_SNAP) -> dict:
@@ -448,6 +482,9 @@ def tile_range_net_chain(chain: RangeNetChain,
     nodes, movements = (
         _solve_corners(chain.nodes, module_len) if snap else (list(chain.nodes), [])
     )
+    end_moved = 0.0
+    if nodes[0] != nodes[-1]:  # a closed loop's seam can't move
+        nodes, end_moved = _snap_chain_length(nodes, module_len)
     chain.nodes = nodes
     cum = _cumulative_lengths(nodes)
     total = cum[-1]
@@ -503,6 +540,7 @@ def tile_range_net_chain(chain: RangeNetChain,
         "length_m": _round(total),
         "segments": n_segments,
         "corners_moved_m": [_round(m) for m in movements],
+        "end_moved_m": _round(end_moved),
         "objects": objects,
     }
 
@@ -537,6 +575,9 @@ def build_range_net_records(
         if record["corners_moved_m"]:
             moved_note = (f", {len(record['corners_moved_m'])} inner corner(s) repositioned "
                           f"({max(record['corners_moved_m']):.2f} m max)")
+        if record["end_moved_m"]:
+            moved_note += (f", far end {'extended' if record['end_moved_m'] > 0 else 'trimmed'} "
+                           f"{abs(record['end_moved_m']):.2f} m to the module grid")
         printf(f"  chain (source_ids={record['source_ids']}): {record['segments']} segment(s) "
                f"along {record['length_m']:.1f} m, {len(record['objects'])} object(s){moved_note}")
     printf(f"  {len(records)} range-net chain(s) ({skipped} skipped)")

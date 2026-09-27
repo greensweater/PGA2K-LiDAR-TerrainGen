@@ -86,15 +86,22 @@ FEATURES_TO_SURFACES = {
 _STATIC_SPLINE_PARAMS: dict[str, dict] = {
     "bunker": dict(surface="bunker", path_width=0.01, handle_length=1.0,
                    tight_splines=True, secondary_surface="heavyrough", secondary_width=2.5),
+    # green/fairway: smooth_v_handles re-smooths any waypoint whose two
+    # handles form a little "V" (see _smooth_v_handles) -- Chad's tight
+    # 0.2 m perpendicular handles do this at every OSM node, and the game
+    # renders it as a sharp corner. Collinear (smooth) and sharpened
+    # handles are left as built.
     "green": dict(surface="green", path_width=1.7, handle_length=0.2,
-                  tight_splines=True, secondary_surface="heavyrough", secondary_width=2.5),
+                  tight_splines=True, secondary_surface="heavyrough", secondary_width=2.5,
+                  smooth_v_handles=True),
     # Tees are output as surface=green (confirmed: newTeeBox sets
     # surface to featuresToSurfaces["green"], not a dedicated tee ID --
     # there isn't one), just via a separately-nameable spline_json key.
     "tee": dict(surface="green", path_width=1.7, handle_length=0.2,
                 tight_splines=True, secondary_surface="heavyrough", secondary_width=2.5),
     "fairway": dict(surface="fairway", path_width=3.0, handle_length=3.0,
-                     tight_splines=False, secondary_surface="rough", secondary_width=5.0),
+                     tight_splines=False, secondary_surface="rough", secondary_width=5.0,
+                     smooth_v_handles=True),
     "rough": dict(surface="rough", path_width=1.7, handle_length=3.0,
                    tight_splines=False, secondary_surface="", secondary_width=0.0),
     "heavyrough": dict(surface="heavyrough", path_width=1.7, handle_length=3.0,
@@ -131,6 +138,11 @@ _ROAD_KIND_STYLES = {
 
 DEFAULT_MERGE_EPSILON_M = 0.5  # ported from an internal cleanup script's MERGE_EPSILON
 DEFAULT_HANDLE_SCALE = 0.3     # ported from the same script's DEFAULT_HANDLE_SCALE
+# _smooth_v_handles: each re-smoothed handle is this fraction of the segment on its own
+# side. Same ratio the game's editor writes for smooth interior object-
+# path waypoints (course_output/fences.py's SMOOTH_HANDLE_RATIO);
+# close to Catmull-Rom's 1/3, so the curve stays inside the hull.
+SMOOTH_HANDLE_RATIO = 0.375
 
 
 def _tangent_angle(p: tuple[float, float], n: tuple[float, float]) -> float:
@@ -300,6 +312,64 @@ def _build_waypoints(
     return waypoints
 
 
+V_HANDLE_TOLERANCE_DEG = 5.0  # angular slack for "collinear" / "along the segment"
+
+
+def _smooth_v_handles(waypoints: list[dict], is_closed: bool) -> int:
+    """
+    Re-smooth, in place, every waypoint whose handles form a "V" --
+    the two handles neither opposed along one line (already smooth) nor
+    each lying along its own segment toward the neighbour (deliberately
+    sharpened). A V renders as a sharp corner in-game. The fix puts both
+    handles on the (next - prev) tangent, each SMOOTH_HANDLE_RATIO of its
+    own adjacent segment. Zero-length handles count as sharpened and are
+    left alone, as are open-path endpoints. Returns the number fixed.
+    """
+    cos_tol = math.cos(math.radians(V_HANDLE_TOLERANCE_DEG))
+    n = len(waypoints)
+
+    def xy(pt):
+        return pt["x"], pt["y"]
+
+    def unit(v):
+        m = math.hypot(*v)
+        return (v[0] / m, v[1] / m) if m > 1e-6 else None
+
+    def dot(a, b):
+        return a[0] * b[0] + a[1] * b[1]
+
+    fixed = 0
+    for i in range(n):
+        if not is_closed and (i == 0 or i == n - 1):
+            continue
+        c = xy(waypoints[i]["waypoint"])
+        prev = xy(waypoints[i - 1]["waypoint"])
+        nxt = xy(waypoints[(i + 1) % n]["waypoint"])
+        h1, h2 = xy(waypoints[i]["pointOne"]), xy(waypoints[i]["pointTwo"])
+        b = unit((h1[0] - c[0], h1[1] - c[1]))
+        f = unit((h2[0] - c[0], h2[1] - c[1]))
+        if b is None or f is None:
+            continue
+        if dot(b, f) <= -cos_tol:
+            continue  # collinear: already smooth
+        to_prev = unit((prev[0] - c[0], prev[1] - c[1]))
+        to_next = unit((nxt[0] - c[0], nxt[1] - c[1]))
+        if (to_prev and to_next and dot(b, to_prev) >= cos_tol
+                and dot(f, to_next) >= cos_tol):
+            continue  # sharpened: each handle along its own segment
+        tangent = unit((nxt[0] - prev[0], nxt[1] - prev[1]))
+        if tangent is None:
+            continue
+        back = math.hypot(c[0] - prev[0], c[1] - prev[1]) * SMOOTH_HANDLE_RATIO
+        fwd = math.hypot(nxt[0] - c[0], nxt[1] - c[1]) * SMOOTH_HANDLE_RATIO
+        waypoints[i]["pointOne"] = {"x": round(c[0] - back * tangent[0], 3),
+                                    "y": round(c[1] - back * tangent[1], 3)}
+        waypoints[i]["pointTwo"] = {"x": round(c[0] + fwd * tangent[0], 3),
+                                    "y": round(c[1] + fwd * tangent[1], 3)}
+        fixed += 1
+    return fixed
+
+
 def _build_spline(
     points: list[tuple[float, float]],
     surface: str,
@@ -313,6 +383,7 @@ def _build_spline(
     is_closed: bool = True,
     is_filled: bool = True,
     clean_up: bool = True,
+    smooth_v_handles: bool = False,
 ) -> dict:
     if clean_up:
         points = _merge_overlapping_points(points, is_closed)
@@ -324,6 +395,8 @@ def _build_spline(
         shrunk, handle_length, is_clockwise, tight_splines,
         adaptive_handle_cap=clean_up, is_closed=is_closed,
     )
+    if smooth_v_handles:
+        _smooth_v_handles(waypoints, is_closed)
     return {
         "surface": FEATURES_TO_SURFACES[surface],
         "secondarySurface": FEATURES_TO_SURFACES.get(secondary_surface, 11),
