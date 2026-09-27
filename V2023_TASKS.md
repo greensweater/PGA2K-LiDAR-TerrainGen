@@ -836,6 +836,15 @@ prioritize it; treat the object-tile version as a later optional variant.
         `V2023_SCHEMA.md` "In-game fence test results".
   - [ ] 3.5.5 Regression: confirm untouched features (trees, water, splines)
         are unchanged when fences/clear-objects are present vs absent.
+    - **Fences: DONE 2026-09-27** on a bouldercreek2 scratch copy (71
+      objectPaths, incl. leveled + multi-part), write-objects with vs
+      without `fences.json`:
+      - all 20 other nodes byte-identical (userLayers2, surfaceSplines2,
+        holes2, ...);
+      - in `placedObjects3`, the 15 non-fence groups (trees, range-net
+        items) are identical in content and order; fences add only their
+        own 12 groups.
+    - Clear-objects half still open: re-run once 3.4 exists.
 
 **Exit:** OSM fence/wall ways become correctly-grounded objectPath fences/walls
 in a playable v2023 `.course` (trick presets included), clear-objects fill
