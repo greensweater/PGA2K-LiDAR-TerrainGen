@@ -128,11 +128,18 @@ _STATIC_SPLINE_PARAMS: dict[str, dict] = {
 # see ingest/osm.py's classify_way). handle_length keeps the same 2x-
 # width ratio the original single fixed cartpath width (2.0 ->
 # handle_length 4.0) used.
+#
+# Third/fourth fields are the secondary (blend) surface + width. Only
+# "motorway" uses one: a 10.0 surface3 road inside a 12.0 surface1
+# (cartpath-texture) shoulder. Both exceed the in-editor slider max
+# (0-100 on the slider = 0-10 stored), but the game loads and renders
+# them fine -- confirmed in-game in v2023 (2026-09-27).
 _ROAD_KIND_STYLES = {
-    "cartpath": ("surface1", 1.7),
-    "service_road": ("surface3", 2.3),
-    "roadway": ("surface3", 3.5),
-    "driveway": ("surface3", 3.5),
+    "cartpath": ("surface1", 1.7, "", 0.0),
+    "service_road": ("surface3", 2.3, "", 0.0),
+    "roadway": ("surface3", 3.5, "", 0.0),
+    "driveway": ("surface3", 3.5, "", 0.0),
+    "motorway": ("surface3", 10.0, "surface1", 12.0),
 }
 
 
@@ -454,12 +461,12 @@ def feature_to_spline(feature: Feature) -> Optional[dict]:
 
 
     if feature.kind in _ROAD_KIND_STYLES:
-        surface, width = _ROAD_KIND_STYLES[feature.kind]
+        surface, width, secondary_surface, secondary_width = _ROAD_KIND_STYLES[feature.kind]
         return _build_spline(
             points, surface=surface, path_width=width,
             shrink_distance=None if is_area else 0.0,
             handle_length=width * 2.0, tight_splines=False,
-            secondary_surface="", secondary_width=0.0,
+            secondary_surface=secondary_surface, secondary_width=secondary_width,
             state=3 if is_area else 0, is_closed=is_area, is_filled=is_area,
         )
 

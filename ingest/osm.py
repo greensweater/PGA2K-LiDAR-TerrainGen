@@ -57,17 +57,17 @@ DEFAULT_HOLE_CORRIDOR_BUFFER_PX = 30.0
 GOLF_OBJECT_KINDS = ("fairway", "green", "tee", "hole")  # mask (=excluded) defaults False for these, True otherwise
 
 # Standard OSM vehicular-road highway= values -- classified as
-# "roadway" (the widest of the three road widths; see splines.py's
-# _ROAD_KIND_WIDTHS), distinct from "service_road" (highway=service)
-# and "cartpath"/"path" (golf-cart or foot access). Includes the
-# motorway/trunk family (and their _link variants) -- those are real
-# roads and get the same "roadway" treatment as every other entry
-# here, including the paved surface-3 texture and full road width.
-# (They used to be deliberately excluded as "not worth rendering",
-# but that dropped them from the course entirely -- a motorway
-# bordering the course should still render as a road.)
+# "roadway" (see splines.py's _ROAD_KIND_STYLES), distinct from
+# "service_road" (highway=service) and "cartpath"/"path" (golf-cart or
+# foot access). Includes the trunk family and motorway_link ramps --
+# real roads that get the same paved surface-3 "roadway" treatment.
+# highway=motorway itself is NOT here: it gets its own wider
+# "motorway" kind (see classify_way). (Motorway/trunk used to be
+# deliberately excluded as "not worth rendering", but that dropped
+# them from the course entirely -- a motorway bordering the course
+# should still render as a road.)
 ROADWAY_HIGHWAY_TYPES = (
-    "motorway", "motorway_link", "trunk", "trunk_link",
+    "motorway_link", "trunk", "trunk_link",
     "primary", "primary_link", "secondary", "secondary_link",
     "tertiary", "tertiary_link", "unclassified", "residential", "living_street",
 )
@@ -291,6 +291,10 @@ def classify_way(tags: dict) -> Optional[tuple[str, bool]]:
             return ("driveway", explicit_area)
         if highway_type == "service":
             return ("service_road", explicit_area)
+        if highway_type == "motorway":
+            # Widest road kind, wider than the in-editor 10 max (see
+            # splines.py's _ROAD_KIND_STYLES) -- confirmed in-game.
+            return ("motorway", explicit_area)
         if highway_type in ROADWAY_HIGHWAY_TYPES:
             return ("roadway", explicit_area)
         if way_foot_access != "no":

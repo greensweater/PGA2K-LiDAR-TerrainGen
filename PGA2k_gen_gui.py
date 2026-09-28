@@ -1967,7 +1967,7 @@ class PGAGenGUI:
 
     _SPLINE_KIND_FILTERS = (
         "All", "green", "tee", "fairway", "rough", "heavyrough", "bunker",
-        "water", "cartpath", "service_road", "roadway", "driveway", "path",
+        "water", "cartpath", "service_road", "roadway", "motorway", "driveway", "path",
         "building", "wood", "pavement", "mulch", "hole", "collection",
         SYNTHETIC_BORDER_KIND, SYNTHETIC_MASKED_KIND,
     )
