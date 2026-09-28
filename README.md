@@ -42,7 +42,7 @@ Steps:
 14. Under "Splines", click "Write Splines" to generate course objects from OSM.
 15. Under "Splines", filter by "hole" to select up to 18 holes for your course (apply Mask to exclude holes from output). Click "Write Holes" to add holes.
 16. Click "Repack" to output the .course file to the working directory (give it a name first; ".course" suffix is not needed).
-17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. ~~Only v2019 is supported but .course can be opened in v2021.~~ Choose the game version and refresh all outputs to target v2019 or v2021. (TODO: v2023, v2025)
+17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. ~~Only v2019 is supported but .course can be opened in v2021.~~ Choose the game version and refresh all outputs to target v2019, v2021 or v2023. (TODO: v2025)
 
 ### Funsies
 
@@ -53,6 +53,8 @@ Steps:
 5. Create "borders" using splines filled with object clusters, e.g. water hazard edges, course O.B. areas
 6. Use alt-drag marquee to remove masked areas from borders
 7. Create streams on OSM water object splines (stream, creek, ditch) adds water tiles, low falls, low splash, plus rocks and vegetation
+8. (v2023) Spline fences and walls from OSM `barrier=*` ways: all 28 in-game fence types, cap styles, curved/straight and leveled runs, per-way style from the Fences panel
+9. Clear the game's own generated scatter (trees, plants, grass, rocks) inside chosen areas: mark polygon splines in the Splines tab ("Clear Generated Objects"), then Generate + Write Terrain. Works in v2019/v2021/v2023
 
 ### TODO
 - ~~Trees from LiDAR~~ done

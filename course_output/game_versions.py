@@ -51,8 +51,8 @@ class VersionSchema:
     has_pins_field: bool = False  # v2021+ holes.json "pins"
     has_orientation_fields: bool = False  # v2021 only: userLayers height/OOB-entry _orientation/orientation
     has_radius_field: bool = True  # v2019/v2021 height/OOB entries carry "radius": 0.0; v2023 dropped it
-    # v2023+ placedObjects3 Value.objectPaths[] (schema confirmed, fence
-    # writer not built yet). Also gates the v2023 group envelope
+    # v2023+ placedObjects3 Value.objectPaths[] spline fences (written by
+    # course_output/fences.py, verified in-game). Also gates the v2023 group envelope
     # (objectPaths + IsEmpty on every group, objects.placed_object_groups_to_v2023).
     has_fences: bool = False
     has_texture_paint: bool = False  # v2025+ (not v2023) -- UNCONFIRMED placeholder, not implemented

@@ -35,7 +35,8 @@ per-version asset resolution to differ, so no build_X_v2023 copies.
 What does differ is the group envelope: v2023 adds Value.objectPaths[]
 and a derived Value.IsEmpty to every group, which
 placed_object_groups_to_v2023 applies once over the merged group list.
-objectPaths[] (spline fences) has no builder here yet. v2025
+objectPaths[] (spline fences) are built in course_output/fences.py
+(fence_records_to_groups_v2023), not here. v2025
 isn't confirmed against a real extracted .course file, so
 IMPLEMENTED_GAME_VERSIONS (game_versions.py) excludes it rather than
 guessing.
