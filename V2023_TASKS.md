@@ -892,14 +892,20 @@ Only if a texture-painting schema is confirmed. Independent of fences.
 
 ## Phase 5 — Docs + cleanup
 
-- [ ] **5.1** Update `README.md` line 45 ("TODO: v2023, v2025") to reflect
-        v2023 support (fences/walls + texture paint status).
-- [ ] **5.2** Update `game_versions.py` and `objects.py` module docstrings to
-        drop "not implemented yet" for v2023.
-- [ ] **5.3** Update the `pga2k-terragen` skill with the confirmed v2023
-        fence/wall schema + pipeline shape (so future sessions don't
-        re-derive it).
-- [ ] **5.4** Record the finished feature in `~/completed-tasks.md`.
+- [x] **5.1** Update `README.md` line 45 ("TODO: v2023, v2025") to reflect
+      v2023 support (fences/walls + texture paint status).
+      DONE 2026-09-28: line now says "target v2019, v2021, or v2023 (v2023
+      adds spline fences/walls; texture painting not yet supported). (TODO: v2025)".
+- [x] **5.2** Update `game_versions.py` and `objects.py` module docstrings to
+      drop "not implemented yet" for v2023.
+      Already landed during Phases 1–3 (the `game_versions.py` docstring says
+      '"2023" is confirmed'); verified 2026-09-28 that no stale "not
+      implemented" markers for v2023 remain in either module.
+- [x] **5.3** Update the `pga2k-terragen` skill with the confirmed v2023
+      fence/wall schema + pipeline shape (so future sessions don't
+      re-derive it). DONE 2026-09-28.
+- [x] **5.4** Record the finished feature in `~/completed-tasks.md`.
+      DONE 2026-09-28.
   - **Done when (phase)**: all Phase 5 items checked; `git log` shows the
     v2023 work on `hermes-experiment` with no leftover "TODO: v2023" markers
     in docs that are now stale.

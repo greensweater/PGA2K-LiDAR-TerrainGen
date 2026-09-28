@@ -42,7 +42,7 @@ Steps:
 14. Under "Splines", click "Write Splines" to generate course objects from OSM.
 15. Under "Splines", filter by "hole" to select up to 18 holes for your course (apply Mask to exclude holes from output). Click "Write Holes" to add holes.
 16. Click "Repack" to output the .course file to the working directory (give it a name first; ".course" suffix is not needed).
-17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. ~~Only v2019 is supported but .course can be opened in v2021.~~ Choose the game version and refresh all outputs to target v2019 or v2021. (TODO: v2023, v2025)
+17. Click "Copy to Game Folder" to move the .course file to the appropriate PGA2K directory. ~~Only v2019 is supported but .course can be opened in v2021.~~ Choose the game version and refresh all outputs to target v2019, v2021, or v2023 (v2023 adds spline fences/walls; texture painting not yet supported). (TODO: v2025)
 
 ### Funsies
 
