@@ -87,6 +87,12 @@ HOLE_ID_NONE = -1
 UNUSED_RADIUS_FIELD = 0.0  # see module docstring: sizing is via `scale`
 POSITION_Y = "-Infinity"
 
+# "surfaces" entry category for clear-generated-objects paint (see
+# course_output/clear_objects.py). write_user_layers owns only these
+# entries in that array; editor-painted clear trees (6) / heavy rough
+# (11) and anything else there are kept.
+CLEAR_OBJECTS_CATEGORY = 5
+
 # PGA's grid is centered on the origin; this compiler works in a local
 # [0, COURSE_SIZE_M] frame. Subtracting this at write time converts
 # between the two -- see module docstring's NOTE on sign convention.
@@ -431,7 +437,7 @@ def stamp_to_entry(stamp: Stamp, game_version: str = DEFAULT_GAME_VERSION) -> di
 
 def write_user_layers(
     path: Path, stamps: Optional[Sequence[Stamp]] = None, water: Optional[Sequence[dict]] = None,
-    oob: Optional[Sequence[dict]] = None,
+    oob: Optional[Sequence[dict]] = None, clear_objects: Optional[Sequence[dict]] = None,
     game_version: str = DEFAULT_GAME_VERSION,
 ) -> None:
     """
@@ -440,7 +446,10 @@ def write_user_layers(
     if `water` is given (see water.py's build_water_objects), replaces
     the "water" key; if `oob` is given (already-formatted
     "outOfBounds" entries, see course_output/out_of_bounds.py), replaces
-    the "outOfBounds" key -- each independently, so a caller can write
+    the "outOfBounds" key; if `clear_objects` is given (already-formatted
+    "surfaces" entries, see course_output/clear_objects.py), replaces the
+    CLEAR_OBJECTS_CATEGORY entries of "surfaces" and keeps every other
+    entry there -- each independently, so a caller can write
     just one without disturbing the others (e.g. PGA2k_gen.py's
     step_write_terrain writes "height" + "outOfBounds", step_write_water
     only "water"). Any omitted (None) key is left exactly as found --
@@ -468,6 +477,12 @@ def write_user_layers(
         data["water"] = list(water)
     if oob is not None:
         data["outOfBounds"] = list(oob)
+    if clear_objects is not None:
+        kept = [
+            e for e in data.get("surfaces", [])
+            if e.get("surfaceCategory") != CLEAR_OBJECTS_CATEGORY
+        ]
+        data["surfaces"] = kept + list(clear_objects)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:

@@ -69,6 +69,7 @@ from PGA2k_gen import (  # noqa: E402
 from course_output.out_of_bounds import (  # noqa: E402
     OOB_BAND_WIDTH_M, OOB_CAP_SCALE_RATIO, OOB_INNER_BUFFER_M, OOB_MERGE_GAP_M, OOB_SIMPLIFY_TOL_M,
 )
+from course_output.clear_objects import CLEAR_CELL_M, PGA_CLEAR_OBJECTS_TAG  # noqa: E402
 from course_output.parking import (  # noqa: E402
     PARKING_ACCENT_COUNT, PARKING_COLOR_WEIGHTS, PARKING_MAX_VARIANTS, PARKING_OFFSET_M,
     PARKING_ORIENTATION, PARKING_SIDES, PARKING_SKIP_PROB, PARKING_SPACING_M,
@@ -281,13 +282,16 @@ def _spline_object_detail(f: Feature) -> str:
     -- "" if untagged. A spec that no longer resolves (stale tag after
     asset_catalog.json changed) shows as "?" rather than being silently
     dropped, so it's still visible that *something* is tagged there.
+
+    A spline marked PGA_CLEAR_OBJECTS_TAG (Clear Generated Objects)
+    gets a leading "[clear]".
     """
     if f.kind == "collection":
         return f.tags.get(PGA_COLLECTION_TAG, "")
-    specs = f.tags.get(PGA_CLUSTER_FILLS_TAG)
-    if not specs:
-        return ""
-    return ", ".join(_ASSET_LABEL_BY_KEY.get((s.get("category"), s.get("type")), "?") for s in specs)
+    parts = ["[clear]"] if f.tags.get(PGA_CLEAR_OBJECTS_TAG) else []
+    specs = f.tags.get(PGA_CLUSTER_FILLS_TAG) or []
+    parts += [_ASSET_LABEL_BY_KEY.get((s.get("category"), s.get("type")), "?") for s in specs]
+    return ", ".join(parts)
 
 
 def _hand_tuned_member_paths(template_path: Path) -> list[str]:
@@ -2153,6 +2157,103 @@ class PGAGenGUI:
 
         ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
         self._build_oob_section(parent)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=6)
+        self._build_clear_objects_section(parent)
+
+    def _build_clear_objects_section(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Clear Generated Objects", font=("TkDefaultFont", 10, "bold")).pack(
+            anchor="w", pady=(0, 2))
+        ttk.Label(
+            parent,
+            text="Paint marked polygon splines so the game spawns none of its own trees, plants, "
+                 "grass or rocks inside. Our placed objects (LIDAR trees, clusters) stay.",
+            wraplength=360, foreground="#555",
+        ).pack(anchor="w", pady=(0, 2))
+
+        mark_row = ttk.Frame(parent)
+        mark_row.pack(anchor="w", pady=2)
+        mark_btn = ttk.Button(mark_row, text="Mark", width=10,
+                              command=lambda: self._set_selected_clear_objects(True))
+        mark_btn.pack(side="left")
+        _Tooltip(mark_btn, "Mark the selected polygon spline(s) as clear-objects regions (shown as "
+                 "[clear] in the Objects column). Bare lines can't be filled and are skipped.")
+        unmark_btn = ttk.Button(mark_row, text="Unmark", width=10,
+                                command=lambda: self._set_selected_clear_objects(False))
+        unmark_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(unmark_btn, "Remove the clear-objects mark from the selected spline(s).")
+
+        cell = ttk.Frame(parent)
+        cell.pack(anchor="w", pady=2)
+        self.clear_objects_cell_var = tk.StringVar(value=f"{CLEAR_CELL_M}")
+        cell_lbl = ttk.Label(cell, text="GRID m")
+        cell_lbl.pack(anchor="w")
+        cell_entry = ttk.Entry(cell, textvariable=self.clear_objects_cell_var, width=10)
+        cell_entry.pack(anchor="w")
+        cell_tip = ("Grid cell (m) the marked polygons are filled on. The painted edge lands within "
+                    "half a cell of the spline; smaller = closer fit, more stamps.")
+        _Tooltip(cell_lbl, cell_tip)
+        _Tooltip(cell_entry, cell_tip)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(anchor="w", pady=2)
+        ttk.Button(btn_row, text="Generate Clear Objects", width=22,
+                   command=self._run_generate_clear_objects).pack(side="left")
+        clear_btn = ttk.Button(btn_row, text="Clear", width=12, command=self._run_clear_clear_objects)
+        clear_btn.pack(side="left", padx=(4, 0))
+        _Tooltip(clear_btn, "Delete the generated fill (clear_objects.json) and drop it from "
+                 "userLayers. Marks stay. Re-run Write Terrain + Repack to apply.")
+        ttk.Label(
+            parent,
+            text="Then run Write Terrain (Terrain tab) + Repack to ship it.",
+            foreground="#555",
+        ).pack(anchor="w")
+
+    def _set_selected_clear_objects(self, marked: bool) -> None:
+        """Set or remove PGA_CLEAR_OBJECTS_TAG on every selected spline, then save features.geojson."""
+        wd = self.working_dir.get().strip()
+        selected_ids = {int(s) for s in self.splines_tree.selection()}
+        if not wd or not selected_ids:
+            messagebox.showwarning("No splines selected", "Select one or more splines in the list first.")
+            return
+        targets = [f for f in self._splines_features if f.osm_id in selected_ids]
+        changed = skipped = 0
+        for f in targets:
+            if marked:
+                if f.geometry.geom_type not in ("Polygon", "MultiPolygon"):
+                    skipped += 1
+                    continue
+                if not f.tags.get(PGA_CLEAR_OBJECTS_TAG):
+                    f.tags[PGA_CLEAR_OBJECTS_TAG] = "yes"
+                    changed += 1
+            elif f.tags.pop(PGA_CLEAR_OBJECTS_TAG, None) is not None:
+                changed += 1
+        if changed:
+            save_features(self._splines_features, Path(wd) / FEATURES_FILE)
+            self._refresh_splines_list()
+            restorable_ids = [str(i) for i in selected_ids if self.splines_tree.exists(str(i))]
+            if restorable_ids:
+                self.splines_tree.selection_set(restorable_ids)
+        verb = "marked" if marked else "unmarked"
+        msg = f"\n[clear objects: {verb} {changed} spline(s)"
+        if skipped:
+            msg += f", skipped {skipped} bare line(s)"
+        self._append_log(msg + " -- run Generate Clear Objects to update the fill]\n")
+
+    def _run_generate_clear_objects(self) -> None:
+        wd = self._require_working_dir()
+        if not wd:
+            return
+        args = ["--step", "generate-clear-objects"]
+        val = self.clear_objects_cell_var.get().strip()
+        if val:
+            args += ["--clear-objects-cell", val]
+        self._run_step(args, wd)
+
+    def _run_clear_clear_objects(self) -> None:
+        wd = self._require_working_dir()
+        if wd:
+            self._run_step(["--step", "generate-clear-objects", "--clear-objects-clear"], wd)
 
     def _build_oob_section(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Out of Bounds", font=("TkDefaultFont", 10, "bold")).pack(

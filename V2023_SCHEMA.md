@@ -239,9 +239,10 @@ new key). Two stamps were provided:
 uses (`OOB_ROUND_BRUSH=8`, `OOB_SQUARE_BRUSH=15` in
 `course_output/out_of_bounds.py`) — the course author's expectation that they
 correspond to known stamp shapes is borne out by the data, and the shapes were
-confirmed in-game (0.3b.2, see below). Entry shape is identical to a
-height-layer stamp (tool 0, y "-Infinity" = terrain-grounded, value 1.0) but
-with `surfaceCategory` instead of the height layer's `value` semantics.
+confirmed in-game (0.3b.2, see below). Entry shape is a height-layer stamp
+(y "-Infinity" = terrain-grounded, value 1.0) with `surfaceCategory` in place
+of `tool`. There is **no `tool` key**: v2023 entries are exactly
+`surfaceCategory, position, rotation, scale, type, value, holeId`.
 
 ### In-game results (0.3b.1/0.3b.2, Andy, 2026-09-27)
 
@@ -339,6 +340,29 @@ Side finding: the game-saved **v2019** course carries `_orientation` /
 without them have always loaded, so the game accepts both; no writer change
 needed. A v2019 clear-stamp formatter can go either way, but copying the
 game's shape (with the fields) is the safer default.
+
+### Clear-objects fill (task 3.4 decision, 2026-09-27)
+
+The generator's `generate-clear-objects` step (`course_output/clear_objects.py`)
+fills polygon splines marked `pga_clear_objects` in the GUI. It emits only
+**category 5**, and **only paints**: our placed objects are not suppressed
+inside the regions, which matches how the game treats them.
+
+- **Fill, not outline.** Each polygon is rasterised on a `cell_m` grid
+  (default 2 m) aligned to its minimum rotated rectangle. Cells whose centre
+  is inside the polygon are merged into row runs, and identical runs in
+  adjacent rows are merged into rectangles. Each rectangle becomes one
+  **type-72 hard square** with `scale` = half its side + 0.25 m overlap. Since
+  type 72's edge is exactly at `±scale`, the painted edge is within
+  `cell_m/2 + 0.25` m of the spline. A rotated rectangular area becomes a
+  single stamp.
+- Bouldercreek2 (68 wood + building polygons) produces 3637 stamps at 2 m,
+  1839 at 4 m and 934 at 8 m. For scale, its height layer has about 112k.
+- `write_user_layers` owns only the category-5 entries in `surfaces`, and keeps
+  editor-painted 6/11 entries.
+- **Type 72 works with category 5**, confirmed in-game (Andy, 2026-09-27,
+  `clearobj_bc2_1.course`), although the editor itself wrote 15/8 for 5/6 and 72
+  only for 11. The brush type is independent of the clear category.
 
 ## Version registry (task 1.1 decisions, 2026-09-23)
 

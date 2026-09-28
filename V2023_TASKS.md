@@ -674,7 +674,7 @@ prioritize it; treat the object-tile version as a later optional variant.
         object-tile-along-line pattern, placing fence post/panel `items[]`
         (reuse existing tiling/rotation — no hand-rolled sampling).
   - [ ] 3.3b.2 Per-way choice between objectPaths vs object-tile representation.
-- [ ] **3.4 Fill splines with "clear generated objects" stamps (new feature)**
+- [x] **3.4 Fill splines with "clear generated objects" stamps (new feature)**
       — **schema confirmed** (0.3b): `userLayers2.json` → `surfaces[]` entries
       with `surfaceCategory: 5`, OOB-shaped stamps (`type` 8 round / 15 smooth
       square, `scale` = centre-to-edge in m, the same convention as height stamps,
@@ -689,13 +689,30 @@ prioritize it; treat the object-tile version as a later optional variant.
     emission along a shape); `course_output/water.py` already writes
     `surfaceCategory: 9` stamps into the same `surfaces` array (read how it
     merges); `step_write_terrain` in `PGA2k_gen.py` for the fold-in point.
+  - **Status (2026-09-27): DONE, verified in-game (Andy, `clearobj_bc2_1.course`;
+    type 72 works for category 5).**
+    Decisions (Andy): regions are polygon splines marked in the GUI; the fill
+    emits category 5 only; it is paint only, with no generator-side
+    suppression; the fill uses type-72 hard-square rectangles.
+    `course_output/clear_objects.py` + `--step generate-clear-objects` →
+    `clear_objects.json`, folded into `surfaces` by write-terrain. Two
+    corrections to the notes below: nothing in the repo wrote `surfaces`
+    before this (water goes to the `water` key), and the game's `surfaces`
+    entries carry **no** `tool` key.
   - **Steps**:
-  - [ ] 3.4.1 **Record builder**: follow the `out_of_bounds.py` blueprint —
+  - [x] 3.4.1 **Record builder**: `course_output/clear_objects.py`
+        (`ClearRecord`, `build_clear_records`, `clear_records_to_entries`
+        in the game's exact per-version shape). Original note: follow the `out_of_bounds.py` blueprint —
         version-agnostic frozen records in their own file
         (e.g. `clear_objects.json`), entries formatted for the target layer by
         a `_v2023` (or shared) formatter that emits the exact confirmed shape
         (`surfaceCategory: 5`, brush `type`, `scale`, `value: 1.0`).
-  - [ ] 3.4.2 **Input path**: how the fill area is designated — OSM tag on a
+  - [x] 3.4.2 **Input path** — DECIDED: Splines tab Mark/Unmark sets
+        `pga_clear_objects=yes` on selected polygon splines in
+        features.geojson (carried across OSM re-ingest like
+        pga_cluster_fills). Fill = rectangle cover on a grid aligned to each
+        polygon's minimum rotated rectangle (`V2023_SCHEMA.md` "Clear-objects
+        fill"). Original question: how the fill area is designated — OSM tag on a
         closed way (e.g. `pga_clear_objects=yes`)? a spline drawn in the GUI?
         (mirror however OOB gets its shape — check `step_generate_oob` input).
         Note the sample uses *brush stamps*, not a spline outline — the
@@ -703,31 +720,50 @@ prioritize it; treat the object-tile version as a later optional variant.
         (OOB does exactly this: round caps per vertex + stretched squares per
         edge) or a coarse stamp grid over the region; decide which and record
         the decision in `V2023_SCHEMA.md`.
-  - [ ] 3.4.3 **Merge into userLayers**: `step_write_terrain` (or the
+  - [x] 3.4.3 **Merge into userLayers**: `write_user_layers(clear_objects=...)`
+        replaces only the category-5 `surfaces` entries, and keeps editor-painted
+        6/11 (and anything else). Original note: `step_write_terrain` (or the
         userLayers writer) must append these entries to the existing `surfaces`
         array alongside water entries (`surfaceCategory: 9`) — same layer,
         different category; confirm no key-ordering or dedup assumptions break.
-  - [ ] 3.4.4 **Generator-side suppression** (the core logic): when
+  - [x] 3.4.4 **Generator-side suppression** — DROPPED (Andy, 2026-09-27:
+        paint only; our placed objects stay, matching how the game treats
+        them). Original plan: when
         `step_generate_trees` / other object-generating steps place objects,
         test each candidate point against the clear-objects region (point-in-
         region test against the filled area) and skip it. Centralize the
         containment test so every generator uses the same rule. (This is
         independent of the paint: it keeps our generator consistent with areas
         painted in-game, and gives us a containment primitive to reuse.)
-  - [ ] 3.4.5 **Scope decision**: in-game, the paint only clears the game's
+  - [x] 3.4.5 **Scope decision** — DECIDED: category 5 only, all versions,
+        no suppression (3.4.4). Original note: in-game, the paint only clears the game's
         *own* procedural scatter; our placedObjects3 trees are unaffected
         (0.3b.1). So the generator-side suppression (3.4.4) is a choice we
         make, not something the game does for us. Also decide which categories
         to emit: 5 objects, 6 trees, 11 heavy rough. Categories 5/6 work in
         every version (`has_clear_objects`); 11 is v2023 only
         (`has_clear_heavy_rough`) (0.3b.3).
-  - [ ] 3.4.6 **Wiring**: `step_generate_clear_objects` (+ clear flag,
+  - [x] 3.4.6 **Wiring**: done — `--step generate-clear-objects
+        [--clear-objects-cell M] [--clear-objects-clear]`, project.json
+        `clear_objects_enabled` / `clear_objects_cell_m`, export-status
+        staleness. Original note: `step_generate_clear_objects` (+ clear flag,
         mirroring `step_generate_oob`/`_clear_oob`), fold into
         `step_write_terrain` like OOB is (`oob_entries` pattern), `project.json`
         enable flag.
-  - [ ] 3.4.7 **GUI**: brush/draw area + apply/clear controls, mirroring the
-        OOB UI.
-  - [ ] 3.4.8 **Verification**: paint a clear region over a tree-dense area,
+  - [x] 3.4.7 **GUI**: Splines tab "Clear Generated Objects" section (Mark /
+        Unmark, GRID m, Generate Clear Objects / Clear); marked rows show
+        `[clear]` in the Objects column.
+  - [x] 3.4.8 **Verification** — CONFIRMED in-game (Andy, 2026-09-27): the fill
+        clears the game's scatter, and type 72 works for category 5.
+        Test course: `clearobj_bc2_1.course` in the v2023
+        Courses folder (bouldercreek2 with all 68 wood + building polygons
+        filled, 3637 type-72 stamps on a 2 m grid). Check: (a) no game scatter
+        (grass/plants/rocks/procedural trees) inside the woods/building
+        footprints, with scatter still just outside; (b) LIDAR trees are still
+        present inside the woods; (c) no hairline uncleared seams between
+        stamps; (d) type 72 works for category 5 (so far it has only been seen
+        on category 11). If 72 doesn't work for category 5, fall back to type 15
+        (soft edges). Original note: paint a clear region over a tree-dense area,
         regenerate, confirm generated trees/objects are absent inside the
         region and present just outside it; confirm manually placed objects are
         unaffected; also load the generated course in-game and confirm the

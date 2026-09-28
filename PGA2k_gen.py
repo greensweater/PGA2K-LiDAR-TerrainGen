@@ -26,6 +26,12 @@ directory, running one pipeline step at a time:
                                  caps + stretched type-15 squares -- just outside the playable
                                  area -> oob.json; folded into userLayers.json by write-terrain.
                                  --oob-clear deletes it; re-run write-terrain to apply)
+    PGA2k_gen.py <working_dir> --step generate-clear-objects [--clear-objects-cell M]
+                                 [--clear-objects-clear]
+                                 (fill every polygon spline marked pga_clear_objects with
+                                 "clear generated objects" paint -- type-72 hard squares,
+                                 surfaces category 5 -> clear_objects.json; folded into
+                                 userLayers.json by write-terrain)
     PGA2k_gen.py <working_dir> --step generate-collections [--collection-library <dir>]
     PGA2k_gen.py <working_dir> --step generate-parking [--parking-spacing M] [--parking-offset M]
                                  [--parking-sides left|right|both] [--parking-orientation
@@ -300,12 +306,16 @@ from terrain.streams import (
     load_stream_records, rebuild_stream_drop_rows, save_stream_records,
 )
 from course_output.userLayers import (
-    GRID_ORIGIN_OFFSET, build_baseline_flatten_stamp, build_registration_mark_stamps,
+    CLEAR_OBJECTS_CATEGORY, GRID_ORIGIN_OFFSET, build_baseline_flatten_stamp, build_registration_mark_stamps,
     normalize_stamp_heights, normalize_stamp_heights_by_value_shift, stamp_to_entry, write_user_layers,
 )
 from course_output.out_of_bounds import (
     OOB_BAND_WIDTH_M, OOB_CAP_SCALE_RATIO, OOB_INCLUDE_CAPS, OOB_INNER_BUFFER_M, OOB_MERGE_GAP_M,
     OOB_SIMPLIFY_TOL_M, build_oob_records, load_oob_records, oob_records_to_entries, save_oob_records,
+)
+from course_output.clear_objects import (
+    CLEAR_CELL_M, PGA_CLEAR_OBJECTS_TAG, build_clear_records, clear_records_to_entries,
+    load_clear_records, save_clear_records,
 )
 from course_output.water import (
     build_water_objects, build_stream_water_objects,
@@ -327,6 +337,7 @@ STREAMS_FILE = "streams.json"
 COLLECTIONS_FILE = "collections.json"
 PARKING_FILE = "parking.json"
 OOB_FILE = "oob.json"
+CLEAR_OBJECTS_FILE = "clear_objects.json"
 INGAME_OBJECTS_FILE = "ingame_objects.json"
 
 # This project's own OSM tag (not an OSM standard) on a 2-node way that
@@ -1245,8 +1256,9 @@ def step_ingest_osm(
         if any(preserved.values()):
             print(f"  preserved {preserved['synthetic']} synthetic feature(s), re-applied "
                   f"{preserved['mask_reapplied']} mask override(s) and "
-                  f"{preserved['fills_reapplied']} cluster-fill edit(s) and "
-                  f"{preserved['fence_styles_reapplied']} fence style(s) from the existing "
+                  f"{preserved['fills_reapplied']} cluster-fill edit(s), "
+                  f"{preserved['fence_styles_reapplied']} fence style(s) and "
+                  f"{preserved['clear_objects_reapplied']} clear-objects mark(s) from the existing "
                   f"{FEATURES_FILE} (--no-preserve-synthetic rebuilds purely from map.osm)")
 
     counts: dict[str, int] = {}
@@ -1389,10 +1401,11 @@ def _preserved_synthetic_features(parsed: list, previous: list) -> tuple[list, d
     copied when the fresh Feature has none, so a spec coming straight
     from OSM tags wins and GUI-only spec lists (always written whole)
     never get duplicated. Per-way fence style tags (fences.FENCE_STYLE_TAGS,
-    set from the GUI's Fences panel) follow the same rule, per tag.
+    set from the GUI's Fences panel) follow the same rule, per tag, and
+    so does PGA_CLEAR_OBJECTS_TAG (the Splines tab's clear-objects mark).
 
     Returns (synthetic_features, {"synthetic", "mask_reapplied", "fills_reapplied",
-    "fence_styles_reapplied"}).
+    "fence_styles_reapplied", "clear_objects_reapplied"}).
     """
     synthetic = [f for f in previous if _is_synthetic_feature(f)]
 
@@ -1400,7 +1413,7 @@ def _preserved_synthetic_features(parsed: list, previous: list) -> tuple[list, d
         f.osm_id: f for f in previous
         if f.osm_id is not None and not _is_synthetic_feature(f)
     }
-    mask_reapplied = fills_reapplied = fence_styles_reapplied = 0
+    mask_reapplied = fills_reapplied = fence_styles_reapplied = clear_objects_reapplied = 0
     for f in parsed:
         old = prev_by_id.get(f.osm_id)
         if old is None:
@@ -1416,12 +1429,16 @@ def _preserved_synthetic_features(parsed: list, previous: list) -> tuple[list, d
         for t in carried:
             f.tags[t] = old.tags[t]
         fence_styles_reapplied += bool(carried)
+        if PGA_CLEAR_OBJECTS_TAG in old.tags and PGA_CLEAR_OBJECTS_TAG not in f.tags:
+            f.tags[PGA_CLEAR_OBJECTS_TAG] = old.tags[PGA_CLEAR_OBJECTS_TAG]
+            clear_objects_reapplied += 1
 
     return synthetic, {
         "synthetic": len(synthetic),
         "mask_reapplied": mask_reapplied,
         "fills_reapplied": fills_reapplied,
         "fence_styles_reapplied": fence_styles_reapplied,
+        "clear_objects_reapplied": clear_objects_reapplied,
     }
 
 
@@ -3560,6 +3577,108 @@ def step_generate_oob(
     })
 
 
+def _clear_clear_objects(working_dir: Path) -> None:
+    """
+    Remove the generated clear-objects paint: delete clear_objects.json
+    and mark the project's fill as deliberately empty
+    (clear_objects_enabled=False), so the next write-terrain drops the
+    category-5 "surfaces" entries rather than leaving the last fill
+    stale. Also drops them from any already-written userLayers.json for
+    immediate effect. Other "surfaces" entries are kept. The
+    pga_clear_objects marks on the splines are left alone.
+    """
+    removed = []
+    clear_path = working_dir / CLEAR_OBJECTS_FILE
+    if clear_path.exists():
+        clear_path.unlink()
+        removed.append(CLEAR_OBJECTS_FILE)
+
+    nodes_dir = working_dir / "course" / "CourseDescription_nodes"
+    for name in ("userLayers.json", "userLayers2.json"):
+        ul = nodes_dir / name
+        if not ul.exists():
+            continue
+        try:
+            with ul.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if any(e.get("surfaceCategory") == CLEAR_OBJECTS_CATEGORY for e in data.get("surfaces", [])):
+            write_user_layers(ul, clear_objects=[])
+            removed.append(f"{name}:surfaces")
+
+    save_project(working_dir, {"clear_objects_enabled": False})
+    if removed:
+        print("  cleared clear-objects paint: " + ", ".join(removed))
+    else:
+        print("  no clear-objects paint to clear.")
+
+
+def step_generate_clear_objects(
+    working_dir: Path, *, cell_m: float | None = None, clear: bool = False,
+) -> None:
+    """
+    Fill every polygon spline marked pga_clear_objects (Splines tab ->
+    "Clear Objects") with "clear generated objects" paint: type-72
+    hard-square brush stamps, surfaceCategory 5, so the game spawns none
+    of its own procedural trees/plants/grass/rocks inside. Our own
+    placed objects are unaffected (paint only; see
+    course_output/clear_objects.py).
+
+    Output: clear_objects.json -- a frozen, version-agnostic record list
+    (course-local frame), overwritten wholesale on every run (like
+    oob.json). step_write_terrain formats it into userLayers.json's
+    "surfaces" array, replacing only the category-5 entries -- the tool
+    owns those once this step has run for the project (project.json
+    "clear_objects_enabled"), so deleting clear_objects.json / passing
+    clear=True and re-running write-terrain removes the fill.
+
+    clear=True: delete clear_objects.json, mark the fill empty, and
+    return (no regeneration).
+    """
+    if clear:
+        _clear_clear_objects(working_dir)
+        return
+
+    features_path = working_dir / FEATURES_FILE
+    if not features_path.exists():
+        raise StepError(f"No {FEATURES_FILE} found under {working_dir}. Run --step ingest-osm first.")
+
+    project = load_project(working_dir)
+    cell_m = cell_m if cell_m is not None else project.get("clear_objects_cell_m", CLEAR_CELL_M)
+    if cell_m <= 0:
+        raise StepError(f"--clear-objects-cell must be > 0 (got {cell_m}).")
+
+    marked = [f for f in load_features(features_path) if f.tags.get(PGA_CLEAR_OBJECTS_TAG)]
+    course_marked = _crop_features_to_course(working_dir, marked)
+    regions = [
+        f.geometry for f in course_marked
+        if f.geometry.geom_type in ("Polygon", "MultiPolygon")
+    ]
+    skipped = len(marked) - len(regions)
+    if not marked:
+        print(f"  no splines marked {PGA_CLEAR_OBJECTS_TAG} in {FEATURES_FILE}. "
+              "Mark polygon splines in the GUI's Splines tab (Clear Objects).")
+    if skipped:
+        print(f"  skipped {skipped} marked spline(s) with no polygon area inside the course "
+              "(bare lines, or cropped away).")
+
+    course_bounds = BoundingBox(min_x=0.0, min_z=0.0, max_x=COURSE_SIZE_M, max_z=COURSE_SIZE_M)
+    records = build_clear_records(regions, cell_m=cell_m, course_bounds=course_bounds)
+    out_path = working_dir / CLEAR_OBJECTS_FILE
+    if not records and not out_path.exists() and not project.get("clear_objects_enabled"):
+        return
+
+    # Written even when empty, so unmarking every spline and re-running
+    # replaces the last fill instead of leaving it in place.
+    save_clear_records(records, out_path)
+    print(f"  wrote {out_path} ({len(records)} clear-objects stamp(s) over "
+          f"{len(regions)} region(s), {cell_m} m grid)")
+    print("  run --step write-terrain (then repack) to fold it into userLayers.json.")
+
+    save_project(working_dir, {"clear_objects_enabled": True, "clear_objects_cell_m": cell_m})
+
+
 def step_generate_collections(working_dir: Path, library_dir: Path | None = None) -> None:
     """
     Resolve every OSM 2-node way tagged pga_collection=<template name>
@@ -4512,13 +4631,30 @@ def step_write_terrain(
     elif "oob_enabled" in project:
         oob_entries = []
 
+    # Clear-objects paint, same ownership rule, but it shares "surfaces"
+    # with editor-painted entries, so only its category-5 entries are
+    # replaced (see write_user_layers).
+    clear_entries = None
+    clear_path = working_dir / CLEAR_OBJECTS_FILE
+    if clear_path.exists():
+        clear_entries = clear_records_to_entries(load_clear_records(clear_path), game_version)
+    elif "clear_objects_enabled" in project:
+        clear_entries = []
+
     out_path = nodes_dir / schema_for(game_version).userlayers_filename
-    write_user_layers(out_path, stamps=stamps, oob=oob_entries, game_version=game_version)
+    write_user_layers(
+        out_path, stamps=stamps, oob=oob_entries, clear_objects=clear_entries,
+        game_version=game_version,
+    )
     print(f"Wrote {out_path}")
     if oob_entries:
         print(f"  including {len(oob_entries)} out-of-bounds stamp(s) from {OOB_FILE}")
     elif oob_entries == []:
         print("  outOfBounds cleared (no oob.json)")
+    if clear_entries:
+        print(f"  including {len(clear_entries)} clear-objects stamp(s) from {CLEAR_OBJECTS_FILE}")
+    elif clear_entries == []:
+        print("  clear-objects paint cleared")
 
     # If a course name has been set (see the GUI's "Course name" field /
     # project.json), write it into the course/ JSON. Also re-applied at
@@ -5227,6 +5363,7 @@ def export_status(working_dir: Path) -> dict[str, str]:
     collections_path = working_dir / COLLECTIONS_FILE
     streams_path = working_dir / STREAMS_FILE
     oob_path = working_dir / OOB_FILE
+    clear_objects_path = working_dir / CLEAR_OBJECTS_FILE
     objects_json_path = working_dir / OBJECTS_FILE
 
     course_dir = working_dir / "course"
@@ -5234,7 +5371,8 @@ def export_status(working_dir: Path) -> dict[str, str]:
 
     return {
         "height": _status(
-            schema.userlayers_filename, [*stamps_mtime_paths, collections_path, oob_path],
+            schema.userlayers_filename,
+            [*stamps_mtime_paths, collections_path, oob_path, clear_objects_path],
         ),
         "water": _status(
             schema.userlayers_filename, [*stamps_mtime_paths, features_path, streams_path],
@@ -5767,6 +5905,7 @@ STEPS = {
     "generate-cart-paths": step_generate_cart_paths,
     "generate-streams": step_generate_streams,
     "generate-oob": step_generate_oob,
+    "generate-clear-objects": step_generate_clear_objects,
     "generate-collections": step_generate_collections,
     "generate-parking": step_generate_parking,
     "generate-range-nets": step_generate_range_nets,
@@ -6166,6 +6305,14 @@ def main(argv: list[str] | None = None) -> int:
                          help="generate-oob: delete the generated OOB band (oob.json + previews) "
                               "and mark the layer empty instead of regenerating -- the next "
                               "write-terrain then writes an empty outOfBounds array.")
+    parser.add_argument("--clear-objects-cell", type=float, default=None,
+                         help="generate-clear-objects: grid cell (m) the marked polygons are filled "
+                              "on; the painted edge lands within half a cell of the spline. "
+                              f"Default: project.json, or {CLEAR_CELL_M}.")
+    parser.add_argument("--clear-objects-clear", action="store_true",
+                         help="generate-clear-objects: delete the generated fill (clear_objects.json) "
+                              "instead of regenerating -- the next write-terrain then drops the "
+                              "category-5 surfaces entries. Spline marks are kept.")
     parser.add_argument("--parking-spacing", type=float, default=None,
                          help="generate-parking: along-row centre-to-centre car spacing (m). "
                               f"Default: project.json, or {PARKING_SPACING_M}.")
@@ -6697,6 +6844,10 @@ def main(argv: list[str] | None = None) -> int:
                 cap_scale_ratio=args.oob_cap_ratio,
                 include_caps=(False if args.oob_no_caps else None),
                 clear=args.oob_clear,
+            )
+        elif args.step == "generate-clear-objects":
+            step_generate_clear_objects(
+                working_dir, cell_m=args.clear_objects_cell, clear=args.clear_objects_clear,
             )
         elif args.step == "generate-collections":
             step_generate_collections(working_dir, args.collection_library)
