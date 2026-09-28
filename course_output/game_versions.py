@@ -12,7 +12,7 @@ dependency on objects.py).
 
 This is deliberately a registry of filenames + capability flags, NOT a
 generic schema-mapping/transform engine -- most of what 2023 (spline
-fences, texture painting) and 2025 (spline water) add is new
+fences) and 2025 (spline water, texture painting) add is new
 *generation logic* with new inputs, not a reshaping of data this
 project already produces, so a declarative field mapper couldn't
 shortcut writing it anyway. Where the *same* logical data (a placed
@@ -55,7 +55,7 @@ class VersionSchema:
     # writer not built yet). Also gates the v2023 group envelope
     # (objectPaths + IsEmpty on every group, objects.placed_object_groups_to_v2023).
     has_fences: bool = False
-    has_texture_paint: bool = False  # v2023+ -- deferred (V2023_TASKS.md Phase 4), not implemented
+    has_texture_paint: bool = False  # v2025+ (not v2023) -- UNCONFIRMED placeholder, not implemented
     # userLayers "surfaces" clear stamps for the game's procedural scatter:
     # surfaceCategory 5 = clear generated objects (trees/plants/grass/rocks),
     # 6 = clear generated trees. Confirmed from editor exports in all three

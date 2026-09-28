@@ -1,8 +1,9 @@
 # PGA2K v2023 implementation — task list
 
 Working task breakdown for adding **v2023** support to PGA2K-LiDAR-TerrainGen.
-Headline feature: **spline fences and walls**. Secondary v2023 capability
-flagged in the registry: texture painting (`has_texture_paint`).
+Headline feature: **spline fences and walls**. Texture painting
+(`has_texture_paint`) is a **v2025** feature, not v2023 (Andy, 2026-09-27),
+so it is out of scope here (see Phase 4).
 
 **How this list is meant to be executed** (read first — this is the contract
 with fresh sessions): development runs **piecemeal, one task or subtask at a
@@ -199,7 +200,7 @@ in `V2023_SCHEMA.md`. Remaining items below are the confirmed gaps.
         from base) is loaded, and adjust `_ensure_course_baseline` /
         `course_repack.py` accordingly if the game wants it in the base.
   - [x] 1.1.3 Set capability flags: `has_fences=True` (objectPaths),
-        `has_texture_paint` (deferred, Phase 4), and a clear-objects flag
+        `has_texture_paint` (stays False: it's a v2025 feature, see Phase 4), and a clear-objects flag
         (e.g. `has_clear_objects=True` — the schema is confirmed; add the field
         to `VersionSchema` now, set it per version once 0.3b.3 resolves
         v2019/v2021 support). Done 2026-09-27: `has_clear_objects` is True for
@@ -772,7 +773,8 @@ prioritize it; treat the object-tile version as a later optional variant.
     objects inside and leaves outside areas untouched; `V2023_SCHEMA.md`
     records which object kinds are suppressed and the v2019/v2021 support
     answer (0.3b.3).
-- [ ] **3.5 Fence + clear-objects verification**
+- [x] **3.5 Fence + clear-objects verification** — DONE 2026-09-27 (3.5.7
+      moved to the Backlog)
   - **Context**: everything in Phase 3 built; this is the gate before
     declaring v2023 done.
   - **Harness (2026-09-26):** `--step push-fence-test` / GUI Objects →
@@ -886,13 +888,9 @@ prioritize it; treat the object-tile version as a later optional variant.
       point, like one placed in the editor. Test it on a way over a slope
       (`pga_fence_heightRule=1`); the picket and railing parts should line
       up in the same load.
-  - [ ] 3.5.7 (future, from Andy) **Retaining wall along pond edges.** The
-        retaining wall draws a ground-textured cap tile about 1.9 m back
-        from the spline, at cap height (Γ profile). Place the spline about
-        2 m inside the water contour, and set `height` by trig from the bank
-        slope over a ~1.5 m run so the tile clips into the terrain. See
-        `V2023_SCHEMA.md` "In-game fence test results".
-  - [ ] 3.5.5 Regression: confirm untouched features (trees, water, splines)
+  - 3.5.7 Retaining wall along pond edges: moved to the Backlog (end of
+        file), 2026-09-27.
+  - [x] 3.5.5 Regression: confirm untouched features (trees, water, splines)
         are unchanged when fences/clear-objects are present vs absent.
     - **Fences: DONE 2026-09-27** on a bouldercreek2 scratch copy (71
       objectPaths, incl. leveled + multi-part), write-objects with vs
@@ -902,34 +900,38 @@ prioritize it; treat the object-tile version as a later optional variant.
       - in `placedObjects3`, the 15 non-fence groups (trees, range-net
         items) are identical in content and order; fences add only their
         own 12 groups.
-    - Clear-objects half still open: re-run once 3.4 exists.
+    - **Clear-objects: DONE 2026-09-27.** Andy built bouldercreek2 twice from
+      the pipeline: `bouldercreek_cleared` (fill on) and `bouldercreek` (fill
+      off). Diff of the game-saved extracts:
+      - `userLayers2` differs only in `surfaces`: 291 category-5 type-72
+        stamps vs none. Key order, `height` (112387), `water` and every
+        other key are identical.
+      - Every other node (placedObjects3, surfaceSplines2, holes2, ...) is
+        byte-identical.
+      - CourseDescription/CourseMetadata differ only in the filename-derived
+        `_id`/`courseId` and `timeStamp`.
 
-**Exit:** OSM fence/wall ways become correctly-grounded objectPath fences/walls
+**Exit — MET 2026-09-27 (3.5.7 moved to the Backlog):** OSM fence/wall ways become correctly-grounded objectPath fences/walls
 in a playable v2023 `.course` (trick presets included), clear-objects fill
 suppresses generated objects where painted, with no regression to existing
 features.
 
 ---
 
-## Phase 4 — Texture painting (secondary v2023 capability, optional/deferred)
+## Phase 4 — Texture painting: NOT APPLICABLE to v2023
 
-Only if a texture-painting schema is confirmed. Independent of fences.
-
-- [ ] **4.1** Capture the paint schema from a reference `.course`
-  (extract + diff per AGENTS.md ".course file format" section).
-  - **Where**: a v2023 `.course` with texture paint (none in the repo yet —
-    needs a new sample from the game), diffed against `2023_fences.course`.
-- [ ] **4.2** Set `has_texture_paint=True` once implemented.
-- [ ] **4.3** Build the paint generator + wire a step; verify in-game.
-  - **Done when**: a v2023 course with painted texture regions loads and
-    renders correctly in-game.
+**Dropped 2026-09-27 (Andy):** v2023 has no texture painting; it arrives in
+**v2025**. The v2023 editor feature this was confused with is "clear
+generated heavy rough" (surfaceCategory 11, see `V2023_SCHEMA.md` "Three
+clear-stamp categories"). `has_texture_paint` stays False for every version
+until a v2025 task list picks it up.
 
 ---
 
 ## Phase 5 — Docs + cleanup
 
 - [ ] **5.1** Update `README.md` line 45 ("TODO: v2023, v2025") to reflect
-        v2023 support (fences/walls + texture paint status).
+        v2023 support (fences/walls + clear-objects paint).
 - [ ] **5.2** Update `game_versions.py` and `objects.py` module docstrings to
         drop "not implemented yet" for v2023.
 - [ ] **5.3** Update the `pga2k-terragen` skill with the confirmed v2023
@@ -949,3 +951,14 @@ Only if a texture-painting schema is confirmed. Independent of fences.
 - Grep every consumer of a feature `kind` before adding/renaming it.
 - Verify with the repo venv, not system python (needs `overpy`/`shapely`/`pyproj`).
 - Confirm the real schema before building — the whole point of Phase 0.
+
+---
+
+## Backlog (not blocking v2023 completion)
+
+- [ ] **B.1** (from Andy, moved from 3.5.7 on 2026-09-27) **Retaining wall
+      along pond edges.** The retaining wall draws a ground-textured cap tile
+      about 1.9 m back from the spline, at cap height (Γ profile). Place the
+      spline about 2 m inside the water contour, and set `height` by trig
+      from the bank slope over a ~1.5 m run so the tile clips into the
+      terrain. See `V2023_SCHEMA.md` "In-game fence test results".
