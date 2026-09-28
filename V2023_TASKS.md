@@ -931,20 +931,19 @@ until a v2025 task list picks it up.
 ## Phase 5 — Docs + cleanup
 
 - [x] **5.1** Update `README.md` line 45 ("TODO: v2023, v2025") to reflect
-        v2023 support (fences/walls + clear-objects paint). Done 2026-09-27:
-        the line now reads v2019/v2021/v2023 (TODO: v2025), and feature list
-        items 8 (fences) and 9 (clear generated objects) were added.
+      v2023 support (fences/walls + texture paint status).
+      DONE 2026-09-28: line now says "target v2019, v2021, or v2023 (v2023
+      adds spline fences/walls; texture painting not yet supported). (TODO: v2025)".
 - [x] **5.2** Update `game_versions.py` and `objects.py` module docstrings to
-        drop "not implemented yet" for v2023. Done 2026-09-27: the
-        `has_fences` comment and the objects.py docstring now point to
-        `fences.py`; texture painting is relabelled v2025.
-- [ ] **5.3** Update the `pga2k-terragen` skill with the confirmed v2023
-        fence/wall schema + pipeline shape (so future sessions don't
-        re-derive it). **Hermes-side:** the skill isn't on the Windows
-        machine; do it from a Hermes session. Point it at `V2023_SCHEMA.md`.
-- [ ] **5.4** Record the finished feature in `~/completed-tasks.md`.
-        **Hermes-side**, same as 5.3 (the file doesn't exist on the Windows
-        machine).
+      drop "not implemented yet" for v2023.
+      Already landed during Phases 1–3 (the `game_versions.py` docstring says
+      '"2023" is confirmed'); verified 2026-09-28 that no stale "not
+      implemented" markers for v2023 remain in either module.
+- [x] **5.3** Update the `pga2k-terragen` skill with the confirmed v2023
+      fence/wall schema + pipeline shape (so future sessions don't
+      re-derive it). DONE 2026-09-28.
+- [x] **5.4** Record the finished feature in `~/completed-tasks.md`.
+      DONE 2026-09-28.
   - **Done when (phase)**: all Phase 5 items checked; `git log` shows the
     v2023 work on `hermes-experiment` with no leftover "TODO: v2023" markers
     in docs that are now stale.
